@@ -17685,8 +17685,9 @@ static bool isFusedOp(const MatchContextClass &Matcher, SDValue N) {
 /// would duplicate the multiply without reducing the total number of
 /// operations.
 ///
-/// Currently checks for the following pattern:
+/// Currently checks for the following patterns:
 ///   - fmul --> fadd/fsub: Direct contraction
+///   - fmul --> fneg --> fsub: Contraction through fneg
 static bool allMulUsesCanBeContracted(SDValue Mul) {
   for (const auto *User : Mul->users()) {
     unsigned Opcode = User->getOpcode();
@@ -17694,6 +17695,16 @@ static bool allMulUsesCanBeContracted(SDValue Mul) {
     // Direct FADD/FSUB - contractable.
     if (Opcode == ISD::FADD || Opcode == ISD::FSUB)
       continue;
+
+    // FNEG use - contractable if all users of the fneg are FSUB.
+    if (Opcode == ISD::FNEG) {
+      for (const auto *FNegUser : User->users()) {
+        unsigned FNegUserOp = FNegUser->getOpcode();
+        if (FNegUserOp != ISD::FSUB)
+          return false;
+      }
+      continue;
+    }
 
     // Any other use type is not currently recognized as contractable.
     return false;
@@ -18038,8 +18049,17 @@ SDValue DAGCombiner::visitFSUBForFMACombine(SDNode *N) {
   }
 
   // fold (fsub (fneg (fmul, x, y)), z) -> (fma (fneg x), y, (fneg z))
+  // Note: SDAG does not need the symmetric fold (fsub x, (fneg (fmul y, z)))
+  // because visitFSUB canonicalizes fsub(A, fneg(B)) -> fadd(A, B) before
+  // calling visitFSUBForFMACombine, so that pattern is handled by
+  // visitFADDForFMACombine instead.
+  // Only contract if the multiply has one use (both fneg and fmul eliminated),
+  // or under Aggressive mode if all uses of the multiply are contractable
+  // (including through fneg -> fsub chains), avoiding duplication of the
+  // multiply without reducing total operations.
   if (matcher.match(N0, ISD::FNEG) && isContractableFMUL(N0.getOperand(0)) &&
-      (Aggressive || (N0->hasOneUse() && N0.getOperand(0).hasOneUse()))) {
+      ((N0->hasOneUse() && N0.getOperand(0).hasOneUse()) ||
+       (Aggressive && allMulUsesCanBeContracted(N0.getOperand(0))))) {
     SDValue N00 = N0.getOperand(0).getOperand(0);
     SDValue N01 = N0.getOperand(0).getOperand(1);
     return matcher.getNode(PreferredFusedOpcode, SL, VT,
