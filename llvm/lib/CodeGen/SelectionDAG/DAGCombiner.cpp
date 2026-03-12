@@ -17685,25 +17685,75 @@ static bool isFusedOp(const MatchContextClass &Matcher, SDValue N) {
 /// would duplicate the multiply without reducing the total number of
 /// operations.
 ///
-/// Currently checks for the following patterns:
+/// This uses a simple, non-recursive check for the following patterns:
 ///   - fmul --> fadd/fsub: Direct contraction
 ///   - fmul --> fneg --> fsub: Contraction through fneg
-static bool allMulUsesCanBeContracted(SDValue Mul) {
+///   - fmul --> fneg --> fpext --> fsub: FNEG then FPEXT folds if foldable
+///   - fmul --> fpext --> {fadd, fsub}: FPEXT folds if foldable
+///   - fmul --> fpext --> fneg --> fsub: FPEXT then FNEG to FSUB
+static bool allMulUsesCanBeContracted(SDValue Mul,
+                                      const unsigned PreferredFusedOpcode,
+                                      const TargetLowering &TLI,
+                                      SelectionDAG &DAG) {
   for (const auto *User : Mul->users()) {
-    unsigned Opcode = User->getOpcode();
+    SDNode *UserNode = const_cast<SDNode *>(User);
+    unsigned Opcode = UserNode->getOpcode();
 
     // Direct FADD/FSUB - contractable.
     if (Opcode == ISD::FADD || Opcode == ISD::FSUB)
       continue;
 
-    // FNEG use - contractable if all users of the fneg are FSUB.
+    // FNEG - check if ALL users are FSUB or foldable FPEXT --> FSUB
     if (Opcode == ISD::FNEG) {
-      for (const auto *FNegUser : User->users()) {
+      for (const auto *FNegUser : UserNode->users()) {
         unsigned FNegUserOp = FNegUser->getOpcode();
-        if (FNegUserOp != ISD::FSUB)
-          return false;
+
+        if (FNegUserOp == ISD::FSUB) {
+          // FNEG --> FSUB
+          continue;
+        }
+        if (FNegUserOp == ISD::FP_EXTEND) {
+          // FNEG --> FPEXT --> FSUB
+          EVT SrcVT = UserNode->getValueType(0); // Src of FPEXT is the FNEG
+          for (const auto *FNegFPExtUser : FNegUser->users()) {
+            if (FNegFPExtUser->getOpcode() != ISD::FSUB)
+              return false;
+            if (!TLI.isFPExtFoldable(DAG, PreferredFusedOpcode,
+                                     FNegFPExtUser->getValueType(0), SrcVT))
+              return false;
+          }
+          continue;
+        }
+        return false;
       }
-      continue;
+      continue; // All FNEG uses are contractable
+    }
+
+    // FP_EXTEND - check if ALL users are FADD, FSUB, or FNEG --> FSUB
+    if (Opcode == ISD::FP_EXTEND) {
+      EVT SrcVT = Mul.getValueType();
+
+      for (const auto *FPExtUser : UserNode->users()) {
+        unsigned ExtUserOp = FPExtUser->getOpcode();
+        EVT DstVT = FPExtUser->getValueType(0);
+        if (!TLI.isFPExtFoldable(DAG, PreferredFusedOpcode, DstVT, SrcVT))
+          return false; // this FPEXT cannot be folded
+
+        if (ExtUserOp == ISD::FADD || ExtUserOp == ISD::FSUB) {
+          continue; // FPEXT --> {FADD, FSUB} is contractable
+        }
+        if (ExtUserOp == ISD::FNEG) {
+          // FP_EXTEND --> FNEG --> FSUB
+          for (const auto *FPExtFNegUser : FPExtUser->users()) {
+            if (FPExtFNegUser->getOpcode() != ISD::FSUB) {
+              return false;
+            }
+          }
+          continue;
+        }
+        return false;
+      }
+      continue; // All FPEXT uses are contractable
     }
 
     // Any other use type is not currently recognized as contractable.
@@ -17777,7 +17827,9 @@ SDValue DAGCombiner::visitFADDForFMACombine(SDNode *N) {
   // Only contract if the multiply has one use or all uses are contractable,
   // avoiding duplication of the multiply without reducing total operations.
   if (isContractableFMUL(N0) &&
-      (N0->hasOneUse() || (Aggressive && allMulUsesCanBeContracted(N0)))) {
+      (N0->hasOneUse() ||
+       (Aggressive &&
+        allMulUsesCanBeContracted(N0, PreferredFusedOpcode, TLI, DAG)))) {
     return matcher.getNode(PreferredFusedOpcode, SL, VT, N0.getOperand(0),
                            N0.getOperand(1), N1);
   }
@@ -17787,7 +17839,9 @@ SDValue DAGCombiner::visitFADDForFMACombine(SDNode *N) {
   // Only contract if the multiply has one use or all uses are contractable,
   // avoiding duplication of the multiply without reducing total operations.
   if (isContractableFMUL(N1) &&
-      (N1->hasOneUse() || (Aggressive && allMulUsesCanBeContracted(N1)))) {
+      (N1->hasOneUse() ||
+       (Aggressive &&
+        allMulUsesCanBeContracted(N1, PreferredFusedOpcode, TLI, DAG)))) {
     return matcher.getNode(PreferredFusedOpcode, SL, VT, N1.getOperand(0),
                            N1.getOperand(1), N0);
   }
@@ -17834,6 +17888,7 @@ SDValue DAGCombiner::visitFADDForFMACombine(SDNode *N) {
   if (matcher.match(N0, ISD::FP_EXTEND)) {
     SDValue N00 = N0.getOperand(0);
     if (isContractableFMUL(N00) &&
+        allMulUsesCanBeContracted(N00, PreferredFusedOpcode, TLI, DAG) &&
         TLI.isFPExtFoldable(DAG, PreferredFusedOpcode, VT,
                             N00.getValueType())) {
       return matcher.getNode(
@@ -17848,6 +17903,7 @@ SDValue DAGCombiner::visitFADDForFMACombine(SDNode *N) {
   if (matcher.match(N1, ISD::FP_EXTEND)) {
     SDValue N10 = N1.getOperand(0);
     if (isContractableFMUL(N10) &&
+        allMulUsesCanBeContracted(N10, PreferredFusedOpcode, TLI, DAG) &&
         TLI.isFPExtFoldable(DAG, PreferredFusedOpcode, VT,
                             N10.getValueType())) {
       return matcher.getNode(
@@ -18006,7 +18062,9 @@ SDValue DAGCombiner::visitFSUBForFMACombine(SDNode *N) {
   // avoiding duplication of the multiply without reducing total operations.
   auto tryToFoldXYSubZ = [&](SDValue XY, SDValue Z) {
     if (isContractableFMUL(XY) &&
-        (XY->hasOneUse() || (Aggressive && allMulUsesCanBeContracted(XY)))) {
+        (XY->hasOneUse() ||
+         (Aggressive &&
+          allMulUsesCanBeContracted(XY, PreferredFusedOpcode, TLI, DAG)))) {
       return matcher.getNode(PreferredFusedOpcode, SL, VT, XY.getOperand(0),
                              XY.getOperand(1),
                              matcher.getNode(ISD::FNEG, SL, VT, Z));
@@ -18020,7 +18078,9 @@ SDValue DAGCombiner::visitFSUBForFMACombine(SDNode *N) {
   // avoiding duplication of the multiply without reducing total operations.
   auto tryToFoldXSubYZ = [&](SDValue X, SDValue YZ) {
     if (isContractableFMUL(YZ) &&
-        (YZ->hasOneUse() || (Aggressive && allMulUsesCanBeContracted(YZ)))) {
+        (YZ->hasOneUse() ||
+         (Aggressive &&
+          allMulUsesCanBeContracted(YZ, PreferredFusedOpcode, TLI, DAG)))) {
       return matcher.getNode(
           PreferredFusedOpcode, SL, VT,
           matcher.getNode(ISD::FNEG, SL, VT, YZ.getOperand(0)),
@@ -18059,7 +18119,8 @@ SDValue DAGCombiner::visitFSUBForFMACombine(SDNode *N) {
   // multiply without reducing total operations.
   if (matcher.match(N0, ISD::FNEG) && isContractableFMUL(N0.getOperand(0)) &&
       ((N0->hasOneUse() && N0.getOperand(0).hasOneUse()) ||
-       (Aggressive && allMulUsesCanBeContracted(N0.getOperand(0))))) {
+       (Aggressive && allMulUsesCanBeContracted(
+                          N0.getOperand(0), PreferredFusedOpcode, TLI, DAG)))) {
     SDValue N00 = N0.getOperand(0).getOperand(0);
     SDValue N01 = N0.getOperand(0).getOperand(1);
     return matcher.getNode(PreferredFusedOpcode, SL, VT,
@@ -18074,6 +18135,7 @@ SDValue DAGCombiner::visitFSUBForFMACombine(SDNode *N) {
   if (matcher.match(N0, ISD::FP_EXTEND)) {
     SDValue N00 = N0.getOperand(0);
     if (isContractableFMUL(N00) &&
+        allMulUsesCanBeContracted(N00, PreferredFusedOpcode, TLI, DAG) &&
         TLI.isFPExtFoldable(DAG, PreferredFusedOpcode, VT,
                             N00.getValueType())) {
       return matcher.getNode(
@@ -18090,6 +18152,7 @@ SDValue DAGCombiner::visitFSUBForFMACombine(SDNode *N) {
   if (matcher.match(N1, ISD::FP_EXTEND)) {
     SDValue N10 = N1.getOperand(0);
     if (isContractableFMUL(N10) &&
+        allMulUsesCanBeContracted(N10, PreferredFusedOpcode, TLI, DAG) &&
         TLI.isFPExtFoldable(DAG, PreferredFusedOpcode, VT,
                             N10.getValueType())) {
       return matcher.getNode(
@@ -18112,6 +18175,7 @@ SDValue DAGCombiner::visitFSUBForFMACombine(SDNode *N) {
     if (matcher.match(N00, ISD::FNEG)) {
       SDValue N000 = N00.getOperand(0);
       if (isContractableFMUL(N000) &&
+          allMulUsesCanBeContracted(N000, PreferredFusedOpcode, TLI, DAG) &&
           TLI.isFPExtFoldable(DAG, PreferredFusedOpcode, VT,
                               N00.getValueType())) {
         return matcher.getNode(
@@ -18136,6 +18200,7 @@ SDValue DAGCombiner::visitFSUBForFMACombine(SDNode *N) {
     if (matcher.match(N00, ISD::FP_EXTEND)) {
       SDValue N000 = N00.getOperand(0);
       if (isContractableFMUL(N000) &&
+          allMulUsesCanBeContracted(N000, PreferredFusedOpcode, TLI, DAG) &&
           TLI.isFPExtFoldable(DAG, PreferredFusedOpcode, VT,
                               N000.getValueType())) {
         return matcher.getNode(
