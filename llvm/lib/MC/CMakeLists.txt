@@ -5,6 +5,7 @@ add_llvm_component_library(LLVMMC
   ELFObjectWriter.cpp
   GOFFObjectWriter.cpp
   MCAsmBackend.cpp
+  MCAsmBaseStreamer.cpp
   MCAsmInfo.cpp
   MCAsmInfoCOFF.cpp
   MCAsmInfoDarwin.cpp
