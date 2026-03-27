@@ -1666,9 +1666,9 @@ static llvm::StringRef getCUDAPrefix(clang::ASTContext *astCtx) {
   return "cuda";
 }
 
-static llvm::StringRef addUnderscoredPrefix(llvm::StringRef prefix,
+static std::string addUnderscoredPrefix(llvm::StringRef prefix,
                                         llvm::StringRef name) {
-  return ("__" + prefix + name).getSingleStringRef();
+  return ("__" + prefix + name).str();
 }
 
 /// Creates a global constructor function for the module:
@@ -1746,8 +1746,7 @@ void LoweringPreparePass::buildCUDAModuleCtor() {
   // Create the fatbin string constant with GPU binary contents.
   auto fatbinType =
       ArrayType::get(&getContext(), charTy, gpuBinary->getBuffer().size());
-  llvm::StringRef fatbinStrName =
-      addUnderscoredPrefix(cudaPrefix, "_fatbin_str");
+  std::string fatbinStrName = addUnderscoredPrefix(cudaPrefix, "_fatbin_str");
   GlobalOp fatbinStr = GlobalOp::create(builder, loc, fatbinStrName, fatbinType,
                                         /*isConstant=*/true, {},
                                         GlobalLinkageKind::PrivateLinkage);
@@ -1762,7 +1761,7 @@ void LoweringPreparePass::buildCUDAModuleCtor() {
   auto fatbinWrapperType = RecordType::get(
       &getContext(), {intTy, intTy, voidPtrTy, voidPtrTy},
       /*packed=*/false, /*padded=*/false, RecordType::RecordKind::Struct);
-  llvm::StringRef fatbinWrapperName =
+  std::string fatbinWrapperName =
       addUnderscoredPrefix(cudaPrefix, "_fatbin_wrapper");
   GlobalOp fatbinWrapper = GlobalOp::create(
       builder, loc, fatbinWrapperName, fatbinWrapperType,
@@ -1784,7 +1783,7 @@ void LoweringPreparePass::buildCUDAModuleCtor() {
                            {magicInit, versionInit, fatbinInit, unusedInit})));
 
   // Create the GPU binary handle global variable.
-  llvm::StringRef gpubinHandleName =
+  std::string gpubinHandleName =
       addUnderscoredPrefix(cudaPrefix, "_gpubin_handle");
 
   GlobalOp gpuBinHandle = GlobalOp::create(
