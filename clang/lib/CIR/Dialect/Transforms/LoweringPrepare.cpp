@@ -1849,7 +1849,8 @@ void LoweringPreparePass::buildCUDAModuleCtor() {
                                FuncType::get({voidPtrPtrTy}, voidTy));
       builder.createCallOp(loc, endFunc, gpuBinaryHandle);
     }
-  }
+  } else
+    llvm_unreachable("GPU RDC NYI");
 
   // Create destructor and register it with atexit() the way NVCC does it. Doing
   // it during regular destructor phase worked in CUDA before 9.2 but results in
