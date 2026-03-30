@@ -10740,7 +10740,7 @@ SIInstrInfo::getGenericInstructionUniformity(const MachineInstr &MI) const {
     unsigned SrcAS = SrcTy.getAddressSpace();
     return SrcAS == AMDGPUAS::PRIVATE_ADDRESS &&
                    DstAS == AMDGPUAS::FLAT_ADDRESS &&
-                   ST.hasGloballyAddressableScratch()
+                   ST.hasGloballyAddressableScratchSupport()
                ? InstructionUniformity::NeverUniform
                : InstructionUniformity::Default;
   };
