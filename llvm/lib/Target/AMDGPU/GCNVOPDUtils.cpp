@@ -49,7 +49,12 @@ static bool canMapVOP3PToVOPD(const MachineInstr &MI) {
   if (MI.getOperand(Src1ModsIdx).getImm() != SISrcMods::OP_SEL_1)
     return false;
   int16_t Src1Idx = getNamedOperandIdx(Opc, AMDGPU::OpName::src1);
-  if (!MI.getOperand(Src1Idx).isReg())
+  const MachineFunction *MF = MI.getMF();
+  const GCNSubtarget &ST = MF->getSubtarget<GCNSubtarget>();
+  const SIRegisterInfo *TRI = ST.getRegisterInfo();
+  const MachineRegisterInfo &MRI = MF->getRegInfo();
+  if (!MI.getOperand(Src1Idx).isReg() ||
+      !TRI->isVGPR(MRI, MI.getOperand(Src1Idx).getReg()))
     return false;
   int16_t Src2ModsIdx = getNamedOperandIdx(Opc, AMDGPU::OpName::src2_modifiers);
   if (MI.getOperand(Src2ModsIdx).getImm() != SISrcMods::OP_SEL_1)
