@@ -44,3 +44,14 @@ add_llvm_component_library(LLVMAsmPrinter
   Support
   Target
   )
+
+# Experimental embedded/JIT option: replace the MCParser-based inline-asm
+# emission path with a raw-text fallback. Breaks the force-reference from
+# libLLVMAsmPrinter.a(AsmPrinterInlineAsm.cpp.o) into libLLVMMCParser.a.
+# Only affects JIT/embedded builds that never feed inline asm to the
+# AsmPrinter.
+option(LLVM_DISABLE_INLINE_ASM_PARSER
+       "Disable the MCParser-based inline asm path in AsmPrinter" OFF)
+if(LLVM_DISABLE_INLINE_ASM_PARSER)
+  target_compile_definitions(LLVMAsmPrinter PRIVATE LLVM_DISABLE_INLINE_ASM_PARSER=1)
+endif()

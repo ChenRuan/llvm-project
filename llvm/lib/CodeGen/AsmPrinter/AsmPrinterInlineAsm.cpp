@@ -85,6 +85,18 @@ void AsmPrinter::emitInlineAsm(StringRef Str, const MCSubtargetInfo &STI,
   // system assembler does.
   const MCAsmInfo *MCAI = TM.getMCAsmInfo();
   assert(MCAI && "No MCAsmInfo");
+#ifdef LLVM_DISABLE_INLINE_ASM_PARSER
+  // Embedded/JIT trim build: the MC assembler parser (libLLVMMCParser.a)
+  // has been excluded. Inline asm always falls back to raw-text emission.
+  // JIT input streams typically contain no inline asm, so this path is
+  // effectively dead; any module that does hit it will get the textual
+  // form emitted to the streamer.
+  (void)MCAI;
+  emitInlineAsmStart();
+  OutStreamer->emitRawText(Str);
+  emitInlineAsmEnd(STI, nullptr);
+  return;
+#else
   if (!MCAI->useIntegratedAssembler() &&
       !MCAI->parseInlineAsmUsingAsmParser() &&
       !OutStreamer->isIntegratedAssemblerRequired()) {
@@ -127,6 +139,7 @@ void AsmPrinter::emitInlineAsm(StringRef Str, const MCSubtargetInfo &STI,
   (void)Parser->Run(/*NoInitialTextSection*/ true,
                     /*NoFinalize*/ true);
   emitInlineAsmEnd(STI, &TAP->getSTI());
+#endif
 }
 
 static void EmitInlineAsmStr(const char *AsmStr, const MachineInstr *MI,
