@@ -232,11 +232,13 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAArch64Target() {
   initializeFalkorMarkStridedAccessesLegacyPass(*PR);
   initializeLDTLSCleanupPass(*PR);
   initializeSVEIntrinsicOptsPass(*PR);
+#ifndef LLVM_AARCH64_DISABLE_HARDENING_PASSES
   initializeAArch64SpeculationHardeningPass(*PR);
   initializeAArch64SLSHardeningPass(*PR);
   initializeAArch64StackTaggingPass(*PR);
   initializeAArch64StackTaggingPreRAPass(*PR);
   initializeAArch64LowerHomogeneousPrologEpilogPass(*PR);
+#endif
 }
 
 //===----------------------------------------------------------------------===//
@@ -594,8 +596,10 @@ void AArch64PassConfig::addIRPasses() {
 
   TargetPassConfig::addIRPasses();
 
+#ifndef LLVM_AARCH64_DISABLE_HARDENING_PASSES
   addPass(createAArch64StackTaggingPass(
       /*IsOptNone=*/TM->getOptLevel() == CodeGenOpt::None));
+#endif
 
   // Match interleaved memory accesses to ldN/stN intrinsics.
   if (TM->getOptLevel() != CodeGenOpt::None) {
@@ -732,8 +736,10 @@ bool AArch64PassConfig::addILPOpts() {
   if (EnableStPairSuppress)
     addPass(createAArch64StorePairSuppressPass());
   addPass(createAArch64SIMDInstrOptPass());
+#ifndef LLVM_AARCH64_DISABLE_HARDENING_PASSES
   if (TM->getOptLevel() != CodeGenOpt::None)
     addPass(createAArch64StackTaggingPreRAPass());
+#endif
   return true;
 }
 
@@ -763,8 +769,10 @@ void AArch64PassConfig::addPostRegAlloc() {
 
 void AArch64PassConfig::addPreSched2() {
   // Lower homogeneous frame instructions
+#ifndef LLVM_AARCH64_DISABLE_HARDENING_PASSES
   if (EnableHomogeneousPrologEpilog)
     addPass(createAArch64LowerHomogeneousPrologEpilogPass());
+#endif
   // Expand some pseudo instructions to allow proper scheduling.
   addPass(createAArch64ExpandPseudoPass());
   // Use load/store pair instructions when possible.
@@ -778,10 +786,12 @@ void AArch64PassConfig::addPreSched2() {
   // Therefore, run the AArch64SpeculationHardeningPass before the
   // FalkorHWPFFixPass to avoid recomputing dominator tree and natural loop
   // info.
+#ifndef LLVM_AARCH64_DISABLE_HARDENING_PASSES
   addPass(createAArch64SpeculationHardeningPass());
 
   addPass(createAArch64IndirectThunks());
   addPass(createAArch64SLSHardeningPass());
+#endif
 
   if (TM->getOptLevel() != CodeGenOpt::None) {
     if (EnableFalkorHWPFFix)

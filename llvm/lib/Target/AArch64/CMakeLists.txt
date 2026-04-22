@@ -55,6 +55,16 @@ if(LLVM_AARCH64_DISABLE_FASTISEL)
   add_compile_definitions(LLVM_AARCH64_DISABLE_FASTISEL=1)
 endif()
 
+# Experimental: drop security/hardening/MTE/speculation passes that are only
+# effective when user code has specific function attributes. For a bare JIT
+# compiling plain C they are always no-ops at function level but still pulled
+# into the static link.
+option(LLVM_AARCH64_DISABLE_HARDENING_PASSES
+       "Disable SLS / speculation / MTE-stack-tagging / homogeneous-prolog-epilog passes" OFF)
+if(LLVM_AARCH64_DISABLE_HARDENING_PASSES)
+  add_compile_definitions(LLVM_AARCH64_DISABLE_HARDENING_PASSES=1)
+endif()
+
 add_llvm_target(AArch64CodeGen
   GISel/AArch64CallLowering.cpp
   GISel/AArch64GlobalISelUtils.cpp
