@@ -2,6 +2,14 @@ if( CMAKE_HOST_UNIX AND HAVE_LIBRT )
   set(rt_lib rt)
 endif()
 
+# Embedded/JIT trim: drop MachO + COFF dispatch in ObjectFileInterface and
+# the MachOPlatform bootstrap (ELF-only aarch64/x86_64 Linux JITs).
+option(LLVM_ORC_DISABLE_NON_ELF_PLATFORMS
+       "Drop MachO/COFF object-format paths from libLLVMOrcJIT" OFF)
+if(LLVM_ORC_DISABLE_NON_ELF_PLATFORMS)
+  add_compile_definitions(LLVM_ORC_DISABLE_NON_ELF_PLATFORMS=1)
+endif()
+
 add_llvm_component_library(LLVMOrcJIT
   CompileOnDemandLayer.cpp
   CompileUtils.cpp

@@ -8,10 +8,14 @@
 
 #include "llvm/ExecutionEngine/Orc/ObjectFileInterface.h"
 #include "llvm/ExecutionEngine/Orc/ELFNixPlatform.h"
+#ifndef LLVM_ORC_DISABLE_NON_ELF_PLATFORMS
 #include "llvm/ExecutionEngine/Orc/MachOPlatform.h"
 #include "llvm/Object/COFF.h"
+#endif
 #include "llvm/Object/ELFObjectFile.h"
+#ifndef LLVM_ORC_DISABLE_NON_ELF_PLATFORMS
 #include "llvm/Object/MachO.h"
+#endif
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/Debug.h"
 
@@ -35,6 +39,7 @@ void addInitSymbol(MaterializationUnit::Interface &I, ExecutionSession &ES,
   I.SymbolFlags[I.InitSymbol] = JITSymbolFlags::MaterializationSideEffectsOnly;
 }
 
+#ifndef LLVM_ORC_DISABLE_NON_ELF_PLATFORMS
 static Expected<MaterializationUnit::Interface>
 getMachOObjectFileSymbolInfo(ExecutionSession &ES,
                              const object::MachOObjectFile &Obj) {
@@ -91,6 +96,7 @@ getMachOObjectFileSymbolInfo(ExecutionSession &ES,
 
   return I;
 }
+#endif // !LLVM_ORC_DISABLE_NON_ELF_PLATFORMS
 
 static Expected<MaterializationUnit::Interface>
 getELFObjectFileSymbolInfo(ExecutionSession &ES,
@@ -146,6 +152,7 @@ getELFObjectFileSymbolInfo(ExecutionSession &ES,
   return I;
 }
 
+#ifndef LLVM_ORC_DISABLE_NON_ELF_PLATFORMS
 static Expected<MaterializationUnit::Interface>
 getCOFFObjectFileSymbolInfo(ExecutionSession &ES,
                             const object::COFFObjectFile &Obj) {
@@ -218,6 +225,7 @@ getCOFFObjectFileSymbolInfo(ExecutionSession &ES,
 
   return I;
 }
+#endif // !LLVM_ORC_DISABLE_NON_ELF_PLATFORMS
 
 Expected<MaterializationUnit::Interface>
 getGenericObjectFileSymbolInfo(ExecutionSession &ES,
@@ -266,12 +274,17 @@ getObjectFileInterface(ExecutionSession &ES, MemoryBufferRef ObjBuffer) {
   if (!Obj)
     return Obj.takeError();
 
+#ifndef LLVM_ORC_DISABLE_NON_ELF_PLATFORMS
   if (auto *MachOObj = dyn_cast<object::MachOObjectFile>(Obj->get()))
     return getMachOObjectFileSymbolInfo(ES, *MachOObj);
   else if (auto *ELFObj = dyn_cast<object::ELFObjectFileBase>(Obj->get()))
     return getELFObjectFileSymbolInfo(ES, *ELFObj);
   else if (auto *COFFObj = dyn_cast<object::COFFObjectFile>(Obj->get()))
     return getCOFFObjectFileSymbolInfo(ES, *COFFObj);
+#else
+  if (auto *ELFObj = dyn_cast<object::ELFObjectFileBase>(Obj->get()))
+    return getELFObjectFileSymbolInfo(ES, *ELFObj);
+#endif
 
   return getGenericObjectFileSymbolInfo(ES, **Obj);
 }
