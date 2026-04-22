@@ -1,12 +1,22 @@
 // light_aarch64.h — experimental narrow codegen for post-EasyJIT-specialized IR.
 //
-// Supports a *tiny* subset (round-5 PoC):
-//   - one function, one basic block
-//   - integer params (i1/i8/i16/i32/i64) in x0..x7
-//   - ops:  add/sub/mul/and/or/xor/shl/lshr/ashr   (reg-reg or reg-imm12)
-//   - sext/zext/trunc between i32/i64
-//   - ret i32 / ret i64 / ret void
-// Everything else -> LightCodegenError::Unsupported (fallback to full backend).
+// Supports a narrow subset (round-6 extension on top of round-5 PoC):
+//   - one function, multi-BB with forward/backward branches
+//   - integer or pointer params in x0..x7 (≤8 args)
+//   - static alloca with fixed layout; constant-offset GEP on alloca
+//   - load/store i32/i64 with uimm12-scaled offset from sp or from a
+//     pointer-arg register (offset 0 only for reg-based pointers)
+//   - llvm.memcpy.p0.p0.i64 with ConstantInt size ≤ 32 bytes, no overlap
+//   - icmp (eq/ne/slt/sle/sgt/sge/ult/ule/ugt/uge) — must be fused into
+//     the following conditional br; icmp-as-GPR is not supported
+//   - br i1 / br label, phi (lowered via predecessor-edge copy)
+//   - add/sub/mul/and/or/xor/shl/lshr/ashr
+//   - sext/zext/trunc between i1/i8/i16/i32/i64 (reg alias, no-op)
+//   - ret i32 / ret i64 / ret void  (with sp restore)
+// Everything else -> Status::Unsupported.
+//
+// Endian: LE-only. aarch64_be is rejected up-front. See REPORT_ROUND6.md
+// §aarch64_be for the full list of load/store sites that assume LE.
 //
 // The emitter writes AArch64 little-endian instruction words into a user-
 // supplied buffer, returning the byte length on success.
