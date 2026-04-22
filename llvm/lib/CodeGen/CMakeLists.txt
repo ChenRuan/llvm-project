@@ -1,3 +1,19 @@
+# Embedded / JIT-only trim options. Each flag cuts a chunk of the
+# libLLVMCodeGen surface unreachable in a bare JIT scenario.
+option(LLVM_CODEGEN_DISABLE_NONLINUX_EH
+       "Drop SjLj/Wasm/WinEH prepare passes from libLLVMCodeGen" OFF)
+option(LLVM_CODEGEN_DISABLE_MACHINE_OUTLINER "Drop MachineOutliner" OFF)
+option(LLVM_CODEGEN_DISABLE_SAFESTACK "Drop SafeStack IR pass" OFF)
+if(LLVM_CODEGEN_DISABLE_NONLINUX_EH)
+  add_compile_definitions(LLVM_CODEGEN_DISABLE_NONLINUX_EH=1)
+endif()
+if(LLVM_CODEGEN_DISABLE_MACHINE_OUTLINER)
+  add_compile_definitions(LLVM_CODEGEN_DISABLE_MACHINE_OUTLINER=1)
+endif()
+if(LLVM_CODEGEN_DISABLE_SAFESTACK)
+  add_compile_definitions(LLVM_CODEGEN_DISABLE_SAFESTACK=1)
+endif()
+
 if (DEFINED LLVM_HAVE_TF_AOT OR DEFINED LLVM_HAVE_TF_API)
   include(TensorFlowCompile)
   set(LLVM_RAEVICT_MODEL_PATH_DEFAULT "models/regalloc-eviction")

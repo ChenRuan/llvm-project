@@ -79,7 +79,9 @@ void llvm::initializeCodeGen(PassRegistry &Registry) {
   initializeMachineLoopInfoPass(Registry);
   initializeMachineModuleInfoWrapperPassPass(Registry);
   initializeMachineOptimizationRemarkEmitterPassPass(Registry);
+#ifndef LLVM_CODEGEN_DISABLE_MACHINE_OUTLINER
   initializeMachineOutlinerPass(Registry);
+#endif
   initializeMachinePipelinerPass(Registry);
   initializeModuloScheduleTestPass(Registry);
   initializeMachinePostDominatorTreePass(Registry);
@@ -106,11 +108,15 @@ void llvm::initializeCodeGen(PassRegistry &Registry) {
   initializeRegisterCoalescerPass(Registry);
   initializeRemoveRedundantDebugValuesPass(Registry);
   initializeRenameIndependentSubregsPass(Registry);
+#ifndef LLVM_CODEGEN_DISABLE_SAFESTACK
   initializeSafeStackLegacyPassPass(Registry);
+#endif
   initializeSelectOptimizePass(Registry);
   initializeShadowStackGCLoweringPass(Registry);
   initializeShrinkWrapPass(Registry);
+#ifndef LLVM_CODEGEN_DISABLE_NONLINUX_EH
   initializeSjLjEHPreparePass(Registry);
+#endif
   initializeSlotIndexesPass(Registry);
   initializeStackColoringPass(Registry);
   initializeStackMapLivenessPass(Registry);
@@ -126,8 +132,10 @@ void llvm::initializeCodeGen(PassRegistry &Registry) {
   initializeUnreachableMachineBlockElimPass(Registry);
   initializeVirtRegMapPass(Registry);
   initializeVirtRegRewriterPass(Registry);
+#ifndef LLVM_CODEGEN_DISABLE_NONLINUX_EH
   initializeWasmEHPreparePass(Registry);
   initializeWinEHPreparePass(Registry);
+#endif
   initializeXRayInstrumentationPass(Registry);
 }
 

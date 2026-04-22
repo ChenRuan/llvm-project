@@ -952,6 +952,7 @@ void TargetPassConfig::addPassesToHandleExceptions() {
   const MCAsmInfo *MCAI = TM->getMCAsmInfo();
   assert(MCAI && "No MCAsmInfo");
   switch (MCAI->getExceptionHandlingType()) {
+#ifndef LLVM_CODEGEN_DISABLE_NONLINUX_EH
   case ExceptionHandling::SjLj:
     // SjLj piggy-backs on dwarf for this bit. The cleanups done apply to both
     // Dwarf EH prepare needs to be run after SjLj prepare. Otherwise,
@@ -961,11 +962,13 @@ void TargetPassConfig::addPassesToHandleExceptions() {
     // edge from elsewhere.
     addPass(createSjLjEHPreparePass(TM));
     LLVM_FALLTHROUGH;
+#endif
   case ExceptionHandling::DwarfCFI:
   case ExceptionHandling::ARM:
   case ExceptionHandling::AIX:
     addPass(createDwarfEHPass(getOptLevel()));
     break;
+#ifndef LLVM_CODEGEN_DISABLE_NONLINUX_EH
   case ExceptionHandling::WinEH:
     // We support using both GCC-style and MSVC-style exceptions on Windows, so
     // add both preparation passes. Each pass will only actually run if it
@@ -981,6 +984,7 @@ void TargetPassConfig::addPassesToHandleExceptions() {
     addPass(createWinEHPass(/*DemoteCatchSwitchPHIOnly=*/false));
     addPass(createWasmEHPass());
     break;
+#endif
   case ExceptionHandling::None:
     addPass(createLowerInvokePass());
 
@@ -1008,7 +1012,9 @@ void TargetPassConfig::addISelPrepare() {
 
   // Add both the safe stack and the stack protection passes: each of them will
   // only protect functions that have corresponding attributes.
+#ifndef LLVM_CODEGEN_DISABLE_SAFESTACK
   addPass(createSafeStackPass());
+#endif
   addPass(createStackProtectorPass());
 
   if (PrintISelInput)
@@ -1268,6 +1274,7 @@ void TargetPassConfig::addMachinePasses() {
   addPass(&StackMapLivenessID);
   addPass(&LiveDebugValuesID);
 
+#ifndef LLVM_CODEGEN_DISABLE_MACHINE_OUTLINER
   if (TM->Options.EnableMachineOutliner && getOptLevel() != CodeGenOpt::None &&
       EnableMachineOutliner != RunOutliner::NeverOutline) {
     bool RunOnAllFunctions =
@@ -1277,6 +1284,7 @@ void TargetPassConfig::addMachinePasses() {
     if (AddOutliner)
       addPass(createMachineOutlinerPass(RunOnAllFunctions));
   }
+#endif
 
   // Machine function splitter uses the basic block sections feature. Both
   // cannot be enabled at the same time. Basic block sections takes precedence.
