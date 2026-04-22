@@ -1,3 +1,9 @@
+option(LLVM_DISABLE_IR_SYMBOL_TABLE_ASM_PARSING
+  "Disable module-level inline asm parsing in ModuleSymbolTable (embedded JIT builds)" OFF)
+if(LLVM_DISABLE_IR_SYMBOL_TABLE_ASM_PARSING)
+  add_compile_definitions(LLVM_DISABLE_IR_SYMBOL_TABLE_ASM_PARSING=1)
+endif()
+
 add_llvm_component_library(LLVMObject
   Archive.cpp
   ArchiveWriter.cpp

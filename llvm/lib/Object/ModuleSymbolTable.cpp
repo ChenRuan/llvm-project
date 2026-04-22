@@ -28,8 +28,10 @@
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCObjectFileInfo.h"
+#ifndef LLVM_DISABLE_IR_SYMBOL_TABLE_ASM_PARSING
 #include "llvm/MC/MCParser/MCAsmParser.h"
 #include "llvm/MC/MCParser/MCTargetAsmParser.h"
+#endif
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/MCSymbol.h"
@@ -73,6 +75,13 @@ initializeRecordStreamer(const Module &M,
   if (InlineAsm.empty())
     return;
 
+#ifdef LLVM_DISABLE_IR_SYMBOL_TABLE_ASM_PARSING
+  // Embedded JIT build: module-level inline asm parsing is disabled to avoid
+  // pulling in libLLVMMCParser. Any module that actually contains inline asm
+  // symbols in this configuration will simply not have them collected.
+  (void)Init;
+  return;
+#else
   std::string Err;
   const Triple TT(M.getTargetTriple());
   const Target *T = TargetRegistry::lookupTarget(TT.str(), Err);
@@ -125,6 +134,7 @@ initializeRecordStreamer(const Module &M,
     return;
 
   Init(Streamer);
+#endif
 }
 
 void ModuleSymbolTable::CollectAsmSymbols(
