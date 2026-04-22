@@ -81,6 +81,16 @@ static uint32_t encMovz16(bool is64, unsigned rd, uint16_t imm16) {
   if (is64) op |= 0x80000000u;
   return op | ((uint32_t)imm16 << 5) | (rd & 0x1Fu);
 }
+// MOVZ with hw-shift (hw ∈ {0,1,2,3}; shift = hw * 16). 64-bit form only.
+// LE-neutral: address value is just a 64-bit integer; the instruction
+// stream itself is unconditionally LE regardless of data endian.
+static uint32_t encMovzHw64(unsigned rd, uint16_t imm16, unsigned hw) {
+  return 0xD2800000u | ((hw & 3u) << 21) | ((uint32_t)imm16 << 5) | (rd & 0x1Fu);
+}
+// MOVK with hw-shift (keeps other halfwords unchanged). 64-bit form.
+static uint32_t encMovkHw64(unsigned rd, uint16_t imm16, unsigned hw) {
+  return 0xF2800000u | ((hw & 3u) << 21) | ((uint32_t)imm16 << 5) | (rd & 0x1Fu);
+}
 static uint32_t encMovReg(bool is64, unsigned rd, unsigned rm) {
   return encLogicReg(1, is64, rd, 31u, rm);
 }
@@ -213,9 +223,26 @@ static bool constGepOffset(const GEPOperator *GEP, const DataLayout &DL,
 
 // ------------------------------ emit ------------------------------
 
-Result light::emit(const Function &Fn, uint8_t *buf, size_t cap) {
+Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
+                   const GlobalSymbol *globals, size_t nglobals) {
   Result r;
   Writer W{buf, cap};
+
+  // Host-address resolver for external GlobalVariables. Linear lookup is
+  // fine: the table is ~O(few symbols) in practice (the snapshot struct(s)
+  // referenced by the JIT'd function). Names are compared against the
+  // GlobalVariable spelling in IR, which matches the one registered by
+  // EasyJIT's MapGlobals.
+  auto resolveGlobal = [&](const GlobalVariable *GV) -> const void * {
+    if (!globals || nglobals == 0) return nullptr;
+    llvm::StringRef N = GV->getName();
+    for (size_t i = 0; i < nglobals; ++i) {
+      if (!globals[i].name) continue;
+      if (N == globals[i].name) return globals[i].address;
+    }
+    return nullptr;
+  };
+  (void)resolveGlobal; // used below; silence unused in early-exit paths.
 
   const auto &Triple = Fn.getParent()->getTargetTriple();
   if (Triple.rfind("aarch64_be", 0) == 0) {
@@ -533,6 +560,122 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap) {
         if (bits != 32 && bits != 64) {
           r.status = Status::Unsupported; r.reason = "load width"; return r;
         }
+
+        // Fast-path: if the pointer is a constant GEP on a GlobalVariable
+        // whose initializer is a ConstantStruct/Array, extract the constant
+        // element and materialize it as an immediate. This handles the
+        // common "global snapshot" case where the pass left a global but
+        // the runtime snapshot values are known at compile time.
+        if (auto *GEP = dyn_cast<GEPOperator>(LI->getPointerOperand())) {
+          if (auto *GV = dyn_cast<GlobalVariable>(GEP->getPointerOperand())) {
+            if (GV->hasInitializer()) {
+              if (auto *CS = dyn_cast<ConstantStruct>(GV->getInitializer())) {
+                // Expect struct geps of the form getelementptr <struct>, ptr @gv, i32 0, i32 idx
+                if (GEP->getNumOperands() >= 3) {
+                  if (auto *Idx = dyn_cast<ConstantInt>(GEP->getOperand(2))) {
+                    uint64_t field = Idx->getZExtValue();
+                    if (field < CS->getNumOperands()) {
+                      if (auto *CE = dyn_cast<ConstantInt>(CS->getAggregateElement((unsigned)field))) {
+                        int rd = assignReg(LI);
+                        if (rd < 0) { r.status = Status::Unsupported; r.reason = "scratch OOM (load const global)"; return r; }
+                        unsigned outReg;
+                        if (!materializeImm16(CE, bits==64, outReg)) {
+                          r.status = Status::Unsupported; r.reason = "global const too large"; return r;
+                        }
+                        // if assignReg allocated a different reg, move into it
+                        if ((unsigned)rd != outReg) {
+                          if (!W.emit(encMovReg(bits==64, (unsigned)rd, outReg))) { r.status = Status::TooLarge; return r; }
+                        }
+                        continue;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // Another fast-path: direct load from a GlobalVariable (no GEP)
+        if (auto *GV = dyn_cast<GlobalVariable>(LI->getPointerOperand())) {
+          if (GV->hasInitializer()) {
+            if (auto *CS = dyn_cast<ConstantStruct>(GV->getInitializer())) {
+              // load from base pointer -> field 0
+              if (CS->getNumOperands() >= 1) {
+                if (auto *CE = dyn_cast<ConstantInt>(CS->getAggregateElement((unsigned)0))) {
+                  int rd = assignReg(LI);
+                  if (rd < 0) { r.status = Status::Unsupported; r.reason = "scratch OOM (load const global)"; return r; }
+                  unsigned outReg;
+                  if (!materializeImm16(CE, bits==64, outReg)) {
+                    r.status = Status::Unsupported; r.reason = "global const too large"; return r;
+                  }
+                  if ((unsigned)rd != outReg) {
+                    if (!W.emit(encMovReg(bits==64, (unsigned)rd, outReg))) { r.status = Status::TooLarge; return r; }
+                  }
+                  continue;
+                }
+              }
+            }
+          }
+        }
+
+        // External-global path: pointer resolves (directly or via constant
+        // GEP) to a GlobalVariable whose host address was supplied in the
+        // `globals` table. We materialize the 64-bit host address into x17
+        // via MOVZ + MOVK chain and issue an LDR at [x17, #constOff].
+        //
+        // LE-only hazard: the ADDRESS is a plain integer (endian-neutral)
+        // and the instruction encoding is endian-neutral in the aarch64
+        // stream. But the LDR itself reads target-endian bytes; this is
+        // the SAME LE assumption the existing LDR/STR paths already make.
+        {
+          const Value *P = LI->getPointerOperand();
+          const GlobalVariable *GV = nullptr;
+          int64_t off = 0;
+          if (auto *GVD = dyn_cast<GlobalVariable>(P)) {
+            GV = GVD;
+          } else if (auto *GEP = dyn_cast<GEPOperator>(P)) {
+            if (auto *GVB = dyn_cast<GlobalVariable>(GEP->getPointerOperand())) {
+              APInt apOff(64, 0);
+              if (GEP->accumulateConstantOffset(DL, apOff) &&
+                  apOff.getActiveBits() <= 31) {
+                GV = GVB;
+                off = apOff.getSExtValue();
+              }
+            }
+          }
+          if (GV) {
+            if (const void *Host = resolveGlobal(GV)) {
+              int scaled = fitsScaled((int32_t)off, bits == 64 ? 3u : 2u);
+              if (scaled < 0) {
+                r.status = Status::Unsupported; r.reason = "global load uimm12 overflow"; return r;
+              }
+              int rd = assignReg(LI);
+              if (rd < 0) { r.status = Status::Unsupported; r.reason = "scratch OOM (global load)"; return r; }
+              // Materialize Host into x17 via MOVZ/MOVK chain.
+              uint64_t addr = reinterpret_cast<uintptr_t>(Host);
+              uint16_t c0 = (uint16_t)(addr >>  0);
+              uint16_t c1 = (uint16_t)(addr >> 16);
+              uint16_t c2 = (uint16_t)(addr >> 32);
+              uint16_t c3 = (uint16_t)(addr >> 48);
+              if (!W.emit(encMovzHw64(17, c0, 0))) { r.status=Status::TooLarge; return r; }
+              if (c1 && !W.emit(encMovkHw64(17, c1, 1))) { r.status=Status::TooLarge; return r; }
+              if (c2 && !W.emit(encMovkHw64(17, c2, 2))) { r.status=Status::TooLarge; return r; }
+              if (c3 && !W.emit(encMovkHw64(17, c3, 3))) { r.status=Status::TooLarge; return r; }
+              if (!W.emit(encLdrStrUI(true, bits == 64 ? 3u : 2u,
+                                      (unsigned)rd, 17, (unsigned)scaled))) {
+                r.status=Status::TooLarge; return r;
+              }
+              continue;
+            }
+            // GV found but no host mapping — bail with a clear message.
+            r.status = Status::Unsupported;
+            r.reason = std::string("unresolved external global: ") + GV->getName().str();
+            return r;
+          }
+        }
+
+        // Fallback: regular ptr-based load (stack-rel or reg-based)
         auto it = ptrLoc.find(LI->getPointerOperand());
         if (it == ptrLoc.end()) {
           r.status = Status::Unsupported; r.reason = "load ptr"; return r;
@@ -552,6 +695,55 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap) {
         if (bits != 32 && bits != 64) {
           r.status = Status::Unsupported; r.reason = "store width"; return r;
         }
+
+        // External-global store path (mirrors the load path above).
+        {
+          const Value *P = SI->getPointerOperand();
+          const GlobalVariable *GV = nullptr;
+          int64_t off = 0;
+          if (auto *GVD = dyn_cast<GlobalVariable>(P)) {
+            GV = GVD;
+          } else if (auto *GEP = dyn_cast<GEPOperator>(P)) {
+            if (auto *GVB = dyn_cast<GlobalVariable>(GEP->getPointerOperand())) {
+              APInt apOff(64, 0);
+              if (GEP->accumulateConstantOffset(DL, apOff) &&
+                  apOff.getActiveBits() <= 31) {
+                GV = GVB;
+                off = apOff.getSExtValue();
+              }
+            }
+          }
+          if (GV) {
+            if (const void *Host = resolveGlobal(GV)) {
+              int scaled = fitsScaled((int32_t)off, bits == 64 ? 3u : 2u);
+              if (scaled < 0) {
+                r.status = Status::Unsupported; r.reason = "global store uimm12 overflow"; return r;
+              }
+              unsigned rs;
+              if (!valueInReg(V, bits == 64, rs)) {
+                r.status = Status::Unsupported; r.reason = "global store value"; return r;
+              }
+              uint64_t addr = reinterpret_cast<uintptr_t>(Host);
+              uint16_t c0 = (uint16_t)(addr >>  0);
+              uint16_t c1 = (uint16_t)(addr >> 16);
+              uint16_t c2 = (uint16_t)(addr >> 32);
+              uint16_t c3 = (uint16_t)(addr >> 48);
+              if (!W.emit(encMovzHw64(17, c0, 0))) { r.status=Status::TooLarge; return r; }
+              if (c1 && !W.emit(encMovkHw64(17, c1, 1))) { r.status=Status::TooLarge; return r; }
+              if (c2 && !W.emit(encMovkHw64(17, c2, 2))) { r.status=Status::TooLarge; return r; }
+              if (c3 && !W.emit(encMovkHw64(17, c3, 3))) { r.status=Status::TooLarge; return r; }
+              if (!W.emit(encLdrStrUI(false, bits == 64 ? 3u : 2u,
+                                      rs, 17, (unsigned)scaled))) {
+                r.status=Status::TooLarge; return r;
+              }
+              continue;
+            }
+            r.status = Status::Unsupported;
+            r.reason = std::string("unresolved external global (store): ") + GV->getName().str();
+            return r;
+          }
+        }
+
         auto it = ptrLoc.find(SI->getPointerOperand());
         if (it == ptrLoc.end()) {
           r.status = Status::Unsupported; r.reason = "store ptr"; return r;
@@ -589,6 +781,75 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap) {
             r.status = Status::Unsupported; r.reason = "icmp rhs"; return r;
           }
         }
+        continue;
+      }
+      
+      // select i1, x, y  — lower to small conditional sequence using the
+      // pendingCmp if available. We emit a B.cond stub, materialize the
+      // true-value, branch over the false-value, then materialize false.
+      if (auto *SI = dyn_cast<SelectInst>(&I)) {
+        // Only support selects whose condition is an immediately preceding
+        // icmp that we recorded in pendingCmp.
+  const Value *Cond = SI->getCondition();
+        if (!pendingCmp.I || pendingCmp.I != Cond) {
+          r.status = Status::Unsupported; r.reason = "select without fused icmp"; return r;
+        }
+        // allocate result reg
+        int rd = assignReg(SI);
+        if (rd < 0) { r.status = Status::Unsupported; r.reason = "scratch OOM (select)"; return r; }
+
+        // emit CMP
+        if (pendingCmp.rhsImm >= 0) {
+          if (!W.emit(encSubsImm32(pendingCmp.lhsReg, (unsigned)pendingCmp.rhsImm))) { r.status=Status::TooLarge; return r; }
+          if (pendingCmp.is64) { r.status = Status::Unsupported; r.reason = "i64 cmp imm in select"; return r; }
+        } else {
+          if (pendingCmp.is64) { r.status = Status::Unsupported; r.reason = "i64 cmp reg in select"; return r; }
+          if (!W.emit(encSubsReg32(pendingCmp.lhsReg, pendingCmp.rhsReg))) { r.status=Status::TooLarge; return r; }
+        }
+
+        unsigned cond = icmpToCond(pendingCmp.pred);
+        unsigned invCond = cond ^ 1u;
+        size_t bcondPos = W.pos;
+        if (!W.emit(encBcondStub(invCond))) { r.status=Status::TooLarge; return r; }
+
+        // TRUE case: materialize true value into rd
+        unsigned trueReg;
+        if (!valueInReg(SI->getTrueValue(), SI->getTrueValue()->getType()->isIntegerTy(64), trueReg)) { r.status=Status::Unsupported; r.reason = "select true val"; return r; }
+        if ((unsigned)rd != trueReg) {
+          if (!W.emit(encMovReg(SI->getType()->isIntegerTy(64), (unsigned)rd, trueReg))) { r.status=Status::TooLarge; return r; }
+        }
+
+        // jump over false-case
+        size_t bTruePos = W.pos;
+        if (!W.emit(encBStub())) { r.status=Status::TooLarge; return r; }
+
+        // patch bcond to jump here (false-case start)
+        {
+          int32_t diff = (int32_t)W.pos - (int32_t)bcondPos;
+          int32_t imm19 = diff / 4;
+          if (imm19 < -(1<<18) || imm19 >= (1<<18)) { r.status=Status::TooLarge; return r; }
+          uint32_t w = 0x54000000u | (((uint32_t)imm19 & 0x7FFFFu) << 5) | (invCond & 0xFu);
+          W.patch32(bcondPos, w);
+        }
+
+        // FALSE case
+        unsigned falseReg;
+        if (!valueInReg(SI->getFalseValue(), SI->getFalseValue()->getType()->isIntegerTy(64), falseReg)) { r.status=Status::Unsupported; r.reason = "select false val"; return r; }
+        if ((unsigned)rd != falseReg) {
+          if (!W.emit(encMovReg(SI->getType()->isIntegerTy(64), (unsigned)rd, falseReg))) { r.status=Status::TooLarge; return r; }
+        }
+
+        // patch bTrue to jump to continuation (TRUE target)
+        {
+          int32_t diff = (int32_t)W.pos - (int32_t)bTruePos;
+          int32_t imm = diff / 4;
+          if (imm < -(1<<25) || imm >= (1<<25)) { r.status=Status::TooLarge; return r; }
+          uint32_t w = 0x14000000u | ((uint32_t)imm & 0x3FFFFFFu);
+          W.patch32(bTruePos, w);
+        }
+
+        // select lowered; clear pendingCmp
+        pendingCmp.I = nullptr;
         continue;
       }
 
@@ -808,12 +1069,13 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap) {
 
 // ------------------------------ compile ------------------------------
 
-void *light::compile(const Function &Fn, Result &out) {
+void *light::compile(const Function &Fn, Result &out,
+                     const GlobalSymbol *globals, size_t nglobals) {
   const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
   void *page = ::mmap(nullptr, pageSize, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (page == MAP_FAILED) { out.status = Status::TooLarge; out.reason = "mmap"; return nullptr; }
-  out = emit(Fn, (uint8_t *)page, pageSize);
+  out = emit(Fn, (uint8_t *)page, pageSize, globals, nglobals);
   if (out.status != Status::Ok) { ::munmap(page, pageSize); return nullptr; }
   __builtin___clear_cache((char *)page, (char *)page + out.codeBytes);
   if (::mprotect(page, pageSize, PROT_READ | PROT_EXEC) != 0) {

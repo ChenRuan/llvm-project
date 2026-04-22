@@ -1,0 +1,40 @@
+# Phase 1 trim: drop archives unlikely to be needed by a minimal AArch64 JIT
+# that uses SelectionDAG path + ORC + no bitcode writing + no Mach-O/Win PDB.
+# Dropped vs baseline:
+#   libLLVMAArch64AsmParser.a   (JIT doesn't parse textual asm)
+#   libLLVMBitWriter.a          (EasyJIT reads bitcode, doesn't write)
+#   libLLVMDebugInfoCodeView.a  (MS PDB, Linux)
+#   libLLVMDebugInfoDWARF.a     (only tiny footprint; try drop)
+#   libLLVMCFGuard.a            (Windows CF guard)
+#   libLLVMRemarks.a            (optimization remarks output)
+#   libLLVMTextAPI.a            (Mach-O TAPI)
+#   libLLVMipo.a                (IPO passes; custom trim pipeline doesn't call IPO)
+#   libLLVMLinker.a             (llvm::Linker Module linker)
+#   libLLVMProfileData.a        (PGO profiling; we don't use)
+libLLVMAArch64CodeGen.a
+libLLVMAArch64Desc.a
+libLLVMAArch64Info.a
+libLLVMAArch64Utils.a
+libLLVMAnalysis.a
+libLLVMAsmPrinter.a
+libLLVMBinaryFormat.a
+libLLVMBitReader.a
+libLLVMBitstreamReader.a
+libLLVMCodeGen.a
+libLLVMCore.a
+libLLVMDemangle.a
+libLLVMExecutionEngine.a
+libLLVMGlobalISel.a
+libLLVMJITLink.a
+libLLVMMC.a
+libLLVMMCParser.a
+libLLVMObject.a
+libLLVMOrcJIT.a
+libLLVMOrcShared.a
+libLLVMOrcTargetProcess.a
+libLLVMRuntimeDyld.a
+libLLVMScalarOpts.a
+libLLVMSelectionDAG.a
+libLLVMSupport.a
+libLLVMTarget.a
+libLLVMTransformUtils.a

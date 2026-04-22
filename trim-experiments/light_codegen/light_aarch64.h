@@ -39,14 +39,26 @@ struct Result {
   std::string reason; // human-readable when not Ok
 };
 
+// Name-to-host-address table. Shape mirrors easy::GlobalMapping so an
+// EasyJIT trim runtime wrapper can pass its existing GlobalMapping*
+// straight through (sentinel-terminated with Name==nullptr, or pass the
+// explicit count form below).
+struct GlobalSymbol {
+  const char *name;     // LLVM GlobalVariable::getName() spelling
+  const void *address;  // Host address (live process memory)
+};
+
 // Emit machine code for Fn into [buf, buf+bufCap). Only a handful of IR
-// patterns are supported; see the header comment above. Never emits calls
-// or accesses memory.
-Result emit(const llvm::Function &Fn, std::uint8_t *buf, std::size_t bufCap);
+// patterns are supported; see the header comment above.
+// Globals: optional table used to resolve external GlobalVariable loads
+// and stores. Pass {nullptr, 0} if none.
+Result emit(const llvm::Function &Fn, std::uint8_t *buf, std::size_t bufCap,
+            const GlobalSymbol *globals = nullptr, std::size_t nglobals = 0);
 
 // Allocate an RWX page, emit Fn into it, return a callable function pointer
 // (or nullptr on failure, with reason populated). The page is leaked on
 // purpose — this is an experimental PoC, not a production allocator.
-void *compile(const llvm::Function &Fn, Result &out);
+void *compile(const llvm::Function &Fn, Result &out,
+              const GlobalSymbol *globals = nullptr, std::size_t nglobals = 0);
 
 } // namespace light

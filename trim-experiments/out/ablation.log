@@ -1,0 +1,28 @@
+DROPPED                             TEXT_Δ    STATUS
+baseline text = 26819671
+libLLVMAArch64AsmParser.a           -          LINK FAIL: `LLVMInitializeAArch64AsmParser'
+libLLVMAArch64Utils.a               -          LINK FAIL: `llvm::AArch64SysReg::lookupSysRegByName(llvm::StringRef)'
+libLLVMAsmPrinter.a                 -          LINK FAIL: `llvm::AsmPrinter::AsmPrinter(llvm::TargetMachine&, std::unique_ptr<llvm::MCStreamer, std::default_delete<llvm::MCStream
+libLLVMBinaryFormat.a               -          LINK FAIL: `llvm::MachO::getCPUType(llvm::Triple const&)'
+libLLVMBitReader.a                  -          LINK FAIL: `llvm::parseBitcodeFile(llvm::MemoryBufferRef, llvm::LLVMContext&, llvm::function_ref<llvm::Optional<std::__cxx11::basic
+libLLVMBitstreamReader.a            -          LINK FAIL: `llvm::BitstreamCursor::ReadBlockInfoBlock(bool)'
+libLLVMBitWriter.a                  -          LINK FAIL: `llvm::WriteBitcodeToFile(llvm::Module const&, llvm::raw_ostream&, bool, llvm::ModuleSummaryIndex const*, bool, std::arr
+libLLVMCFGuard.a                    -          LINK FAIL: `llvm::createCFGuardCheckPass()'
+libLLVMDebugInfoCodeView.a          -          LINK FAIL: `llvm::codeview::GlobalTypeTableBuilder::hashes() const'
+libLLVMDebugInfoDWARF.a             -          LINK FAIL: `llvm::DWARFExpression::Operation::extract(llvm::DataExtractor, unsigned char, unsigned long, llvm::Optional<llvm::dwarf
+libLLVMDemangle.a                   -          LINK FAIL: `llvm::itanium_demangle::parse_discriminator(char const*, char const*)'
+libLLVMExecutionEngine.a            -          LINK FAIL: `llvm::SectionMemoryManager::SectionMemoryManager(llvm::SectionMemoryManager::MemoryMapper*)'
+libLLVMGlobalISel.a                 -          LINK FAIL: `llvm::getStandardCSEConfigForOpt(llvm::CodeGenOpt::Level)'
+libLLVMJITLink.a                    -          LINK FAIL: `vtable for llvm::jitlink::InProcessMemoryManager'
+libLLVMLinker.a                     -          LINK FAIL: `llvm::Linker::linkModules(llvm::Module&, std::unique_ptr<llvm::Module, std::default_delete<llvm::Module> >, unsigned in
+libLLVMMCParser.a                   -          LINK FAIL: `llvm::AsmToken::getLoc() const'
+libLLVMObject.a                     -          LINK FAIL: `llvm::irsymtab::build(llvm::ArrayRef<llvm::Module*>, llvm::SmallVector<char, 0u>&, llvm::StringTableBuilder&, llvm::Bum
+libLLVMOrcShared.a                  -          LINK FAIL: `llvm::orc::orcError(llvm::orc::OrcErrorCode)'
+libLLVMOrcTargetProcess.a           -          LINK FAIL: `llvm::orc::runAsMain(int (*)(int, char**), llvm::ArrayRef<std::__cxx11::basic_string<char, std::char_traits<char>, std:
+libLLVMProfileData.a                -          LINK FAIL: `ProfileSummaryCutoffHot'
+libLLVMRemarks.a                    -          LINK FAIL: `llvm::remarks::RemarkStreamer::needsSection() const'
+libLLVMRuntimeDyld.a                -          LINK FAIL: `llvm::RTDyldMemoryManager::getSymbolAddressInProcess(std::__cxx11::basic_string<char, std::char_traits<char>, std::allo
+libLLVMScalarOpts.a                 -          LINK FAIL: `llvm::createSeparateConstOffsetFromGEPPass(bool)'
+libLLVMTarget.a                     -          LINK FAIL: `llvm::TargetLoweringObjectFile::~TargetLoweringObjectFile()'
+libLLVMTextAPI.a                         -4096 OK (text=26815575, runs)
+libLLVMipo.a                        -          LINK FAIL: `llvm::createFunctionInliningPass(unsigned int, unsigned int, bool)'
