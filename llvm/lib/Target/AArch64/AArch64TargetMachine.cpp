@@ -24,6 +24,7 @@
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/CodeGen/CFIFixup.h"
 #include "llvm/CodeGen/CSEConfigBase.h"
+#ifndef LLVM_AARCH64_DISABLE_GISEL
 #include "llvm/CodeGen/GlobalISel/CSEInfo.h"
 #include "llvm/CodeGen/GlobalISel/IRTranslator.h"
 #include "llvm/CodeGen/GlobalISel/InstructionSelect.h"
@@ -31,6 +32,7 @@
 #include "llvm/CodeGen/GlobalISel/LoadStoreOpt.h"
 #include "llvm/CodeGen/GlobalISel/Localizer.h"
 #include "llvm/CodeGen/GlobalISel/RegBankSelect.h"
+#endif
 #include "llvm/CodeGen/MIRParser/MIParser.h"
 #include "llvm/CodeGen/MachineScheduler.h"
 #include "llvm/CodeGen/Passes.h"
@@ -180,6 +182,7 @@ static cl::opt<unsigned> SVEVectorBitsMinOpt(
 
 extern cl::opt<bool> EnableHomogeneousPrologEpilog;
 
+#ifndef LLVM_AARCH64_DISABLE_GISEL
 static cl::opt<bool> EnableGISelLoadStoreOptPreLegal(
     "aarch64-enable-gisel-ldst-prelegal",
     cl::desc("Enable GlobalISel's pre-legalizer load/store optimization pass"),
@@ -189,6 +192,7 @@ static cl::opt<bool> EnableGISelLoadStoreOptPostLegal(
     "aarch64-enable-gisel-ldst-postlegal",
     cl::desc("Enable GlobalISel's post-legalizer load/store optimization pass"),
     cl::init(false), cl::Hidden);
+#endif
 
 extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAArch64Target() {
   // Register the target.
@@ -198,7 +202,9 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAArch64Target() {
   RegisterTargetMachine<AArch64leTargetMachine> W(getTheARM64_32Target());
   RegisterTargetMachine<AArch64leTargetMachine> V(getTheAArch64_32Target());
   auto PR = PassRegistry::getPassRegistry();
+#ifndef LLVM_AARCH64_DISABLE_GISEL
   initializeGlobalISel(*PR);
+#endif
   initializeAArch64A53Fix835769Pass(*PR);
   initializeAArch64A57FPLoadBalancingPass(*PR);
   initializeAArch64AdvSIMDScalarPass(*PR);
@@ -212,11 +218,13 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAArch64Target() {
   initializeAArch64LoadStoreOptPass(*PR);
   initializeAArch64MIPeepholeOptPass(*PR);
   initializeAArch64SIMDInstrOptPass(*PR);
+#ifndef LLVM_AARCH64_DISABLE_GISEL
   initializeAArch64O0PreLegalizerCombinerPass(*PR);
   initializeAArch64PreLegalizerCombinerPass(*PR);
   initializeAArch64PostLegalizerCombinerPass(*PR);
   initializeAArch64PostLegalizerLoweringPass(*PR);
   initializeAArch64PostSelectOptimizePass(*PR);
+#endif
   initializeAArch64PromoteConstantPass(*PR);
   initializeAArch64RedundantCopyEliminationPass(*PR);
   initializeAArch64StorePairSuppressPass(*PR);
@@ -347,6 +355,7 @@ AArch64TargetMachine::AArch64TargetMachine(const Target &T, const Triple &TT,
 
   // Enable GlobalISel at or below EnableGlobalISelAt0, unless this is
   // MachO/CodeModel::Large, which GlobalISel does not support.
+#ifndef LLVM_AARCH64_DISABLE_GISEL
   if (getOptLevel() <= EnableGlobalISelAtO &&
       TT.getArch() != Triple::aarch64_32 &&
       TT.getEnvironment() != Triple::GNUILP32 &&
@@ -354,6 +363,7 @@ AArch64TargetMachine::AArch64TargetMachine(const Target &T, const Triple &TT,
     setGlobalISel(true);
     setGlobalISelAbort(GlobalISelAbortMode::Disable);
   }
+#endif
 
   // AArch64 supports the MachineOutliner.
   setMachineOutliner(true);
@@ -498,6 +508,7 @@ public:
   bool addPreISel() override;
   void addCodeGenPrepare() override;
   bool addInstSelector() override;
+#ifndef LLVM_AARCH64_DISABLE_GISEL
   bool addIRTranslator() override;
   void addPreLegalizeMachineIR() override;
   bool addLegalizeMachineIR() override;
@@ -505,6 +516,7 @@ public:
   bool addRegBankSelect() override;
   void addPreGlobalInstructionSelect() override;
   bool addGlobalInstructionSelect() override;
+#endif
   void addMachineSSAOptimization() override;
   bool addILPOpts() override;
   void addPreRegAlloc() override;
@@ -513,7 +525,9 @@ public:
   void addPreEmitPass() override;
   void addPreEmitPass2() override;
 
+#ifndef LLVM_AARCH64_DISABLE_GISEL
   std::unique_ptr<CSEConfigBase> getCSEConfig() const override;
+#endif
 };
 
 } // end anonymous namespace
@@ -527,9 +541,11 @@ TargetPassConfig *AArch64TargetMachine::createPassConfig(PassManagerBase &PM) {
   return new AArch64PassConfig(*this, PM);
 }
 
+#ifndef LLVM_AARCH64_DISABLE_GISEL
 std::unique_ptr<CSEConfigBase> AArch64PassConfig::getCSEConfig() const {
   return getStandardCSEConfigForOpt(TM->getOptLevel());
 }
+#endif
 
 void AArch64PassConfig::addIRPasses() {
   // Always expand atomic operations, we don't deal with atomicrmw or cmpxchg
@@ -646,6 +662,7 @@ bool AArch64PassConfig::addInstSelector() {
   return false;
 }
 
+#ifndef LLVM_AARCH64_DISABLE_GISEL
 bool AArch64PassConfig::addIRTranslator() {
   addPass(new IRTranslator(getOptLevel()));
   return false;
@@ -691,6 +708,7 @@ bool AArch64PassConfig::addGlobalInstructionSelect() {
     addPass(createAArch64PostSelectOptimize());
   return false;
 }
+#endif // LLVM_AARCH64_DISABLE_GISEL
 
 void AArch64PassConfig::addMachineSSAOptimization() {
   // Run default MachineSSAOptimization first.

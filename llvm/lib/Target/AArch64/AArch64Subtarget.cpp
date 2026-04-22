@@ -274,6 +274,7 @@ AArch64Subtarget::AArch64Subtarget(const Triple &TT, const std::string &CPU,
   if (AArch64::isX18ReservedByDefault(TT))
     ReserveXRegister.set(18);
 
+#ifndef LLVM_AARCH64_DISABLE_GISEL
   CallLoweringInfo.reset(new AArch64CallLowering(*getTargetLowering()));
   InlineAsmLoweringInfo.reset(new InlineAsmLowering(getTargetLowering()));
   Legalizer.reset(new AArch64LegalizerInfo(*this));
@@ -287,6 +288,9 @@ AArch64Subtarget::AArch64Subtarget(const Triple &TT, const std::string &CPU,
       *static_cast<const AArch64TargetMachine *>(&TM), *this, *RBI));
 
   RegBankInfo.reset(RBI);
+#else
+  (void)TM;
+#endif
 }
 
 const CallLowering *AArch64Subtarget::getCallLowering() const {

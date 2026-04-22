@@ -2,6 +2,14 @@ add_llvm_component_group(AArch64 HAS_JIT)
 
 set(LLVM_TARGET_DEFINITIONS AArch64.td)
 
+# Experimental: trim GlobalISel for embedded/static builds. When enabled,
+# the AArch64 backend falls back to SelectionDAG-only codegen and the
+# libLLVMGlobalISel.a archive (and AArch64's GISel/* TUs) are no longer
+# referenced by the final link. The GISel tablegen outputs are still
+# generated (cheap) because other .td fragments may depend on them.
+option(LLVM_AARCH64_DISABLE_GISEL
+       "Disable GlobalISel in the AArch64 backend (SelectionDAG only)" OFF)
+
 tablegen(LLVM AArch64GenAsmMatcher.inc -gen-asm-matcher)
 tablegen(LLVM AArch64GenAsmWriter.inc -gen-asm-writer)
 tablegen(LLVM AArch64GenAsmWriter1.inc -gen-asm-writer -asmwriternum=1)
@@ -28,6 +36,15 @@ tablegen(LLVM AArch64GenSystemOperands.inc -gen-searchable-tables)
 tablegen(LLVM AArch64GenExegesis.inc -gen-exegesis)
 
 add_public_tablegen_target(AArch64CommonTableGen)
+
+# When LLVM_AARCH64_DISABLE_GISEL is ON, we still compile the GISel/* TUs
+# (so subtarget/target-machine code can refer to the classes if needed),
+# but we cut the force-reference chain (pass initialisers + subtarget
+# GISel member construction) so the entire libLLVMGlobalISel.a archive
+# and all AArch64 GISel/* .o members are pruned at final static link.
+if(LLVM_AARCH64_DISABLE_GISEL)
+  add_compile_definitions(LLVM_AARCH64_DISABLE_GISEL=1)
+endif()
 
 add_llvm_target(AArch64CodeGen
   GISel/AArch64CallLowering.cpp
