@@ -2033,7 +2033,13 @@ bool AArch64TargetLowering::allowsMisalignedMemoryAccesses(
 FastISel *
 AArch64TargetLowering::createFastISel(FunctionLoweringInfo &funcInfo,
                                       const TargetLibraryInfo *libInfo) const {
+#ifdef LLVM_AARCH64_DISABLE_FASTISEL
+  (void)funcInfo;
+  (void)libInfo;
+  return nullptr;
+#else
   return AArch64::createFastISel(funcInfo, libInfo);
+#endif
 }
 
 const char *AArch64TargetLowering::getTargetNodeName(unsigned Opcode) const {

@@ -46,6 +46,15 @@ if(LLVM_AARCH64_DISABLE_GISEL)
   add_compile_definitions(LLVM_AARCH64_DISABLE_GISEL=1)
 endif()
 
+# Experimental: drop the -O0 FastISel path. The JIT compiler runs at -O2/-O3
+# where SelectionDAG is used anyway, so the entire AArch64FastISel.cpp is
+# dead code in the embedded static-link scenario.
+option(LLVM_AARCH64_DISABLE_FASTISEL
+       "Disable the AArch64 FastISel path" OFF)
+if(LLVM_AARCH64_DISABLE_FASTISEL)
+  add_compile_definitions(LLVM_AARCH64_DISABLE_FASTISEL=1)
+endif()
+
 add_llvm_target(AArch64CodeGen
   GISel/AArch64CallLowering.cpp
   GISel/AArch64GlobalISelUtils.cpp
