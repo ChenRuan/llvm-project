@@ -7686,8 +7686,13 @@ SDValue SelectionDAGBuilder::lowerEndEH(SDValue Chain, const InvokeInst *II,
   // actually use outlined funclets and their LSDA info style.
   if (MF.hasEHFunclets() && isFuncletEHPersonality(Pers)) {
     assert(II && "II should've been set");
+#ifdef LLVM_CODEGEN_DISABLE_NONLINUX_EH
+    report_fatal_error("funclet EH reached SelectionDAG lowering with "
+                       "LLVM_CODEGEN_DISABLE_NONLINUX_EH");
+#else
     WinEHFuncInfo *EHInfo = MF.getWinEHFuncInfo();
     EHInfo->addIPToStateRange(II, BeginLabel, EndLabel);
+#endif
   } else if (!isScopedEHPersonality(Pers)) {
     assert(EHPadBB);
     MF.addInvoke(FuncInfo.MBBMap[EHPadBB], BeginLabel, EndLabel);

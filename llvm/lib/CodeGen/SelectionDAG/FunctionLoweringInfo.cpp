@@ -24,8 +24,10 @@
 #include "llvm/CodeGen/TargetLowering.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
+#ifndef LLVM_CODEGEN_DISABLE_NONLINUX_EH
 #include "llvm/CodeGen/WasmEHFuncInfo.h"
 #include "llvm/CodeGen/WinEHFuncInfo.h"
+#endif
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -99,6 +101,10 @@ void FunctionLoweringInfo::set(const Function &fn, MachineFunction &mf,
   EHPersonality Personality = classifyEHPersonality(
       Fn->hasPersonalityFn() ? Fn->getPersonalityFn() : nullptr);
   if (isFuncletEHPersonality(Personality)) {
+#ifdef LLVM_CODEGEN_DISABLE_NONLINUX_EH
+    report_fatal_error("non-Linux EH personality reached SelectionDAG "
+                       "lowering with LLVM_CODEGEN_DISABLE_NONLINUX_EH");
+#else
     // Calculate state numbers if we haven't already.
     WinEHFuncInfo &EHInfo = *MF->getWinEHFuncInfo();
     if (Personality == EHPersonality::MSVC_CXX)
@@ -118,10 +124,16 @@ void FunctionLoweringInfo::set(const Function &fn, MachineFunction &mf,
           H.CatchObj.FrameIndex = INT_MAX;
       }
     }
+#endif
   }
   if (Personality == EHPersonality::Wasm_CXX) {
+#ifdef LLVM_CODEGEN_DISABLE_NONLINUX_EH
+    report_fatal_error("Wasm EH personality reached SelectionDAG lowering "
+                       "with LLVM_CODEGEN_DISABLE_NONLINUX_EH");
+#else
     WasmEHFuncInfo &EHInfo = *MF->getWasmEHFuncInfo();
     calculateWasmEHInfo(&fn, EHInfo);
+#endif
   }
 
   // Initialize the mapping of values to registers.  This is only set up for
@@ -303,6 +315,7 @@ void FunctionLoweringInfo::set(const Function &fn, MachineFunction &mf,
   }
 
   if (isFuncletEHPersonality(Personality)) {
+#ifndef LLVM_CODEGEN_DISABLE_NONLINUX_EH
     WinEHFuncInfo &EHInfo = *MF->getWinEHFuncInfo();
 
     // Map all BB references in the WinEH data to MBBs.
@@ -323,9 +336,11 @@ void FunctionLoweringInfo::set(const Function &fn, MachineFunction &mf,
       const auto *BB = CME.Handler.get<const BasicBlock *>();
       CME.Handler = MBBMap[BB];
     }
+#endif
   }
 
   else if (Personality == EHPersonality::Wasm_CXX) {
+#ifndef LLVM_CODEGEN_DISABLE_NONLINUX_EH
     WasmEHFuncInfo &EHInfo = *MF->getWasmEHFuncInfo();
     // Map all BB references in the Wasm EH data to MBBs.
     DenseMap<BBOrMBB, BBOrMBB> SrcToUnwindDest;
@@ -344,6 +359,7 @@ void FunctionLoweringInfo::set(const Function &fn, MachineFunction &mf,
             MBBMap[P.get<const BasicBlock *>()]);
     }
     EHInfo.UnwindDestToSrcs = std::move(UnwindDestToSrcs);
+#endif
   }
 }
 

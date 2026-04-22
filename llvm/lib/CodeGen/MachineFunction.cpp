@@ -217,12 +217,22 @@ void MachineFunction::init() {
 
   if (isFuncletEHPersonality(classifyEHPersonality(
           F.hasPersonalityFn() ? F.getPersonalityFn() : nullptr))) {
+#ifdef LLVM_CODEGEN_DISABLE_NONLINUX_EH
+    report_fatal_error("funclet EH personality encountered with "
+                       "LLVM_CODEGEN_DISABLE_NONLINUX_EH");
+#else
     WinEHInfo = new (Allocator) WinEHFuncInfo();
+#endif
   }
 
   if (isScopedEHPersonality(classifyEHPersonality(
           F.hasPersonalityFn() ? F.getPersonalityFn() : nullptr))) {
+#ifdef LLVM_CODEGEN_DISABLE_NONLINUX_EH
+    report_fatal_error("scoped (Wasm) EH personality encountered with "
+                       "LLVM_CODEGEN_DISABLE_NONLINUX_EH");
+#else
     WasmEHInfo = new (Allocator) WasmEHFuncInfo();
+#endif
   }
 
   assert(Target.isCompatibleDataLayout(getDataLayout()) &&
@@ -271,6 +281,7 @@ void MachineFunction::clear() {
     Allocator.Deallocate(JumpTableInfo);
   }
 
+#ifndef LLVM_CODEGEN_DISABLE_NONLINUX_EH
   if (WinEHInfo) {
     WinEHInfo->~WinEHFuncInfo();
     Allocator.Deallocate(WinEHInfo);
@@ -280,6 +291,7 @@ void MachineFunction::clear() {
     WasmEHInfo->~WasmEHFuncInfo();
     Allocator.Deallocate(WasmEHInfo);
   }
+#endif
 }
 
 const DataLayout &MachineFunction::getDataLayout() const {
