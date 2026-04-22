@@ -55,3 +55,17 @@ option(LLVM_DISABLE_INLINE_ASM_PARSER
 if(LLVM_DISABLE_INLINE_ASM_PARSER)
   target_compile_definitions(LLVMAsmPrinter PRIVATE LLVM_DISABLE_INLINE_ASM_PARSER=1)
 endif()
+
+# Experimental embedded/JIT option: skip the DwarfDebug / CodeViewDebug
+# handler construction in AsmPrinter::doInitialization. When the JIT
+# input module carries no debuginfo metadata, this prevents pulling
+# DwarfDebug.cpp.o, DwarfCompileUnit.cpp.o, DwarfUnit.cpp.o,
+# CodeViewDebug.cpp.o and friends (and transitively
+# libLLVMDebugInfoDWARF.a / libLLVMDebugInfoCodeView.a) from
+# libLLVMAsmPrinter.a. Binaries built with this option will silently
+# drop any DI metadata that does reach codegen.
+option(LLVM_DISABLE_DEBUG_INFO_EMISSION
+       "Disable DWARF/CodeView debug-info emission in AsmPrinter" OFF)
+if(LLVM_DISABLE_DEBUG_INFO_EMISSION)
+  target_compile_definitions(LLVMAsmPrinter PRIVATE LLVM_DISABLE_DEBUG_INFO_EMISSION=1)
+endif()

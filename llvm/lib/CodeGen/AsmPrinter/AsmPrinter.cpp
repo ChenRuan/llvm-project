@@ -403,6 +403,7 @@ void AsmPrinter::EmitToStreamer(MCStreamer &S, const MCInst &Inst) {
 }
 
 void AsmPrinter::emitInitialRawDwarfLocDirective(const MachineFunction &MF) {
+#ifndef LLVM_DISABLE_DEBUG_INFO_EMISSION
   if (DD) {
     assert(OutStreamer->hasRawTextSupport() &&
            "Expected assembly output mode.");
@@ -413,6 +414,9 @@ void AsmPrinter::emitInitialRawDwarfLocDirective(const MachineFunction &MF) {
       return;
     (void)DD->emitInitialLocDirective(MF, /*CUID=*/0);
   }
+#else
+  (void)MF;
+#endif
 }
 
 /// getCurrentSection() - Return the current section we are emitting to.
@@ -503,6 +507,7 @@ bool AsmPrinter::doInitialization(Module &M) {
   }
 
   if (MAI->doesSupportDebugInformation()) {
+#ifndef LLVM_DISABLE_DEBUG_INFO_EMISSION
     bool EmitCodeView = M.getCodeViewFlag();
     if (EmitCodeView && TM.getTargetTriple().isOSWindows()) {
       Handlers.emplace_back(std::make_unique<CodeViewDebug>(this),
@@ -518,6 +523,7 @@ bool AsmPrinter::doInitialization(Module &M) {
                               DWARFGroupDescription);
       }
     }
+#endif // LLVM_DISABLE_DEBUG_INFO_EMISSION
   }
 
   if (M.getNamedMetadata(PseudoProbeDescMetadataName)) {
