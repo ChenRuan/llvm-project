@@ -65,6 +65,18 @@ if(LLVM_AARCH64_DISABLE_HARDENING_PASSES)
   add_compile_definitions(LLVM_AARCH64_DISABLE_HARDENING_PASSES=1)
 endif()
 
+# Experimental: drop AArch64 passes that only help specific CPUs
+# (A53 erratum, A57 FP balancing, Falkor HWPF/strided, SVE intrinsic
+# rewrites, Cortex-specific CondBrTuning, BTI branch-target emission).
+# The embedded JIT never targets these specific cores, and -mbranch-protection
+# is not used; all of these passes either no-op at runtime via subtarget
+# checks or are behind feature attributes that the JIT never sets.
+option(LLVM_AARCH64_DISABLE_CPU_SPECIFIC_PASSES
+       "Disable AArch64 per-CPU / BTI / SVE / Falkor tuning passes" OFF)
+if(LLVM_AARCH64_DISABLE_CPU_SPECIFIC_PASSES)
+  add_compile_definitions(LLVM_AARCH64_DISABLE_CPU_SPECIFIC_PASSES=1)
+endif()
+
 add_llvm_target(AArch64CodeGen
   GISel/AArch64CallLowering.cpp
   GISel/AArch64GlobalISelUtils.cpp

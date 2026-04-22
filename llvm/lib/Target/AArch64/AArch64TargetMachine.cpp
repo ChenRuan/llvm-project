@@ -205,10 +205,16 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAArch64Target() {
 #ifndef LLVM_AARCH64_DISABLE_GISEL
   initializeGlobalISel(*PR);
 #endif
+#ifndef LLVM_AARCH64_DISABLE_CPU_SPECIFIC_PASSES
   initializeAArch64A53Fix835769Pass(*PR);
   initializeAArch64A57FPLoadBalancingPass(*PR);
-  initializeAArch64AdvSIMDScalarPass(*PR);
   initializeAArch64BranchTargetsPass(*PR);
+  initializeFalkorHWPFFixPass(*PR);
+  initializeFalkorMarkStridedAccessesLegacyPass(*PR);
+  initializeSVEIntrinsicOptsPass(*PR);
+  initializeAArch64CondBrTuningPass(*PR);
+#endif
+  initializeAArch64AdvSIMDScalarPass(*PR);
   initializeAArch64CollectLOHPass(*PR);
   initializeAArch64CompressJumpTablesPass(*PR);
   initializeAArch64ConditionalComparesPass(*PR);
@@ -555,8 +561,10 @@ void AArch64PassConfig::addIRPasses() {
   addPass(createAtomicExpandPass());
 
   // Expand any SVE vector library calls that we can't code generate directly.
+#ifndef LLVM_AARCH64_DISABLE_CPU_SPECIFIC_PASSES
   if (EnableSVEIntrinsicOpts && TM->getOptLevel() == CodeGenOpt::Aggressive)
     addPass(createSVEIntrinsicOptsPass());
+#endif
 
   // Cmpxchg instructions are often used with a subsequent comparison to
   // determine whether it succeeded. We can exploit existing control-flow in
@@ -577,8 +585,10 @@ void AArch64PassConfig::addIRPasses() {
   if (TM->getOptLevel() != CodeGenOpt::None) {
     if (EnableLoopDataPrefetch)
       addPass(createLoopDataPrefetchPass());
+#ifndef LLVM_AARCH64_DISABLE_CPU_SPECIFIC_PASSES
     if (EnableFalkorHWPFFix)
       addPass(createFalkorMarkStridedAccessesPass());
+#endif
   }
 
   if (TM->getOptLevel() == CodeGenOpt::Aggressive && EnableGEPOpt) {
@@ -729,8 +739,10 @@ bool AArch64PassConfig::addILPOpts() {
     addPass(createAArch64ConditionalCompares());
   if (EnableMCR)
     addPass(&MachineCombinerID);
+#ifndef LLVM_AARCH64_DISABLE_CPU_SPECIFIC_PASSES
   if (EnableCondBrTuning)
     addPass(createAArch64CondBrTuning());
+#endif
   if (EnableEarlyIfConversion)
     addPass(&EarlyIfConverterID);
   if (EnableStPairSuppress)
@@ -762,9 +774,11 @@ void AArch64PassConfig::addPostRegAlloc() {
   if (TM->getOptLevel() != CodeGenOpt::None && EnableRedundantCopyElimination)
     addPass(createAArch64RedundantCopyEliminationPass());
 
+#ifndef LLVM_AARCH64_DISABLE_CPU_SPECIFIC_PASSES
   if (TM->getOptLevel() != CodeGenOpt::None && usingDefaultRegAlloc())
     // Improve performance for some FP/SIMD code for A57.
     addPass(createAArch64A57FPLoadBalancing());
+#endif
 }
 
 void AArch64PassConfig::addPreSched2() {
@@ -794,8 +808,10 @@ void AArch64PassConfig::addPreSched2() {
 #endif
 
   if (TM->getOptLevel() != CodeGenOpt::None) {
+#ifndef LLVM_AARCH64_DISABLE_CPU_SPECIFIC_PASSES
     if (EnableFalkorHWPFFix)
       addPass(createFalkorHWPFFixPass());
+#endif
   }
 }
 
@@ -810,10 +826,12 @@ void AArch64PassConfig::addPreEmitPass() {
       EnableAArch64CopyPropagation)
     addPass(createMachineCopyPropagationPass(true));
 
+#ifndef LLVM_AARCH64_DISABLE_CPU_SPECIFIC_PASSES
   addPass(createAArch64A53Fix835769());
 
   if (EnableBranchTargets)
     addPass(createAArch64BranchTargetsPass());
+#endif
 
   // Relax conditional branch instructions if they're otherwise out of
   // range of their destination.
