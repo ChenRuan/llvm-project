@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ProfileData/InstrProfCorrelator.h"
+#ifndef LLVM_PROFILEDATA_DISABLE_CORRELATOR
 #include "llvm/DebugInfo/DIContext.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
 #include "llvm/DebugInfo/DWARF/DWARFDie.h"
@@ -15,12 +16,38 @@
 #include "llvm/DebugInfo/DWARF/DWARFLocationExpression.h"
 #include "llvm/DebugInfo/DWARF/DWARFUnit.h"
 #include "llvm/Object/MachO.h"
+#endif
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "correlator"
 
 using namespace llvm;
 
+#ifdef LLVM_PROFILEDATA_DISABLE_CORRELATOR
+// Embedded JIT build: profile-data correlation against debug info is disabled
+// to avoid pulling in libLLVMDebugInfoDWARF.a / libLLVMObject MachO paths.
+// Only the minimal symbols required to satisfy the header's declarations are
+// defined here; the factory functions always return an error.
+const char *InstrProfCorrelator::FunctionNameAttributeName = "Function Name";
+const char *InstrProfCorrelator::CFGHashAttributeName = "CFG Hash";
+const char *InstrProfCorrelator::NumCountersAttributeName = "Num Counters";
+
+Expected<std::unique_ptr<InstrProfCorrelator>>
+InstrProfCorrelator::get(StringRef) {
+  return make_error<InstrProfError>(
+      instrprof_error::unable_to_correlate_profile,
+      "profile correlation disabled in this build");
+}
+
+Expected<std::unique_ptr<InstrProfCorrelator>>
+InstrProfCorrelator::get(std::unique_ptr<MemoryBuffer>) {
+  return make_error<InstrProfError>(
+      instrprof_error::unable_to_correlate_profile,
+      "profile correlation disabled in this build");
+}
+
+Optional<size_t> InstrProfCorrelator::getDataSize() const { return {}; }
+#else
 /// Get the __llvm_prf_cnts section.
 Expected<object::SectionRef> getCountersSection(const object::ObjectFile &Obj) {
   for (auto &Section : Obj.sections())
@@ -293,3 +320,4 @@ void DwarfInstrProfCorrelator<IntPtrT>::correlateProfileDataImpl() {
     for (const auto &Entry : CU->dies())
       maybeAddProbe(DWARFDie(CU.get(), &Entry));
 }
+#endif // LLVM_PROFILEDATA_DISABLE_CORRELATOR

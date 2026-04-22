@@ -1,0 +1,36 @@
+# Phase-2 archive list: AsmParser dropped (stub provides the one symbol we
+# still force-reference).
+libLLVMAArch64CodeGen.a
+libLLVMAArch64Desc.a
+libLLVMAArch64Info.a
+libLLVMAArch64Utils.a
+libLLVMAnalysis.a
+libLLVMAsmPrinter.a
+libLLVMBinaryFormat.a
+libLLVMBitReader.a
+libLLVMBitstreamReader.a
+libLLVMBitWriter.a
+libLLVMCFGuard.a
+libLLVMCodeGen.a
+libLLVMCore.a
+libLLVMDebugInfoCodeView.a
+libLLVMDemangle.a
+libLLVMExecutionEngine.a
+libLLVMGlobalISel.a
+libLLVMipo.a
+libLLVMJITLink.a
+libLLVMLinker.a
+libLLVMMC.a
+libLLVMMCParser.a
+libLLVMObject.a
+libLLVMOrcJIT.a
+libLLVMOrcShared.a
+libLLVMOrcTargetProcess.a
+libLLVMProfileData.a
+libLLVMRemarks.a
+libLLVMRuntimeDyld.a
+libLLVMScalarOpts.a
+libLLVMSelectionDAG.a
+libLLVMSupport.a
+libLLVMTarget.a
+libLLVMTransformUtils.a

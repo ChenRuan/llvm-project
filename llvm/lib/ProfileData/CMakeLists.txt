@@ -26,4 +26,10 @@ add_llvm_component_library(LLVMProfileData
   DebugInfoDWARF
   )
 
+option(LLVM_PROFILEDATA_DISABLE_CORRELATOR
+  "Disable InstrProfCorrelator DWARF-based profile correlation (embedded JIT builds)" OFF)
+if(LLVM_PROFILEDATA_DISABLE_CORRELATOR)
+  target_compile_definitions(LLVMProfileData PRIVATE LLVM_PROFILEDATA_DISABLE_CORRELATOR=1)
+endif()
+
 add_subdirectory(Coverage)
