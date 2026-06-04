@@ -67,12 +67,26 @@ set(EJIT_SOURCES
   EJitOptimizer.cpp
   EJitPassBuilder.cpp
 )
-
-# Async/sync compiler — excluded in freestanding mode (single-threaded, no std::thread)
 if(NOT EJIT_FREESTANDING)
   list(APPEND EJIT_SOURCES
     EJitSyncCompiler.cpp
     EJitAsyncCompiler.cpp
+  )
+endif()
+
+#===-- Optional experimental AArch64 light backend ------------------------===#
+# When ON, compiles the EmbeddedJIT light AArch64 emitter + code allocators
+# into LLVMEJIT and defines EJIT_LIGHT_BACKEND so the runtime exposes the
+# optional light backend mode. Default OFF: the default build is unaffected
+# and the ORC/JITLink path remains the only backend.
+option(EJIT_ENABLE_LIGHT_BACKEND
+  "Enable EmbeddedJIT experimental AArch64 light backend" OFF)
+if(EJIT_ENABLE_LIGHT_BACKEND)
+  message(STATUS "EmbeddedJIT: light AArch64 backend ENABLED (experimental)")
+  list(APPEND EJIT_SOURCES
+    LightBackend/EJitLightAArch64.cpp
+    LightBackend/EJitLightCodeAllocator.cpp
+    LightBackend/EJitLightBackend.cpp
   )
 endif()
 
@@ -102,6 +116,11 @@ add_llvm_component_library(LLVMEJIT
 if(EJIT_DEFAULT_TARGET_TRIPLE)
   target_compile_definitions(LLVMEJIT PUBLIC
     EJIT_DEFAULT_TRIPLE="${EJIT_DEFAULT_TARGET_TRIPLE}")
+endif()
+
+# Expose the light-backend feature macro to the runtime translation units.
+if(EJIT_ENABLE_LIGHT_BACKEND)
+  target_compile_definitions(LLVMEJIT PUBLIC EJIT_LIGHT_BACKEND=1)
 endif()
 
 #===-- Minimal embedded runtime target -----------------------------------===#
