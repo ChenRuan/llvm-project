@@ -187,3 +187,25 @@ add_library(ejit_baremetal STATIC
   BareMetal/ejit_baremetal_stubs.c)
 target_compile_options(ejit_baremetal PRIVATE -ffunction-sections -fdata-sections)
 target_include_directories(ejit_baremetal PUBLIC BareMetal)
+
+#===-- Light backend standalone test --------------------------------------===#
+# Only built when the experimental light backend is enabled. Produces a
+# self-contained executable (no lit/gtest) and a convenience run target
+# check-ejit-light-backend. On an AArch64 host it additionally executes the
+# emitted machine code; on other hosts it runs emit/reject/byte-pattern
+# checks only.
+if(EJIT_ENABLE_LIGHT_BACKEND)
+  set(LLVM_LINK_COMPONENTS Core Support TargetParser)
+  add_llvm_executable(ejit-light-backend-test
+    ${LLVM_MAIN_SRC_DIR}/test/ExecutionEngine/EJIT/light-backend/ejit-light-backend-test.cpp
+    PARTIAL_SOURCES_INTENDED
+    )
+  target_link_libraries(ejit-light-backend-test PRIVATE LLVMEJIT)
+
+  add_custom_target(check-ejit-light-backend
+    COMMAND $<TARGET_FILE:ejit-light-backend-test>
+    DEPENDS ejit-light-backend-test
+    COMMENT "Running EmbeddedJIT light backend standalone tests"
+    USES_TERMINAL
+    )
+endif()
