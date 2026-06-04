@@ -15,6 +15,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include <memory>
 #include <string>
+#ifdef EJIT_LIGHT_BACKEND
+#include <map>
+#endif
 
 namespace llvm {
 namespace ejit {
@@ -82,10 +85,16 @@ private:
   /// Owns all code emitted by the light path; lives until the driver dies.
   std::unique_ptr<light::CodeAllocator> lightAlloc_;
 
+  /// User symbols registered via registerSymbol(). The light path resolves
+  /// global addresses locally (no ORC), so it keeps its own copy in addition
+  /// to forwarding to the ORC engine.
+  std::map<std::string, void *> lightUserSymbols_;
+
   /// Light backend path used by getOrCompile() when backendMode is Light or
   /// Auto. Returns the function pointer, or nullptr if compilation did not
   /// succeed (the bool out-param reports whether the failure was "unsupported"
-  /// so Auto mode can fall back to ORC).
+  /// so Auto mode can fall back to ORC). Fully self-contained: it does NOT
+  /// depend on the ORC engine being available.
   void *tryCompileLight(const std::string &funcName, uint32_t cacheKey,
                         const std::string &bitcode,
                         const SpecializationContext &ctx,

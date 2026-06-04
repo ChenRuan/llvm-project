@@ -208,4 +208,23 @@ if(EJIT_ENABLE_LIGHT_BACKEND)
     COMMENT "Running EmbeddedJIT light backend standalone tests"
     USES_TERMINAL
     )
+
+  #===-- Light backend runtime end-to-end test ----------------------------===#
+  # Drives the optional light backend through the real ejit_* C runtime API
+  # (register bitcode -> set backend mode LIGHT/AUTO -> compile_or_get).
+  # Validates Tasks F (runtime mode) and G (global symbol mapping). On an
+  # AArch64 host it additionally executes the emitted machine code.
+  set(LLVM_LINK_COMPONENTS Core Support TargetParser BitWriter)
+  add_llvm_executable(ejit-light-runtime-test
+    ${LLVM_MAIN_SRC_DIR}/test/ExecutionEngine/EJIT/light-backend/ejit-light-runtime-test.cpp
+    PARTIAL_SOURCES_INTENDED
+    )
+  target_link_libraries(ejit-light-runtime-test PRIVATE LLVMEJIT)
+
+  add_custom_target(check-ejit-light-runtime
+    COMMAND $<TARGET_FILE:ejit-light-runtime-test>
+    DEPENDS ejit-light-runtime-test
+    COMMENT "Running EmbeddedJIT light backend runtime end-to-end test"
+    USES_TERMINAL
+    )
 endif()

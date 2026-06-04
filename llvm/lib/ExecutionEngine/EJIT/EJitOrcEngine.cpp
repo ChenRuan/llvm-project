@@ -15,12 +15,6 @@
 #include "llvm/TargetParser/Triple.h"
 #include <map>
 
-#ifdef EJIT_LIGHT_BACKEND
-#include "llvm/ExecutionEngine/EJIT/LightBackend/EJitLightBackend.h"
-#include "llvm/ExecutionEngine/EJIT/LightBackend/EJitLightCodeAllocator.h"
-#include <vector>
-#endif
-
 using namespace llvm;
 using namespace llvm::ejit;
 
@@ -283,75 +277,3 @@ const SpecializationContext *EJitOrcEngine::getActiveContext() const {
 void EJitOrcEngine::addUserSymbol(const std::string &name, void *addr) {
   P->userSymbols[name] = addr;
 }
-
-#ifdef EJIT_LIGHT_BACKEND
-Expected<void *>
-EJitOrcEngine::compileLight(StringRef bitcodeData, const std::string &fnName,
-                           const SpecializationContext &ctx,
-                           light::CodeAllocator &alloc,
-                           light::CompileResult *outResult) {
-  // 1. Parse bitcode into a fresh module/context. The context must outlive
-  //    code emission; the emitted machine code is position-independent and
-  //    embeds global addresses as immediates, so after emit() we can drop the
-  //    module safely.
-  auto Ctx = std::make_unique<LLVMContext>();
-  auto Buf = MemoryBuffer::getMemBuffer(
-      bitcodeData, ("light_" + std::to_string(ctx.cacheKey) + ".bc"));
-  auto ModuleOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *Ctx);
-  if (!ModuleOrErr)
-    return ModuleOrErr.takeError();
-  std::unique_ptr<Module> M = std::move(*ModuleOrErr);
-
-  // 2. Run the same SPEC4/PASS7 specialization pipeline that the ORC transform
-  //    layer uses, so the light path sees identical specialized IR.
-  {
-    EJitOptimizer opt(*P->periodReg);
-    opt.runPipeline(*M, ctx);
-  }
-
-  // 3. Locate the specialized entry function.
-  Function *F = M->getFunction(fnName);
-  if (!F || F->isDeclaration()) {
-    if (outResult) {
-      outResult->status = light::Status::Unsupported;
-      outResult->reason =
-          "specialized function not found or is a declaration: " + fnName;
-    }
-    return nullptr;
-  }
-
-  // 4. Collect global symbols (Task G): period array base addresses, static
-  //    vars, and user-registered symbols. These are bound as absolute
-  //    addresses into the emitted code.
-  std::vector<light::GlobalSymbol> globals;
-  auto addGlobal = [&](const std::string &name, void *addr) {
-    if (name.empty() || !addr)
-      return;
-    globals.push_back({name.c_str(), reinterpret_cast<uint64_t>(addr)});
-  };
-  // Keep names alive for the duration of the call: GlobalSymbol stores const
-  // char*. Snapshot the names into a stable container first.
-  std::vector<std::string> nameStorage;
-  std::vector<void *> addrStorage;
-  for (const auto &sv : P->periodReg->getStaticVars()) {
-    nameStorage.push_back(sv.varName);
-    addrStorage.push_back(sv.varAddr);
-  }
-  for (const auto &kv : P->periodReg->getAllArraysByPeriod()) {
-    for (const auto &info : kv.second) {
-      nameStorage.push_back(info.varName);
-      addrStorage.push_back(info.baseAddr);
-    }
-  }
-  for (const auto &us : P->userSymbols) {
-    nameStorage.push_back(us.first);
-    addrStorage.push_back(us.second);
-  }
-  globals.reserve(nameStorage.size());
-  for (size_t i = 0; i < nameStorage.size(); ++i)
-    addGlobal(nameStorage[i], addrStorage[i]);
-
-  // 5. Emit via the light AArch64 backend.
-  return light::compileAArch64Light(*F, globals, alloc, outResult);
-}
-#endif // EJIT_LIGHT_BACKEND

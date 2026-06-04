@@ -21,13 +21,6 @@ namespace ejit {
 class PeriodArrayRegistry;
 class EJitRuntimeState;
 
-#ifdef EJIT_LIGHT_BACKEND
-namespace light {
-class CodeAllocator;
-struct CompileResult;
-} // namespace light
-#endif
-
 struct SpecializationContext {
   std::string fnName;
   uint32_t cacheKey = 0;
@@ -71,24 +64,6 @@ public:
   /// JIT can resolve when compiling bitcode modules. Required for bare-metal
   /// environments where dynamic symbol lookup is unavailable.
   void addUserSymbol(const std::string &name, void *addr);
-
-#ifdef EJIT_LIGHT_BACKEND
-  /// Optional light backend path. Parses the bitcode, runs the same
-  /// SPEC4/PASS7 specialization pipeline as the ORC transform layer, then
-  /// hands the specialized function to the AArch64 light emitter instead of
-  /// ORC/JITLink. Global symbols (period arrays, static vars, user symbols)
-  /// are collected from the registry and bound as absolute addresses.
-  ///
-  /// Returns the executable function pointer on success. On unsupported IR
-  /// returns a null pointer (not an Error) with details in \p outResult so
-  /// the caller can decide whether to fall back to ORC. Hard failures
-  /// (allocation, internal) are returned as an Error.
-  Expected<void *> compileLight(StringRef bitcodeData,
-                                const std::string &fnName,
-                                const SpecializationContext &ctx,
-                                light::CodeAllocator &alloc,
-                                light::CompileResult *outResult);
-#endif
 
 private:
   struct Impl;
