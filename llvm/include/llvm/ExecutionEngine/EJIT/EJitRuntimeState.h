@@ -44,6 +44,11 @@ public:
 
   const std::vector<PeriodArrayInfo> *getArrays(const std::string &periodName) const;
   const std::vector<StaticVarInfo> &getStaticVars() const { return staticVars_; }
+  /// Read-only enumeration of every registered period array, grouped by
+  /// period name. Used by the optional light backend to bind global symbol
+  /// addresses; harmless for the ORC path.
+  const std::unordered_map<std::string, std::vector<PeriodArrayInfo>> &
+  getAllArraysByPeriod() const { return arraysByPeriod_; }
   const PeriodArrayInfo *getArrayInfo(const std::string &varName) const;
   void *getStaticVarAddr(const std::string &varName) const;
 

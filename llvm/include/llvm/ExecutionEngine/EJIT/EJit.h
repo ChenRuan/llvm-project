@@ -52,6 +52,15 @@ public:
   void setOptimizationLevel(OptimizationLevel level);
   OptimizationLevel getOptimizationLevel() const;
 
+  /// Select the execution backend (ORC default / Light / Auto). The Light
+  /// path is only effective when the runtime was built with the optional
+  /// EJIT_ENABLE_LIGHT_BACKEND CMake option; otherwise it behaves like ORC.
+  void setBackendMode(BackendMode mode);
+  BackendMode getBackendMode() const;
+
+  /// True if LLVMEJIT was compiled with the optional light backend.
+  static bool isLightBackendAvailable();
+
   /// Register a user-defined external symbol for JIT resolution.
   /// Required for bare-metal where dlsym is unavailable.
   void registerSymbol(const std::string &name, void *addr);

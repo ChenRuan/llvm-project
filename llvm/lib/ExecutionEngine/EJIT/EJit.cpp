@@ -218,6 +218,22 @@ OptimizationLevel EJit::getOptimizationLevel() const {
   return config_.optLevel;
 }
 
+void EJit::setBackendMode(BackendMode mode) {
+  config_.backendMode = mode;
+}
+
+BackendMode EJit::getBackendMode() const {
+  return config_.backendMode;
+}
+
+bool EJit::isLightBackendAvailable() {
+#ifdef EJIT_LIGHT_BACKEND
+  return true;
+#else
+  return false;
+#endif
+}
+
 EJitCache::Stats EJit::getStats() const {
   return cache_->getStats();
 }

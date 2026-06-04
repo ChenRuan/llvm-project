@@ -228,4 +228,40 @@ ejit_compile_mode_t ejit_get_compile_mode(void) {
                                                         : EJIT_COMPILE_SYNC;
 }
 
+void ejit_set_backend_mode(ejit_backend_mode_t mode) {
+  if (!gEJIT)
+    return;
+  BackendMode bm = BackendMode::Orc;
+  switch (mode) {
+  case EJIT_BACKEND_LIGHT:
+    bm = BackendMode::Light;
+    break;
+  case EJIT_BACKEND_AUTO:
+    bm = BackendMode::Auto;
+    break;
+  case EJIT_BACKEND_ORC:
+    bm = BackendMode::Orc;
+    break;
+  }
+  gEJIT->setBackendMode(bm);
+}
+
+ejit_backend_mode_t ejit_get_backend_mode(void) {
+  if (!gEJIT)
+    return EJIT_BACKEND_ORC;
+  switch (gEJIT->getBackendMode()) {
+  case BackendMode::Light:
+    return EJIT_BACKEND_LIGHT;
+  case BackendMode::Auto:
+    return EJIT_BACKEND_AUTO;
+  case BackendMode::Orc:
+    return EJIT_BACKEND_ORC;
+  }
+  return EJIT_BACKEND_ORC;
+}
+
+bool ejit_light_backend_available(void) {
+  return EJit::isLightBackendAvailable();
+}
+
 } // extern "C"

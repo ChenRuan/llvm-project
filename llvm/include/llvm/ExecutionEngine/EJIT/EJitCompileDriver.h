@@ -22,6 +22,13 @@ namespace ejit {
 class EJitOrcEngine;
 class EJitLogger;
 
+#ifdef EJIT_LIGHT_BACKEND
+struct SpecializationContext;
+namespace light {
+class CodeAllocator;
+} // namespace light
+#endif
+
 /// Unified entry point for sync and async compilation. Handles cache
 /// lookup, time-window state verification, bitcode retrieval, and
 /// compilation dispatch.
@@ -69,6 +76,21 @@ private:
 
   std::unique_ptr<EJitOrcEngine> syncEngine_;
   // Async compiler will be added in EJitAsyncCompiler phase
+
+#ifdef EJIT_LIGHT_BACKEND
+  /// Lazily-created executable-memory allocator for the light backend.
+  /// Owns all code emitted by the light path; lives until the driver dies.
+  std::unique_ptr<light::CodeAllocator> lightAlloc_;
+
+  /// Light backend path used by getOrCompile() when backendMode is Light or
+  /// Auto. Returns the function pointer, or nullptr if compilation did not
+  /// succeed (the bool out-param reports whether the failure was "unsupported"
+  /// so Auto mode can fall back to ORC).
+  void *tryCompileLight(const std::string &funcName, uint32_t cacheKey,
+                        const std::string &bitcode,
+                        const SpecializationContext &ctx,
+                        bool &unsupported);
+#endif
 };
 
 } // namespace ejit

@@ -65,6 +65,12 @@ typedef enum {
 } ejit_compile_mode_t;
 
 typedef enum {
+  EJIT_BACKEND_ORC = 0,   /* default: ORC/JITLink/LLJIT path */
+  EJIT_BACKEND_LIGHT = 1, /* optional AArch64 light backend (no ORC) */
+  EJIT_BACKEND_AUTO = 2,  /* try light first, fall back to ORC on unsupported */
+} ejit_backend_mode_t;
+
+typedef enum {
   EJIT_OPT_L1 = 1,
   EJIT_OPT_L2 = 2,
   EJIT_OPT_L3 = 3,
@@ -138,6 +144,20 @@ const ejit_error_t *ejit_get_last_error(void);
 // Configuration
 void ejit_set_compile_mode(ejit_compile_mode_t mode);
 ejit_compile_mode_t ejit_get_compile_mode(void);
+
+// Execution backend selection.
+//   EJIT_BACKEND_ORC   - default, proven ORC/JITLink path.
+//   EJIT_BACKEND_LIGHT - optional AArch64 light backend; if the runtime was
+//                        not built with EJIT_ENABLE_LIGHT_BACKEND, or the IR
+//                        is unsupported under forced-light, compilation fails.
+//   EJIT_BACKEND_AUTO  - try light first, transparently fall back to ORC.
+// When LLVMEJIT is built without the light backend, LIGHT/AUTO act like ORC.
+void ejit_set_backend_mode(ejit_backend_mode_t mode);
+ejit_backend_mode_t ejit_get_backend_mode(void);
+
+// Returns true if this runtime was built with the optional light backend
+// (EJIT_ENABLE_LIGHT_BACKEND / macro EJIT_LIGHT_BACKEND).
+bool ejit_light_backend_available(void);
 
 #ifdef __cplusplus
 }
