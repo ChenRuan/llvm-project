@@ -34,6 +34,8 @@ EJIT_TARGET_TRIPLE=""
 SYSROOT=""
 LLVM_TARGETS="AArch64"
 ENABLE_PROJECTS="clang;lld"
+LLVM_TARGETS_SET=false
+ENABLE_PROJECTS_SET=false
 BUILD_TARGETS="LLVMEJIT"
 DO_CONFIGURE=true
 DO_BUILD=true
@@ -64,6 +66,13 @@ log() {
 die() {
   printf '[ejit-cross][error] %s\n' "$*" >&2
   exit 1
+}
+
+abs_path_under_root() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "${ROOT_DIR}" "$1" ;;
+  esac
 }
 
 usage() {
@@ -139,8 +148,8 @@ while [[ $# -gt 0 ]]; do
     --build-dir) need_value "$@"; CROSS_BUILD_DIR="$2"; shift 2 ;;
     --native-build-dir) need_value "$@"; NATIVE_BUILD_DIR="$2"; shift 2 ;;
     --build-type) need_value "$@"; BUILD_TYPE="$2"; shift 2 ;;
-    --llvm-targets) need_value "$@"; LLVM_TARGETS="$2"; shift 2 ;;
-    --projects) need_value "$@"; ENABLE_PROJECTS="$2"; shift 2 ;;
+    --llvm-targets) need_value "$@"; LLVM_TARGETS="$2"; LLVM_TARGETS_SET=true; shift 2 ;;
+    --projects) need_value "$@"; ENABLE_PROJECTS="$2"; ENABLE_PROJECTS_SET=true; shift 2 ;;
     --targets) need_value "$@"; BUILD_TARGETS="$2"; shift 2 ;;
     --extra-targets) need_value "$@"; BUILD_TARGETS="${BUILD_TARGETS} $2"; shift 2 ;;
     --target-triple) need_value "$@"; EJIT_TARGET_TRIPLE="$2"; shift 2 ;;
@@ -189,6 +198,44 @@ if [[ -z "${CLANGXX_BIN}" ]]; then
   CLANGXX_BIN="$(command -v clang++ || true)"
 fi
 
+cmake_arg_present() {
+  local key="$1"
+  local arg
+  for arg in "${EXTRA_CMAKE_ARGS[@]}"; do
+    if [[ "${arg}" == "${key}" || "${arg}" == "${key}="* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+add_cmake_arg_once() {
+  local arg="$1"
+  local key="${arg%%=*}"
+  if ! cmake_arg_present "${key}"; then
+    EXTRA_CMAKE_ARGS+=("${arg}")
+  fi
+}
+
+if ${EJIT_LIGHT_ONLY}; then
+  if ! ${ENABLE_PROJECTS_SET}; then
+    ENABLE_PROJECTS=""
+  fi
+  if ! ${LLVM_TARGETS_SET}; then
+    LLVM_TARGETS=""
+  fi
+  add_cmake_arg_once "-DLLVM_INCLUDE_TOOLS=OFF"
+  add_cmake_arg_once "-DLLVM_BUILD_TOOLS=OFF"
+  add_cmake_arg_once "-DLLVM_INCLUDE_UTILS=OFF"
+  add_cmake_arg_once "-DLLVM_BUILD_UTILS=OFF"
+fi
+
+CROSS_BUILD_DIR="$(abs_path_under_root "${CROSS_BUILD_DIR}")"
+NATIVE_BUILD_DIR="$(abs_path_under_root "${NATIVE_BUILD_DIR}")"
+if [[ -n "${LIPO_OUTPUT}" ]]; then
+  LIPO_OUTPUT="$(abs_path_under_root "${LIPO_OUTPUT}")"
+fi
+
 [[ -n "${CLANG_BIN}" ]] || die "clang not found; pass --clang"
 [[ -n "${CLANGXX_BIN}" ]] || die "clang++ not found; pass --clangxx"
 [[ -x "${CLANG_BIN}" ]] || die "clang is not executable: ${CLANG_BIN}"
@@ -233,11 +280,7 @@ if ${DO_CONFIGURE}; then
     -DBUILD_SHARED_LIBS=OFF
     "-DLLVM_NATIVE_TOOL_DIR=${NATIVE_BUILD_DIR}/bin"
     "-DLLVM_TABLEGEN=${LLVM_TBLGEN}"
-    "-DLLVM_TABLEGEN_EXE=${LLVM_TBLGEN}"
-    -DLLVM_TABLEGEN_TARGET=
     "-DCLANG_TABLEGEN=${CLANG_TBLGEN}"
-    "-DCLANG_TABLEGEN_EXE=${CLANG_TBLGEN}"
-    -DCLANG_TABLEGEN_TARGET=
     -DLLVM_ENABLE_ZLIB=OFF
     -DLLVM_ENABLE_ZSTD=OFF
     -DLLVM_INCLUDE_BENCHMARKS=OFF
