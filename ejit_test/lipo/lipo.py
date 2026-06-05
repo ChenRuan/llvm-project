@@ -24,7 +24,7 @@ The resulting ejit.o (~30-40 MB) can replace all individual LLVM .a files
 when linking EJIT test binaries.
 """
 
-import subprocess as sp, os, sys, re, argparse, struct, glob
+import subprocess as sp, os, sys, re, argparse, struct, glob, shlex
 
 
 # ── per-architecture configuration ──────────────────────────────────────────
@@ -54,9 +54,18 @@ COMMON_LIBS = [
     "libLLVMGlobalISel.a",
 ]
 
+LIGHT_ONLY_LIBS = [
+    "libLLVMCore.a", "libLLVMSupport.a", "libLLVMDemangle.a",
+    "libLLVMBinaryFormat.a", "libLLVMBitReader.a",
+    "libLLVMBitstreamReader.a", "libLLVMAnalysis.a",
+    "libLLVMInstCombine.a", "libLLVMTransformUtils.a",
+]
 
-def all_libs(arch):
+
+def all_libs(arch, light_only=False):
     """Return the full list of .a basenames for the given architecture."""
+    if light_only:
+        return LIGHT_ONLY_LIBS
     return COMMON_LIBS + TARGET_LIBS.get(arch, [])
 
 
@@ -83,7 +92,7 @@ def build_symbol_index(build_dir):
     idx = {}
     for a in sorted(glob.glob(os.path.join(L, "libLLVM*.a"))):
         aname = os.path.basename(a)
-        r = sp.run(["nm", "--print-armap", a], capture_output=True, text=True)
+        r = sp.run(["nm", "--print-armap", a], stdout=sp.PIPE, stderr=sp.PIPE, universal_newlines=True)
         for line in r.stdout.split("\n"):
             if " in " in line:
                 mangled, member = line.split(" in ", 1)
@@ -115,13 +124,13 @@ def _try_strip_arm_mapping_symbols(merged_o, work_dir, build_dir):
     nostrip_o = os.path.join(work_dir, "_nostrip.o")
 
     r = sp.run([objcopy_tool, "-w", "-N", "$x", "-N", "$d",
-                merged_o, nostrip_o], capture_output=True, text=True)
+                merged_o, nostrip_o], stdout=sp.PIPE, stderr=sp.PIPE, universal_newlines=True)
     if r.returncode == 0 and os.path.exists(nostrip_o):
         try:
-            before = len(sp.run(["nm", merged_o], capture_output=True,
-                                text=True).stdout.splitlines())
-            after = len(sp.run(["nm", nostrip_o], capture_output=True,
-                               text=True).stdout.splitlines())
+            before = len(sp.run(["nm", merged_o], stdout=sp.PIPE, stderr=sp.PIPE,
+                                universal_newlines=True).stdout.splitlines())
+            after = len(sp.run(["nm", nostrip_o], stdout=sp.PIPE, stderr=sp.PIPE,
+                               universal_newlines=True).stdout.splitlines())
             if after < before:
                 print(f"       stripped {before - after} $x/$d mapping symbols"
                       f"{' (llvm-objcopy)' if is_llvm else ''}")
@@ -149,7 +158,7 @@ def _try_remove_group(merged_o, nogroup_o, build_dir):
     """
     objcopy_tool, is_llvm = _find_objcopy(build_dir)
     r = sp.run([objcopy_tool, "--remove-section=.group", merged_o, nogroup_o],
-               capture_output=True, text=True)
+               stdout=sp.PIPE, stderr=sp.PIPE, universal_newlines=True)
     if r.returncode == 0 and os.path.exists(nogroup_o):
         before_mb = os.path.getsize(merged_o) / (1024 * 1024)
         after_mb = os.path.getsize(nogroup_o) / (1024 * 1024)
@@ -176,13 +185,17 @@ def doit_extract(args):
     CXX = args.cxx or cxx(build_dir)
     LD = args.ld or ld(build_dir)
     custom_ld = args.ld is not None
+    cxxflags = shlex.split(args.cxxflags or "")
+    ldflags = shlex.split(args.ldflags or "")
+    libs_flags = shlex.split(args.libs if args.libs is not None
+                             else "-lz -lpthread -ldl")
 
     # Quick test object to drive the link
     test_o = os.path.join(work, "_test_main.o")
-    sp.run([CXX, "-x", "c", "-", "-O2", "-c", "-o", test_o],
-           input=b"int main(){return 0;}", capture_output=True)
+    sp.run([CXX, *cxxflags, "-x", "c", "-", "-O2", "-c", "-o", test_o],
+           input=b"int main(){return 0;}", stdout=sp.PIPE, stderr=sp.PIPE)
 
-    libs = all_libs(arch)
+    libs = all_libs(arch, args.light_only)
     all_a = " ".join(os.path.join(L, f) for f in libs)
     ejit_a = os.path.join(L, "libLLVMEJIT.a")
 
@@ -199,14 +212,14 @@ def doit_extract(args):
         link_cmd = [CXX, f"-B{ld_dir}", fuse_ld_flag, "-L/tmp"]
     else:
         link_cmd = [CXX, f"-fuse-ld={LD}"]
-    r = sp.run(link_cmd + [
+    r = sp.run(link_cmd + cxxflags + [
         "-Os", "-Wl,--gc-sections",
         "-Wl,--print-map",
         "-Wl,--allow-multiple-definition",
         f"-Wl,--whole-archive", ejit_a, f"-Wl,--no-whole-archive",
-        *all_a.split(), "-lz", "-lpthread", "-ldl", test_o,
-        "-o", os.path.join(work, "_ref")
-    ], capture_output=True, text=True)
+        *all_a.split(), *libs_flags, test_o,
+        *ldflags, "-o", os.path.join(work, "_ref")
+    ], stdout=sp.PIPE, stderr=sp.PIPE, universal_newlines=True)
     if r.returncode != 0:
         print("ERROR: reference link failed. Is the build directory valid?")
         print(r.stderr[-500:])
@@ -233,7 +246,7 @@ def doit_extract(args):
         if unique in extracted:
             return unique
         arch = os.path.join(L, aname)
-        sp.run(["ar", "x", arch, member], cwd=work, capture_output=True)
+        sp.run(["ar", "x", arch, member], cwd=work, stdout=sp.PIPE, stderr=sp.PIPE)
         src = os.path.join(work, member)
         dst = os.path.join(work, unique)
         if os.path.exists(src):
@@ -252,7 +265,7 @@ def doit_extract(args):
             extract_one(aname, member)
 
     # EJIT (whole-archive)
-    sp.run(["ar", "x", ejit_a], cwd=work, capture_output=True)
+    sp.run(["ar", "x", ejit_a], cwd=work, stdout=sp.PIPE, stderr=sp.PIPE)
     for f in os.listdir(work):
         if f.endswith(".o") and not f.startswith("libLLVM"):
             src = os.path.join(work, f)
@@ -266,7 +279,7 @@ def doit_extract(args):
         added = 0
         for unique in sorted(extracted):
             o_path = os.path.join(work, unique)
-            r = sp.run(["nm", "-u", o_path], capture_output=True, text=True)
+            r = sp.run(["nm", "-u", o_path], stdout=sp.PIPE, stderr=sp.PIPE, universal_newlines=True)
             for line in r.stdout.split("\n"):
                 parts = line.strip().split()
                 if len(parts) >= 2 and parts[0] == "U":
@@ -291,7 +304,7 @@ def doit_extract(args):
     # Remove old archive to avoid stale members (ar crs only replaces, not deletes)
     if os.path.exists(output):
         os.unlink(output)
-    sp.run(["ar", "crs", output, *o_files], capture_output=True)
+    sp.run(["ar", "crs", output, *o_files], stdout=sp.PIPE, stderr=sp.PIPE)
 
     sz_mb = os.path.getsize(output) / (1024 * 1024)
     orig_mb = sum(os.path.getsize(os.path.join(L, f)) for f in libs) / (1024 * 1024)
@@ -315,10 +328,11 @@ def doit_gc_merge(args):
 
     LD = args.ld or ld(args.build_dir)
     CXX = cxx(args.build_dir)
+    ldflags = shlex.split(args.ldflags or "")
 
     # ── 1. Extract .o from input .a ───────────────────────────────────────
     print("[1/3] Extracting .o from input .a ...", flush=True)
-    sp.run(["ar", "x", input_a], cwd=work, capture_output=True)
+    sp.run(["ar", "x", input_a], cwd=work, stdout=sp.PIPE, stderr=sp.PIPE)
     o_files = [os.path.join(work, f) for f in sorted(os.listdir(work))
                if f.endswith(".o")]
     before_mb = sum(os.path.getsize(o) for o in o_files) / (1024 * 1024)
@@ -346,8 +360,9 @@ def doit_gc_merge(args):
         [LD, "-r", "-o", merged_o, "--gc-sections", "--entry=ejit_init",
          "--allow-multiple-definition"]
         + u_flags
-        + o_files,
-        capture_output=True, text=True,
+        + o_files
+        + ldflags,
+        stdout=sp.PIPE, stderr=sp.PIPE, universal_newlines=True,
     )
     if r.returncode != 0:
         print("ERROR: ld -r failed")
@@ -372,7 +387,7 @@ def doit_gc_merge(args):
 
     # ── 3. Build new .a ───────────────────────────────────────────────────
     print(f"[3/3] Building {output} ...", flush=True)
-    sp.run(["ar", "crs", output, merged_o], capture_output=True)
+    sp.run(["ar", "crs", output, merged_o], stdout=sp.PIPE, stderr=sp.PIPE)
     sz_mb = os.path.getsize(output) / (1024 * 1024)
     print(f"       {sz_mb:.0f} MB")
     print(f"       output: {output}")
@@ -393,12 +408,14 @@ def doit_merge(args):
 
     output = args.output or os.path.join(script_dir, "ejit.o")
     LD = args.ld or ld(build_dir)
+    ldflags = shlex.split(args.ldflags or "")
 
     print(f"[merge] ld -r -T merge.ld -> {output} ...", flush=True)
     r = sp.run([
         LD, "-r", "-o", output, "-T", merge_ld,
         "--whole-archive", input_a,
-    ], capture_output=True, text=True)
+        *ldflags,
+    ], stdout=sp.PIPE, stderr=sp.PIPE, universal_newlines=True)
 
     if r.returncode != 0:
         print("ERROR: ld -r failed")
@@ -414,7 +431,9 @@ def doit_merge(args):
 
 def main():
     p = argparse.ArgumentParser(description="EJIT Lipo tool")
-    sub = p.add_subparsers(dest="mode", required=True)
+    # argparse.add_subparsers(required=True) is only available on newer Python.
+    # Keep this script usable on older build servers by checking mode manually.
+    sub = p.add_subparsers(dest="mode")
 
     e = sub.add_parser("extract", help="Extract used .o -> single .a")
     e.add_argument("--arch", required=True, choices=["x86", "aarch64"])
@@ -422,6 +441,11 @@ def main():
     e.add_argument("--output", help="Output .a path")
     e.add_argument("--cxx", help="Override C++ compiler (default: build-dir/bin/clang++)")
     e.add_argument("--ld", help="Override linker (default: build-dir/bin/ld.lld)")
+    e.add_argument("--cxxflags", help="Extra flags for the reference compile/link command")
+    e.add_argument("--ldflags", help="Extra flags appended to the reference link command")
+    e.add_argument("--libs", help="Reference link libraries. Default: '-lz -lpthread -ldl'. Pass '' for none")
+    e.add_argument("--light-only", action="store_true",
+                   help="Use the light-backend-only LLVM archive list")
     e.add_argument("--exclude", action="append", default=[],
                    help="Exclude .o files matching this substring (repeatable)")
 
@@ -429,15 +453,20 @@ def main():
     g.add_argument("--input", required=True, help="Input .a from extract step")
     g.add_argument("--build-dir", required=True, help="LLVM build directory")
     g.add_argument("--ld", help="Override linker (default: build-dir/bin/ld.lld)")
+    g.add_argument("--ldflags", help="Extra flags appended to ld -r --gc-sections")
     g.add_argument("--output", help="Output .a path")
 
     m = sub.add_parser("merge", help="ld -r merge into single ejit.o")
     m.add_argument("--input", required=True, help="Input .a from gc-merge step")
     m.add_argument("--build-dir", required=True, help="LLVM build directory")
     m.add_argument("--ld", help="Override linker (default: build-dir/bin/ld.lld)")
+    m.add_argument("--ldflags", help="Extra flags appended to ld -r merge")
     m.add_argument("--output", help="Output .o path (default: ejit.o alongside lipo.py)")
 
     args = p.parse_args()
+    if args.mode is None:
+        p.print_help()
+        sys.exit(2)
 
     if args.mode == "extract":
         doit_extract(args)

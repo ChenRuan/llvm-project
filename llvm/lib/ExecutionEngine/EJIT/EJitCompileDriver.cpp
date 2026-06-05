@@ -4,7 +4,9 @@
 #ifndef EJIT_FREESTANDING
 #include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
 #endif
+#ifndef EJIT_LIGHT_BACKEND_ONLY
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
+#endif
 #ifndef EJIT_FREESTANDING
 #include <chrono>
 #endif
@@ -39,13 +41,17 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
 
 EJitCompileDriver::~EJitCompileDriver() = default;
 
+#ifndef EJIT_LIGHT_BACKEND_ONLY
 void EJitCompileDriver::setSyncEngine(std::unique_ptr<EJitOrcEngine> engine) {
   syncEngine_ = std::move(engine);
 }
+#endif
 
 void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
+#ifndef EJIT_LIGHT_BACKEND_ONLY
   if (syncEngine_)
     syncEngine_->addUserSymbol(name, addr);
+#endif
 #ifdef EJIT_LIGHT_BACKEND
   lightUserSymbols_[name] = addr;
 #endif
@@ -102,8 +108,14 @@ void *EJitCompileDriver::getOrCompile(
   // Optional light backend path. Taken when explicitly selected. It is fully
   // self-contained (no ORC engine dependency), so it runs *before* the
   // syncEngine_ availability check below.
-  if (config_.backendMode == BackendMode::Light ||
-      config_.backendMode == BackendMode::Auto) {
+  if (
+#ifdef EJIT_LIGHT_BACKEND_ONLY
+      true
+#else
+      config_.backendMode == BackendMode::Light ||
+      config_.backendMode == BackendMode::Auto
+#endif
+      ) {
     bool unsupported = false;
     void *lightPtr = tryCompileLight(funcName, cacheKey, bitcode, ctx,
                                      unsupported);
@@ -115,7 +127,13 @@ void *EJitCompileDriver::getOrCompile(
       return lightPtr;
     }
     // Light path did not produce code.
-    if (config_.backendMode == BackendMode::Light) {
+    if (
+#ifdef EJIT_LIGHT_BACKEND_ONLY
+        true
+#else
+        config_.backendMode == BackendMode::Light
+#endif
+        ) {
       // Forced light: do NOT silently fall back to ORC.
 #ifndef EJIT_FREESTANDING
       if (logger_)
@@ -137,6 +155,7 @@ void *EJitCompileDriver::getOrCompile(
   }
 #endif // EJIT_LIGHT_BACKEND
 
+#ifndef EJIT_LIGHT_BACKEND_ONLY
   // Sync compile
   if (!syncEngine_) {
 #ifndef EJIT_FREESTANDING
@@ -196,6 +215,15 @@ void *EJitCompileDriver::getOrCompile(
   cache_.put(cacheKey, funcPtr, bitcode.size(), periodDeps);
 
   return funcPtr;
+#else
+#ifndef EJIT_FREESTANDING
+  if (logger_)
+    logger_->log(ErrorCode::CompilationFailed,
+                 "Light-backend-only build: function not supported by light backend",
+                 funcName, std::to_string(cacheKey));
+#endif
+  return nullptr;
+#endif
 }
 
 #ifdef EJIT_LIGHT_BACKEND

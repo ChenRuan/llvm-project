@@ -62,7 +62,9 @@ public:
   EJitCache &getCache() { return cache_; }
   EJitRuntimeState &getRuntimeState() { return runtimeState_; }
 
+#ifndef EJIT_LIGHT_BACKEND_ONLY
   void setSyncEngine(std::unique_ptr<EJitOrcEngine> engine);
+#endif
 
   /// Register a user-defined symbol for JIT resolution (bare-metal).
   void registerSymbol(const std::string &name, void *addr);
@@ -77,7 +79,9 @@ private:
   EJitLogger *logger_;
 #endif
 
+#ifndef EJIT_LIGHT_BACKEND_ONLY
   std::unique_ptr<EJitOrcEngine> syncEngine_;
+#endif
   // Async compiler will be added in EJitAsyncCompiler phase
 
 #ifdef EJIT_LIGHT_BACKEND

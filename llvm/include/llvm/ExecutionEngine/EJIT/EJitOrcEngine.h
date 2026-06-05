@@ -10,7 +10,9 @@
 #define LLVM_EXECUTIONENGINE_EJIT_EJITORCENGINE_H
 
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
+#ifndef EJIT_LIGHT_BACKEND_ONLY
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#endif
 #include "llvm/Support/Error.h"
 #include <memory>
 #include <string>
@@ -32,6 +34,7 @@ struct SpecializationContext {
   OptimizationLevel optLevel = OptimizationLevel::L2;
 };
 
+#ifndef EJIT_LIGHT_BACKEND_ONLY
 /// Wraps an LLJIT instance with EmbeddedJIT-specific configuration:
 /// custom memory manager and IR transform layer for the JIT pipeline.
 class EJitOrcEngine {
@@ -69,6 +72,7 @@ private:
   struct Impl;
   std::unique_ptr<Impl> P;
 };
+#endif
 
 } // namespace ejit
 } // namespace llvm

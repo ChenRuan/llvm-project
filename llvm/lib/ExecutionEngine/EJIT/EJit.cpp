@@ -3,10 +3,14 @@
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
+#ifndef EJIT_LIGHT_BACKEND_ONLY
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
+#endif
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
+#ifndef EJIT_LIGHT_BACKEND_ONLY
 #include "llvm/Support/TargetSelect.h"
+#endif
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -92,6 +96,7 @@ EJit::EJit(const Config &config) : config_(config) {
       reg.registerStaticVar(sv.varName, sv.varAddr);
   }
 
+#ifndef EJIT_LIGHT_BACKEND_ONLY
   // Create sync JIT engine (target must be initialized first).
   // Use InitializeAll* instead of InitializeNative* so that cross-compiled
   // builds (e.g. AArch64 target built on x86 host) also work correctly.
@@ -118,6 +123,7 @@ EJit::EJit(const Config &config) : config_(config) {
     consumeError(engine.takeError());
 #endif
   }
+#endif
 }
 
 EJit::~EJit() {

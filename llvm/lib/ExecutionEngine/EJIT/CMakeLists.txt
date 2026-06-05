@@ -56,7 +56,6 @@ set(EJIT_SOURCES
   EJitRuntime.cpp
   EJitRegistration.cpp
   EJitRegistryTable.c
-  EJitOrcEngine.cpp
   EJitCompileDriver.cpp
   EJitCache.cpp
   EJitRuntimeState.cpp
@@ -67,7 +66,21 @@ set(EJIT_SOURCES
   EJitOptimizer.cpp
   EJitPassBuilder.cpp
 )
-if(NOT EJIT_FREESTANDING)
+option(EJIT_ENABLE_LIGHT_BACKEND
+  "Enable EmbeddedJIT experimental AArch64 light backend" OFF)
+option(EJIT_LIGHT_BACKEND_ONLY
+  "Build LLVMEJIT with only the AArch64 light backend, excluding ORC/JITLink" OFF)
+if(EJIT_LIGHT_BACKEND_ONLY)
+  set(EJIT_ENABLE_LIGHT_BACKEND ON)
+  message(STATUS "EmbeddedJIT: LIGHT-BACKEND-ONLY mode enabled")
+endif()
+
+if(NOT EJIT_LIGHT_BACKEND_ONLY)
+  list(APPEND EJIT_SOURCES
+    EJitOrcEngine.cpp
+  )
+endif()
+if(NOT EJIT_FREESTANDING AND NOT EJIT_LIGHT_BACKEND_ONLY)
   list(APPEND EJIT_SOURCES
     EJitSyncCompiler.cpp
     EJitAsyncCompiler.cpp
@@ -79,8 +92,6 @@ endif()
 # into LLVMEJIT and defines EJIT_LIGHT_BACKEND so the runtime exposes the
 # optional light backend mode. Default OFF: the default build is unaffected
 # and the ORC/JITLink path remains the only backend.
-option(EJIT_ENABLE_LIGHT_BACKEND
-  "Enable EmbeddedJIT experimental AArch64 light backend" OFF)
 if(EJIT_ENABLE_LIGHT_BACKEND)
   message(STATUS "EmbeddedJIT: light AArch64 backend ENABLED (experimental)")
   list(APPEND EJIT_SOURCES
@@ -90,21 +101,29 @@ if(EJIT_ENABLE_LIGHT_BACKEND)
   )
 endif()
 
+set(EJIT_LINK_COMPONENTS
+  BitReader
+  Core
+  Support
+  InstCombine
+  TransformUtils
+  Analysis
+)
+if(NOT EJIT_LIGHT_BACKEND_ONLY)
+  list(APPEND EJIT_LINK_COMPONENTS
+    OrcJIT
+    JITLink
+    ${EJIT_TARGET_COMPONENTS}
+  )
+endif()
+
 add_llvm_component_library(LLVMEJIT
   ${EJIT_SOURCES}
 
   PARTIAL_SOURCES_INTENDED
 
   LINK_COMPONENTS
-  BitReader
-  Core
-  OrcJIT
-  JITLink
-  Support
-  InstCombine
-  TransformUtils
-  Analysis
-  ${EJIT_TARGET_COMPONENTS}
+  ${EJIT_LINK_COMPONENTS}
   # IPO and Scalar are not listed here — their LINK_COMPONENTS would
   # recursively pull in BitWriter, Instrumentation, Linker, AsmParser,
   # and AggressiveInstCombine.  Instead, they are added manually to the
@@ -121,6 +140,9 @@ endif()
 # Expose the light-backend feature macro to the runtime translation units.
 if(EJIT_ENABLE_LIGHT_BACKEND)
   target_compile_definitions(LLVMEJIT PUBLIC EJIT_LIGHT_BACKEND=1)
+endif()
+if(EJIT_LIGHT_BACKEND_ONLY)
+  target_compile_definitions(LLVMEJIT PUBLIC EJIT_LIGHT_BACKEND_ONLY=1)
 endif()
 
 #===-- Minimal embedded runtime target -----------------------------------===#
