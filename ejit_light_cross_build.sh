@@ -228,6 +228,10 @@ if ${EJIT_LIGHT_ONLY}; then
   add_cmake_arg_once "-DLLVM_BUILD_TOOLS=OFF"
   add_cmake_arg_once "-DLLVM_INCLUDE_UTILS=OFF"
   add_cmake_arg_once "-DLLVM_BUILD_UTILS=OFF"
+  add_cmake_arg_once "-DLLVM_INCLUDE_TESTS=OFF"
+  add_cmake_arg_once "-DLLVM_BUILD_TESTS=OFF"
+  add_cmake_arg_once "-DLLVM_INCLUDE_EXAMPLES=OFF"
+  add_cmake_arg_once "-DLLVM_BUILD_EXAMPLES=OFF"
 fi
 
 CROSS_BUILD_DIR="$(abs_path_under_root "${CROSS_BUILD_DIR}")"
