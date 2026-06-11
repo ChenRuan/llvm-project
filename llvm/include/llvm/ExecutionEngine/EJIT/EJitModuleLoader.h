@@ -40,6 +40,12 @@ public:
   /// precondition: detectHashCollisions() passed at init time.
   const FuncMeta &getOrCacheFuncMeta(uint32_t funcIdx);
 
+  /// Number of times getOrCacheFuncMeta() actually parsed an embedded bitcode
+  /// module. Observability hook for tests/diagnostics: it must stay flat across
+  /// repeated lookups of an already-cached funcIdx, proving the parse happens
+  /// at most once per function (a JIT-overhead invariant).
+  uint64_t getParseCount() const { return parseCount_; }
+
 private:
   struct Entry {
     std::string funcName;
@@ -48,6 +54,7 @@ private:
   };
   std::unordered_map<uint32_t, Entry> entriesByFuncIdx_;
   mutable std::unordered_map<uint32_t, FuncMeta> funcMetaCache_;
+  uint64_t parseCount_ = 0;
 };
 
 } // namespace ejit

@@ -20,6 +20,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
@@ -190,6 +191,57 @@ TEST(EJitModuleLoader, MultipleFunctions) {
   auto r2 = loader.getBitcodeByFuncIdx(hashFuncName("f2"));
   ASSERT_TRUE(static_cast<bool>(r2));
   EXPECT_EQ(r2->size(), 2u);
+}
+
+// JIT-overhead invariant: the embedded bitcode for a function is parsed at most
+// once for metadata extraction; repeated getOrCacheFuncMeta() calls hit the
+// cache and do NOT re-parse. This guards the cache-miss path against redundant
+// bitcode parsing (see the SPEC audit "double parse" finding).
+TEST(EJitModuleLoader, FuncMetaParsedOnceAndCached) {
+  // Build a tiny module with one ejit_entry function that declares a single
+  // ejit_period_arr_ind("cell") dimension on arg 0, then serialize to bitcode.
+  LLVMContext Ctx;
+  auto M = std::make_unique<Module>("meta_mod", Ctx);
+  M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  Type *I32 = Type::getInt32Ty(Ctx);
+  auto *FT = FunctionType::get(Type::getVoidTy(Ctx), {I32}, false);
+  auto *F = Function::Create(FT, GlobalValue::ExternalLinkage, "meta_entry", M.get());
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(BB);
+  B.CreateRetVoid();
+  // !ejit.metadata = !{ !{"ejit_entry"}, !{"ejit_period_arr_ind","cell",i32 0} }
+  Metadata *EntryTag[] = {MDString::get(Ctx, TAG_EJIT_ENTRY)};
+  Metadata *IndTag[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_ARR_IND),
+                        MDString::get(Ctx, "cell"),
+                        ConstantAsMetadata::get(ConstantInt::get(I32, 0))};
+  F->setMetadata(MD_EJIT_METADATA,
+                 MDNode::getDistinct(Ctx, {MDNode::get(Ctx, EntryTag),
+                                           MDNode::get(Ctx, IndTag)}));
+
+  std::string bc;
+  raw_string_ostream os(bc);
+  WriteBitcodeToFile(*M, os);
+  os.flush();
+
+  EJitModuleLoader loader;
+  loader.registerBitcode("meta_entry",
+                         reinterpret_cast<const uint8_t *>(bc.data()), bc.size());
+  uint32_t idx = hashFuncName("meta_entry");
+
+  EXPECT_EQ(loader.getParseCount(), 0u);
+
+  const auto &m1 = loader.getOrCacheFuncMeta(idx);
+  EXPECT_EQ(loader.getParseCount(), 1u);    // parsed once
+  ASSERT_EQ(m1.dimCount, 1u);
+  EXPECT_EQ(m1.periodNames[0], "cell");
+
+  const auto &m2 = loader.getOrCacheFuncMeta(idx);
+  EXPECT_EQ(loader.getParseCount(), 1u);    // cached: no re-parse
+  EXPECT_EQ(&m1, &m2);                       // same cached object
+
+  // A third lookup still does not re-parse.
+  (void)loader.getOrCacheFuncMeta(idx);
+  EXPECT_EQ(loader.getParseCount(), 1u);
 }
 
 //===----------------------------------------------------------------------===//

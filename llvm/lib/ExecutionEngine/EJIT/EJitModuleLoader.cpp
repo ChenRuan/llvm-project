@@ -64,6 +64,9 @@ EJitModuleLoader::getOrCacheFuncMeta(uint32_t funcIdx) {
   auto Ctx = std::make_unique<LLVMContext>();
   auto Buf = MemoryBuffer::getMemBuffer(*bitcode,
       "meta_" + std::to_string(funcIdx) + ".bc");
+  // Count the actual parse so tests can confirm it happens at most once per
+  // funcIdx (subsequent calls hit funcMetaCache_ and return above).
+  ++parseCount_;
   auto MOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *Ctx);
   if (!MOrErr) {
     consumeError(MOrErr.takeError());
