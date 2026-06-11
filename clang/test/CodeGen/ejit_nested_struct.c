@@ -1,4 +1,4 @@
-// RUN: %clang_cc1 -emit-llvm -o - %s | FileCheck %s
+// RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -emit-llvm -o - %s | FileCheck %s
 // Test: Nested struct with ejit_may_const fields generates correct metadata on loads.
 
 struct Inner {
@@ -37,6 +37,6 @@ int process_static_only() {
   return 0;
 }
 
-// CHECK-DAG: ![[ARR_META]] = distinct !{![[ARR:[0-9]+]]}
+// CHECK-DAG: ![[ARR_META]] = distinct !{![[ARR:[0-9]+]]{{(, ![0-9]+)*}}}
 // CHECK-DAG: ![[ARR]] = !{!"ejit_period_arr", !"cell", i32 8}
 // CHECK-DAG: ![[MAYCONST]] = !{}

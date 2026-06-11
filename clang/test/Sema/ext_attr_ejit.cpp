@@ -1,4 +1,4 @@
-// RUN: %clang_cc1 -fsyntax-only -verify=expected %s
+// RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -fsyntax-only -verify=expected %s
 // EmbeddedJIT attribute semantic analysis tests
 
 // === Correct usage -- should produce no diagnostics ===

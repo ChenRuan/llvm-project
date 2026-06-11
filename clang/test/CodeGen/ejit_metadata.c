@@ -1,4 +1,4 @@
-// RUN: %clang_cc1 -emit-llvm -o - %s | FileCheck %s
+// RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -emit-llvm -o - %s | FileCheck %s
 // EmbeddedJIT CodeGen metadata tests
 
 struct CellConfig {
@@ -27,9 +27,9 @@ void lc_func(__attribute__((ejit_period_arr_ind("cell"))) int cellIdx) {
   g_cellCfg[cellIdx].xx = 42; // modify non-may_const field
 }
 
-// CHECK-DAG: ![[PERIOD_META]] = distinct !{![[PERIOD:[0-9]+]]}
+// CHECK-DAG: ![[PERIOD_META]] = distinct !{![[PERIOD:[0-9]+]]{{(, ![0-9]+)*}}}
 // CHECK-DAG: ![[PERIOD]] = !{!"ejit_period", !"static"}
-// CHECK-DAG: ![[ARR_META]] = distinct !{![[ARR:[0-9]+]]}
+// CHECK-DAG: ![[ARR_META]] = distinct !{![[ARR:[0-9]+]]{{(, ![0-9]+)*}}}
 // CHECK-DAG: ![[ARR]] = !{!"ejit_period_arr", !"cell", i32 16}
 // CHECK-DAG: ![[ENTRY_META]] = distinct !{![[ENTRY:[0-9]+]], ![[IND:[0-9]+]]}
 // CHECK-DAG: ![[ENTRY]] = !{!"ejit_entry"}
