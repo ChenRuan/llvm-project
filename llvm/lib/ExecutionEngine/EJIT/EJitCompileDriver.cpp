@@ -13,6 +13,24 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+namespace {
+
+#ifndef EJIT_FREESTANDING
+static void bumpCounter(std::atomic<uint64_t> &Counter) {
+  Counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+static uint64_t loadCounter(const std::atomic<uint64_t> &Counter) {
+  return Counter.load(std::memory_order_relaxed);
+}
+#else
+static void bumpCounter(uint64_t &Counter) { ++Counter; }
+
+static uint64_t loadCounter(uint64_t Counter) { return Counter; }
+#endif
+
+} // namespace
+
 EJitCompileDriver::EJitCompileDriver(const Config &config,
                                      EJitCache &cache,
                                      EJitRuntimeState &runtimeState,
@@ -37,12 +55,16 @@ void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
 }
 
 void *EJitCompileDriver::getOrCompile(uint64_t cacheKey) {
+  bumpCounter(counters_.calls);
 
   // ── Hot path: single hash find ──────────────────────────────────────────
-  if (void *cached = cache_.getOrNull(cacheKey))
+  if (void *cached = cache_.getOrNull(cacheKey)) {
+    bumpCounter(counters_.cacheHits);
     return cached;
+  }
 
   // ── Cold path: decode cacheKey, verify, compile ────────────────────────
+  bumpCounter(counters_.coldMisses);
   uint32_t funcIdx = static_cast<uint32_t>(cacheKey >> 32);
   uint8_t dims[4] = {
     static_cast<uint8_t>(cacheKey & 0xFF),
@@ -53,12 +75,15 @@ void *EJitCompileDriver::getOrCompile(uint64_t cacheKey) {
 
   // Resolve funcName from loader
   const std::string &funcName = loader_.getFuncNameByFuncIdx(funcIdx);
-  if (funcName.empty())
+  if (funcName.empty()) {
+    bumpCounter(counters_.missingFunc);
     return nullptr;
+  }
 
   // Get bitcode
   auto bitcodeOrErr = loader_.getBitcodeByFuncIdx(funcIdx);
   if (!bitcodeOrErr) {
+    bumpCounter(counters_.missingBitcode);
 #ifndef EJIT_FREESTANDING
     if (logger_)
       logger_->log(EJIT_ERR_BITCODE_NOT_FOUND,
@@ -77,6 +102,7 @@ void *EJitCompileDriver::getOrCompile(uint64_t cacheKey) {
   // Verify time-window state for each dimension.
   for (unsigned i = 0; i < dimCount; ++i) {
     if (!runtimeState_.isActive(periodNames[i], dims[i])) {
+      bumpCounter(counters_.windowInactive);
 #ifndef EJIT_FREESTANDING
       if (logger_)
         logger_->log(EJIT_ERR_NOT_ACTIVE,
@@ -96,6 +122,7 @@ void *EJitCompileDriver::getOrCompile(uint64_t cacheKey) {
     ctx.dimensions.push_back({periodNames[i], dims[i]});
 
   if (!syncEngine_) {
+    bumpCounter(counters_.engineMissing);
 #ifndef EJIT_FREESTANDING
     if (logger_)
       logger_->log(EJIT_ERR_NOT_ACTIVE,
@@ -105,14 +132,14 @@ void *EJitCompileDriver::getOrCompile(uint64_t cacheKey) {
     return nullptr;
   }
 
-#ifndef EJIT_FREESTANDING
-  auto start = std::chrono::steady_clock::now();
-#endif
+  // Past all early-return guards: this miss will attempt a JIT compile.
+  bumpCounter(counters_.compileAttempts);
 
   syncEngine_->setActiveContext(&ctx);
 
   if (auto Err = syncEngine_->loadBitcodeModule(bitcode, cacheKey, funcName)) {
     syncEngine_->setActiveContext(nullptr);
+    bumpCounter(counters_.compileFailed);
 #ifndef EJIT_FREESTANDING
     if (logger_)
       logger_->log(EJIT_ERR_COMPILE_FAILED,
@@ -128,6 +155,7 @@ void *EJitCompileDriver::getOrCompile(uint64_t cacheKey) {
   syncEngine_->setActiveContext(nullptr);
 
   if (!addrOrErr) {
+    bumpCounter(counters_.compileFailed);
 #ifndef EJIT_FREESTANDING
     if (logger_)
       logger_->log(EJIT_ERR_COMPILE_FAILED,
@@ -147,5 +175,21 @@ void *EJitCompileDriver::getOrCompile(uint64_t cacheKey) {
 
   cache_.put(cacheKey, funcPtr, bitcode.size(), periodDeps);
 
+  bumpCounter(counters_.compiled);
   return funcPtr;
+}
+
+EJitCompileDriver::Counters EJitCompileDriver::getCounters() const {
+  Counters c;
+  c.calls = loadCounter(counters_.calls);
+  c.cacheHits = loadCounter(counters_.cacheHits);
+  c.coldMisses = loadCounter(counters_.coldMisses);
+  c.missingFunc = loadCounter(counters_.missingFunc);
+  c.missingBitcode = loadCounter(counters_.missingBitcode);
+  c.windowInactive = loadCounter(counters_.windowInactive);
+  c.engineMissing = loadCounter(counters_.engineMissing);
+  c.compileAttempts = loadCounter(counters_.compileAttempts);
+  c.compileFailed = loadCounter(counters_.compileFailed);
+  c.compiled = loadCounter(counters_.compiled);
+  return c;
 }

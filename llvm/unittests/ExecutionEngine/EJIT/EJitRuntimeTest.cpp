@@ -13,6 +13,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCache.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
@@ -2204,5 +2205,98 @@ TEST(EJitCacheLifecycle, ReputAfterInvalidate) {
   cache.put(777, &newVal, 64, deps);
   EXPECT_EQ(cache.getOrNull(777), &newVal);
 }
+
+//===----------------------------------------------------------------------===//
+// EJitCompileDriver fast-path / observability counter tests
+//
+// These construct the driver directly (no JIT engine) to prove that the fast
+// path (cache hit) returns without ever entering the cold compile path, and
+// that cold-path early-returns are attributed to the right reason. The compile
+// stage itself is native-target dependent and is exercised by the end-to-end
+// pipeline tests; here we only assert control-flow accounting, which is
+// host-independent.
+//===----------------------------------------------------------------------===//
+
+namespace {
+// Build a driver wired to caller-owned components, with no sync engine.
+struct DriverHarness {
+  Config config;
+  EJitCache cache{64, 1024 * 1024};
+  EJitRuntimeState state;
+  EJitModuleLoader loader;
+  EJitCompileDriver driver{config, cache, state, loader, nullptr};
+};
+} // namespace
+
+TEST(EJitCompileDriverCounters, CacheHitAvoidsColdPath) {
+  DriverHarness H;
+  int dummyFn = 0;
+  // Pre-populate the cache for a key; getOrCompile must return it via the fast
+  // path without decoding the key or touching the (absent) engine.
+  const uint64_t key = (static_cast<uint64_t>(0x1234) << 32) | 0x07;
+  H.cache.put(key, &dummyFn, 32, {});
+
+  void *p = H.driver.getOrCompile(key);
+  EXPECT_EQ(p, &dummyFn);
+
+  auto c = H.driver.getCounters();
+  EXPECT_EQ(c.calls, 1u);
+  EXPECT_EQ(c.cacheHits, 1u);
+  EXPECT_EQ(c.coldMisses, 0u);
+  EXPECT_EQ(c.compileAttempts, 0u);
+}
+
+TEST(EJitCompileDriverCounters, RepeatedCacheHitNeverCompiles) {
+  DriverHarness H;
+  int dummyFn = 0;
+  const uint64_t key = (static_cast<uint64_t>(0xABCD) << 32) | 0x02;
+  H.cache.put(key, &dummyFn, 32, {});
+
+  for (int i = 0; i < 5; ++i)
+    EXPECT_EQ(H.driver.getOrCompile(key), &dummyFn);
+
+  auto c = H.driver.getCounters();
+  EXPECT_EQ(c.calls, 5u);
+  EXPECT_EQ(c.cacheHits, 5u);
+  EXPECT_EQ(c.coldMisses, 0u);
+  EXPECT_EQ(c.compileAttempts, 0u);
+  EXPECT_EQ(c.compiled, 0u);
+}
+
+TEST(EJitCompileDriverCounters, UnknownFuncIdxEarlyReturn) {
+  DriverHarness H;
+  // No bitcode/name registered for this funcIdx -> missingFunc, no compile.
+  const uint64_t key = (static_cast<uint64_t>(0xDEAD) << 32) | 0x00;
+  EXPECT_EQ(H.driver.getOrCompile(key), nullptr);
+
+  auto c = H.driver.getCounters();
+  EXPECT_EQ(c.calls, 1u);
+  EXPECT_EQ(c.cacheHits, 0u);
+  EXPECT_EQ(c.coldMisses, 1u);
+  EXPECT_EQ(c.missingFunc, 1u);
+  EXPECT_EQ(c.compileAttempts, 0u);
+}
+
+TEST(EJitCompileDriverCounters, MissAfterHitAccounting) {
+  DriverHarness H;
+  int dummyFn = 0;
+  const uint64_t hitKey = (static_cast<uint64_t>(0x1111) << 32) | 0x01;
+  const uint64_t missKey = (static_cast<uint64_t>(0x2222) << 32) | 0x01;
+  H.cache.put(hitKey, &dummyFn, 32, {});
+
+  EXPECT_EQ(H.driver.getOrCompile(hitKey), &dummyFn);  // hit
+  EXPECT_EQ(H.driver.getOrCompile(missKey), nullptr);  // cold miss (unknown)
+
+  auto c = H.driver.getCounters();
+  // Core invariants of the counter model.
+  EXPECT_EQ(c.calls, c.cacheHits + c.coldMisses);
+  EXPECT_EQ(c.calls, 2u);
+  EXPECT_EQ(c.cacheHits, 1u);
+  EXPECT_EQ(c.coldMisses, 1u);
+  EXPECT_EQ(c.missingFunc, 1u);
+  EXPECT_EQ(c.compileAttempts, c.compiled + c.compileFailed);
+  EXPECT_EQ(c.compileAttempts, 0u);
+}
+
 
 
