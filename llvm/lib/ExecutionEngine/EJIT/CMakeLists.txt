@@ -64,6 +64,9 @@ set(EJIT_SOURCES
   EJitStructFieldPass.cpp
   EJitOptimizer.cpp
   EJitPassBuilder.cpp
+  EJitCodePool.cpp
+  EJitCodePoolMemoryManager.cpp
+  EJitSrePlatform.cpp
 )
 
 # Async/sync compiler — excluded in freestanding mode (single-threaded, no std::thread)
