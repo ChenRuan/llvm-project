@@ -8,7 +8,7 @@
 //
 //  Host-runnable tests that drive EJitCodePoolMemoryManager with a synthetic
 //  JITLink LinkGraph and a mock SRE backend. These exercise the exact
-//  allocate -> finalize -> seal path the engine uses at lookup, without needing
+//  allocate -> finalize(seal) -> lookup(no-op seal) path, without needing
 //  a native backend to actually execute code (the host has no matching JIT
 //  target, so end-to-end execution is validated on the target instead).
 //
@@ -108,9 +108,10 @@ TEST(EJitCodePoolMemMgr, CodeMemoryComesFromPool) {
   cantFail(MM.deallocate(std::move(FA)));
 }
 
-// finalize() does NOT seal: the pool stays RW so JITLink can keep writing.
-// Sealing happens out-of-band (the engine does it at lookup).
-TEST(EJitCodePoolMemMgr, FinalizeKeepsPoolWritable) {
+// finalize() seals the backing 2MiB pool before running JITLink allocation
+// finalizers. A later lookup-time seal is idempotent and must not re-invoke
+// enable_ex.
+TEST(EJitCodePoolMemMgr, FinalizeSealsPoolBeforeLookup) {
   MockSre M;
   EJitCodePoolManager Pool(
       poolOpts(256 * 1024), [&M](size_t N) { return M.rawAlloc(N); },
@@ -122,11 +123,10 @@ TEST(EJitCodePoolMemMgr, FinalizeKeepsPoolWritable) {
   void *CodeAddr = firstBlockAddr(*G);
   auto FA = cantFail(IFA->finalize());
 
-  // The memory manager must not have flipped permissions.
-  EXPECT_EQ(M.SealCalls, 0u);
-  EXPECT_EQ(Pool.getStats().sealedCount, 0u);
+  EXPECT_EQ(M.SealCalls, 1u);
+  EXPECT_EQ(Pool.getStats().sealedCount, 1u);
 
-  // The engine's lookup step seals the containing pool.
+  // The engine's lookup step may defensively seal again; it must be a no-op.
   cantFail(Pool.sealPoolContaining(CodeAddr));
   EXPECT_EQ(M.SealCalls, 1u);
   EXPECT_EQ(Pool.getStats().sealedCount, 1u);
@@ -148,7 +148,7 @@ TEST(EJitCodePoolMemMgr, RepeatedSealNoDuplicateEnableEx) {
   void *CodeAddr = firstBlockAddr(*G);
   auto FA = cantFail(IFA->finalize());
 
-  cantFail(Pool.sealPoolContaining(CodeAddr)); // first lookup
+  cantFail(Pool.sealPoolContaining(CodeAddr)); // lookup after finalize
   cantFail(Pool.sealPoolContaining(CodeAddr)); // second lookup, same pool
   EXPECT_EQ(M.SealCalls, 1u);
   EXPECT_EQ(Pool.getStats().sealInvocations, 1u);
@@ -156,10 +156,9 @@ TEST(EJitCodePoolMemMgr, RepeatedSealNoDuplicateEnableEx) {
   cantFail(MM.deallocate(std::move(FA)));
 }
 
-// Runtime scenario: two functions are compiled and "looked up" in turn. The
-// first seals its pool; because a sealed pool is never reused, the second
-// function is allocated from a brand-new pool. Mirrors the engine flow of
-// compile -> lookup(seal) -> compile -> lookup(seal).
+// Runtime scenario: two functions are compiled in turn. The first finalize
+// seals its pool; because a sealed pool is never reused, the second function is
+// allocated from a brand-new pool. Lookup-time sealing remains idempotent.
 TEST(EJitCodePoolMemMgr, SecondFunctionUsesNewPoolAfterSeal) {
   constexpr size_t kPoolSize = 64 * 1024;
   MockSre M;
@@ -168,12 +167,11 @@ TEST(EJitCodePoolMemMgr, SecondFunctionUsesNewPoolAfterSeal) {
       [&M](void *B) { return M.seal(B); });
   EJitCodePoolMemoryManager MM(Pool, 4096);
 
-  // Function 1: allocate, finalize, seal (first lookup).
+  // Function 1: allocate, finalize seals.
   auto G1 = makeCodeGraph(64, 0x1000);
   auto IFA1 = cantFail(MM.allocate(nullptr, *G1));
   void *Addr1 = firstBlockAddr(*G1);
   auto FA1 = cantFail(IFA1->finalize());
-  cantFail(Pool.sealPoolContaining(Addr1));
   EXPECT_EQ(M.SealCalls, 1u);
   EXPECT_EQ(Pool.getStats().poolCount, 1u);
 
@@ -183,7 +181,7 @@ TEST(EJitCodePoolMemMgr, SecondFunctionUsesNewPoolAfterSeal) {
   auto IFA2 = cantFail(MM.allocate(nullptr, *G2));
   void *Addr2 = firstBlockAddr(*G2);
   auto FA2 = cantFail(IFA2->finalize());
-  cantFail(Pool.sealPoolContaining(Addr2));
+  cantFail(Pool.sealPoolContaining(Addr2)); // lookup no-op after finalize
 
   auto S = Pool.getStats();
   EXPECT_EQ(S.poolCount, 2u);
@@ -199,4 +197,3 @@ TEST(EJitCodePoolMemMgr, SecondFunctionUsesNewPoolAfterSeal) {
   cantFail(MM.deallocate(std::move(FA1)));
   cantFail(MM.deallocate(std::move(FA2)));
 }
-

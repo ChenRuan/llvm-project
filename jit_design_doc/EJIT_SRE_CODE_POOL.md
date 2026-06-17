@@ -1,6 +1,6 @@
 # EmbeddedJIT SRE 机器码内存池设计（EJIT_SRE_CODE_POOL）
 
-**状态**: 已实现（方案 B，完整接管 JITLink 代码内存分配 + lookup 处 enable_ex 封固）
+**状态**: 已实现（方案 B，完整接管 JITLink 代码内存分配 + finalize 处 enable_ex 封固）
 **开关**: `-DEJIT_SRE_CODE_POOL=ON`（默认 OFF，上游默认行为不变）
 **关联代码**:
 - `llvm/include/llvm/ExecutionEngine/EJIT/EJitCodePool.h` / `llvm/lib/ExecutionEngine/EJIT/EJitCodePool.cpp`
@@ -20,8 +20,8 @@
 
 EmbeddedJIT 需要在运行期把 JIT 生成的机器码变为可执行。直接的做法（wrap 全局
 `mprotect`）会破坏 ORC/JITLink 的后续写入，因此本方案让 EmbeddedJIT **自己拥有
-JIT 代码内存**：以 2MiB 池为单位分配、写入阶段保持 RW、在把函数指针交还调用者之前
-对该池调用 `enable_ex` 封固为 RX，封固后的池永不再写。
+JIT 代码内存**：以 2MiB 池为单位分配、写入阶段保持 RW、在 JITLink finalize
+运行 allocation actions 之前对该池调用 `enable_ex` 封固为 RX，封固后的池永不再写。
 
 ---
 
@@ -41,28 +41,34 @@ JIT 代码内存**：以 2MiB 池为单位分配、写入阶段保持 RW、在�
 
 ---
 
-## 3. 为什么 enable_ex 必须在"JIT 写完之后、返回函数指针之前"
+## 3. 为什么 enable_ex 必须在"JIT 写完之后、JITLink finalizer 执行之前"
 
 - **之前**（写入期间）：JITLink 需要把机器码拷进内存并应用重定位，这要求该内存
   **可写（RW）**。如果过早 `enable_ex` 置 RX，写入/重定位会失败。
 - **之后**（调用之前）：调用者拿到函数指针就会执行它，这要求该内存
   **可执行（RX）**。
-- 因此唯一安全的封固点是：**JITLink finalize 完成、即将把函数指针交还调用者的那一刻**。
-  在本实现里就是 `EJitOrcEngine::lookup()` 取得解析地址之后、`return` 之前。
+- JITLink 的 allocation actions 可能在 `lookup()` 返回之前执行目标侧代码/桩函数。
+  如果等到 `lookup()` 取得地址之后才封固，finalizer 里的取指已经太晚。
+- 因此唯一安全的封固点是：**JITLink 已完成写入/重定位之后、allocation actions
+  开始之前**。在本实现里就是 `EJitCodePoolMemoryManager::finalize()` 中，
+  `runFinalizeActions()` 之前。`EJitOrcEngine::lookup()` 仍保留一次幂等 seal 作为
+  防御性兜底。
 
 时序：
 
 ```
 allocate(RW, 来自 2MiB 池)
    -> JITLink 写机器码 + 重定位（池保持 RW）
-   -> finalize（本实现不做 mprotect，池仍 RW）
-   -> lookup 得到函数地址
-   -> enable_ex(1, pool->base) 封固该 2MiB 池为 RX，标记 sealed
+   -> finalize: enable_ex(1, pool->base) 封固该 2MiB 池为 RX，标记 sealed
+   -> finalize: 执行 JITLink allocation actions
+   -> lookup 得到函数地址（再次 seal 为 no-op）
    -> 返回函数指针（此时指向 RX 内存，可安全执行）
 ```
 
-> 注意：`enable_ex` 内部已完成权限/cache 同步，所以本实现在 SRE 模式下
-> **不调用 `__builtin___clear_cache`**。
+> 注意：2MiB 模式会在 `enable_ex` 成功后补一次纯 AArch64 cache maintenance 序列：
+> `dc cvau` 清 D-cache、`ic ivau` 失效 I-cache，并用 `dsb/isb` 做执行同步。平台
+> `enable_ex` 仍是权限翻转的唯一来源；这里的同步只用于避免 finalize action 或调用者
+> 在权限/cache 状态尚未对取指可见时跳入代码。
 
 ---
 
@@ -139,13 +145,13 @@ allocate(RW, 来自 2MiB 池)
 - `EJitCodePoolMemoryManager::allocate` 仿照 `InProcessMemoryManager`，用
   `BasicLayout` 计算各 segment 大小，但 slab **来自 `EJitCodePoolManager` 的 2MiB
   池**（而非 mmap）。
-- `finalize()` **刻意不做任何 mprotect**，让池保持 RW；也不调用
-  `InvalidateInstructionCache`（由 `enable_ex` 负责）。
-- 真正的 RW→RX 封固由 `EJitOrcEngine::lookup` 在返回函数指针前对包含该地址的池调用
-  `enable_ex` 完成（幂等：已封固的池不重复调用）。
+- `finalize()` **刻意不做任何 per-segment mprotect**；它在 `runFinalizeActions()` 前
+  对整块 2MiB 池调用 `enable_ex`，并做本地取指同步。
+- `EJitOrcEngine::lookup` 在返回函数指针前仍会对包含该地址的池调用一次
+  `enable_ex`，但这是幂等兜底：已封固的池不重复调用。
 
 换言之：**代码内存来自 EJITCodePoolManager，而非普通 mmap/mprotect**；封固在
-lookup 处发生。两部分共同构成完整方案，没有"伪装成内存池"的浅层实现。
+finalize 处发生，lookup 处保留 no-op 防线。两部分共同构成完整方案，没有"伪装成内存池"的浅层实现。
 
 ---
 
@@ -202,7 +208,7 @@ cmake --build build-ejit --target check-ejit-code-pool -j4
   重复 seal 不重复 enable_ex、enable_ex 失败返回 Error、超池大小 clean reject、
   统计正确、rollover 自动封固、`sealAllWritablePools` 等。
 - `EJitCodePoolMemoryManagerTest`：用合成 JITLink `LinkGraph` 驱动内存管理器，验证
-  JIT 代码来自池、finalize 后仍 RW、lookup 式封固只翻一次、第二个函数在前一个池
+  JIT 代码来自池、finalize 先封固、lookup 式封固不重复、第二个函数在前一个池
   sealed 后进入新池。
 
 **代码池开关构建（开关 ON）**：

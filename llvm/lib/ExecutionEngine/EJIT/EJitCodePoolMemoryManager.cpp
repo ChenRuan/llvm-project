@@ -11,6 +11,7 @@
 #include "llvm/ExecutionEngine/Orc/Shared/AllocationActions.h"
 #include "llvm/Support/MathExtras.h"
 #include <cstring>
+#include <cstdint>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -18,6 +19,30 @@ using namespace llvm::jitlink;
 
 using orc::ExecutorAddr;
 using WrapperFunctionCall = orc::shared::WrapperFunctionCall;
+
+static void syncCodeForExecution(const void *Base, size_t Size) {
+  if (!Base || Size == 0)
+    return;
+
+#if defined(__aarch64__)
+  auto Begin = reinterpret_cast<uintptr_t>(Base);
+  auto End = Begin + Size;
+
+  uint64_t Ctr = 0;
+  asm volatile("mrs %0, ctr_el0" : "=r"(Ctr));
+
+  const uintptr_t DLine = uintptr_t{4} << ((Ctr >> 16) & 0xf);
+  const uintptr_t ILine = uintptr_t{4} << (Ctr & 0xf);
+
+  for (uintptr_t P = Begin & ~(DLine - 1); P < End; P += DLine)
+    asm volatile("dc cvau, %0" : : "r"(P) : "memory");
+  asm volatile("dsb sy" ::: "memory");
+
+  for (uintptr_t P = Begin & ~(ILine - 1); P < End; P += ILine)
+    asm volatile("ic ivau, %0" : : "r"(P) : "memory");
+  asm volatile("dsb sy\nisb" ::: "memory");
+#endif
+}
 
 /// Side record used as the FinalizedAlloc handle. Holds the dealloc actions and
 /// the pool-backed base address. Pool memory itself is not freed in v1.
@@ -29,16 +54,24 @@ struct EJitCodePoolMemoryManager::FinalizedInfo {
 class EJitCodePoolMemoryManager::InFlightAllocImpl
     : public JITLinkMemoryManager::InFlightAlloc {
 public:
-  InFlightAllocImpl(EJitCodePoolMemoryManager &, LinkGraph &G, BasicLayout BL,
-                    void *Base)
-      : G(&G), BL(std::move(BL)), Base(Base) {}
+  InFlightAllocImpl(EJitCodePoolManager &Pool, LinkGraph &G, BasicLayout BL,
+                    void *Base, size_t Size)
+      : Pool(&Pool), G(&G), BL(std::move(BL)), Base(Base), Size(Size) {}
 
   void finalize(OnFinalizedFunction OnFinalized) override {
     // The content has already been written into working memory, which (for an
-    // in-process pool) is the executor memory. Deliberately DO NOT apply any
-    // memory protection here: the pool stays RW until it is sealed as a whole
-    // 2MiB region by EJitCodePoolManager. Likewise we do not invalidate the
-    // instruction cache — enable_ex performs that sync on the target.
+    // in-process pool) is the executor memory. Seal the backing 2MiB pool
+    // before running allocation finalizers: some JITLink actions may execute
+    // target code before lookup() returns, so lookup-time sealing is too late.
+    // The lookup path still performs an idempotent seal as a defensive fallback.
+    if (Pool && Base) {
+      if (auto Err = Pool->sealPoolContaining(Base)) {
+        OnFinalized(std::move(Err));
+        return;
+      }
+      syncCodeForExecution(Base, Size);
+    }
+
     runFinalizeActions(
         G->allocActions(),
         [this, OnFinalized = std::move(OnFinalized)](
@@ -66,9 +99,11 @@ public:
   }
 
 private:
+  EJitCodePoolManager *Pool;
   LinkGraph *G;
   BasicLayout BL;
   void *Base;
+  size_t Size;
 };
 
 EJitCodePoolMemoryManager::EJitCodePoolMemoryManager(EJitCodePoolManager &Pool,
@@ -123,8 +158,8 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
     return;
   }
 
-  OnAllocated(
-      std::make_unique<InFlightAllocImpl>(*this, G, std::move(BL), Slab));
+  OnAllocated(std::make_unique<InFlightAllocImpl>(Pool_, G, std::move(BL), Slab,
+                                                  static_cast<size_t>(Total)));
 }
 
 void EJitCodePoolMemoryManager::deallocate(std::vector<FinalizedAlloc> Allocs,

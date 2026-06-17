@@ -15,9 +15,10 @@
 //
 //    * Each pool is a 2MiB-aligned region carved from a raw SRE allocation.
 //    * While JITLink writes machine code the pool stays RW.
-//    * Before a JIT function pointer is handed back to the caller, the pool
-//      containing it is sealed: enable_ex flips it to RX and it is marked
-//      executable. A sealed pool is never written or allocated from again.
+//    * After JITLink writes machine code and before its allocation finalizers
+//      run, the containing pool is sealed: enable_ex flips it to RX and it is
+//      marked executable. A sealed pool is never written or allocated from
+//      again.
 //    * New JIT code always lands in a fresh (or current unsealed) pool.
 //
 //  This class is intentionally free of any SRE header dependency: the raw

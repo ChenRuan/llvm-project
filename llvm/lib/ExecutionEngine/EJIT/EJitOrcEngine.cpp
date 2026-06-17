@@ -94,8 +94,8 @@ EJitOrcEngine::Create(const Config &config,
   // Route JIT machine-code memory through EmbeddedJIT's own 2MiB pools instead
   // of the default JITLink mmap/mprotect path. The pool manager is owned by the
   // engine (so it outlives the LLJIT); the object linking layer owns a memory
-  // manager that references it. Pages are kept RW here and sealed to RX later,
-  // at lookup time, by the pool manager's enable_ex sealing.
+  // manager that references it. Pages are kept RW through JITLink writes, then
+  // sealed to RX in the memory manager before allocation finalizers run.
   engine->P->codePool = makeSreCodePoolManager();
   {
     EJitCodePoolManager *Pool = engine->P->codePool.get();
@@ -308,13 +308,11 @@ Expected<void *> EJitOrcEngine::lookup(uint64_t cacheKey,
   void *Ptr = reinterpret_cast<void *>(addr->getValue());
 
 #ifdef EJIT_SRE_CODE_POOL
-  // Seal the 2MiB pool that contains the resolved function before it is handed
-  // back, so the page is RX (executable) at the call site. This is the only
-  // point a JIT pool transitions RW->RX. Idempotent: a pool already sealed
-  // (e.g. on allocation rollover) is not re-flipped, so repeated lookups of the
-  // same function do not re-invoke enable_ex. Only pool-backed code is sealed;
-  // an address resolved outside the pools (e.g. a process/absolute symbol) is
-  // left untouched. If sealing fails we must not return a callable pointer.
+  // The memory manager normally sealed this 2MiB pool before JITLink allocation
+  // finalizers ran. Keep a defensive lookup-time seal too: it is idempotent, so
+  // repeated lookups of the same function do not re-invoke enable_ex. Only
+  // pool-backed code is sealed; an address resolved outside the pools (e.g. a
+  // process/absolute symbol) is left untouched.
   if (P->codePool && P->codePool->contains(Ptr)) {
     if (auto Err = P->codePool->sealPoolContaining(Ptr))
       return std::move(Err);

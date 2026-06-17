@@ -9,12 +9,12 @@
 //  A JITLink memory manager that backs all JIT segment memory with
 //  EJitCodePoolManager's 2MiB pools instead of mmap/mprotect.
 //
-//  Unlike InProcessMemoryManager, finalize() does NOT apply memory protections:
-//  the pool is left RW so JITLink/ORC can keep writing relocations, and the
-//  RW->RX transition happens later, exactly once per 2MiB pool, via the pool
-//  manager's enable_ex sealing (driven from the engine right before a function
-//  pointer is returned). This keeps execute-permission flips at the required
-//  2MiB granularity and avoids the W^X conflict that wrapping mprotect causes.
+//  Unlike InProcessMemoryManager, finalize() does not apply per-segment memory
+//  protections. Instead it seals the whole backing 2MiB pool through
+//  EJitCodePoolManager before running JITLink allocation finalizers. This keeps
+//  execute-permission flips at the required 2MiB granularity, avoids the W^X
+//  conflict that wrapping mprotect causes, and still makes code executable for
+//  any finalization action that runs before lookup() returns.
 //
 //  v1 does not reclaim pool memory on deallocate (only dealloc actions run);
 //  pool lifetime equals the engine lifetime. See EJIT_SRE_CODE_POOL.md.
@@ -31,8 +31,8 @@ namespace llvm {
 namespace ejit {
 
 /// JITLinkMemoryManager that allocates JIT segments from EJitCodePoolManager
-/// and never changes page protections itself (sealing is done out-of-band by
-/// the pool manager). The referenced pool manager must outlive this object.
+/// and never applies per-segment page protections itself. The referenced pool
+/// manager must outlive this object.
 class EJitCodePoolMemoryManager : public jitlink::JITLinkMemoryManager {
 public:
   EJitCodePoolMemoryManager(EJitCodePoolManager &Pool, size_t PageSize);
