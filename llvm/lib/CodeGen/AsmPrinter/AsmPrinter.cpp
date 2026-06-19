@@ -4800,6 +4800,7 @@ std::tuple<const MCSymbol *, uint64_t, const MCSymbol *,
            codeview::JumpTableEntrySize>
 AsmPrinter::getCodeViewJumpTableInfo(int JTI, const MachineInstr *BranchInstr,
                                      const MCSymbol *BranchLabel) const {
+#ifndef EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL
   const auto TLI = MF->getSubtarget().getTargetLowering();
   const auto BaseExpr =
       TLI->getPICJumpTableRelocBaseExpr(MF, JTI, MMI->getContext());
@@ -4809,6 +4810,9 @@ AsmPrinter::getCodeViewJumpTableInfo(int JTI, const MachineInstr *BranchInstr,
   // EK_LabelDifference32 is implemented as an Int32 from the base address.
   return std::make_tuple(Base, 0, BranchLabel,
                          codeview::JumpTableEntrySize::Int32);
+#else
+  return {};
+#endif
 }
 
 void AsmPrinter::emitCOFFReplaceableFunctionData(Module &M) {

@@ -1038,15 +1038,23 @@ bool MCAssembler::relaxDwarfCallFrameFragment(MCDwarfCallFrameFragment &DF) {
 }
 
 bool MCAssembler::relaxCVInlineLineTable(MCCVInlineLineTableFragment &F) {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   unsigned OldSize = F.getContents().size();
   getContext().getCVContext().encodeInlineLineTable(*this, F);
   return OldSize != F.getContents().size();
+#else
+  return false;
+#endif
 }
 
 bool MCAssembler::relaxCVDefRange(MCCVDefRangeFragment &F) {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   unsigned OldSize = F.getContents().size();
   getContext().getCVContext().encodeDefRange(*this, F);
   return OldSize != F.getContents().size();
+#else
+  return false;
+#endif
 }
 
 bool MCAssembler::relaxFill(MCFillFragment &F) {
