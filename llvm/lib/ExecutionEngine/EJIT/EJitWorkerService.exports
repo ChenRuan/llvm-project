@@ -1,0 +1,13 @@
+# Linker version script for the EmbeddedJIT worker service dlib.
+#
+# Only the stable C ABI (ejit_service_*) is exported with default visibility.
+# Every other symbol — including all statically linked LLVM symbols and the
+# service's C++ internals — is made local so the dlib never leaks LLVM internal
+# symbols into the platform's global namespace. Combined with -fvisibility=hidden
+# and -Wl,--exclude-libs,ALL at the link step.
+EJIT_SERVICE_1.0 {
+  global:
+    ejit_service_*;
+  local:
+    *;
+};

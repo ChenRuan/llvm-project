@@ -203,3 +203,50 @@ add_library(ejit_baremetal STATIC
   BareMetal/ejit_baremetal_stubs.c)
 target_compile_options(ejit_baremetal PRIVATE -ffunction-sections -fdata-sections)
 target_include_directories(ejit_baremetal PUBLIC BareMetal)
+
+#===-- Standalone worker-service dlib --------------------------------------===#
+# libLLVMEJITWorkerService.so — a single dynamic library that wraps LLVMEJIT and
+# exposes ONLY the stable ejit_service_* C ABI (see EJitWorkerService.h and
+# jit_design_doc/EJIT_WORKER_SERVICE_DLIB.md). The whole service is an in-library
+# singleton: under platform model A (one shared dlib data/bss for all cores) it
+# is the one worker / queue / cache / ORC.
+#
+# Built only when EJIT_WORKER_SERVICE=ON, so the default LLVMEJIT build is
+# completely unaffected (no new service object is added to LLVMEJIT).
+if(EJIT_WORKER_SERVICE)
+  if(NOT EJIT_SRE_TASKPOOL)
+    message(FATAL_ERROR
+      "EJIT_WORKER_SERVICE=ON requires EJIT_SRE_TASKPOOL=ON "
+      "(the service needs the single queue/worker/cache scheduler).")
+  endif()
+
+  add_library(LLVMEJITWorkerService SHARED EJitWorkerService.cpp)
+
+  target_compile_definitions(LLVMEJITWorkerService PRIVATE
+    EJIT_WORKER_SERVICE
+    EJIT_SRE_TASKPOOL
+    EJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS}
+    EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}
+    EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE})
+
+  # Hide C++ internals; export only the C ABI through the version script.
+  target_compile_options(LLVMEJITWorkerService PRIVATE
+    -fvisibility=hidden -fvisibility-inlines-hidden)
+  set(_svc_exports "${CMAKE_CURRENT_SOURCE_DIR}/EJitWorkerService.exports")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(LLVMEJITWorkerService PRIVATE
+      "LINKER:--version-script=${_svc_exports}"
+      "LINKER:--exclude-libs,ALL")
+  endif()
+  set_target_properties(LLVMEJITWorkerService PROPERTIES
+    LINK_DEPENDS "${_svc_exports}")
+
+  # Link the real backend. LLVMEJIT carries its LINK_COMPONENTS transitively, so
+  # the service pulls exactly the same LLVM components as LLVMEJIT — no extra
+  # backend is bundled.
+  target_link_libraries(LLVMEJITWorkerService PRIVATE LLVMEJIT)
+
+  message(STATUS "EmbeddedJIT: worker-service dlib enabled "
+                 "(LLVMEJITWorkerService, worker stack="
+                 "${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE} bytes)")
+endif()

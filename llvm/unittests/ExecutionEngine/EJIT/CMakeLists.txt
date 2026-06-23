@@ -67,3 +67,40 @@ add_custom_target(check-ejit-taskpool
   COMMENT "Running EmbeddedJIT SRE taskpool unit tests"
   USES_TERMINAL
   )
+
+# Worker-service tests: compile the service source + taskpool sources directly
+# with EJIT_WORKER_SERVICE_TESTING so the service uses a deterministic MOCK
+# compiler (no ORC, no real codegen, no real threads in the SYNC/MANUAL paths).
+# Only LLVMSupport is linked (gtest harness); this target never pulls in
+# OrcJIT/EJIT, so it is a self-contained host static unit-test variant.
+set(EJIT_SERVICE_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
+set(LLVM_LINK_COMPONENTS Support)
+add_llvm_unittest(EJITWorkerServiceTests
+  EJitWorkerServiceTest.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitWorkerService.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitTaskPool.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSreQueue.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitWorker.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSreTask_host.cpp
+
+  PARTIAL_SOURCES_INTENDED
+  )
+set(LLVM_LINK_COMPONENTS "${EJIT_SERVICE_LINK_COMPONENTS_SAVED}")
+
+target_compile_definitions(EJITWorkerServiceTests PRIVATE
+  EJIT_WORKER_SERVICE
+  EJIT_WORKER_SERVICE_TESTING
+  EJIT_SRE_TASKPOOL
+  EJIT_SRE_TASKPOOL_BUCKETS=32
+  EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
+  EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=4096
+  EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=1048576
+  )
+
+# Convenience target: build + run only the worker-service unit tests.
+add_custom_target(check-ejit-worker-service
+  COMMAND $<TARGET_FILE:EJITWorkerServiceTests>
+  DEPENDS EJITWorkerServiceTests
+  COMMENT "Running EmbeddedJIT worker-service unit tests"
+  USES_TERMINAL
+  )

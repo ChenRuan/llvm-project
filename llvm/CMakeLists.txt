@@ -654,6 +654,30 @@ if(EJIT_SRE_TASKPOOL)
                  "maxFuncIndex=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX})")
 endif()
 
+# Single async worker task stack size (bytes). Consumed by EJitSreTask_sre.cpp
+# (the SRE adapter) and reported by the worker service diagnostics. 1 MiB default,
+# platform-tunable; not passed via add_definitions globally so changing it does
+# not recompile the whole tree — it is forwarded only to the targets that use it.
+set(EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE "1048576" CACHE STRING
+  "EmbeddedJIT SRE taskpool single-worker stack size in bytes (default 1 MiB)")
+
+#===-- EmbeddedJIT standalone worker-service dlib -------------------------===#
+# Build libLLVMEJITWorkerService.so: a standalone dynamic library that wraps
+# LLVMEJIT and exposes ONLY the ejit_service_* C ABI. The service is a plain
+# in-library singleton holding one worker / queue / cache / ORC; under platform
+# model A (one shared dlib data/bss instance) it is the one shared JIT service.
+# Default OFF: the default LLVMEJIT build is completely unaffected. Requires
+# EJIT_SRE_TASKPOOL=ON. See jit_design_doc/EJIT_WORKER_SERVICE_DLIB.md.
+option(EJIT_WORKER_SERVICE
+  "Build the standalone EmbeddedJIT worker-service dlib (ejit_service_* C ABI)" OFF)
+if(EJIT_WORKER_SERVICE AND NOT EJIT_SRE_TASKPOOL)
+  message(FATAL_ERROR "EJIT_WORKER_SERVICE=ON requires EJIT_SRE_TASKPOOL=ON")
+endif()
+if(EJIT_WORKER_SERVICE)
+  message(STATUS "EmbeddedJIT: worker-service dlib enabled "
+                 "(worker stack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE} bytes)")
+endif()
+
 set(LLVM_TARGETS_TO_BUILD "all"
     CACHE STRING "Semicolon-separated list of targets to build, or \"all\".")
 
