@@ -10,7 +10,9 @@
  * 核心验证: ejit_activate vs ejit_activate_array 的区别
  *   同一 period name ("cell") 关联多个数组时:
  *   - ejit_activate("cell", 0)   → 激活 cellCfg[0] AND cellPhy[0]
- *   - ejit_activate_array("cell", &cellCfg, 0) → 仅激活 cellCfg[0]
+ *   - legacy runtime: ejit_activate_array("cell", &cellCfg, 0) → 仅激活 cellCfg[0]
+ *   - taskpool runtime: multi-array activate_array is clean-rejected because
+ *     the shared switch table is keyed by period/lifecycle + index only.
  */
 
 #include <stdint.h>
@@ -30,9 +32,15 @@ struct CellPhy {
   uint32_t rssi;
 };
 
+struct SingleCfg {
+  __attribute__((ejit_may_const)) uint32_t value;
+  uint32_t padding;
+};
+
 #define N 8
 __attribute__((ejit_period_arr("cell"))) struct CellCfg g_cellCfg[N];
 __attribute__((ejit_period_arr("cell"))) struct CellPhy g_cellPhy[N];
+__attribute__((ejit_period_arr("single"))) struct SingleCfg g_singleCfg[N];
 
 __attribute__((ejit_period("static"))) uint32_t g_sysVer;
 
@@ -43,6 +51,13 @@ uint32_t read_both(
     __attribute__((ejit_period_arr_ind("cell"))) uint8_t ci)
 {
   return g_cellCfg[ci].cellType + g_cellPhy[ci].phyCellId;
+}
+
+__attribute__((ejit_entry))
+uint32_t read_single(
+    __attribute__((ejit_period_arr_ind("single"))) uint8_t ci)
+{
+  return g_singleCfg[ci].value;
 }
 
 //===-- 运行时 API (完整声明) -----------------------------------------------===//
@@ -81,6 +96,7 @@ int main(int argc, char **argv) {
   T(!ejit_is_active("cell", ci),  "cell[%u] NOT active before activate", ci);
   T(!ejit_is_active("cell", ci2), "cell[%u] NOT active before activate", ci2);
   T(!ejit_is_active("trp",  ci),  "unknown period returns false");
+  T(!ejit_is_active("single", ci), "single[%u] NOT active before activate", ci);
 
   //===-- 2. ejit_activate: 激活所有共享 period name 的数组 -----------------===//
   printf("\n--- 2. activate(ci=%u) (激活所有同名数组) ---\n", ci);
@@ -103,36 +119,64 @@ int main(int argc, char **argv) {
 
   // 4a. 仅激活 cellCfg[ci]
   rc = ejit_activate_array("cell", g_cellCfg, ci);
-  T(rc == 0, "activate_array(cell, &cellCfg, %u) returns %d", ci, rc);
-  // isActive 是 period 级语义：只要该 period 下有任一数组在 ci 活跃即返回 true
-  T(ejit_is_active("cell", ci), "cell[%u] IS active (cellCfg activated)", ci);
+  bool multi_array_granularity = (rc == 0);
+  if (multi_array_granularity) {
+    T(rc == 0, "activate_array(cell, &cellCfg, %u) returns %d", ci, rc);
+    // isActive 是 period 级语义：只要该 period 下有任一数组在 ci 活跃即返回 true
+    T(ejit_is_active("cell", ci), "cell[%u] IS active (cellCfg activated)", ci);
 
-  // 4b. 仅激活 cellCfg 不会激活 cellPhy
-  //     验证：deactivate 仅 cellCfg → cellPhy 从未被激活 → isActive 应为 false
-  rc = ejit_deactivate_array("cell", g_cellCfg, ci);
-  T(rc == 0, "deactivate_array(cell, &cellCfg, %u) returns %d", ci, rc);
-  T(!ejit_is_active("cell", ci),
-    "cell[%u] NOT active — only cellCfg was deactivated, cellPhy never activated", ci);
+    // 4b. 仅激活 cellCfg 不会激活 cellPhy
+    //     验证：deactivate 仅 cellCfg → cellPhy 从未被激活 → isActive 应为 false
+    rc = ejit_deactivate_array("cell", g_cellCfg, ci);
+    T(rc == 0, "deactivate_array(cell, &cellCfg, %u) returns %d", ci, rc);
+    T(!ejit_is_active("cell", ci),
+      "cell[%u] NOT active — only cellCfg was deactivated, cellPhy never activated", ci);
 
-  // 4c. 分别激活两个数组 → deactivate 其中一个 → 另一个仍活跃
-  rc = ejit_activate_array("cell", g_cellCfg, ci);
-  T(rc == 0, "activate_array(cell, &cellCfg, %u)", ci);
-  rc = ejit_activate_array("cell", g_cellPhy, ci);
-  T(rc == 0, "activate_array(cell, &cellPhy, %u)", ci);
-  T(ejit_is_active("cell", ci), "cell[%u] active (both arrays activated)", ci);
+    // 4c. 分别激活两个数组 → deactivate 其中一个 → 另一个仍活跃
+    rc = ejit_activate_array("cell", g_cellCfg, ci);
+    T(rc == 0, "activate_array(cell, &cellCfg, %u)", ci);
+    rc = ejit_activate_array("cell", g_cellPhy, ci);
+    T(rc == 0, "activate_array(cell, &cellPhy, %u)", ci);
+    T(ejit_is_active("cell", ci), "cell[%u] active (both arrays activated)", ci);
 
-  // 仅失效 cellCfg
-  rc = ejit_deactivate_array("cell", g_cellCfg, ci);
-  T(rc == 0, "deactivate_array(cell, &cellCfg, %u)", ci);
-  // cellPhy 仍在活跃，isActive 应仍为 true
-  T(ejit_is_active("cell", ci),
-    "cell[%u] still active — only cellCfg deactivated, cellPhy still active", ci);
+    // 仅失效 cellCfg
+    rc = ejit_deactivate_array("cell", g_cellCfg, ci);
+    T(rc == 0, "deactivate_array(cell, &cellCfg, %u)", ci);
+    // cellPhy 仍在活跃，isActive 应仍为 true
+    T(ejit_is_active("cell", ci),
+      "cell[%u] still active — only cellCfg deactivated, cellPhy still active", ci);
 
-  // 再失效 cellPhy
-  rc = ejit_deactivate_array("cell", g_cellPhy, ci);
-  T(rc == 0, "deactivate_array(cell, &cellPhy, %u)", ci);
-  T(!ejit_is_active("cell", ci),
-    "cell[%u] NOT active — both arrays now deactivated", ci);
+    // 再失效 cellPhy
+    rc = ejit_deactivate_array("cell", g_cellPhy, ci);
+    T(rc == 0, "deactivate_array(cell, &cellPhy, %u)", ci);
+    T(!ejit_is_active("cell", ci),
+      "cell[%u] NOT active — both arrays now deactivated", ci);
+  } else {
+    T(rc != 0,
+      "activate_array(cell, &cellCfg, %u) clean-rejected for multi-array period: %d",
+      ci, rc);
+    T(!ejit_is_active("cell", ci),
+      "cell[%u] unchanged after rejected multi-array activate_array", ci);
+    rc = ejit_deactivate_array("cell", g_cellCfg, ci);
+    T(rc != 0,
+      "deactivate_array(cell, &cellCfg, %u) clean-rejected for multi-array period: %d",
+      ci, rc);
+    T(!ejit_is_active("cell", ci),
+      "cell[%u] unchanged after rejected multi-array deactivate_array", ci);
+  }
+
+  // 4d. 单数组 period: legacy/taskpool 都应支持 array-level API.
+  printf("\n--- 4d. activate_array (single-array period) ---\n");
+  ejit_deactivate_all("single");
+  rc = ejit_activate_array("single", g_singleCfg, ci);
+  T(rc == 0, "activate_array(single, &singleCfg, %u) returns %d", ci, rc);
+  T(ejit_is_active("single", ci), "single[%u] IS active after activate_array", ci);
+  g_singleCfg[ci].value = 1234;
+  uint32_t sr = read_single(ci);
+  T(sr == 1234, "read_single(%u) = %u (expected 1234)", ci, sr);
+  rc = ejit_deactivate_array("single", g_singleCfg, ci);
+  T(rc == 0, "deactivate_array(single, &singleCfg, %u) returns %d", ci, rc);
+  T(!ejit_is_active("single", ci), "single[%u] NOT active after deactivate_array", ci);
 
   //===-- 5. ejit_activate vs ejit_activate_array: 粒度差异 ------------------===//
   printf("\n--- 5. period vs array granularity ---\n");
@@ -146,12 +190,22 @@ int main(int argc, char **argv) {
   ejit_deactivate("cell", ci);
   T(!ejit_is_active("cell", ci), "cell[%u] NOT active (period-level deactivate)", ci);
 
-  // 5b. 对比: activate_array + 另一个数组未激活 → deactivate_array 后不应残留
-  ejit_activate_array("cell", g_cellCfg, ci);
-  // cellPhy[ci] 未被激活
-  ejit_deactivate_array("cell", g_cellCfg, ci);
-  T(!ejit_is_active("cell", ci),
-    "cell[%u] NOT active — only cellCfg was array-activated, then deactivated", ci);
+  // 5b. 对比: legacy 支持 multi-array per-array 粒度；taskpool 会 clean reject.
+  rc = ejit_activate_array("cell", g_cellCfg, ci);
+  if (multi_array_granularity) {
+    T(rc == 0, "activate_array(cell, &cellCfg, %u) returns %d", ci, rc);
+    // cellPhy[ci] 未被激活
+    rc = ejit_deactivate_array("cell", g_cellCfg, ci);
+    T(rc == 0, "deactivate_array(cell, &cellCfg, %u) returns %d", ci, rc);
+    T(!ejit_is_active("cell", ci),
+      "cell[%u] NOT active — only cellCfg was array-activated, then deactivated", ci);
+  } else {
+    T(rc != 0,
+      "activate_array(cell, &cellCfg, %u) remains rejected for multi-array period: %d",
+      ci, rc);
+    T(!ejit_is_active("cell", ci),
+      "cell[%u] still NOT active after rejected multi-array activate_array", ci);
+  }
 
   //===-- 6. ejit_activate_all / ejit_deactivate_all: 批量操作 --------------===//
   printf("\n--- 6. activate_all / deactivate_all ---\n");
