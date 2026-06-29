@@ -1,0 +1,761 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EJIT Architecture Diagrams</title>
+  <style>
+    :root {
+      --primary: #2c5282;
+      --primary-2: #1a365d;
+      --accent: #3182ce;
+      --green: #38a16f;
+      --orange: #dd6b20;
+      --purple: #6b46c1;
+      --red: #c53030;
+      --dark: #2d3748;
+      --gray: #4a5568;
+      --muted: #718096;
+      --border: #d9dee6;
+      --bg: #f5f7fa;
+      --panel: #ffffff;
+      --blue-light: #ebf2fa;
+      --green-light: #f0fff4;
+      --orange-light: #fff7ed;
+      --purple-light: #f5f0ff;
+      --red-light: #fff5f5;
+      --code-bg: #111827;
+      --code-fg: #e5e7eb;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #f8fafc 0%, #ffffff 44%);
+      color: var(--dark);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+      line-height: 1.6;
+    }
+    header {
+      position: relative;
+      background: linear-gradient(135deg, var(--primary), var(--primary-2));
+      color: white;
+      padding: 38px 34px 32px;
+      border-bottom: 6px solid #bee3f8;
+    }
+    header h1 { margin: 0 0 8px; font-size: 34px; letter-spacing: .5px; }
+    header p { margin: 0; max-width: 1120px; color: #dbeafe; font-size: 16px; }
+    main { max-width: 1380px; margin: 0 auto; padding: 28px 28px 70px; }
+    section {
+      margin: 26px 0;
+      padding: 24px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: 0 10px 28px rgba(44, 82, 130, .08);
+    }
+    h2 {
+      margin: 0 0 18px;
+      color: var(--primary);
+      font-size: 25px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    h2::before {
+      content: "";
+      display: inline-block;
+      width: 7px;
+      height: 28px;
+      border-radius: 999px;
+      background: var(--primary);
+    }
+    h3 { margin: 22px 0 10px; color: var(--dark); }
+    p { margin: 8px 0 14px; }
+    a { color: var(--accent); }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      background: #eef2f7;
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-size: .92em;
+    }
+    pre {
+      background: var(--code-bg);
+      color: var(--code-fg);
+      border-radius: 12px;
+      padding: 16px 18px;
+      overflow: auto;
+      border: 1px solid #243044;
+    }
+    pre code { background: transparent; color: inherit; padding: 0; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
+    th, td { border: 1px solid var(--border); padding: 9px 10px; vertical-align: top; }
+    th { background: #edf2f7; text-align: left; }
+    tr:nth-child(even) td { background: #fafcff; }
+    .nav a{margin-right:12px;color:var(--accent)}
+    .lead {
+      background: var(--blue-light);
+      border-left: 5px solid var(--accent);
+      border-radius: 10px;
+      padding: 12px 14px;
+      color: #29415f;
+    }
+    .note {
+      background: var(--blue-light);
+      border-left: 5px solid var(--accent);
+      border-radius: 10px;
+      padding: 12px 14px;
+      color: #29415f;
+    }
+    .ok { background: var(--green-light); border-left: 5px solid var(--green); border-radius: 10px; padding: 12px 14px; }
+    .warn { background: var(--orange-light); border-left: 5px solid var(--orange); border-radius: 10px; padding: 12px 14px; }
+    .danger { background: var(--red-light); border-left: 5px solid var(--red); border-radius: 10px; padding: 12px 14px; }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 14px;
+      margin: 14px 0;
+    }
+    .card {
+      border: 1px solid var(--border);
+      border-left: 5px solid var(--primary);
+      border-radius: 12px;
+      padding: 14px;
+      background: #fff;
+    }
+    .card h3 { margin-top: 0; }
+    .card.green { border-left-color: var(--green); }
+    .card.orange { border-left-color: var(--orange); }
+    .card.purple { border-left-color: var(--purple); }
+    .card.red { border-left-color: var(--red); }
+    .flow {
+      background: #f8fafc;
+      border: 1px dashed var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+      color: #334155;
+    }
+    .diagram-wrap {
+      width: 100%;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: #fbfdff;
+      padding: 14px;
+      margin: 14px 0;
+    }
+    svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 14px 0 0;
+    }
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 10px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: #fff;
+      font-size: 13px;
+      color: var(--gray);
+    }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .blue { background: var(--accent); }
+    .green-dot { background: var(--green); }
+    .orange-dot { background: var(--orange); }
+    .purple-dot { background: var(--purple); }
+    .muted { color: var(--muted); }
+    footer {
+      margin-top: 30px;
+      padding-top: 18px;
+      color: var(--muted);
+      font-size: 13px;
+      border-top: 1px solid var(--border);
+    }
+    .svg-title { font: 700 18px sans-serif; fill: #2d3748; }
+    .svg-small { font: 12px sans-serif; fill: #4a5568; }
+    .svg-label { font: 700 13px sans-serif; fill: #2d3748; }
+    .svg-white { font: 700 13px sans-serif; fill: white; }
+    .svg-note { font: 11px sans-serif; fill: #4a5568; }
+    .svg-step { font: 700 12px sans-serif; fill: #2c5282; }
+    .box-shadow { filter: drop-shadow(0 4px 8px rgba(44, 82, 130, .12)); }
+    .lang-switch{position:absolute;top:14px;right:18px;z-index:20;background:rgba(255,255,255,.2);color:#fff;border:1px solid rgba(255,255,255,.5);border-radius:8px;padding:6px 12px;font-size:13px;font-weight:700;text-decoration:none;white-space:nowrap}
+    .lang-switch:hover{background:rgba(255,255,255,.35)}
+    @media print {
+      header { background: var(--primary); -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+      section { box-shadow: none; break-inside: avoid; }
+      .diagram-wrap { overflow: visible; }
+    }
+  </style>
+</head>
+<body>
+<header>
+  <a class="lang-switch" href="../EJIT_ARCHITECTURE.html">中文</a>
+  <h1>EJIT Architecture Diagrams</h1>
+  <p>EmbeddedJIT end-to-end architecture, AOT/JIT flow, synchronous compilation, asynchronous compilation, time-window lifecycle, runtime components, and bare-metal/SRE deployment diagrams. This document is pure HTML/SVG and can be opened offline.</p>
+</header>
+
+<main>
+  <div class="nav"><a href="index.html">← Doc index</a><a href="EJIT_USER_MANUAL.html">User manual</a><a href="EJIT_INTERNAL_PIPELINE.html">Internal pipeline</a></div>
+
+  <section id="overview">
+    <h2>1. Overall architecture</h2>
+    <p class="lead">EJIT's core goal: the user still calls the original function name; the AOT phase places the JIT-able function closure, time-window metadata, and wrapper into the binary; at runtime the wrapper looks up the cache, compiles, or falls back based on the current time-window instance.</p>
+    <div class="cards">
+      <div class="card">
+        <h3>Compile time</h3>
+        <p>Clang recognizes the <code>ejit_*</code> attributes and emits metadata; the AOT pass embeds bitcode, registers period/static, and inserts the wrapper and lifecycle logic.</p>
+      </div>
+      <div class="card green">
+        <h3>Runtime</h3>
+        <p>The wrapper computes the cache key at the function entry; on a cache hit it calls the specialized code directly; on a miss it enters the compile path in sync or async mode.</p>
+      </div>
+      <div class="card orange">
+        <h3>Synchronous compile</h3>
+        <p>On the first miss the current thread blocks to compile; once compilation succeeds it runs the JIT code immediately, and on failure falls back to the original AOT body.</p>
+      </div>
+      <div class="card purple">
+        <h3>Asynchronous compile</h3>
+        <p>On the first miss it submits a background task and falls back immediately; the worker publishes to the cache after compiling, and later calls hit the specialized code.</p>
+      </div>
+    </div>
+
+    <div class="diagram-wrap">
+      <svg width="1260" height="650" viewBox="0 0 1260 650" role="img" aria-label="EJIT end-to-end architecture diagram">
+        <defs>
+          <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#2c5282" /></marker>
+          <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#38a16f" /></marker>
+          <marker id="arrowOrange" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#dd6b20" /></marker>
+          <marker id="arrowPurple" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#6b46c1" /></marker>
+          <linearGradient id="gBlue" x1="0" x2="1"><stop offset="0" stop-color="#2c5282" /><stop offset="1" stop-color="#3182ce" /></linearGradient>
+          <linearGradient id="gGreen" x1="0" x2="1"><stop offset="0" stop-color="#2f855a" /><stop offset="1" stop-color="#38a16f" /></linearGradient>
+          <linearGradient id="gOrange" x1="0" x2="1"><stop offset="0" stop-color="#c05621" /><stop offset="1" stop-color="#dd6b20" /></linearGradient>
+          <linearGradient id="gPurple" x1="0" x2="1"><stop offset="0" stop-color="#553c9a" /><stop offset="1" stop-color="#805ad5" /></linearGradient>
+        </defs>
+
+        <text x="30" y="34" class="svg-title">EJIT End-to-End Architecture</text>
+
+        <rect x="35" y="70" width="220" height="155" rx="14" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" class="box-shadow" />
+        <text x="64" y="100" class="svg-label">User source</text>
+        <text x="62" y="128" class="svg-small">• ejit_may_const fields</text>
+        <text x="62" y="152" class="svg-small">• ejit_period/static</text>
+        <text x="62" y="176" class="svg-small">• ejit_period_arr + index</text>
+        <text x="62" y="200" class="svg-small">• ejit_entry / lifecycle</text>
+
+        <rect x="310" y="70" width="220" height="155" rx="14" fill="url(#gBlue)" class="box-shadow" />
+        <text x="338" y="100" class="svg-white">Clang frontend/CodeGen</text>
+        <text x="340" y="132" class="svg-white">Attribute Sema checks</text>
+        <text x="338" y="158" class="svg-white">emit !ejit.metadata</text>
+        <text x="338" y="184" class="svg-white">emit !ejit.may_const</text>
+
+        <rect x="585" y="60" width="290" height="205" rx="14" fill="#ffffff" stroke="#2c5282" stroke-width="2" class="box-shadow" />
+        <rect x="585" y="60" width="290" height="38" rx="14" fill="#2c5282" />
+        <text x="671" y="85" class="svg-white">AOT Pass Pipeline</text>
+        <text x="610" y="122" class="svg-small">PASS1: extract closure bitcode</text>
+        <text x="610" y="150" class="svg-small">O2/O3: standard opts</text>
+        <text x="610" y="178" class="svg-small">PASS2: register period/static</text>
+        <text x="610" y="206" class="svg-small">PASS3: insert wrapper</text>
+        <text x="610" y="234" class="svg-small">PASS4: lifecycle instrumentation</text>
+
+        <rect x="950" y="70" width="245" height="175" rx="14" fill="#f0fff4" stroke="#38a16f" stroke-width="2" class="box-shadow" />
+        <text x="994" y="102" class="svg-label">User program binary</text>
+        <text x="980" y="134" class="svg-small">• original AOT body</text>
+        <text x="980" y="160" class="svg-small">• wrapper entry logic</text>
+        <text x="980" y="186" class="svg-small">• __ejit_bitcode section</text>
+        <text x="980" y="212" class="svg-small">• __ejit_registry_* static tables</text>
+
+        <rect x="55" y="340" width="360" height="235" rx="18" fill="#ffffff" stroke="#d9dee6" stroke-width="2" class="box-shadow" />
+        <rect x="55" y="340" width="360" height="42" rx="18" fill="#2d3748" />
+        <text x="165" y="367" class="svg-white">Wrapper Hot Path</text>
+        <text x="88" y="415" class="svg-small">1. read period index from entry args</text>
+        <text x="88" y="443" class="svg-small">2. compute cacheKey = funcIdx + dims</text>
+        <text x="88" y="471" class="svg-small">3. check active/invalid state</text>
+        <text x="88" y="499" class="svg-small">4. query cache</text>
+        <text x="88" y="527" class="svg-small">5. hit → JIT dispatch; fail → fallback</text>
+
+        <rect x="465" y="340" width="310" height="235" rx="18" fill="#ffffff" stroke="#d9dee6" stroke-width="2" class="box-shadow" />
+        <rect x="465" y="340" width="310" height="42" rx="18" fill="url(#gOrange)" />
+        <text x="535" y="367" class="svg-white">Sync Compile Mode</text>
+        <text x="500" y="415" class="svg-small">on miss, current thread compiles</text>
+        <text x="500" y="443" class="svg-small">bitcode → param const → PASS6</text>
+        <text x="500" y="471" class="svg-small">LLVM opts → ORC/JITLink</text>
+        <text x="500" y="499" class="svg-small">publish cache entry</text>
+        <text x="500" y="527" class="svg-small">success: this call runs JIT</text>
+
+        <rect x="825" y="340" width="340" height="235" rx="18" fill="#ffffff" stroke="#d9dee6" stroke-width="2" class="box-shadow" />
+        <rect x="825" y="340" width="340" height="42" rx="18" fill="url(#gPurple)" />
+        <text x="913" y="367" class="svg-white">Async Compile Mode</text>
+        <text x="860" y="415" class="svg-small">on miss, submit task / dedup</text>
+        <text x="860" y="443" class="svg-small">current call falls back to AOT</text>
+        <text x="860" y="471" class="svg-small">worker compiles &amp; finalizes</text>
+        <text x="860" y="499" class="svg-small">atomic publish code ptr / bucket</text>
+        <text x="860" y="527" class="svg-small">later calls cache hit → JIT dispatch</text>
+
+        <line x1="255" y1="148" x2="310" y2="148" stroke="#2c5282" stroke-width="3" marker-end="url(#arrow)" />
+        <line x1="530" y1="148" x2="585" y2="148" stroke="#2c5282" stroke-width="3" marker-end="url(#arrow)" />
+        <line x1="875" y1="158" x2="950" y2="158" stroke="#38a16f" stroke-width="3" marker-end="url(#arrowGreen)" />
+        <path d="M1072 245 C1072 310, 255 300, 235 340" fill="none" stroke="#38a16f" stroke-width="3" marker-end="url(#arrowGreen)" />
+        <path d="M415 456 L465 456" fill="none" stroke="#dd6b20" stroke-width="3" marker-end="url(#arrowOrange)" />
+        <path d="M415 506 C560 615, 900 615, 995 575" fill="none" stroke="#6b46c1" stroke-width="3" marker-end="url(#arrowPurple)" />
+
+        <text x="36" y="620" class="svg-note">Key semantics: JIT is only an acceleration path; inactive, compile failure, out of memory, symbol resolution failure, and async pending must all safely fall back to the original AOT body.</text>
+      </svg>
+    </div>
+    <div class="legend">
+      <span><i class="dot blue"></i>Compile time</span>
+      <span><i class="dot green-dot"></i>Artifact / hot path</span>
+      <span><i class="dot orange-dot"></i>Sync compile</span>
+      <span><i class="dot purple-dot"></i>Async compile</span>
+    </div>
+  </section>
+
+  <section id="aot-pipeline">
+    <h2>2. AOT compile pipeline</h2>
+    <p>The AOT pipeline's job is to place both "the runnable original AOT program" and "the JIT input for runtime re-optimization" into the final binary. PASS1 must run as early as possible to prevent standard optimization from losing the raw metadata; PASS2-4 fill in the runtime-needed entry points in the late stage.</p>
+    <div class="diagram-wrap">
+      <svg width="1260" height="430" viewBox="0 0 1260 430" role="img" aria-label="EJIT AOT compile pipeline diagram">
+        <defs>
+          <marker id="aotArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#2c5282" /></marker>
+        </defs>
+        <text x="30" y="34" class="svg-title">AOT Pipeline</text>
+
+        <rect x="35" y="80" width="160" height="90" rx="12" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" />
+        <text x="73" y="112" class="svg-label">Clang IR</text>
+        <text x="58" y="138" class="svg-small">!ejit.metadata</text>
+        <text x="58" y="160" class="svg-small">!ejit.may_const</text>
+
+        <rect x="245" y="70" width="185" height="110" rx="12" fill="#fff7ed" stroke="#dd6b20" stroke-width="2" />
+        <text x="291" y="102" class="svg-label">PASS1</text>
+        <text x="268" y="128" class="svg-small">EJitRegisterBitcode</text>
+        <text x="268" y="152" class="svg-small">extract closure + embed bitcode</text>
+
+        <rect x="480" y="70" width="165" height="110" rx="12" fill="#f8fafc" stroke="#718096" stroke-width="2" />
+        <text x="518" y="102" class="svg-label">O2 / O3</text>
+        <text x="508" y="128" class="svg-small">standard opts</text>
+        <text x="508" y="152" class="svg-small">produce AOT code base</text>
+
+        <rect x="695" y="70" width="185" height="110" rx="12" fill="#f0fff4" stroke="#38a16f" stroke-width="2" />
+        <text x="742" y="102" class="svg-label">PASS2</text>
+        <text x="717" y="128" class="svg-small">EJitRegisterPeriod</text>
+        <text x="717" y="152" class="svg-small">generate period/static registry</text>
+
+        <rect x="930" y="70" width="185" height="110" rx="12" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" />
+        <text x="977" y="102" class="svg-label">PASS3</text>
+        <text x="958" y="128" class="svg-small">EJitWrapperGen</text>
+        <text x="958" y="152" class="svg-small">insert wrapper at entry</text>
+
+        <rect x="930" y="250" width="185" height="110" rx="12" fill="#f5f0ff" stroke="#6b46c1" stroke-width="2" />
+        <text x="977" y="282" class="svg-label">PASS4</text>
+        <text x="947" y="308" class="svg-small">EJitPeriodHandler</text>
+        <text x="947" y="332" class="svg-small">deactivate / activate instrumentation</text>
+
+        <rect x="455" y="250" width="380" height="110" rx="12" fill="#ffffff" stroke="#2c5282" stroke-width="2" />
+        <text x="560" y="282" class="svg-label">PASS5: EJitAotModulePass</text>
+        <text x="485" y="312" class="svg-small">coordinate PASS2 → PASS3 → PASS4; skip fast when no EJIT metadata</text>
+        <text x="485" y="338" class="svg-small">artifact: wrapper + registry + embedded bitcode + original AOT body</text>
+
+        <line x1="195" y1="125" x2="245" y2="125" stroke="#2c5282" stroke-width="3" marker-end="url(#aotArrow)" />
+        <line x1="430" y1="125" x2="480" y2="125" stroke="#2c5282" stroke-width="3" marker-end="url(#aotArrow)" />
+        <line x1="645" y1="125" x2="695" y2="125" stroke="#2c5282" stroke-width="3" marker-end="url(#aotArrow)" />
+        <line x1="880" y1="125" x2="930" y2="125" stroke="#2c5282" stroke-width="3" marker-end="url(#aotArrow)" />
+        <path d="M1022 180 L1022 250" fill="none" stroke="#2c5282" stroke-width="2.5" marker-end="url(#aotArrow)" />
+        <path d="M930 305 C880 305, 860 305, 835 305" fill="none" stroke="#2c5282" stroke-width="2.5" marker-end="url(#aotArrow)" />
+
+        <text x="36" y="400" class="svg-note">Non-LTO recommendation: PASS1 extracts bitcode early → O2/O3 → PASS2-4 late instrumentation. In LTO, ensure the registry/wrapper generation stage can still see the necessary metadata.</text>
+      </svg>
+    </div>
+    <table>
+      <thead><tr><th>Stage</th><th>Input</th><th>Output</th><th>Why it's needed</th></tr></thead>
+      <tbody>
+        <tr><td>PASS1</td><td>Raw IR with metadata</td><td><code>__ejit_bitcode</code> / function-closure bitcode</td><td>The runtime JIT needs intact, optimizable IR.</td></tr>
+        <tr><td>PASS2</td><td>period/static global metadata</td><td>Dynamic registration calls or a static registry table</td><td>The runtime needs to know which memory objects belong to which time window.</td></tr>
+        <tr><td>PASS3</td><td><code>ejit_entry</code> function metadata</td><td>Wrapper at the original function entry</td><td>The user does not change call sites; calling the original function name triggers JIT.</td></tr>
+        <tr><td>PASS4</td><td><code>ejit_period_lc</code> metadata</td><td>deactivate / activate instrumentation</td><td>Automatically invalidates the old cache when config changes, preserving may_const semantics.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="runtime-decision">
+    <h2>3. Runtime hot path and mode selection</h2>
+    <p>The wrapper hot path first does cheap checks: is the runtime initialized, is the time window active, is the cache hit. Only on a miss when JIT is allowed does it enter the sync or async path based on <code>ejit_config_t::compileMode</code>.</p>
+    <div class="flow">User calls the ejit_entry original function
+  ↓
+wrapper reads period index / computes cacheKey
+  ↓
+uninitialized / inactive / disabled? ── yes → fallback AOT
+  ↓ no
+cache hit? ── yes → call specialized function
+  ↓ no
+compileMode == SYNC ? ── yes → current thread compiles → run JIT on success, fallback on failure
+  ↓ no
+compileMode == ASYNC → submit background compile task → current call falls back → later calls hit</div>
+    <div class="cards">
+      <div class="card green">
+        <h3>Cache Key</h3>
+        <p>The typical layout is <code>funcIdx</code> + up to 4 dimension indices. The same function and the same time-window instance combination hit the same specialized code.</p>
+      </div>
+      <div class="card orange">
+        <h3>Version / invalidation</h3>
+        <p><code>deactivate</code> or lifecycle instrumentation marks the instance invalid and makes old cache entries no longer usable as valid specialized code.</p>
+      </div>
+      <div class="card purple">
+        <h3>Fallback principle</h3>
+        <p>Whether miss, pending, OOM, symbol failure, or compile failure, the wrapper must always be able to return to the original AOT body, preserving correctness.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="sync-compile">
+    <h2>4. Synchronous compile mode</h2>
+    <p><code>EJIT_COMPILE_SYNC</code> suits validation, debugging, and scenarios that can accept first-call latency. After a cache miss, the current business thread directly completes the JIT compile; on success this call runs the specialized code.</p>
+    <div class="diagram-wrap">
+      <svg width="1260" height="520" viewBox="0 0 1260 520" role="img" aria-label="EJIT synchronous compile flow diagram">
+        <defs>
+          <marker id="syncArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#dd6b20" /></marker>
+          <marker id="syncGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#38a16f" /></marker>
+          <marker id="syncRed" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#c53030" /></marker>
+        </defs>
+        <text x="30" y="34" class="svg-title">Synchronous Compile Path</text>
+
+        <rect x="40" y="80" width="170" height="86" rx="12" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" />
+        <text x="74" y="112" class="svg-label">Business thread</text>
+        <text x="70" y="140" class="svg-small">call ejit_entry</text>
+
+        <rect x="270" y="80" width="190" height="86" rx="12" fill="#fff" stroke="#2c5282" stroke-width="2" />
+        <text x="330" y="112" class="svg-label">Wrapper</text>
+        <text x="303" y="140" class="svg-small">cache miss</text>
+
+        <rect x="520" y="62" width="250" height="122" rx="14" fill="#fff7ed" stroke="#dd6b20" stroke-width="2" />
+        <text x="572" y="96" class="svg-label">compile on current thread</text>
+        <text x="548" y="126" class="svg-small">load bitcode + clone module</text>
+        <text x="548" y="152" class="svg-small">substitute dims / constants</text>
+
+        <rect x="830" y="62" width="245" height="122" rx="14" fill="#f5f0ff" stroke="#6b46c1" stroke-width="2" />
+        <text x="872" y="96" class="svg-label">JIT opt / codegen</text>
+        <text x="858" y="126" class="svg-small">InstCombine → Inline → PASS6</text>
+        <text x="858" y="152" class="svg-small">L1/L2/L3 → ORC/JITLink</text>
+
+        <rect x="595" y="270" width="230" height="90" rx="14" fill="#f0fff4" stroke="#38a16f" stroke-width="2" />
+        <text x="645" y="302" class="svg-label">publish cache entry</text>
+        <text x="630" y="330" class="svg-small">function pointer + code memory</text>
+
+        <rect x="915" y="270" width="230" height="90" rx="14" fill="#f0fff4" stroke="#38a16f" stroke-width="2" />
+        <text x="965" y="302" class="svg-label">this call runs JIT</text>
+        <text x="952" y="330" class="svg-small">return specialized result</text>
+
+        <rect x="270" y="270" width="210" height="90" rx="14" fill="#fff5f5" stroke="#c53030" stroke-width="2" />
+        <text x="330" y="302" class="svg-label">failure path</text>
+        <text x="300" y="330" class="svg-small">compile/link/OOM → fallback</text>
+
+        <rect x="40" y="395" width="1105" height="62" rx="14" fill="#f8fafc" stroke="#d9dee6" stroke-width="2" />
+        <text x="68" y="432" class="svg-note">Sync mode characteristics: higher first-miss latency, but intuitive call semantics; suits functional validation, IR dumps, confirming branch folding, and small-scale controllable hot functions.</text>
+
+        <line x1="210" y1="123" x2="270" y2="123" stroke="#dd6b20" stroke-width="3" marker-end="url(#syncArrow)" />
+        <line x1="460" y1="123" x2="520" y2="123" stroke="#dd6b20" stroke-width="3" marker-end="url(#syncArrow)" />
+        <line x1="770" y1="123" x2="830" y2="123" stroke="#dd6b20" stroke-width="3" marker-end="url(#syncArrow)" />
+        <path d="M952 184 C952 232, 825 232, 780 270" fill="none" stroke="#38a16f" stroke-width="3" marker-end="url(#syncGreen)" />
+        <line x1="825" y1="315" x2="915" y2="315" stroke="#38a16f" stroke-width="3" marker-end="url(#syncGreen)" />
+        <path d="M645 184 C645 235, 470 230, 405 270" fill="none" stroke="#c53030" stroke-width="2.8" marker-end="url(#syncRed)" />
+      </svg>
+    </div>
+    <table>
+      <thead><tr><th>Step</th><th>Action</th><th>On failure</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>After a wrapper miss, calls the sync branch of <code>ejit_compile_or_get</code></td><td>If the runtime is uninitialized or the instance is inactive, falls back directly</td></tr>
+        <tr><td>2</td><td>Loads the embedded bitcode and clones the module to optimize by <code>cacheKey</code></td><td>If the bitcode is not found, returns NULL</td></tr>
+        <tr><td>3</td><td>Substitutes the period index parameter, runs PASS6 to read the current may_const field value</td><td>Unanalyzable loads are conservatively skipped, with no correctness impact</td></tr>
+        <tr><td>4</td><td>Runs LLVM optimization and ORC/JITLink to produce machine code</td><td>Falls back on target backend, symbol, or memory failure</td></tr>
+        <tr><td>5</td><td>Publishes the cache entry and returns the function pointer to the wrapper</td><td>Falls back if the cache is full or publish fails</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="async-compile">
+    <h2>5. Asynchronous compile mode</h2>
+    <p><code>EJIT_COMPILE_ASYNC</code> suits latency-sensitive paths where the business thread cannot be blocked by the first JIT compile. On a cache miss, the wrapper only submits a background task and falls back immediately; the worker publishes the code after compiling, and later calls hit.</p>
+    <div class="diagram-wrap">
+      <svg width="1260" height="620" viewBox="0 0 1260 620" role="img" aria-label="EJIT asynchronous compile flow diagram">
+        <defs>
+          <marker id="asyncArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#6b46c1" /></marker>
+          <marker id="asyncGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#38a16f" /></marker>
+          <marker id="asyncOrange" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#dd6b20" /></marker>
+        </defs>
+        <text x="30" y="34" class="svg-title">Asynchronous Compile Path</text>
+
+        <rect x="50" y="80" width="230" height="120" rx="14" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" />
+        <text x="100" y="112" class="svg-label">Business thread call</text>
+        <text x="84" y="142" class="svg-small">wrapper cache miss</text>
+        <text x="84" y="168" class="svg-small">compileMode = ASYNC</text>
+
+        <rect x="350" y="80" width="235" height="120" rx="14" fill="#f5f0ff" stroke="#6b46c1" stroke-width="2" />
+        <text x="402" y="112" class="svg-label">submit compile task</text>
+        <text x="382" y="142" class="svg-small">MPSC queue / taskpool</text>
+        <text x="382" y="168" class="svg-small">dedup by cacheKey</text>
+
+        <rect x="660" y="80" width="230" height="120" rx="14" fill="#fff7ed" stroke="#dd6b20" stroke-width="2" />
+        <text x="710" y="112" class="svg-label">this call</text>
+        <text x="695" y="142" class="svg-small">fallback AOT now</text>
+        <text x="695" y="168" class="svg-small">do not wait for JIT</text>
+
+        <rect x="965" y="80" width="220" height="120" rx="14" fill="#f0fff4" stroke="#38a16f" stroke-width="2" />
+        <text x="1015" y="112" class="svg-label">later calls</text>
+        <text x="1000" y="142" class="svg-small">if cache published</text>
+        <text x="1000" y="168" class="svg-small">direct JIT dispatch</text>
+
+        <rect x="210" y="305" width="840" height="230" rx="18" fill="#ffffff" stroke="#d9dee6" stroke-width="2" class="box-shadow" />
+        <rect x="210" y="305" width="840" height="42" rx="18" fill="#2d3748" />
+        <text x="540" y="332" class="svg-white">Background Worker / Taskpool</text>
+
+        <rect x="245" y="375" width="150" height="74" rx="10" fill="#ebf2fa" stroke="#3182ce" />
+        <text x="288" y="405" class="svg-label">pop task</text>
+        <text x="268" y="428" class="svg-small">pop cacheKey</text>
+
+        <rect x="445" y="375" width="160" height="74" rx="10" fill="#fff7ed" stroke="#dd6b20" />
+        <text x="476" y="405" class="svg-label">load bitcode</text>
+        <text x="470" y="428" class="svg-small">clone module</text>
+
+        <rect x="655" y="375" width="160" height="74" rx="10" fill="#f5f0ff" stroke="#6b46c1" />
+        <text x="688" y="405" class="svg-label">optimize &amp; compile</text>
+        <text x="676" y="428" class="svg-small">PASS6 + ORC</text>
+
+        <rect x="865" y="375" width="150" height="74" rx="10" fill="#f0fff4" stroke="#38a16f" />
+        <text x="900" y="405" class="svg-label">publish code</text>
+        <text x="890" y="428" class="svg-small">atomic publish</text>
+
+        <rect x="340" y="500" width="585" height="50" rx="10" fill="#f8fafc" stroke="#d9dee6" />
+        <text x="365" y="531" class="svg-note">Failure or task disabled: record last_error / stats, cache not published; business calls are still kept correct by the AOT fallback.</text>
+
+        <line x1="280" y1="140" x2="350" y2="140" stroke="#6b46c1" stroke-width="3" marker-end="url(#asyncArrow)" />
+        <line x1="585" y1="140" x2="660" y2="140" stroke="#dd6b20" stroke-width="3" marker-end="url(#asyncOrange)" />
+        <path d="M468 200 C468 260, 320 260, 320 375" fill="none" stroke="#6b46c1" stroke-width="3" marker-end="url(#asyncArrow)" />
+        <line x1="395" y1="412" x2="445" y2="412" stroke="#6b46c1" stroke-width="2.8" marker-end="url(#asyncArrow)" />
+        <line x1="605" y1="412" x2="655" y2="412" stroke="#6b46c1" stroke-width="2.8" marker-end="url(#asyncArrow)" />
+        <line x1="815" y1="412" x2="865" y2="412" stroke="#38a16f" stroke-width="2.8" marker-end="url(#asyncGreen)" />
+        <path d="M940 375 C980 285, 1075 270, 1075 200" fill="none" stroke="#38a16f" stroke-width="3" marker-end="url(#asyncGreen)" />
+      </svg>
+    </div>
+    <div class="cards">
+      <div class="card purple">
+        <h3>Task dedup</h3>
+        <p>A miss for the same <code>cacheKey</code> needs only one background compile task; other calls keep falling back, preventing the queue from being filled by duplicate compiles.</p>
+      </div>
+      <div class="card orange">
+        <h3>Publish timing</h3>
+        <p>The worker publishes the function pointer to the cache only after JITLink, memory finalize, and any necessary I/D cache sync are complete.</p>
+      </div>
+      <div class="card green">
+        <h3>Latency</h3>
+        <p>The business thread bears only the enqueue and fallback cost, not the LLVM optimization and target codegen cost.</p>
+      </div>
+      <div class="card red">
+        <h3>Consistency</h3>
+        <p>If the time window is deactivated while the task is compiling, the version/state must be re-checked before publishing, to avoid publishing stale specialized code.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="jit-pipeline">
+    <h2>6. JIT optimization pipeline</h2>
+    <p>Sync and async modes share the same JIT optimization pipeline; only the triggering thread differs. PASS6's core task is to replace memory fields that are stable within the current time window with constants, then hand off to standard LLVM optimization to fold branches and delete dead code.</p>
+    <div class="flow">ModuleLoader
+  ↓
+parameter substitution: period index / static dim → LLVM constant
+  ↓
+InstCombine: GEP / cast / simple arithmetic folding
+  ↓
+Inline: expand cross-function config access into the JIT closure
+  ↓
+PASS6 EJitStructFieldPass: may_const load → current memory-value constant
+  ↓
+standard LLVM opts: SCCP / SimplifyCFG / DCE / GVN / InstCombine
+  ↓
+ORC LLJIT / JITLink: target codegen + symbol resolution + code memory finalize</div>
+    <table>
+      <thead><tr><th>Stage</th><th>Role</th><th>User-observable result</th></tr></thead>
+      <tbody>
+        <tr><td>Parameter substitution</td><td>Substitutes <code>ejit_period_arr_ind</code> parameters with the current instance constants</td><td>Array indices and GEP paths become foldable</td></tr>
+        <tr><td>Inline</td><td>Expands config reads in small functions into the entry closure</td><td>Cross-function config reads can also be recognized by PASS6</td></tr>
+        <tr><td>PASS6</td><td>Reads the <code>ejit_may_const</code> field value within the active time window and replaces the load</td><td>Loads become constants in the IR; branch conditions are fixed</td></tr>
+        <tr><td>Standard optimization</td><td>Constant propagation, branch folding, dead code elimination, CFG simplification</td><td>The dump IR shows only the current-config path retained</td></tr>
+        <tr><td>JITLink</td><td>Generates machine code, resolves external symbols, places it in executable memory</td><td>Cache entries increase; later hits increase</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="lifecycle">
+    <h2>7. Time-window lifecycle and cache invalidation</h2>
+    <p>The time window controls whether the JIT may treat a memory value as a constant. Whenever config may be modified, the old specialized code must be invalidated; after modification and re-activation, later misses recompile using the new value.</p>
+    <div class="diagram-wrap">
+      <svg width="980" height="370" viewBox="0 0 980 370" role="img" aria-label="Time-window lifecycle state machine">
+        <defs>
+          <marker id="lifeArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#2c5282" /></marker>
+          <marker id="lifeOrange" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#dd6b20" /></marker>
+        </defs>
+        <text x="30" y="34" class="svg-title">Period Lifecycle</text>
+
+        <circle cx="160" cy="155" r="70" fill="#f8fafc" stroke="#718096" stroke-width="3" />
+        <text x="124" y="150" class="svg-label">Inactive</text>
+        <text x="96" y="178" class="svg-small">not active, JIT disallowed</text>
+
+        <circle cx="490" cy="155" r="70" fill="#f0fff4" stroke="#38a16f" stroke-width="3" />
+        <text x="462" y="150" class="svg-label">Active</text>
+        <text x="418" y="178" class="svg-small">may_const readable as constant</text>
+
+        <circle cx="820" cy="155" r="70" fill="#fff7ed" stroke="#dd6b20" stroke-width="3" />
+        <text x="790" y="150" class="svg-label">Invalid</text>
+        <text x="762" y="178" class="svg-small">old cache unusable</text>
+
+        <path d="M230 155 L420 155" stroke="#2c5282" stroke-width="3" fill="none" marker-end="url(#lifeArrow)" />
+        <text x="275" y="132" class="svg-small">ejit_activate(name, idx)</text>
+
+        <path d="M560 155 L750 155" stroke="#dd6b20" stroke-width="3" fill="none" marker-end="url(#lifeOrange)" />
+        <text x="606" y="132" class="svg-small">ejit_deactivate(name, idx)</text>
+
+        <path d="M790 220 C700 310 590 310 510 225" stroke="#2c5282" stroke-width="3" fill="none" marker-end="url(#lifeArrow)" />
+        <text x="612" y="308" class="svg-small">re-activate after modification</text>
+
+        <rect x="100" y="270" width="760" height="48" rx="10" fill="#ebf2fa" stroke="#3182ce" />
+        <text x="132" y="300" class="svg-label">ejit_period_lc(name)</text>
+        <text x="292" y="300" class="svg-small">auto deactivate_array at entry; auto activate_array before every return.</text>
+      </svg>
+    </div>
+    <div class="warn">Async compilation especially needs version checks: the period version seen when the task started must still be valid at publish time; otherwise the compile result should be discarded to avoid stale constants entering the cache.</div>
+  </section>
+
+  <section id="runtime-components">
+    <h2>8. Runtime component responsibilities</h2>
+    <table>
+      <thead><tr><th>Component</th><th>Responsibility</th><th>Sync-mode concerns</th><th>Async-mode concerns</th></tr></thead>
+      <tbody>
+        <tr><td>RuntimeState / Registry</td><td>Holds period arrays, static vars, func index, and active state</td><td>Queries must be fast enough to avoid excessive hot-path overhead</td><td>State versioning must support pre-publish re-check</td></tr>
+        <tr><td>EJitCache</td><td>Stores specialized functions, code memory, and versions by cacheKey</td><td>After a miss the current thread can insert directly</td><td>Worker publish and business-thread reads need concurrent safety</td></tr>
+        <tr><td>CompileDriver</td><td>Loads bitcode, runs the JIT pipeline, calls ORC/JITLink</td><td>On failure returns NULL directly to the wrapper</td><td>On failure records to the task state; must not affect the business thread</td></tr>
+        <tr><td>TaskQueue / Dedup</td><td>Task queue and dedup table for async mode</td><td>Usually unused</td><td>Prevent duplicate enqueue of the same cacheKey; handle queue full</td></tr>
+        <tr><td>CodePool / MemoryMgr</td><td>Allocates, writes, and finalizes executable code memory</td><td>Immediately executable after compilation</td><td>Must finalize before publish; under SRE also needs I/D cache sync</td></tr>
+        <tr><td>Error / Stats</td><td>Records last_error, hits, misses, pending, evictions</td><td>Used to confirm whether this call ran JIT</td><td>Used to observe pending count, worker success rate, and fallback frequency</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="failure">
+    <h2>9. Fallback and failure handling</h2>
+    <p>EJIT's correctness boundary: a JIT failure must not change business semantics. The wrapper dispatches only after obtaining an executable, version-valid, signature-matching function pointer; otherwise it must execute the original AOT body.</p>
+    <div class="cards">
+      <div class="card red">
+        <h3>Direct fallback</h3>
+        <p>Runtime uninitialized, instance inactive, EJIT disabled, cacheKey invalid, or bitcode missing.</p>
+      </div>
+      <div class="card orange">
+        <h3>Compile-failure fallback</h3>
+        <p>LLVM optimization failure, JITLink failure, external symbol missing, target backend missing, or out of memory.</p>
+      </div>
+      <div class="card purple">
+        <h3>Async pending fallback</h3>
+        <p>When a task is already queued or compiling, the current call does not wait and continues with AOT; once published, later calls hit.</p>
+      </div>
+      <div class="card green">
+        <h3>Conservative skip</h3>
+        <p>PASS6 skips substitution for loads it cannot prove safe, volatile, or complex pointer origins — no correctness impact.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="deployment">
+    <h2>10. Bare-metal / SRE deployment architecture</h2>
+    <p>In an OS-less or SRE environment, EJIT must replace host dependencies: constructor registration, dynamic symbol lookup, the thread library, mmap/mprotect, and JIT executable-memory management.</p>
+    <div class="diagram-wrap">
+      <svg width="1260" height="560" viewBox="0 0 1260 560" role="img" aria-label="Bare-metal and SRE deployment architecture diagram">
+        <defs>
+          <marker id="bmArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#2c5282" /></marker>
+        </defs>
+        <text x="30" y="34" class="svg-title">Embedded / Bare-metal Deployment</text>
+
+        <rect x="40" y="82" width="245" height="170" rx="14" fill="#ffffff" stroke="#2c5282" stroke-width="2" class="box-shadow" />
+        <rect x="40" y="82" width="245" height="38" rx="14" fill="#2c5282" />
+        <text x="96" y="107" class="svg-white">Build / trim</text>
+        <text x="68" y="150" class="svg-small">• EJIT_TRIM_LLVM_BACKEND</text>
+        <text x="68" y="178" class="svg-small">• lipo merge → ejit.o</text>
+        <text x="68" y="206" class="svg-small">• no-op std/POSIX stubs</text>
+        <text x="68" y="234" class="svg-small">• custom linker script</text>
+
+        <rect x="355" y="82" width="245" height="170" rx="14" fill="#f0fff4" stroke="#38a16f" stroke-width="2" class="box-shadow" />
+        <rect x="355" y="82" width="245" height="38" rx="14" fill="#38a16f" />
+        <text x="406" y="107" class="svg-white">Static registry path</text>
+        <text x="383" y="150" class="svg-small">• __ejit_registry_bitcode[]</text>
+        <text x="383" y="178" class="svg-small">• __ejit_registry_period[]</text>
+        <text x="383" y="206" class="svg-small">• forceStaticRegistry</text>
+        <text x="383" y="234" class="svg-small">• init without global_ctors</text>
+
+        <rect x="670" y="82" width="245" height="170" rx="14" fill="#fff7ed" stroke="#dd6b20" stroke-width="2" class="box-shadow" />
+        <rect x="670" y="82" width="245" height="38" rx="14" fill="#dd6b20" />
+        <text x="738" y="107" class="svg-white">SRE CodePool</text>
+        <text x="698" y="150" class="svg-small">• fixed code pool</text>
+        <text x="698" y="178" class="svg-small">• seal executable pages</text>
+        <text x="698" y="206" class="svg-small">• enable_ex / cache sync</text>
+        <text x="698" y="234" class="svg-small">• avoid writing RX pages</text>
+
+        <rect x="985" y="82" width="225" height="170" rx="14" fill="#f5f0ff" stroke="#6b46c1" stroke-width="2" class="box-shadow" />
+        <rect x="985" y="82" width="225" height="38" rx="14" fill="#6b46c1" />
+        <text x="1048" y="107" class="svg-white">SRE Taskpool</text>
+        <text x="1013" y="150" class="svg-small">• single worker task</text>
+        <text x="1013" y="178" class="svg-small">• MPSC queue + dedup</text>
+        <text x="1013" y="206" class="svg-small">• bucket cache</text>
+        <text x="1013" y="234" class="svg-small">• async publish specialized code</text>
+
+        <rect x="180" y="345" width="890" height="120" rx="16" fill="#ffffff" stroke="#d9dee6" stroke-width="2" class="box-shadow" />
+        <rect x="180" y="345" width="890" height="38" rx="16" fill="#2d3748" />
+        <text x="535" y="370" class="svg-white">Target platform runtime</text>
+        <text x="220" y="414" class="svg-small">1. ejit_init reads the static registry / staged ctor data</text>
+        <text x="220" y="442" class="svg-small">2. register bitcode, period arrays, static vars, external symbols</text>
+        <text x="690" y="414" class="svg-small">3. allocate JIT code via CodePool</text>
+        <text x="690" y="442" class="svg-small">4. sync/async compile and publish code pointer</text>
+
+        <line x1="285" y1="168" x2="355" y2="168" stroke="#2c5282" stroke-width="3" marker-end="url(#bmArrow)" />
+        <line x1="600" y1="168" x2="670" y2="168" stroke="#2c5282" stroke-width="3" marker-end="url(#bmArrow)" />
+        <line x1="915" y1="168" x2="985" y2="168" stroke="#2c5282" stroke-width="3" marker-end="url(#bmArrow)" />
+        <path d="M478 252 C478 300 450 318 450 345" stroke="#2c5282" stroke-width="2.5" fill="none" marker-end="url(#bmArrow)" />
+        <path d="M793 252 C793 300 745 318 745 345" stroke="#2c5282" stroke-width="2.5" fill="none" marker-end="url(#bmArrow)" />
+        <path d="M1098 252 C1098 310 900 322 900 345" stroke="#2c5282" stroke-width="2.5" fill="none" marker-end="url(#bmArrow)" />
+
+        <text x="42" y="520" class="svg-note">Deployment keys: the registry section must not be GC'd; external symbols must be resolvable; JIT code memory must satisfy write, finalize, execute-permission, and I/D cache coherence requirements.</text>
+      </svg>
+    </div>
+  </section>
+
+  <section id="references">
+    <h2>11. Source / document entry points</h2>
+    <div class="cards">
+      <div class="card">
+        <h3>User manual</h3>
+        <p><a href="EJIT_USER_MANUAL.html">EJIT_USER_MANUAL.html</a></p>
+        <p class="muted">The complete user-facing steps, API, and troubleshooting guide.</p>
+      </div>
+      <div class="card green">
+        <h3>Requirements and overall design</h3>
+        <p><a href="../../SPEC4.md">SPEC4.md</a> / <a href="../../PLAN4.md">PLAN4.md</a></p>
+        <p class="muted">Time-window constants, the annotation API, and the AOT/JIT pipeline.</p>
+      </div>
+      <div class="card orange">
+        <h3>Pass design</h3>
+        <p><a href="../../PASS1_EJitRegisterBitcode.md">PASS1</a> ~ <a href="../../PASS7_EJitRuntime_OrcJITLink.md">PASS7</a></p>
+        <p class="muted">bitcode, period, wrapper, lifecycle, runtime, PASS6.</p>
+      </div>
+      <div class="card purple">
+        <h3>SRE / trimming</h3>
+        <p><a href="../../EJIT_SRE_CODE_POOL.md">CodePool</a> / <a href="../../EJIT_SRE_TASKPOOL.md">Taskpool</a> / <a href="../../EJIT_TRIM_LLVM_BACKEND.md">Trim</a></p>
+        <p class="muted">Bare-metal, minimal footprint, code memory, and async scheduling.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    Generated: 2026-06-27. This document is the EJIT architecture diagram description; for design details, refer to the design documents in the parent directory and the current source headers.
+  </footer>
+</main>
+</body>
+</html>
