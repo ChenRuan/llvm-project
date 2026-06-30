@@ -174,10 +174,10 @@ int main(int argc, char **argv) {
   // 4d. 单数组 period: legacy/taskpool 都应支持 array-level API.
   printf("\n--- 4d. activate_array (single-array period) ---\n");
   ejit_deactivate_all("single");
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  // The shared taskpool keys activation by (lifecycle, index) only and the owner
-  // elects dimTypes, so a producer-side single array may not resolve — it is
-  // clean-rejected. The AOT fallback still returns the correct value.
+#ifdef EJIT_SRE_TASKPOOL
+  // A taskpool build keys activation by (lifecycle, index) only, with no array
+  // identity, so array-level ops are clean-rejected (the "single" lifecycle has
+  // no JIT dimType to flip). The AOT fallback still returns the correct value.
   rc = ejit_activate_array("single", g_singleCfg, ci);
   T(rc != 0, "activate_array(single, &singleCfg, %u) clean-rejected: %d", ci, rc);
   T(!ejit_is_active("single", ci), "single[%u] unchanged (array op rejected)", ci);
