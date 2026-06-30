@@ -37,6 +37,10 @@ TARGET_LIBS = {
         "libLLVMAArch64CodeGen.a", "libLLVMAArch64Desc.a",
         "libLLVMAArch64Info.a", "libLLVMAArch64Utils.a",
     ],
+    "aarch64_be": [
+        "libLLVMAArch64CodeGen.a", "libLLVMAArch64Desc.a",
+        "libLLVMAArch64Info.a", "libLLVMAArch64Utils.a",
+    ],
 }
 
 COMMON_LIBS = [
@@ -98,9 +102,7 @@ def _find_objcopy(build_dir):
     llvm_oc = os.path.join(build_dir, "bin", "llvm-objcopy")
     if os.path.exists(llvm_oc):
         return llvm_oc, True
-    # GNU objcopy struggles with extended ELF (>65280 sections) from ld -r.
-    # Try it anyway; callers handle failure gracefully.
-    return "objcopy", False
+    return "llvm-objcopy", True
 
 
 def _try_strip_arm_mapping_symbols(merged_o, work_dir, build_dir):
@@ -179,7 +181,7 @@ def doit_extract(args):
 
     # Quick test object to drive the link
     test_o = os.path.join(work, "_test_main.o")
-    sp.run([CXX, "-x", "c", "-", "-O2", "-c", "-o", test_o],
+    sp.run([CXX, "-x", "c", "-", "-O2", "-fno-PIC", "-fno-PIE" , "-c", "-o", test_o],
            input=b"int main(){return 0;}", capture_output=True)
 
     libs = all_libs(arch)
@@ -205,7 +207,7 @@ def doit_extract(args):
         "-Wl,--print-map",
         "-Wl,--allow-multiple-definition",
         f"-Wl,--whole-archive", ejit_a, f"-Wl,--no-whole-archive",
-        *all_a.split(), "-lz", "-lpthread", "-ldl", test_o,
+        *all_a.split(), "-lpthread", "-Wl,-no-pie", "-ferror-limit=0", "-ldl", test_o,
         "-o", os.path.join(work, "_ref")
     ], capture_output=True, text=True)
     if r.returncode != 0:
@@ -346,7 +348,7 @@ def doit_gc_merge(args):
         "ejit_register_lifecycle", "ejit_register_funcindex",
         "ejit_taskpool_compile_or_get", "ejit_taskpool_release_read",
         "ejit_taskpool_set_instance_enabled", "ejit_taskpool_pending_count",
-        "ejit_taskpool_get_stats",
+        "ejit_taskpool_get_stats", "ejit_taskpool_print_stats", "ejit_taskpool_get_worker_core"
     ]
 
     defined = set()
@@ -442,7 +444,7 @@ def main():
     sub = p.add_subparsers(dest="mode", required=True)
 
     e = sub.add_parser("extract", help="Extract used .o -> single .a")
-    e.add_argument("--arch", required=True, choices=["x86", "aarch64"])
+    e.add_argument("--arch", required=True, choices=["x86", "aarch64", "aarch64_be"])
     e.add_argument("--build-dir", required=True, help="LLVM build directory")
     e.add_argument("--output", help="Output .a path")
     e.add_argument("--cxx", help="Override C++ compiler (default: build-dir/bin/clang++)")

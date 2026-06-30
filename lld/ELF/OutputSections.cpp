@@ -56,7 +56,13 @@ uint32_t OutputSection::getPhdrFlags() const {
 
 template <class ELFT>
 void OutputSection::writeHeaderTo(typename ELFT::Shdr *shdr) {
-  shdr->sh_entsize = entsize;
+  // For init_array/fini_array/preinit_array sections, if sh_entsize is 0,
+  // set it to the pointer size. This matches GNU ld behavior.
+  uint64_t es = entsize;
+  if (es == 0 && (type == SHT_INIT_ARRAY || type == SHT_FINI_ARRAY ||
+                  type == SHT_PREINIT_ARRAY))
+    es = ctx.arg.wordsize;
+  shdr->sh_entsize = es;
   shdr->sh_addralign = addralign;
   shdr->sh_type = type;
   shdr->sh_offset = offset;
