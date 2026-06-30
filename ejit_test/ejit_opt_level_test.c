@@ -27,7 +27,7 @@
 //===-- 外部 API ------------------------------------------------------------===//
 
 typedef enum { EJIT_OK = 0 } ejit_status_t;
-typedef enum { EJIT_COMPILE_SYNC = 0 } ejit_compile_mode_t;
+typedef enum { EJIT_COMPILE_SYNC = 0, EJIT_COMPILE_ASYNC = 1 } ejit_compile_mode_t;
 typedef enum { EJIT_OPT_L1 = 1, EJIT_OPT_L2 = 2, EJIT_OPT_L3 = 3 } ejit_opt_level_t;
 
 typedef struct {
@@ -47,6 +47,22 @@ extern ejit_status_t ejit_init(const ejit_config_t *cfg);
 extern void          ejit_shutdown(void);
 extern ejit_status_t ejit_activate(const char *name, unsigned char idx);
 extern ejit_status_t ejit_get_stats(ejit_stats_t *s);
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+typedef struct {
+  unsigned long long cacheHits, asyncCompiles, asyncEnqueues, alreadyPending;
+  unsigned long long queueFull, compileFailed, publishFailed, instanceDisabled;
+  unsigned readyEntries, pendingEntries, queueApproxSize, reserved;
+} ejit_taskpool_stats_t;
+extern unsigned ejit_taskpool_pending_count(void);
+extern int ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
+static void ejit_drain_taskpool(void) {
+  while (ejit_taskpool_pending_count() > 0)
+    ;
+}
+#else
+static void ejit_drain_taskpool(void) {}
+#endif
 
 //===-- 数据结构 -------------------------------------------------------------===//
 
@@ -141,7 +157,12 @@ int main(int argc, char **argv)
 
     // Init EJIT
     ejit_config_t c; memset(&c,0,sizeof(c));
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+    // Async mode so the shared taskpool worker starts during ejit_init.
+    c.compileMode=EJIT_COMPILE_ASYNC; c.optLevel=lv;
+#else
     c.compileMode=EJIT_COMPILE_SYNC; c.optLevel=lv;
+#endif
     c.maxCodeMemory=512*1024; c.maxDataMemory=256*1024;
     c.maxCacheEntries=64; c.maxCacheSize=1024*1024;
     if (ejit_init(&c)!=EJIT_OK) { printf("FAIL: ejit_init\n"); return 1; }
@@ -166,8 +187,15 @@ int main(int argc, char **argv)
         // power: 40+4*3=52, +6 if mimo
         exp += 52 + ((ci%2==0)?6:0);
 
+        ejit_drain_taskpool();
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+        ejit_taskpool_stats_t s; memset(&s,0,sizeof(s));
+        ejit_taskpool_get_stats(&s);
+        int isJit = (s.asyncCompiles > (size_t)t) ? 1 : 0;
+#else
         ejit_stats_t s; memset(&s,0,sizeof(s)); ejit_get_stats(&s);
         int isJit = (s.entryCount > (size_t)t) ? 1 : 0;
+#endif
 
         printf("[Test %d] ci=%u %s  result=%u expected=%u  ",
                t+1, ci, isJit?"[JIT]":"[AOT]", res, exp);
@@ -175,10 +203,21 @@ int main(int argc, char **argv)
         else { printf("[MISMATCH]\n"); failures++; }
     }
 
+    ejit_drain_taskpool();
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+    ejit_taskpool_stats_t sf; memset(&sf,0,sizeof(sf));
+    ejit_taskpool_get_stats(&sf);
+    printf("\nJIT: compiles=%llu hits=%llu  ",
+           (unsigned long long)sf.asyncCompiles,
+           (unsigned long long)sf.cacheHits);
+    if (sf.asyncCompiles > 0) printf("[ACTIVE]\n");
+    else { printf("[NOT ACTIVE]\n"); failures++; }
+#else
     ejit_stats_t sf; memset(&sf,0,sizeof(sf)); ejit_get_stats(&sf);
     printf("\nJIT: entries=%zu misses=%llu  ", sf.entryCount, sf.misses);
     if (sf.entryCount > 0) printf("[ACTIVE]\n");
     else { printf("[NOT ACTIVE]\n"); failures++; }
+#endif
 
     ejit_shutdown();
     printf("\n=== %s: %d failures ===\n", ln, failures);

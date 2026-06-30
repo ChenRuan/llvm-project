@@ -71,6 +71,18 @@ static int file_contains(const char *path, const char *pattern) {
   return strstr(buf, pattern) != NULL;
 }
 
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+// In a taskpool build the JIT compile (and therefore the IR dump) runs on the
+// async worker, so the dump files only exist after the in-flight compile has
+// drained. Spin until the taskpool has no pending work before inspecting files.
+static void ejit_drain_taskpool(void) {
+  while (ejit_taskpool_pending_count() > 0)
+    ;
+}
+#else
+static void ejit_drain_taskpool(void) {}
+#endif
+
 //===--- Main --------------------------------------------------------------===//
 
 int main(int argc, char **argv) {
@@ -97,7 +109,13 @@ int main(int argc, char **argv) {
 
   ejit_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  // Async mode so the shared taskpool worker starts during ejit_init and
+  // actually compiles (and dumps IR); a Sync init leaves the taskpool Off.
+  cfg.compileMode = EJIT_COMPILE_ASYNC;
+#else
   cfg.compileMode = EJIT_COMPILE_SYNC;
+#endif
   cfg.optLevel = EJIT_OPT_L2;
   cfg.dumpJITDir = dumpDir;
 
@@ -118,6 +136,7 @@ int main(int argc, char **argv) {
   ejit_clear_cache();
 
   int r1 = check_cell((uint8_t)cellIdx);
+  ejit_drain_taskpool();
   printf("  check_cell(%d) = %d\n", cellIdx, r1);
 
   // Verify files exist
@@ -165,6 +184,7 @@ int main(int argc, char **argv) {
   ejit_clear_cache();
 
   int r2 = simple_return((uint8_t)idx2);
+  ejit_drain_taskpool();
   printf("  simple_return(%d) = %d\n", idx2, r2);
 
   // Count dump files
@@ -193,6 +213,7 @@ int main(int argc, char **argv) {
   int before_count = file_count;
 
   int r3 = simple_return((uint8_t)idx2);
+  ejit_drain_taskpool();
   printf("  simple_return(%d) cached = %d\n", idx2, r3);
 
   snprintf(cmd, sizeof(cmd), "ls %s/*.ll 2>/dev/null | wc -l", dumpDir);
@@ -209,6 +230,7 @@ int main(int argc, char **argv) {
   printf("\n--- Test 4: Recompile after clear_cache ---\n");
   ejit_clear_cache();
   int r4 = simple_return((uint8_t)idx2);
+  ejit_drain_taskpool();
   printf("  simple_return(%d) recompiled = %d\n", idx2, r4);
 
   snprintf(cmd, sizeof(cmd), "ls %s/*.ll 2>/dev/null | wc -l", dumpDir);
