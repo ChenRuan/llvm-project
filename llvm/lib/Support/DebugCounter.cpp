@@ -147,14 +147,21 @@ struct DebugCounterOwner : DebugCounter {
 
   DebugCounterOwner() {
     // Our destructor uses the debug stream. By referencing it here, we
-    // ensure that its destructor runs after our destructor.
+    // ensure that its destructor runs after our destructor (prevents static
+    // deinitialization-order use-after-free). Freestanding builds have no
+    // debug stream, so the reference — and the destructor's print — are
+    // compiled out entirely there.
+#ifndef EJIT_FREESTANDING
     (void)dbgs();
+#endif
   }
 
   // Print information when destroyed, iff command line option is specified.
   ~DebugCounterOwner() {
+#ifndef EJIT_FREESTANDING
     if (ShouldPrintCounter)
       print(dbgs());
+#endif
   }
 };
 
