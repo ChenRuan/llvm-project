@@ -21,15 +21,34 @@ SECTIONS
 
   /* ── code ─────────────────────────────────────────────────────────── */
   .text           : { *(.text .text.* .gnu.linkonce.t.*) }
-  .rodata         : { *(.rodata .rodata.* .gnu.linkonce.r.*) }
+  .rodata         : {
+    *(.rodata .rodata.* .gnu.linkonce.r.*)
+    . = ALIGN(8);
+    __start_ejit_bitcode = .;
+    KEEP(*(.ejit_bitcode))
+    __stop_ejit_bitcode = .;
+
+    /* --- EmbeddedJIT period registry --- */
+    . = ALIGN(8);
+    __start_ejit_period = .;
+    KEEP(*(.ejit_period))
+    __stop_ejit_period = .;
+  }
   .data           : { *(.data .data.* .gnu.linkonce.d.*) }
   .bss            : { *(.bss .bss.* .gnu.linkonce.b.*) }
 
   /* ── init / fini ──────────────────────────────────────────────────── */
   .init           : { *(.init) }
   .fini           : { *(.fini) }
-  .init_array     : { *(.init_array .init_array.*) }
-  .fini_array     : { *(.fini_array .fini_array.*) }
+  .init_array : {
+      KEEP (*(SORT_BY_INIT_PRIORITY(.init_array.*)))
+      KEEP (*(.init_array))
+  }
+  .fini_array     : {
+    _fini_array_start = .;
+    *(.fini_array .fini_array.*)
+    _fini_array_end = .;
+  }
 
   /* ── C++ / unwind ─────────────────────────────────────────────────── */
   .eh_frame       : { *(.eh_frame .eh_frame.*) }

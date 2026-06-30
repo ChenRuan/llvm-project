@@ -633,6 +633,54 @@ ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out) {
   return EJIT_OK;
 #endif
 }
+
+void ejit_taskpool_print_stats() {
+  ejit_taskpool_stats_t s = {0};
+  ejit_taskpool_get_stats(&s);
+  EJIT_DIAG("stats_t:");
+  EJIT_DIAG("  cacheHits        = %llu",
+            static_cast<unsigned long long>(s.cacheHits));
+  EJIT_DIAG("  asyncCompiles    = %llu",
+            static_cast<unsigned long long>(s.asyncCompiles));
+  EJIT_DIAG("  asyncEnqueues    = %llu",
+            static_cast<unsigned long long>(s.asyncEnqueues));
+  EJIT_DIAG("  alreadyPending   = %llu",
+            static_cast<unsigned long long>(s.alreadyPending));
+  EJIT_DIAG("  queueFull        = %llu",
+            static_cast<unsigned long long>(s.queueFull));
+  EJIT_DIAG("  compileFailed    = %llu",
+            static_cast<unsigned long long>(s.compileFailed));
+  EJIT_DIAG("  publishFailed    = %llu",
+            static_cast<unsigned long long>(s.publishFailed));
+  EJIT_DIAG("  instanceDisabled = %llu",
+            static_cast<unsigned long long>(s.instanceDisabled));
+  EJIT_DIAG("  readyEntries     = %u", s.readyEntries);
+  EJIT_DIAG("  pendingEntries   = %u", s.pendingEntries);
+  EJIT_DIAG("  queueApproxSize  = %u", s.queueApproxSize);
+  EJIT_DIAG("  reserved         = %u", s.reserved);
+}
+
+// Sentinel returned when no owner core is elected (e.g. not initialized or the
+// shared taskpool has not bound state). Distinct from any valid core id.
+constexpr uint32_t kEJitInvalidOwnerCore = 0xFFFFFFFFu;
+
+uint32_t ejit_taskpool_get_worker_core() {
+  if (!gEJIT)
+    return kEJitInvalidOwnerCore;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
+  if (!sp)
+    return kEJitInvalidOwnerCore;
+  EJitSharedTaskPoolState *sp_state = sp->state();
+  if (!sp_state)
+    return kEJitInvalidOwnerCore;
+  return sp_state->ownerCoreId.loadAcquire();
+#else
+  // The single owner-worker model only exists in the shared taskpool build;
+  // a private per-instance taskpool has no cross-core owner to report.
+  return kEJitInvalidOwnerCore;
+#endif
+}
 #endif // EJIT_SRE_TASKPOOL
 
 } // extern "C"

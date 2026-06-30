@@ -5,6 +5,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include <cassert>
 #ifndef EJIT_FREESTANDING
 #include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
 #endif
@@ -425,19 +426,27 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
   // Validate the request: instanceIds must be encodable in the legacy 8-bit
   // cacheKey slots, and no two dims may share a dimType (a duplicated lifecycle
   // dimension).
-  SmallVector<uint32_t, 4> seenDimTypes;
+  uint32_t seenDimTypes[4] = {};
+  uint32_t seenCount = 0;
+
   for (uint32_t i = 0; i < req.numDims; ++i) {
     if (req.dims[i].instanceId > 255u) {
       EJIT_DIAG("compileNow reject func=%u: instanceId=%u > 255 (dim[%u])",
                 req.funcIndex, req.dims[i].instanceId, i);
       return nullptr;
     }
-    if (llvm::is_contained(seenDimTypes, req.dims[i].dimType)) {
-      EJIT_DIAG("compileNow reject func=%u: duplicate dimType=%u (dim[%u])",
-                req.funcIndex, req.dims[i].dimType, i);
-      return nullptr;
-    }
-    seenDimTypes.push_back(req.dims[i].dimType);
+
+    for (uint32_t j = 0; j < seenCount; ++j)
+      if (seenDimTypes[j] == req.dims[i].dimType) {
+        EJIT_DIAG("compileNow reject func=%u: duplicate dimType=%u (dim[%u])",
+                  req.funcIndex, req.dims[i].dimType, i);
+        return nullptr;
+      }
+
+    // seenDimTypes is fixed-size; the numDims > 4 guard above bounds the loop,
+    // but assert explicitly so a future caller change can't silently overflow.
+    assert(seenCount < 4 && "seenDimTypes overflow: numDims guard broken");
+    seenDimTypes[seenCount++] = req.dims[i].dimType;
   }
 
   // meta.dimTypes[i] is the explicit dimType slot the loader read back BY NAME
