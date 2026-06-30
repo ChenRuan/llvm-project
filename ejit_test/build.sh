@@ -80,6 +80,22 @@ LD_LLD="${BUILD_DIR}/bin/ld.lld"
 EJIT_RUNTIME="${BUILD_DIR}/lib/libLLVMEJIT.a"
 [[ -f "${EJIT_RUNTIME}" ]] || { echo "ERROR: libLLVMEJIT.a not found in ${BUILD_DIR}/lib/"; exit 1; }
 
+cmake_bool_is_on() {
+  local key="$1"
+  local cache="${BUILD_DIR}/CMakeCache.txt"
+  [[ -f "${cache}" ]] || return 1
+  grep -Eq "^${key}(:[^=]+)?=(ON|TRUE|1)$" "${cache}"
+}
+
+# Match test wrapper generation to the selected LLVMEJIT runtime. Taskpool
+# builds need the async wrapper ABI so funcIndex/lifecycle dimType fixups are
+# emitted into the test object (__ejit_dimtype_*, ejit_register_lifecycle).
+GLOBAL_COMPILE_FLAGS=""
+if cmake_bool_is_on "EJIT_SRE_TASKPOOL" ||
+   cmake_bool_is_on "EJIT_SRE_SHARED_TASKPOOL"; then
+  GLOBAL_COMPILE_FLAGS="-mllvm -ejit-wrapper-async"
+fi
+
 # Minimal .a set verified by link-then-test on 2026-05-25.
 # Core = EJIT's direct LINK_COMPONENTS + essential transitive deps
 # (OrcJIT needs OrcTargetProcess/RuntimeDyld/BitWriter,
@@ -232,7 +248,7 @@ build_one() {
 
   echo "  Compiling $(basename "${src}") ..."
   local extra_flags="${COMPILE_FLAGS[${name}]:-}"
-  "${CLANG}" -O2 ${INCLUDES} ${extra_flags} -c "${src}" -o "${obj}"
+  "${CLANG}" -O2 ${INCLUDES} ${GLOBAL_COMPILE_FLAGS} ${extra_flags} -c "${src}" -o "${obj}"
 
   # Compile any extra translation units (multi-TU tests) and link them all.
   local objs=("${obj}")
@@ -244,7 +260,7 @@ build_one() {
     fi
     echo "  Compiling ${extra} ..."
     local eobj; eobj=$(mktemp "${TMPDIR:-/tmp}/ejit_${name}_tu_XXXXXX.o")
-    "${CLANG}" -O2 ${INCLUDES} ${extra_flags} -c "${esrc}" -o "${eobj}"
+    "${CLANG}" -O2 ${INCLUDES} ${GLOBAL_COMPILE_FLAGS} ${extra_flags} -c "${esrc}" -o "${eobj}"
     objs+=("${eobj}")
   done
 
@@ -330,6 +346,9 @@ echo "Arch:    ${ARCH}"
 echo "Build:   ${BUILD_DIR}"
 echo "Output:  ${OUTDIR}"
 echo "Tests:   ${SELECTED[*]}"
+if [[ -n "${GLOBAL_COMPILE_FLAGS}" ]]; then
+  echo "Flags:   ${GLOBAL_COMPILE_FLAGS}"
+fi
 echo ""
 
 BUILD_FAILED=0
