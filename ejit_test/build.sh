@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Build all EJIT integration tests.
-# Usage: ./build.sh [--run] [--arch=x86|aarch64] [--analyze-deps] [--lipo=FILE] [<test>...]
+# Usage: ./build.sh [--run] [--arch=x86|aarch64] [--build-dir=DIR] [--analyze-deps] [--lipo=FILE] [<test>...]
 #   --run          Build and run all tests
 #   --arch=<arch>  Target architecture (default: auto-detect from build dirs)
+#   --build-dir=DIR Use a specific LLVM build dir instead of auto-detecting
 #   --analyze-deps Build & show which LLVM .a files were actually linked
 #   --lipo=<FILE>  Use a single lipo .o/.a (from lipo.py) instead of individual .a files
+#   --host-sre-stubs / --no-host-sre-stubs
+#                  Force-enable/disable Linux SRE platform stubs for local tests
 #   test_name      Build only the named test (without .c extension)
 #
 # Requires a release build (static libs): ./build.sh release <x86|aarch64>
@@ -14,11 +17,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 ARCH=""
+BUILD_DIR_OVERRIDE=""
 SELECTED=()
 DO_RUN=false
 ANALYZE_DEPS=false
 LIPO_FILE=""
 NO_STRIP=false
+HOST_SRE_STUBS="auto"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -26,9 +31,13 @@ while [[ $# -gt 0 ]]; do
     --analyze-deps) ANALYZE_DEPS=true ;;
     --arch=*)      ARCH="${1#--arch=}" ;;
     --arch)        ARCH="$2"; shift ;;
+    --build-dir=*) BUILD_DIR_OVERRIDE="${1#--build-dir=}" ;;
+    --build-dir)   BUILD_DIR_OVERRIDE="$2"; shift ;;
     --lipo=*)      LIPO_FILE="${1#--lipo=}" ;;
     --lipo)        LIPO_FILE="auto" ;;
     --no-strip)    NO_STRIP=true ;;
+    --host-sre-stubs) HOST_SRE_STUBS="on" ;;
+    --no-host-sre-stubs) HOST_SRE_STUBS="off" ;;
     *)             SELECTED+=("$1") ;;
   esac
   shift
@@ -47,7 +56,39 @@ find_build_dir() {
   return 1
 }
 
-if [[ -z "${ARCH}" ]]; then
+infer_arch_from_build_dir() {
+  local dir="$1"
+  local cache="${dir}/CMakeCache.txt"
+  if [[ -f "${cache}" ]]; then
+    if grep -Eq '^LLVM_TARGETS_TO_BUILD(:[^=]+)?=.*AArch64' "${cache}"; then
+      echo "aarch64"; return 0
+    fi
+    if grep -Eq '^LLVM_TARGETS_TO_BUILD(:[^=]+)?=.*X86' "${cache}"; then
+      echo "x86"; return 0
+    fi
+  fi
+  return 1
+}
+
+if [[ -n "${BUILD_DIR_OVERRIDE}" ]]; then
+  if [[ "${BUILD_DIR_OVERRIDE}" = /* ]]; then
+    BUILD_DIR="${BUILD_DIR_OVERRIDE}"
+  else
+    BUILD_DIR="${ROOT_DIR}/${BUILD_DIR_OVERRIDE}"
+  fi
+  if [[ ! -d "${BUILD_DIR}" ]]; then
+    echo "ERROR: build dir not found: ${BUILD_DIR}"
+    exit 1
+  fi
+  if [[ -z "${ARCH}" ]]; then
+    ARCH=$(infer_arch_from_build_dir "${BUILD_DIR}" || true)
+    if [[ -z "${ARCH}" ]]; then
+      echo "ERROR: cannot infer --arch from ${BUILD_DIR}/CMakeCache.txt"
+      echo "  Pass --arch=x86 or --arch=aarch64 explicitly."
+      exit 1
+    fi
+  fi
+elif [[ -z "${ARCH}" ]]; then
   for a in x86 aarch64; do
     BUILD_DIR=$(find_build_dir "$a" || true)
     if [[ -n "${BUILD_DIR}" ]]; then ARCH="$a"; break; fi
@@ -79,6 +120,37 @@ LD_LLD="${BUILD_DIR}/bin/ld.lld"
 
 EJIT_RUNTIME="${BUILD_DIR}/lib/libLLVMEJIT.a"
 [[ -f "${EJIT_RUNTIME}" ]] || { echo "ERROR: libLLVMEJIT.a not found in ${BUILD_DIR}/lib/"; exit 1; }
+
+cmake_bool_is_on() {
+  local key="$1"
+  local cache="${BUILD_DIR}/CMakeCache.txt"
+  [[ -f "${cache}" ]] || return 1
+  grep -Eq "^${key}(:[^=]+)?=(ON|TRUE|1)$" "${cache}"
+}
+
+# Match test wrapper generation to the selected LLVMEJIT runtime. Taskpool
+# builds need the async wrapper ABI so funcIndex/lifecycle dimType fixups are
+# emitted into the test object (__ejit_dimtype_*, ejit_register_lifecycle).
+GLOBAL_COMPILE_FLAGS=""
+if cmake_bool_is_on "EJIT_SRE_TASKPOOL" ||
+   cmake_bool_is_on "EJIT_SRE_SHARED_TASKPOOL"; then
+  GLOBAL_COMPILE_FLAGS="-mllvm -ejit-wrapper-async"
+fi
+
+USE_HOST_SRE_STUBS=false
+if [[ "${HOST_SRE_STUBS}" == "on" ]]; then
+  USE_HOST_SRE_STUBS=true
+elif [[ "${HOST_SRE_STUBS}" == "auto" ]]; then
+  if cmake_bool_is_on "EJIT_FREESTANDING" ||
+     cmake_bool_is_on "EJIT_SRE_CODE_POOL"; then
+    USE_HOST_SRE_STUBS=true
+  fi
+fi
+HOST_SRE_STUB_SRC="${SCRIPT_DIR}/ejit_host_sre_stub.cpp"
+if ${USE_HOST_SRE_STUBS} && [[ ! -f "${HOST_SRE_STUB_SRC}" ]]; then
+  echo "ERROR: host SRE stub source not found: ${HOST_SRE_STUB_SRC}"
+  exit 1
+fi
 
 # Minimal .a set verified by link-then-test on 2026-05-25.
 # Core = EJIT's direct LINK_COMPONENTS + essential transitive deps
@@ -232,10 +304,18 @@ build_one() {
 
   echo "  Compiling $(basename "${src}") ..."
   local extra_flags="${COMPILE_FLAGS[${name}]:-}"
-  "${CLANG}" -O2 ${INCLUDES} ${extra_flags} -c "${src}" -o "${obj}"
+  "${CLANG}" -O2 ${INCLUDES} ${GLOBAL_COMPILE_FLAGS} ${extra_flags} -c "${src}" -o "${obj}" ||
+    return 1
 
   # Compile any extra translation units (multi-TU tests) and link them all.
   local objs=("${obj}")
+  if ${USE_HOST_SRE_STUBS}; then
+    echo "  Compiling host SRE stubs ..."
+    local sobj; sobj=$(mktemp "${TMPDIR:-/tmp}/ejit_${name}_sre_stub_XXXXXX.o")
+    "${CXX}" -O2 ${INCLUDES} -c "${HOST_SRE_STUB_SRC}" -o "${sobj}" ||
+      return 1
+    objs+=("${sobj}")
+  fi
   for extra in ${EXTRA_SRCS[${name}]:-}; do
     local esrc="${SCRIPT_DIR}/${extra}"
     if [[ ! -f "${esrc}" ]]; then
@@ -244,7 +324,8 @@ build_one() {
     fi
     echo "  Compiling ${extra} ..."
     local eobj; eobj=$(mktemp "${TMPDIR:-/tmp}/ejit_${name}_tu_XXXXXX.o")
-    "${CLANG}" -O2 ${INCLUDES} ${extra_flags} -c "${esrc}" -o "${eobj}"
+    "${CLANG}" -O2 ${INCLUDES} ${GLOBAL_COMPILE_FLAGS} ${extra_flags} -c "${esrc}" -o "${eobj}" ||
+      return 1
     objs+=("${eobj}")
   done
 
@@ -265,7 +346,8 @@ build_one() {
       -Os -Wl,--gc-sections ${STRIP_FLAG} ${lds_flag} \
       "${LIPO_ABS}" \
       ${LINK_LIBS} \
-      "${objs[@]}" -o "${bin}"
+      "${objs[@]}" -o "${bin}" ||
+      return 1
   else
     "${CXX}" -fuse-ld="${LD_LLD}" \
       -Os -Wl,--gc-sections ${STRIP_FLAG} ${lds_flag} \
@@ -273,7 +355,8 @@ build_one() {
       ${OTHER_LIBS} \
       ${LINK_LIBS} \
       -Wl,-M \
-      "${objs[@]}" -o "${bin}" > "${map_file}" 2>&1
+      "${objs[@]}" -o "${bin}" > "${map_file}" 2>&1 ||
+      return 1
   fi
 
   echo -e "  ${GREEN}OK${NC}: ${bin}"
@@ -330,6 +413,12 @@ echo "Arch:    ${ARCH}"
 echo "Build:   ${BUILD_DIR}"
 echo "Output:  ${OUTDIR}"
 echo "Tests:   ${SELECTED[*]}"
+if [[ -n "${GLOBAL_COMPILE_FLAGS}" ]]; then
+  echo "Flags:   ${GLOBAL_COMPILE_FLAGS}"
+fi
+if ${USE_HOST_SRE_STUBS}; then
+  echo "Stubs:   host SRE platform"
+fi
 echo ""
 
 BUILD_FAILED=0
