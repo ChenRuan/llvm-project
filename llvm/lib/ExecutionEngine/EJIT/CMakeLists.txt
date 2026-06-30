@@ -64,12 +64,39 @@ set(EJIT_SOURCES
   EJitStructFieldPass.cpp
   EJitOptimizer.cpp
   EJitPassBuilder.cpp
+  EJitCodePool.cpp
+  EJitCodePoolMemoryManager.cpp
+  EJitSrePlatform.cpp
 )
 
 # EJitLogger has its own #ifndef EJIT_FREESTANDING no-op stubs, so always include it.
 list(APPEND EJIT_SOURCES
   EJitLogger.cpp
 )
+
+# SRE taskpool compile scheduler — only compiled into the library when enabled.
+# It uses no C++ threading facilities, so it is compatible with EJIT_FREESTANDING.
+if(EJIT_SRE_TASKPOOL)
+  list(APPEND EJIT_SOURCES
+    EJitTaskPool.cpp
+    EJitSreQueue.cpp
+    EJitWorker.cpp
+  )
+  if(EJIT_FREESTANDING)
+    list(APPEND EJIT_SOURCES EJitSreTask_sre.cpp)
+  else()
+    list(APPEND EJIT_SOURCES EJitSreTask_host.cpp)
+  endif()
+  # Cross-core shared taskpool (single shared worker owner) — only when enabled.
+  # POD shared state + injectable core-id seam; no C++ threading facilities, so
+  # it is compatible with EJIT_FREESTANDING.
+  if(EJIT_SRE_SHARED_TASKPOOL)
+    list(APPEND EJIT_SOURCES
+      EJitSharedTaskPool.cpp
+      EJitSharedPlatform.cpp
+    )
+  endif()
+endif()
 
 # Async/sync compiler — excluded in freestanding mode (single-threaded, no std::thread)
 if(NOT EJIT_FREESTANDING)
@@ -105,6 +132,20 @@ add_llvm_component_library(LLVMEJIT
 if(EJIT_DEFAULT_TARGET_TRIPLE)
   target_compile_definitions(LLVMEJIT PUBLIC
     EJIT_DEFAULT_TRIPLE="${EJIT_DEFAULT_TARGET_TRIPLE}")
+endif()
+
+# 4K-granular code-pool sealing. The only user of this macro is the SRE adapter
+# (EJitSrePlatform.cpp), so scope it to LLVMEJIT instead of a global
+# add_definitions — toggling it then does not recompile the whole LLVM tree.
+# Effective only when the SRE code pool itself is enabled.
+if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_CODE_POOL_4K_SEAL)
+endif()
+
+# EJIT_FREESTANDING must be visible in LLVMJITLink headers so that
+# std::promise / std::future usage is guarded (bare-metal has no <future>).
+if(EJIT_FREESTANDING)
+  target_compile_definitions(LLVMJITLink PUBLIC EJIT_FREESTANDING)
 endif()
 
 #===-- Minimal embedded runtime target -----------------------------------===#

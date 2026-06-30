@@ -557,6 +557,11 @@ set(LLVM_TARGETS_WITH_JIT X86 PowerPC AArch64 ARM Mips SystemZ)
 option(EJIT_TRIM_LLVM_BACKEND "Trim LLVM backend pieces used by EJIT: disable heavyweight debug info, GlobalISel, and optional AArch64 SME/SVE passes" OFF)
 if(EJIT_TRIM_LLVM_BACKEND)
   add_definitions(-DEJIT_TRIM_LLVM_BACKEND)
+  # When trimming for AArch64, exclude non-AArch64 JITLink/ELF backends.
+  # On X86 builds keep the X86 ELF dispatch intact.
+  if(LLVM_TARGETS_TO_BUILD STREQUAL "AArch64")
+    add_definitions(-DEJIT_TRIM_JITLINK_AARCH64_ONLY)
+  endif()
 endif()
 
 option(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL "Trim backend for bare-metal: exclude non-ELF formats, non-AArch64 targets, DWARF/CFI" OFF)
@@ -568,6 +573,161 @@ endif()
 option(EJIT_FREESTANDING "Build EJIT runtime for freestanding: no OS threads, no file I/O, no-op logging" OFF)
 if(EJIT_FREESTANDING)
   add_definitions(-DEJIT_FREESTANDING)
+endif()
+
+#===-- EmbeddedJIT SRE dedicated JIT code memory pool ----------------------===#
+# Route JIT machine-code memory through EmbeddedJIT's own 2MiB-aligned code
+# pools (instead of the default JITLink mmap/mprotect path), and seal each pool
+# to RX via the platform enable_ex primitive before a JIT function pointer is
+# handed back. Default OFF: upstream default behavior is unchanged.
+option(EJIT_SRE_CODE_POOL
+  "Use the EmbeddedJIT SRE 2MiB code pool + enable_ex sealing for JIT code memory" OFF)
+if(EJIT_SRE_CODE_POOL)
+  add_definitions(-DEJIT_SRE_CODE_POOL)
+  # enable_ex sealing is implied by the code pool; allow turning just the seal
+  # call off for bring-up/measurement while still routing code through pools.
+  add_definitions(-DEJIT_SRE_ENABLE_EX)
+endif()
+
+# Per-pool size in bytes (must be a multiple of the 2MiB enable_ex granularity).
+set(EJIT_SRE_CODE_POOL_SIZE "2097152" CACHE STRING
+  "EmbeddedJIT SRE code pool size in bytes (default 2MiB)")
+# SRE memory partition number (ptNo) handed to SRE_MemDbgAlloc.
+set(EJIT_SRE_CODE_POOL_PTNO "8" CACHE STRING
+  "EmbeddedJIT SRE code pool partition number (ptNo) for SRE_MemDbgAlloc")
+if(EJIT_SRE_CODE_POOL)
+  add_definitions(-DEJIT_SRE_CODE_POOL_SIZE=${EJIT_SRE_CODE_POOL_SIZE})
+  add_definitions(-DEJIT_SRE_CODE_POOL_PTNO=${EJIT_SRE_CODE_POOL_PTNO})
+  message(STATUS "EmbeddedJIT: SRE code pool enabled "
+                 "(size=${EJIT_SRE_CODE_POOL_SIZE}, ptNo=${EJIT_SRE_CODE_POOL_PTNO})")
+endif()
+
+# 4K-granular execute-permission sealing for the code pool. The target's large
+# page is still 2MiB (pools stay 2MiB-aligned), but the platform exposes
+# split_2m_to_4k() to break a 2MiB window into 4K mappings and enable_ex() then
+# flips execute permission per 4KiB page. With this ON the pool seals only the
+# 4K pages a finalized function actually covers (instead of a whole 2MiB pool),
+# which is much more memory efficient. Single boolean — no extra numeric knobs;
+# the 2MiB / 4KiB values are baked-in platform constants. Effective only when
+# EJIT_SRE_CODE_POOL is ON; default ON because the code pool targets the SRE
+# platform whose execute-permission interface is now 4K-granular.
+#
+# The -DEJIT_CODE_POOL_4K_SEAL definition is applied narrowly to the LLVMEJIT
+# target (its only user is the SRE adapter EJitSrePlatform.cpp), in
+# llvm/lib/ExecutionEngine/EJIT/CMakeLists.txt, rather than globally — so
+# toggling it does not recompile the whole tree.
+option(EJIT_CODE_POOL_4K_SEAL
+  "Seal JIT code execute permission per 4KiB page (split_2m_to_4k + enable_ex) instead of per 2MiB pool" ON)
+if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
+  message(STATUS "EmbeddedJIT: SRE code pool uses 4K-granular page sealing")
+endif()
+
+#===-- EmbeddedJIT SRE taskpool compile scheduler -------------------------===#
+# Route ejit_compile_or_get through a unified taskpool (cache + dedup + queue)
+# instead of calling the synchronous compile driver directly. Sync and async
+# share the same cache/dedup pipeline; async means "producer + explicit poll
+# worker", never an EJIT-owned thread (the target aarch64_be SRE platform has
+# no C++ thread library). Default OFF: upstream default behavior is unchanged.
+option(EJIT_SRE_TASKPOOL
+  "Enable the EmbeddedJIT SRE taskpool compile scheduler for ejit_compile_or_get" OFF)
+if(EJIT_SRE_TASKPOOL)
+  add_definitions(-DEJIT_SRE_TASKPOOL)
+endif()
+
+# Number of dedup/cache buckets (bucket = funcIndex % N). 32 spreads contention
+# instead of degenerating to a single funcIndex%32 flag.
+set(EJIT_SRE_TASKPOOL_BUCKETS "32" CACHE STRING
+  "EmbeddedJIT SRE taskpool dedup/cache bucket count")
+# Async work-queue capacity (rounded up to a power of two).
+set(EJIT_SRE_TASKPOOL_QUEUE_CAPACITY "1024" CACHE STRING
+  "EmbeddedJIT SRE taskpool async queue capacity (power of two)")
+# Flat dedup table capacity = max dense funcIndex (spec §3.5 inFlight_[]).
+set(EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX "4096" CACHE STRING
+  "EmbeddedJIT SRE taskpool flat dedup capacity (max dense funcIndex)")
+# Single source of truth for the worker task stack size (bytes). The worker —
+# shared OR per-instance — runs LLVM optimize/codegen/ORC/JITLink on its OWN
+# stack via EJitSreTask, so this drives the platform SRE_TaskCreate stack too
+# (EJitSreTask_sre.cpp consumes the SAME macro). 1 MiB is only a DEFAULT; every
+# platform MUST measure the worker stack peak and tune it.
+set(EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE "1048576" CACHE STRING
+  "EmbeddedJIT taskpool worker task stack size in bytes (default only)")
+if(EJIT_SRE_TASKPOOL)
+  add_definitions(-DEJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS})
+  add_definitions(-DEJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY})
+  add_definitions(-DEJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX})
+  add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE})
+  message(STATUS "EmbeddedJIT: SRE taskpool enabled "
+                 "(buckets=${EJIT_SRE_TASKPOOL_BUCKETS}, "
+                 "queue=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}, "
+                 "maxFuncIndex=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}, "
+                 "workerStack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE})")
+endif()
+
+#===-- EmbeddedJIT cross-core SHARED taskpool -----------------------------===#
+# Layer a single, cross-core-shared taskpool state + single worker owner on top
+# of EJIT_SRE_TASKPOOL: many cores produce into one shared queue/dedup/cache and
+# exactly one core (elected by CAS) runs the JIT worker. Default OFF, so the
+# default and the plain EJIT_SRE_TASKPOOL builds are byte-for-byte unchanged. It
+# requires EJIT_SRE_TASKPOOL (it reuses the request/identity model and macros).
+option(EJIT_SRE_SHARED_TASKPOOL
+  "Enable the EmbeddedJIT cross-core shared taskpool (single shared worker owner)" OFF)
+# Fixed cache slots per bucket in the shared POD cache (no std::unordered_map can
+# live in shared memory, so each bucket is a fixed slot array).
+set(EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS "16" CACHE STRING
+  "EmbeddedJIT shared taskpool fixed cache slots per bucket")
+# Cross-core fnPtr sharing capability (spec §11). DEFAULT OFF: a non-owner core
+# cleanly falls back instead of reading a cache fnPtr. Turn ON only when the
+# platform GUARANTEES: same address space, the code pool mapped at the SAME VA
+# on every core, permissions sealed (enable_ex) before publish, and cross-core
+# I/D-cache coherence for execution. Wrongly enabling it can execute an illegal
+# address or run stale I-cache.
+option(EJIT_SRE_SHARED_CODE_POINTERS
+  "Allow non-owner cores to read shared cache fnPtrs (requires platform same-VA + cache coherence)" OFF)
+# Section attribute placing the shared state blob into inter-core shared memory.
+# Empty on host (one address space already). Override per platform, e.g.
+#   -DEJIT_SHARED_SECTION_ATTR=__attribute__((section(\".ejit_shared\")))
+set(EJIT_SHARED_SECTION_ATTR "" CACHE STRING
+  "Attribute placing the shared taskpool state into inter-core shared memory")
+if(EJIT_SRE_SHARED_TASKPOOL)
+  if(NOT EJIT_SRE_TASKPOOL)
+    message(FATAL_ERROR "EJIT_SRE_SHARED_TASKPOOL requires EJIT_SRE_TASKPOOL=ON")
+  endif()
+  add_definitions(-DEJIT_SRE_SHARED_TASKPOOL)
+  add_definitions(-DEJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS=${EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS})
+  if(EJIT_SHARED_SECTION_ATTR)
+    add_definitions("-DEJIT_SHARED_SECTION=${EJIT_SHARED_SECTION_ATTR}")
+    set(_ejit_shared_section "${EJIT_SHARED_SECTION_ATTR}")
+  else()
+    set(_ejit_shared_section "<empty: ordinary .bss, NOT inter-core shared>")
+    # On a real freestanding/multi-core target an empty section attribute means
+    # the state lands in ordinary per-image .bss, so cores do NOT actually share
+    # one blob — defeating the whole design. Refuse to let that pass silently.
+    if(EJIT_FREESTANDING)
+      message(FATAL_ERROR
+        "EJIT_SRE_SHARED_TASKPOOL + EJIT_FREESTANDING requires a non-empty "
+        "EJIT_SHARED_SECTION_ATTR placing the shared state into inter-core "
+        "shared memory (e.g. "
+        "-DEJIT_SHARED_SECTION_ATTR=__attribute__\\(\\(section\\(\\\".ejit_shared\\\"\\)\\)\\) ). "
+        "Without it the shared state is NOT cross-core shared.")
+    endif()
+  endif()
+  # Real cross-core platform path: bind EJitCoreId::current() to the declared-
+  # only platform symbol ejit_sre_current_core_id (NO weak fallback — a missing
+  # strong definition is a link error). Host/unit-test builds (not freestanding)
+  # keep the settable simulated core id.
+  if(EJIT_FREESTANDING)
+    add_definitions(-DEJIT_SRE_SHARED_TASKPOOL_PLATFORM)
+  endif()
+  # Cross-core fnPtr sharing capability (only meaningful with the shared pool).
+  if(EJIT_SRE_SHARED_CODE_POINTERS)
+    add_definitions(-DEJIT_SRE_SHARED_CODE_POINTERS)
+  endif()
+  message(STATUS "EmbeddedJIT: cross-core shared taskpool enabled "
+                 "(cacheSlots=${EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS}, "
+                 "workerStack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}, "
+                 "platformCoreId=${EJIT_FREESTANDING}, "
+                 "codePointers=${EJIT_SRE_SHARED_CODE_POINTERS}, "
+                 "sharedSection=${_ejit_shared_section})")
 endif()
 
 set(LLVM_TARGETS_TO_BUILD "all"
