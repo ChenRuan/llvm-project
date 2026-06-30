@@ -324,7 +324,7 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   // 1. Parameter check.
   if ((numDims > 0 && !dims) || numDims > 4) {
     EJIT_DIAG("taskpool reject func=%u: invalid dims ptr=%p count=%u",
-              funcIndex, dims, numDims);
+              funcIndex, static_cast<const void *>(dims), numDims);
     R.status = EJitCompileOrGetStatus::InvalidParam;
     return R;
   }
