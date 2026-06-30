@@ -22,7 +22,7 @@ bool EJitModuleLoader::registerBitcode(const std::string &funcName,
   // ejit_init (never builds a half-registered taskpool).
   if (!data || size == 0) {
     EJIT_DIAG("bitcode register reject name=%s data=%p size=%zu",
-              funcName.c_str(), data, size);
+              funcName.c_str(), static_cast<const void *>(data), size);
     return false;
   }
   // Dense, order-independent funcIndex assigned ONCE by name in the process-
@@ -63,7 +63,7 @@ bool EJitModuleLoader::registerBitcode(const std::string &funcName,
   E.size = size;
   entriesByFuncIdx_.emplace(idx, std::move(E));
   EJIT_DIAG("bitcode registered name=%s idx=%u data=%p size=%zu",
-            funcName.c_str(), idx, data, size);
+            funcName.c_str(), idx, static_cast<const void *>(data), size);
   return true;
 }
 
@@ -93,14 +93,19 @@ EJitModuleLoader::getOrCacheFuncMeta(uint32_t funcIdx) {
   if (it != funcMetaCache_.end())
     return it->second;
 
+  EJIT_DIAG("getOrCacheFuncMeta: building meta for funcIdx=%u", funcIdx);
   FuncMeta &meta = funcMetaCache_[funcIdx];
   auto Eit = entriesByFuncIdx_.find(funcIdx);
-  if (Eit == entriesByFuncIdx_.end())
+  if (Eit == entriesByFuncIdx_.end()) {
+    EJIT_DIAG("getOrCacheFuncMeta FAIL funcIdx=%u: not registered", funcIdx);
     return meta;
+  }
   const std::string FuncName = Eit->second.funcName;
 
   auto bitcode = getBitcodeByFuncIdx(funcIdx);
   if (!bitcode) {
+    EJIT_DIAG("getOrCacheFuncMeta FAIL funcIdx=%u func=%s: bitcode lookup error",
+              funcIdx, FuncName.c_str());
     consumeError(bitcode.takeError());
     return meta;
   }
@@ -110,6 +115,8 @@ EJitModuleLoader::getOrCacheFuncMeta(uint32_t funcIdx) {
       *bitcode, "meta_" + std::to_string(funcIdx) + ".bc");
   auto MOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *Ctx);
   if (!MOrErr) {
+    EJIT_DIAG("getOrCacheFuncMeta FAIL funcIdx=%u func=%s: parse bitcode error",
+              funcIdx, FuncName.c_str());
     consumeError(MOrErr.takeError());
     return meta;
   }

@@ -5,6 +5,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include <cassert>
 #ifndef EJIT_FREESTANDING
 #include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
 #endif
@@ -38,11 +39,54 @@ bool taskpoolCompileThunk(void *ctx, const EJitCompileRequest &req,
 }
 
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-bool sharedPrepareCodeThunk(void * /*ctx*/, const void *fnPtr) {
+[[maybe_unused]] bool sharedPrepareCodeThunk(void * /*ctx*/,
+                                             const void *fnPtr) {
 #ifdef EJIT_SRE_CODE_POOL
   return prepareSreCodeForCurrentCore(fnPtr);
 #else
   (void)fnPtr;
+  return false;
+#endif
+}
+
+// Owner-private: resolve a freshly compiled pointer to its real, finalized
+// executable range + owning pool (from the code-pool allocation metadata) so it
+// can be published into the shared cache slot for cross-core 4K sealing.
+[[maybe_unused]] bool sharedCodeRangeThunk(void *ctx, const void *fnPtr,
+                                           EJitCompiledCodeInfo *outInfo) {
+#ifdef EJIT_SRE_CODE_POOL
+  auto *drv = static_cast<EJitCompileDriver *>(ctx);
+  EJitOrcEngine *eng = drv->getSyncEngine();
+  if (eng && outInfo)
+    return eng->findCodeRange(fnPtr, *outInfo);
+  return false;
+#else
+  (void)ctx;
+  (void)fnPtr;
+  (void)outInfo;
+  return false;
+#endif
+}
+
+// Per-core platform primitives wrapped so the shared taskpool core never names
+// an SRE symbol directly (spec §7). Both are no-ops returning false when the
+// code pool / seal support is not built.
+[[maybe_unused]] bool sharedSplitPoolThunk(void * /*ctx*/, uintptr_t poolBase,
+                                           uint64_t poolSize) {
+#ifdef EJIT_SRE_CODE_POOL
+  return ejitSreSplitPoolForCurrentCore(poolBase, poolSize);
+#else
+  (void)poolBase;
+  (void)poolSize;
+  return false;
+#endif
+}
+
+[[maybe_unused]] bool sharedSealPageThunk(void * /*ctx*/, uintptr_t pageVA) {
+#ifdef EJIT_SRE_CODE_POOL
+  return ejitSreSealPageForCurrentCore(pageVA);
+#else
+  (void)pageVA;
   return false;
 #endif
 }
@@ -104,9 +148,26 @@ EJitCompileDriver::EJitCompileDriver(const Config &config, EJitCache &cache,
   // EJIT_SRE_SHARED_CODE_POINTERS (default OFF -> clean fallback for non-owner
   // cores). Only the platform may assert same-VA + sealed + I/D-cache-coherent
   // code (spec §11); we never auto-detect it.
+#ifdef EJIT_SRE_CODE_POOL
+  // Owner side (always useful when a code pool exists): resolve each compiled
+  // pointer to its real executable range so the published cache slot carries
+  // the extent a peer must seal. Harmless when sharing is off (no peer reads
+  // it).
+  sharedPool_.setCodeRangeProvider(&sharedCodeRangeThunk, this);
+#endif
 #ifdef EJIT_SRE_SHARED_CODE_POINTERS
   sharedPool_.setCodeSharingEnabled(true);
+#ifdef EJIT_CODE_POOL_4K_SEAL
+  // 4K page seal: a non-owner core splits its 2MiB pool once and then seals
+  // exactly the 4KiB pages the code covers, in its own translation context.
+  sharedPool_.setSealMode(true);
+  sharedPool_.setSplitPoolCallback(&sharedSplitPoolThunk, this);
+  sharedPool_.setSealPageCallback(&sharedSealPageThunk, this);
+#else
+  // Legacy whole-2MiB-pool seal: align fnPtr to its pool base and enable_ex.
+  sharedPool_.setSealMode(false);
   sharedPool_.setPrepareCodeCallback(&sharedPrepareCodeThunk, this);
+#endif
 #else
   sharedPool_.setCodeSharingEnabled(false);
 #endif
@@ -127,10 +188,13 @@ bool EJitCompileDriver::sharedWorkerStart(
     uint64_t *outTaskId) {
   auto *drv = static_cast<EJitCompileDriver *>(ctx);
   if (!EJitSreTask::create(drv->sharedWorkerTask_, entry, entryCtx,
-                           "ejit-shared-worker"))
+                           "ejit-shared-worker")) {
+    EJIT_DIAG("shared worker start FAILED: SRE task create rejected");
     return false;
+  }
   if (outTaskId)
     *outTaskId = 1; // host has no numeric task id; diagnostic only.
+  EJIT_DIAG("shared worker started");
   return true;
 }
 
@@ -152,17 +216,32 @@ bool EJitCompileDriver::startSharedTaskPool() {
   sharedPool_.setRegistrationFingerprint(
       EJitFuncRegistry::instance().fingerprint() * 0x9e3779b97f4a7c15ULL ^
       EJitLifecycleRegistry::instance().fingerprint());
-  switch (sharedPool_.init()) {
+  EJitSharedTaskPool::InitResult r = sharedPool_.init();
+  switch (r) {
   case EJitSharedTaskPool::InitResult::BecameOwner:
+    EJIT_DIAG("shared taskpool init: became owner");
+    return true;
   case EJitSharedTaskPool::InitResult::AttachedReady:
+    EJIT_DIAG("shared taskpool init: attached ready");
     return true;
   case EJitSharedTaskPool::InitResult::OwnerFailed:
+    EJIT_DIAG("shared taskpool init FAILED: owner worker start failed");
+    return false;
   case EJitSharedTaskPool::InitResult::InitInProgress:
+    EJIT_DIAG("shared taskpool init FAILED: peer still initializing");
+    return false;
   case EJitSharedTaskPool::InitResult::AbiMismatch:
+    EJIT_DIAG("shared taskpool init FAILED: ABI mismatch (magic/version/size)");
+    return false;
   case EJitSharedTaskPool::InitResult::FingerprintMismatch:
+    EJIT_DIAG("shared taskpool init FAILED: registration fingerprint mismatch");
+    return false;
   case EJitSharedTaskPool::InitResult::NoState:
+    EJIT_DIAG("shared taskpool init FAILED: no shared state bound");
     return false;
   }
+  EJIT_DIAG("shared taskpool init FAILED: unknown result=%u",
+            static_cast<unsigned>(r));
   return false;
 }
 #endif
@@ -337,19 +416,37 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
 
 #ifdef EJIT_SRE_TASKPOOL
 void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
-  if (req.numDims > 4)
+  EJIT_DIAG("compileNow begin func=%u dims=%u", req.funcIndex, req.numDims);
+  if (req.numDims > 4) {
+    EJIT_DIAG("compileNow reject func=%u: numDims=%u > 4", req.funcIndex,
+              req.numDims);
     return nullptr;
+  }
 
   // Validate the request: instanceIds must be encodable in the legacy 8-bit
   // cacheKey slots, and no two dims may share a dimType (a duplicated lifecycle
   // dimension).
-  SmallVector<uint32_t, 4> seenDimTypes;
+  uint32_t seenDimTypes[4] = {};
+  uint32_t seenCount = 0;
+
   for (uint32_t i = 0; i < req.numDims; ++i) {
-    if (req.dims[i].instanceId > 255u)
+    if (req.dims[i].instanceId > 255u) {
+      EJIT_DIAG("compileNow reject func=%u: instanceId=%u > 255 (dim[%u])",
+                req.funcIndex, req.dims[i].instanceId, i);
       return nullptr;
-    if (llvm::is_contained(seenDimTypes, req.dims[i].dimType))
-      return nullptr;
-    seenDimTypes.push_back(req.dims[i].dimType);
+    }
+
+    for (uint32_t j = 0; j < seenCount; ++j)
+      if (seenDimTypes[j] == req.dims[i].dimType) {
+        EJIT_DIAG("compileNow reject func=%u: duplicate dimType=%u (dim[%u])",
+                  req.funcIndex, req.dims[i].dimType, i);
+        return nullptr;
+      }
+
+    // seenDimTypes is fixed-size; the numDims > 4 guard above bounds the loop,
+    // but assert explicitly so a future caller change can't silently overflow.
+    assert(seenCount < 4 && "seenDimTypes overflow: numDims guard broken");
+    seenDimTypes[seenCount++] = req.dims[i].dimType;
   }
 
   // meta.dimTypes[i] is the explicit dimType slot the loader read back BY NAME
@@ -360,8 +457,11 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
   uint8_t packedDims[4] = {0, 0, 0, 0};
   for (unsigned i = 0; i < meta.dimCount && i < 4; ++i) {
     uint32_t wantedType = meta.dimTypes[i];
-    if (wantedType == kEJitInvalidDimType)
+    if (wantedType == kEJitInvalidDimType) {
+      EJIT_DIAG("compileNow reject func=%u: meta dim[%u] dimType invalid",
+                req.funcIndex, i);
       return nullptr;
+    }
     bool found = false;
     for (uint32_t j = 0; j < req.numDims; ++j) {
       if (req.dims[j].dimType == wantedType) {
@@ -370,8 +470,11 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
         break;
       }
     }
-    if (!found)
+    if (!found) {
+      EJIT_DIAG("compileNow reject func=%u: no request dim for meta dimType=%u",
+                req.funcIndex, wantedType);
       return nullptr;
+    }
   }
 
   uint64_t cacheKey = (static_cast<uint64_t>(req.funcIndex) << 32) |
@@ -379,6 +482,9 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
                       (static_cast<uint64_t>(packedDims[1]) << 8) |
                       (static_cast<uint64_t>(packedDims[2]) << 16) |
                       (static_cast<uint64_t>(packedDims[3]) << 24);
+  EJIT_DIAG("compileNow dispatch func=%u key=0x%016lx dims=[%u,%u,%u,%u]",
+            req.funcIndex, cacheKey, packedDims[0], packedDims[1], packedDims[2],
+            packedDims[3]);
   return compileCold(cacheKey, /*storeLru=*/false);
 }
 #endif
