@@ -554,6 +554,16 @@ set(LLVM_ALL_EXPERIMENTAL_TARGETS
 # List of targets with JIT support:
 set(LLVM_TARGETS_WITH_JIT X86 PowerPC AArch64 ARM Mips SystemZ)
 
+option(EJIT_DIAG_ENABLE "EJIT LOG option" OFF)
+if(EJIT_DIAG_ENABLE)
+  add_definitions(-DEJIT_DIAG_ENABLE)
+endif()
+
+option(EJIT_SRE_DIAG "EJIT LOG ON SRE" OFF)
+if(EJIT_SRE_DIAG)
+  add_definitions(-DEJIT_SRE_DIAG)
+endif()
+
 option(EJIT_TRIM_LLVM_BACKEND "Trim LLVM backend pieces used by EJIT: disable heavyweight debug info, GlobalISel, and optional AArch64 SME/SVE passes" OFF)
 if(EJIT_TRIM_LLVM_BACKEND)
   add_definitions(-DEJIT_TRIM_LLVM_BACKEND)
