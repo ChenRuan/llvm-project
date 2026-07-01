@@ -122,6 +122,21 @@ _set_min_libs() {
   esac
 }
 
+# Detect EJIT taskpool build flags from CMakeCache and propagate them to test
+# compilation.  When EJIT_SRE_SHARED_TASKPOOL is active the async AOT wrapper
+# is also enabled (-mllvm -ejit-wrapper-async=true) so that the compiled tests
+# exercise the real taskpool code path rather than the legacy LRU ABI.
+EJIT_SRE_CFLAGS=""
+if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
+  if grep -q "^EJIT_SRE_TASKPOOL:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
+    EJIT_SRE_CFLAGS="${EJIT_SRE_CFLAGS} -DEJIT_SRE_TASKPOOL"
+  fi
+  if grep -q "^EJIT_SRE_SHARED_TASKPOOL:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
+    EJIT_SRE_CFLAGS="${EJIT_SRE_CFLAGS} -DEJIT_SRE_SHARED_TASKPOOL -mllvm -ejit-wrapper-async=true"
+  fi
+fi
+[[ -n "${EJIT_SRE_CFLAGS}" ]] && echo "Taskpool flags: ${EJIT_SRE_CFLAGS}"
+
 if [[ -n "${LIPO_FILE}" ]]; then
   # Lipo mode: use single pre-built .o/.a instead of individual .a files.
   # The lipo .a already bundles EJIT + all LLVM dependencies (see lipo.py).
@@ -232,7 +247,7 @@ build_one() {
 
   echo "  Compiling $(basename "${src}") ..."
   local extra_flags="${COMPILE_FLAGS[${name}]:-}"
-  "${CLANG}" -O2 ${INCLUDES} ${extra_flags} -c "${src}" -o "${obj}"
+  "${CLANG}" -O2 ${INCLUDES} ${extra_flags} ${EJIT_SRE_CFLAGS} -c "${src}" -o "${obj}"
 
   # Compile any extra translation units (multi-TU tests) and link them all.
   local objs=("${obj}")
@@ -244,7 +259,7 @@ build_one() {
     fi
     echo "  Compiling ${extra} ..."
     local eobj; eobj=$(mktemp "${TMPDIR:-/tmp}/ejit_${name}_tu_XXXXXX.o")
-    "${CLANG}" -O2 ${INCLUDES} ${extra_flags} -c "${esrc}" -o "${eobj}"
+    "${CLANG}" -O2 ${INCLUDES} ${extra_flags} ${EJIT_SRE_CFLAGS} -c "${esrc}" -o "${eobj}"
     objs+=("${eobj}")
   done
 

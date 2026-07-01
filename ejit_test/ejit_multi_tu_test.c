@@ -66,6 +66,43 @@ typedef struct {
 } ejit_stats_t;
 extern int ejit_get_stats(ejit_stats_t *stats);
 
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+#include <string.h>
+// In a shared-taskpool build the async AOT wrapper drives
+// ejit_taskpool_compile_or_get instead of the legacy LRU ABI, and the single
+// cross-core worker is started ONLY by owner election inside ejit_init when the
+// compile mode is Async. A mode flip after a Sync init cannot start the
+// owner-controlled worker, so the test must initialize in Async mode (matching
+// the canonical ejit_config_t ABI) to exercise the JIT at all.
+typedef struct {
+  int compileMode;          // ejit_compile_mode_t: 1 = EJIT_COMPILE_ASYNC
+  int optLevel;             // ejit_opt_level_t:    2 = EJIT_OPT_L2
+  size_t maxCodeMemory, maxDataMemory, maxCacheEntries, maxCacheSize;
+  _Bool enableLogger, forceStaticRegistry;
+  const char *dumpJITDir;
+} ejit_async_config_t;
+static const ejit_async_config_t ejit_async_cfg = {
+    .compileMode = 1, .optLevel = 2,
+    .maxCodeMemory = 512 * 1024, .maxDataMemory = 256 * 1024,
+    .maxCacheEntries = 64, .maxCacheSize = 1024 * 1024,
+};
+#define EJIT_INIT_CFG (&ejit_async_cfg)
+typedef struct {
+  unsigned long long cacheHits, asyncCompiles, asyncEnqueues, alreadyPending;
+  unsigned long long queueFull, compileFailed, publishFailed, instanceDisabled;
+  unsigned readyEntries, pendingEntries, queueApproxSize, reserved;
+} ejit_taskpool_stats_t;
+extern unsigned ejit_taskpool_pending_count(void);
+extern int ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
+static void ejit_drain_taskpool(void) {
+  while (ejit_taskpool_pending_count() > 0)
+    ;
+}
+#else
+#define EJIT_INIT_CFG (0)
+static void ejit_drain_taskpool(void) {}
+#endif
+
 //===-- 断言 ---------------------------------------------------------------===//
 
 static int g_failures = 0;
@@ -94,7 +131,7 @@ int main(int argc, char **argv)
   g_aCfg[ia].kind = 0xAA;     // TU-A global (this file)
   b_init(ib, 0xBB);           // TU-B global (other file)
 
-  int rc = ejit_init(0);
+  int rc = ejit_init(EJIT_INIT_CFG);
   VERIFY(rc == 0, "ejit_init returned %d", rc);
 
   ejit_activate("acell", ia);
@@ -109,18 +146,29 @@ int main(int argc, char **argv)
   uint32_t rb1 = jit_b(ib);
   VERIFY(rb1 == 200, "jit_b(%u) = %u (expected 200, kind=0xBB)", ib, rb1);
 
+  // The key multi-TU assertion: BOTH TUs' bitcode got registered and JIT'd.
+  ejit_drain_taskpool();
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  ejit_taskpool_stats_t tp1; memset(&tp1, 0, sizeof(tp1));
+  ejit_taskpool_get_stats(&tp1);
+  printf("  stats: ready=%u hits=%llu compiles=%llu\n",
+         tp1.readyEntries, (unsigned long long)tp1.cacheHits,
+         (unsigned long long)tp1.asyncCompiles);
+  VERIFY(tp1.readyEntries >= 2,
+         "JIT entries >= 2 (both TUs compiled, actual %u)", tp1.readyEntries);
+  VERIFY(tp1.asyncCompiles >= 2,
+         "JIT compiles >= 2 (both first calls, actual %llu)",
+         (unsigned long long)tp1.asyncCompiles);
+#else
   ejit_stats_t s1;
   ejit_get_stats(&s1);
   printf("  stats: entries=%u hits=%llu misses=%llu\n",
          s1.entries, (unsigned long long)s1.hits, (unsigned long long)s1.misses);
-
-  // The key multi-TU assertion: BOTH TUs' bitcode got registered and JIT'd.
-  // If the two TUs' registries had collided / dropped one, only one function
-  // would produce a JIT entry.
   VERIFY(s1.entries >= 2, "JIT entries >= 2 (both TUs compiled, actual %u)",
          s1.entries);
   VERIFY(s1.misses >= 2, "JIT misses >= 2 (both first calls, actual %llu)",
          (unsigned long long)s1.misses);
+#endif
 
   //=== Second calls hit the cache (specialized code was stored) ===
   printf("\n--- 二次调用应命中缓存 ---\n");
@@ -130,12 +178,22 @@ int main(int argc, char **argv)
   VERIFY(ra2 == 100, "jit_a(%u) 2nd = %u", ia, ra2);
   VERIFY(rb2 == 200, "jit_b(%u) 2nd = %u", ib, rb2);
 
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  ejit_taskpool_stats_t tp2; memset(&tp2, 0, sizeof(tp2));
+  ejit_taskpool_get_stats(&tp2);
+  printf("  stats: ready=%u hits=%llu compiles=%llu\n",
+         tp2.readyEntries, (unsigned long long)tp2.cacheHits,
+         (unsigned long long)tp2.asyncCompiles);
+  VERIFY(tp2.cacheHits >= 2, "Cache hits >= 2 (both 2nd calls, actual %llu)",
+         (unsigned long long)tp2.cacheHits);
+#else
   ejit_stats_t s2;
   ejit_get_stats(&s2);
   printf("  stats: entries=%u hits=%llu misses=%llu\n",
          s2.entries, (unsigned long long)s2.hits, (unsigned long long)s2.misses);
   VERIFY(s2.hits >= 2, "Cache hits >= 2 (both 2nd calls, actual %llu)",
          (unsigned long long)s2.hits);
+#endif
 
   ejit_shutdown();
 

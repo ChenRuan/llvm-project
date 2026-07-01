@@ -93,6 +93,12 @@ int main(int argc, char **argv) {
   //===-- 1. ejit_is_active: 未激活时返回 false -----------------------------===//
   printf("--- 1. is_active (未激活, ci=%u ci2=%u) ---\n", ci, ci2);
   ejit_init(0);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  // The shared taskpool auto-activates all registered periods on init; reset to
+  // a known-clean state before testing per-index activation semantics.
+  ejit_deactivate_all("cell");
+  ejit_deactivate_all("single");
+#endif
   T(!ejit_is_active("cell", ci),  "cell[%u] NOT active before activate", ci);
   T(!ejit_is_active("cell", ci2), "cell[%u] NOT active before activate", ci2);
   T(!ejit_is_active("trp",  ci),  "unknown period returns false");
@@ -168,6 +174,20 @@ int main(int argc, char **argv) {
   // 4d. 单数组 period: legacy/taskpool 都应支持 array-level API.
   printf("\n--- 4d. activate_array (single-array period) ---\n");
   ejit_deactivate_all("single");
+#ifdef EJIT_SRE_TASKPOOL
+  // A taskpool build keys activation by (lifecycle, index) only, with no array
+  // identity, so array-level ops are clean-rejected (the "single" lifecycle has
+  // no JIT dimType to flip). The AOT fallback still returns the correct value.
+  rc = ejit_activate_array("single", g_singleCfg, ci);
+  T(rc != 0, "activate_array(single, &singleCfg, %u) clean-rejected: %d", ci, rc);
+  T(!ejit_is_active("single", ci), "single[%u] unchanged (array op rejected)", ci);
+  g_singleCfg[ci].value = 1234;
+  uint32_t sr = read_single(ci);
+  T(sr == 1234, "read_single(%u) = %u (expected 1234)", ci, sr);
+  rc = ejit_deactivate_array("single", g_singleCfg, ci);
+  T(rc != 0, "deactivate_array(single, &singleCfg, %u) clean-rejected: %d", ci, rc);
+  T(!ejit_is_active("single", ci), "single[%u] NOT active after deactivate_array", ci);
+#else
   rc = ejit_activate_array("single", g_singleCfg, ci);
   T(rc == 0, "activate_array(single, &singleCfg, %u) returns %d", ci, rc);
   T(ejit_is_active("single", ci), "single[%u] IS active after activate_array", ci);
@@ -177,6 +197,7 @@ int main(int argc, char **argv) {
   rc = ejit_deactivate_array("single", g_singleCfg, ci);
   T(rc == 0, "deactivate_array(single, &singleCfg, %u) returns %d", ci, rc);
   T(!ejit_is_active("single", ci), "single[%u] NOT active after deactivate_array", ci);
+#endif
 
   //===-- 5. ejit_activate vs ejit_activate_array: 粒度差异 ------------------===//
   printf("\n--- 5. period vs array granularity ---\n");
@@ -254,10 +275,19 @@ int main(int argc, char **argv) {
   //===-- 8. 边界测试 ---------------------------------------------------------===//
   printf("\n--- 8. 边界测试 ---\n");
 
+#ifdef EJIT_SRE_TASKPOOL
+  // A taskpool build cleanly rejects an unknown period name (neither a registered
+  // lifecycle nor a registered period array); the legacy build silently succeeds.
+  rc = ejit_activate("unknown_period", ci);
+  T(rc != 0, "activate(unknown, %u) rejected rc=%d (unknown period)", ci, rc);
+  rc = ejit_deactivate("unknown_period", ci);
+  T(rc != 0, "deactivate(unknown, %u) rejected rc=%d (unknown period)", ci, rc);
+#else
   rc = ejit_activate("unknown_period", ci);
   T(rc == 0, "activate(unknown, %u) returns %d (safe)", ci, rc);
   rc = ejit_deactivate("unknown_period", ci);
   T(rc == 0, "deactivate(unknown, %u) returns %d (safe)", ci, rc);
+#endif
   T(!ejit_is_active("never_active", ci), "unknown period not active");
 
   ejit_shutdown();
