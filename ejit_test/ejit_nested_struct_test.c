@@ -136,6 +136,10 @@ int main(int argc, char **argv) {
   ejit_activate("cell", ci);
   uint32_t r = check_2level(ci);
   T(r == 60, "check_2level(%u) AA+55 = %u (expected gain*2 = 60)", ci, r);
+  // Async: drain so this specialization compiles/publishes before the next
+  // deactivate/activate bumps the version and invalidates the in-flight compile.
+  // (No-op in sync builds.)
+  ejit_drain_taskpool();
 
   //===-- 2 层嵌套: BB → gain (deactivate → 改值 → activate)---------------===//
   printf("\n--- 2层嵌套 (type=0xBB, gain=80) ---\n");
@@ -147,6 +151,7 @@ int main(int argc, char **argv) {
 
   r = check_2level(ci);
   T(r == 80, "check_2level(%u) BB = %u (expected gain = 80)", ci, r);
+  ejit_drain_taskpool();
 
   //===-- 2 层嵌套: 其他 → 0 ------------------------------------------------===//
   printf("\n--- 2层嵌套 (type=0xCC, no match) ---\n");
@@ -157,6 +162,7 @@ int main(int argc, char **argv) {
 
   r = check_2level(ci);
   T(r == 0, "check_2level(%u) no match = %u (expected 0)", ci, r);
+  ejit_drain_taskpool();
 
   //===-- 3 层嵌套: 11 + v>100 → v+1000 ------------------------------------===//
   printf("\n--- 3层嵌套 (root_type=0x11, l3.value=200) ---\n");
@@ -168,6 +174,7 @@ int main(int argc, char **argv) {
 
   r = check_3level(ci);
   T(r == 1200, "check_3level(%u) 11+200 = %u (expected 200+1000=1200)", ci, r);
+  ejit_drain_taskpool();
 
   //===-- 3 层嵌套: 22 → v+2000 ---------------------------------------------===//
   printf("\n--- 3层嵌套 (root_type=0x22, l3.value=50) ---\n");
@@ -179,6 +186,7 @@ int main(int argc, char **argv) {
 
   r = check_3level(ci);
   T(r == 2050, "check_3level(%u) 22+50 = %u (expected 50+2000=2050)", ci, r);
+  ejit_drain_taskpool();
 
   //===-- 3 层嵌套: 其他 → v ------------------------------------------------===//
   printf("\n--- 3层嵌套 (root_type=0x33, l3.value=77) ---\n");

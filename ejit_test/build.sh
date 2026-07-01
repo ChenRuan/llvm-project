@@ -199,8 +199,16 @@ declare -A PRIMARY_SRC
 PRIMARY_SRC[ejit_baremetal_link_test]="ejit_multi_tu_test.c"
 
 # Custom linker script (-Wl,-T) for a test, relative to this dir.
+# Both ctors-disabled tests need it: the static registry tables live in the
+# dot-named .ejit_bitcode/.ejit_period sections, for which the linker does NOT
+# auto-synthesize __start_/__stop_ bound symbols (dot is not a C identifier).
+# Without the script those weak bounds stay NULL, the static walk registers
+# nothing, and the funcIndex globals are never backfilled — so the async wrapper
+# can never JIT (it falls through to the AOT body). The script provides the
+# bounds so the static-registry path actually loads and specializes.
 declare -A LINKER_SCRIPT
 LINKER_SCRIPT[ejit_baremetal_link_test]="ejit_baremetal.ld"
+LINKER_SCRIPT[ejit_manual_register_test]="ejit_baremetal.ld"
 
 # Extra translation units linked alongside <test>.c (space-separated, with .c).
 # Used by multi-TU tests that exercise cross-TU linking.

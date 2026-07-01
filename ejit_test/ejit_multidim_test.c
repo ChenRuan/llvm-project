@@ -120,6 +120,10 @@ int main(int argc, char **argv) {
   // total = 160 + 160 = 320
   uint32_t exp_a = 320;
   T(r == exp_a, "classify_slot(%u) = %u (expected %u)", ci, r, exp_a);
+  // Async: drain so this specialization compiles/publishes before the next
+  // deactivate/activate bumps the version and invalidates the in-flight compile.
+  // (No-op in sync builds.)
+  ejit_drain_taskpool();
 
   //===-- 场景 A2: 改值后 deactivate + activate → 重新 JIT -------------------===//
   printf("\n--- A2: 改值后重新 JIT (ci=%u) ---\n", ci);
@@ -133,6 +137,7 @@ int main(int argc, char **argv) {
   r = classify_slot(ci);
   uint32_t exp_a2 = 8 * 1 * 10;  // 8 slots × priority=1 × 10 = 80
   T(r == exp_a2, "classify_slot(%u) after change = %u (expected %u)", ci, r, exp_a2);
+  ejit_drain_taskpool();
 
   //===-- 场景 B: 2D nested struct access -----------------------------------===//
   printf("\n--- B: 2D nested check_outer2d(ci=%u) ---\n", ci);
@@ -142,6 +147,7 @@ int main(int argc, char **argv) {
   ejit_activate("cell", ci);
   r = check_outer2d(ci);
   T(r == 777, "check_outer2d(%u) mode=0x55 = %u (expected 777)", ci, r);
+  ejit_drain_taskpool();
 
   // 改值
   ejit_deactivate("cell", ci);
@@ -149,6 +155,7 @@ int main(int argc, char **argv) {
   ejit_activate("cell", ci);
   r = check_outer2d(ci);
   T(r == 888, "check_outer2d(%u) mode=0xAA = %u (expected 888)", ci, r);
+  ejit_drain_taskpool();
 
   // 无匹配
   ejit_deactivate("cell", ci);
