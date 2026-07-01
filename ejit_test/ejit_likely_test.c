@@ -28,26 +28,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "ejit_test_helpers.h"
+
 #define MC_LIKELY(x)   (__builtin_expect((!!(x)), 1))
 #define MC_UNLIKELY(x) (__builtin_expect((!!(x)), 0))
 
 //===-- 结构体与全局变量 ---------------------------------------------------===//
 
 struct CellCfg {
-  __attribute__((ejit_may_const)) uint32_t cellType;
-  __attribute__((ejit_may_const)) uint32_t cellId;
+  ejit_may_const uint32_t cellType;
+  ejit_may_const uint32_t cellId;
   uint32_t trafficLoad;
 };
 
 #define N_CELL 16
-__attribute__((ejit_period_arr("cell"))) struct CellCfg g_cellCfg[N_CELL];
+ejit_period_arr(cell) struct CellCfg g_cellCfg[N_CELL];
 
 //===-- ejit_entry 函数 (均使用 __builtin_expect) -------------------------===//
 
 // 1. 短路 && — bug 最小复现: merge block 的 PHI incoming 含入口块
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t likely_and(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t cellIdx)
+    ejit_period_arr_ind(cell) uint8_t cellIdx)
 {
   uint32_t ct = g_cellCfg[cellIdx].cellType;
   if (MC_LIKELY(ct == 0xFD && g_cellCfg[cellIdx].cellId < 1000))
@@ -56,9 +58,9 @@ uint32_t likely_and(
 }
 
 // 2. 短路 || — 同样产生 merge PHI
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t likely_or(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t cellIdx)
+    ejit_period_arr_ind(cell) uint8_t cellIdx)
 {
   uint32_t ct = g_cellCfg[cellIdx].cellType;
   if (MC_LIKELY(ct == 0xFD || ct == 0xEC))
@@ -67,9 +69,9 @@ uint32_t likely_or(
 }
 
 // 3. MC_UNLIKELY — expect 的第二参数为 0
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t unlikely_branch(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t cellIdx)
+    ejit_period_arr_ind(cell) uint8_t cellIdx)
 {
   if (MC_UNLIKELY(g_cellCfg[cellIdx].cellType == 0xFF))
     return 3000;
@@ -77,9 +79,9 @@ uint32_t unlikely_branch(
 }
 
 // 4. 循环条件使用 MC_LIKELY
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t likely_loop(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t cellIdx)
+    ejit_period_arr_ind(cell) uint8_t cellIdx)
 {
   uint32_t s = 0;
   uint32_t bound = g_cellCfg[cellIdx].cellId;   // may_const, JIT 时常量化
@@ -89,9 +91,9 @@ uint32_t likely_loop(
 }
 
 // 5. 嵌套 MC_LIKELY — 多层短路
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t likely_nested(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t cellIdx)
+    ejit_period_arr_ind(cell) uint8_t cellIdx)
 {
   uint32_t ct = g_cellCfg[cellIdx].cellType;
   uint32_t id = g_cellCfg[cellIdx].cellId;
@@ -103,59 +105,10 @@ uint32_t likely_nested(
 }
 
 //===-- 运行时 API ---------------------------------------------------------===//
+// ejit_config_t / ejit_stats_t / ejit_taskpool_stats_t / ejit_drain_taskpool
+// come from ejit_test_helpers.h (ABI-matching EJitRuntime.h).
 
-extern int ejit_init(const void *cfg);
-extern int ejit_activate(const char *name, unsigned char idx);
 extern void ejit_shutdown(void);
-
-typedef struct {
-  uint32_t entries;
-  uint64_t codeSize;
-  uint64_t maxSize;
-  uint64_t hits;
-  uint64_t misses;
-  uint64_t evictions;
-  uint32_t active;
-} ejit_stats_t;
-
-extern int ejit_get_stats(ejit_stats_t *stats);
-
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-#include <string.h>
-// In a shared-taskpool build the async AOT wrapper drives
-// ejit_taskpool_compile_or_get instead of the legacy LRU ABI, and the single
-// cross-core worker is started ONLY by owner election inside ejit_init when the
-// compile mode is Async. A mode flip after a Sync init cannot start the
-// owner-controlled worker, so the test must initialize in Async mode (matching
-// the canonical ejit_config_t ABI) to exercise the JIT at all.
-typedef struct {
-  int compileMode;          // ejit_compile_mode_t: 1 = EJIT_COMPILE_ASYNC
-  int optLevel;             // ejit_opt_level_t:    2 = EJIT_OPT_L2
-  size_t maxCodeMemory, maxDataMemory, maxCacheEntries, maxCacheSize;
-  _Bool enableLogger, forceStaticRegistry;
-  const char *dumpJITDir;
-} ejit_async_config_t;
-static const ejit_async_config_t ejit_async_cfg = {
-    .compileMode = 1, .optLevel = 2,
-    .maxCodeMemory = 512 * 1024, .maxDataMemory = 256 * 1024,
-    .maxCacheEntries = 64, .maxCacheSize = 1024 * 1024,
-};
-#define EJIT_INIT_CFG (&ejit_async_cfg)
-typedef struct {
-  unsigned long long cacheHits, asyncCompiles, asyncEnqueues, alreadyPending;
-  unsigned long long queueFull, compileFailed, publishFailed, instanceDisabled;
-  unsigned readyEntries, pendingEntries, queueApproxSize, reserved;
-} ejit_taskpool_stats_t;
-extern unsigned ejit_taskpool_pending_count(void);
-extern int ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
-static void ejit_drain_taskpool(void) {
-  while (ejit_taskpool_pending_count() > 0)
-    ;
-}
-#else
-#define EJIT_INIT_CFG (0)
-static void ejit_drain_taskpool(void) {}
-#endif
 
 //===-- 断言 ---------------------------------------------------------------===//
 
@@ -186,7 +139,9 @@ int main(int argc, char **argv)
     g_cellCfg[i].trafficLoad = 0;
   }
 
-  int rc = ejit_init(EJIT_INIT_CFG);
+  ejit_config_t cfg;
+  ejit_default_config(&cfg);
+  int rc = ejit_init(&cfg);
   VERIFY(rc == 0, "ejit_init returned %d", rc);
   ejit_activate("cell", ci);
 
@@ -236,9 +191,9 @@ int main(int argc, char **argv)
 #else
   ejit_stats_t s;
   ejit_get_stats(&s);
-  printf("  entries=%u  hits=%llu  misses=%llu\n",
-         s.entries, (unsigned long long)s.hits, (unsigned long long)s.misses);
-  VERIFY(s.entries >= 1, "JIT entries >= 1 (actual %u)", s.entries);
+  printf("  entries=%zu  hits=%llu  misses=%llu\n",
+         s.entryCount, (unsigned long long)s.hits, (unsigned long long)s.misses);
+  VERIFY(s.entryCount >= 1, "JIT entries >= 1 (actual %zu)", s.entryCount);
 #endif
 
   ejit_shutdown();

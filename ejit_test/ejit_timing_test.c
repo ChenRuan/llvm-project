@@ -19,30 +19,32 @@
 #include <string.h>
 #include <time.h>
 
+#include "ejit_test_helpers.h"
+
 //===-- EJIT 属性 -----------------------------------------------------------===//
 
 struct CellCfg {
-  __attribute__((ejit_may_const)) uint32_t cellType;
-  __attribute__((ejit_may_const)) uint32_t priority;
-  __attribute__((ejit_may_const)) uint32_t maxPower;
+  ejit_may_const uint32_t cellType;
+  ejit_may_const uint32_t priority;
+  ejit_may_const uint32_t maxPower;
   uint32_t result;
 };
 
 #define N 16
-__attribute__((ejit_period_arr("cell"))) struct CellCfg g_cfg[N];
+ejit_period_arr(cell) struct CellCfg g_cfg[N];
 
 //===-- JIT entry (简单函数，减少自身计算对测量的干扰) ----------------------===//
 
 // 场景 A: 无维度参数 (仅依赖 static)
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t simple_jit(void) {
   return 42;
 }
 
 // 场景 B: 单维度参数
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t cell_jit(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t ci)
+    ejit_period_arr_ind(cell) uint8_t ci)
 {
   if (g_cfg[ci].cellType == 0xFD) {
     return g_cfg[ci].maxPower * 2;
@@ -52,16 +54,16 @@ uint32_t cell_jit(
 
 // 场景 C: 双维度参数
 struct TrpCfg {
-  __attribute__((ejit_may_const)) uint32_t trpType;
+  ejit_may_const uint32_t trpType;
   uint32_t status;
 };
 #define M 8
-__attribute__((ejit_period_arr("trp"))) struct TrpCfg g_trp[M];
+ejit_period_arr(trp) struct TrpCfg g_trp[M];
 
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t multi_jit(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t ci,
-    __attribute__((ejit_period_arr_ind("trp")))  uint8_t ti)
+    ejit_period_arr_ind(cell) uint8_t ci,
+    ejit_period_arr_ind(trp)  uint8_t ti)
 {
   if (g_cfg[ci].cellType == 0xFD && g_trp[ti].trpType == 1) {
     return g_cfg[ci].maxPower * g_trp[ti].trpType;
@@ -78,24 +80,7 @@ uint32_t cell_nojit(uint8_t ci) {
 }
 
 //===-- 运行时 API -----------------------------------------------------------===//
-
-extern int ejit_init(const void *cfg);
-extern int ejit_activate(const char *name, unsigned char idx);
-extern int ejit_deactivate(const char *name, unsigned char idx);
-extern int ejit_is_active(const char *name, unsigned char idx);
-extern void ejit_shutdown(void);
-
-typedef struct {
-  uint32_t entries;
-  uint64_t codeSize;
-  uint64_t maxSize;
-  uint64_t hits;
-  uint64_t misses;
-  uint64_t evictions;
-  uint32_t active;
-} ejit_stats_t;
-
-extern int ejit_get_stats(ejit_stats_t *s);
+// 类型/声明/属性宏来自 EJitRuntime.h。
 
 //===-- 高精度计时 (batch timing, 摊销 clock_gettime 开销) -----------------===//
 
@@ -232,8 +217,8 @@ int main(int argc, char **argv) {
 
   ejit_stats_t s;
   ejit_get_stats(&s);
-  printf("  stats: entries=%u hits=%llu misses=%llu\n",
-         s.entries, (unsigned long long)s.hits, (unsigned long long)s.misses);
+  printf("  stats: entries=%zu hits=%llu misses=%llu\n",
+         s.entryCount, (unsigned long long)s.hits, (unsigned long long)s.misses);
 
   //=== 4. Cache hit latency ===//
   printf("\n--- [4] Cache hit path (%llu iters/batch) ---\n",
@@ -241,8 +226,8 @@ int main(int argc, char **argv) {
   batch_call("cell_jit (cache hit)", cell_jit, ci, ITERS_LARGE);
 
   ejit_get_stats(&s);
-  printf("  stats: entries=%u hits=%llu misses=%llu\n\n",
-         s.entries, (unsigned long long)s.hits, (unsigned long long)s.misses);
+  printf("  stats: entries=%zu hits=%llu misses=%llu\n\n",
+         s.entryCount, (unsigned long long)s.hits, (unsigned long long)s.misses);
 
   //=== 5. Multi-dim ===//
   printf("--- [5] Multi-dim (cell+trp, %llu iters/batch) ---\n",
@@ -301,7 +286,7 @@ int main(int argc, char **argv) {
   //=== Summary ===//
   ejit_get_stats(&s);
   printf("\n=== Summary ===\n");
-  printf("  Cache entries:  %u\n", s.entries);
+  printf("  Cache entries:  %zu\n", s.entryCount);
   printf("  Cache hits:     %llu\n", (unsigned long long)s.hits);
   printf("  Cache misses:   %llu\n", (unsigned long long)s.misses);
   printf("  Evictions:      %llu\n", (unsigned long long)s.evictions);

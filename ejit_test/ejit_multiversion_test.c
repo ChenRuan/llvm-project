@@ -17,23 +17,26 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+#include "ejit_test_helpers.h"
 
 //===-- 数据结构 -------------------------------------------------------------===//
 
 struct CellCfg {
-  __attribute__((ejit_may_const)) uint32_t cellType;
-  __attribute__((ejit_may_const)) uint32_t cellId;
+  ejit_may_const uint32_t cellType;
+  ejit_may_const uint32_t cellId;
   uint32_t counter;
 };
 
 #define N 16
-__attribute__((ejit_period_arr("cell"))) struct CellCfg g_cells[N];
+ejit_period_arr(cell) struct CellCfg g_cells[N];
 
 //===-- JIT entry: 分支依赖 may_const 字段 -----------------------------------===//
 
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t classify_cell(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t ci)
+    ejit_period_arr_ind(cell) uint8_t ci)
 {
   uint32_t t = g_cells[ci].cellType;
 
@@ -45,60 +48,10 @@ uint32_t classify_cell(
 }
 
 //===-- 运行时 API -----------------------------------------------------------===//
+// ejit_config_t / ejit_stats_t / ejit_taskpool_stats_t / ejit_drain_taskpool
+// come from ejit_test_helpers.h (ABI-matching EJitRuntime.h).
 
-extern int ejit_init(const void *cfg);
-extern int ejit_activate(const char *name, unsigned char idx);
-extern int ejit_deactivate(const char *name, unsigned char idx);
 extern void ejit_shutdown(void);
-
-typedef struct {
-  uint32_t entries;
-  uint64_t codeSize;
-  uint64_t maxSize;
-  uint64_t hits;
-  uint64_t misses;
-  uint64_t evictions;
-  uint32_t active;
-} ejit_stats_t;
-
-extern int ejit_get_stats(ejit_stats_t *s);
-
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-#include <string.h>
-// In a shared-taskpool build the async AOT wrapper drives
-// ejit_taskpool_compile_or_get instead of the legacy LRU ABI, and the single
-// cross-core worker is started ONLY by owner election inside ejit_init when the
-// compile mode is Async. A mode flip after a Sync init cannot start the
-// owner-controlled worker, so the test must initialize in Async mode (matching
-// the canonical ejit_config_t ABI) to exercise the JIT at all.
-typedef struct {
-  int compileMode;          // ejit_compile_mode_t: 1 = EJIT_COMPILE_ASYNC
-  int optLevel;             // ejit_opt_level_t:    2 = EJIT_OPT_L2
-  size_t maxCodeMemory, maxDataMemory, maxCacheEntries, maxCacheSize;
-  _Bool enableLogger, forceStaticRegistry;
-  const char *dumpJITDir;
-} ejit_async_config_t;
-static const ejit_async_config_t ejit_async_cfg = {
-    .compileMode = 1, .optLevel = 2,
-    .maxCodeMemory = 512 * 1024, .maxDataMemory = 256 * 1024,
-    .maxCacheEntries = 64, .maxCacheSize = 1024 * 1024,
-};
-#define EJIT_INIT_CFG (&ejit_async_cfg)
-typedef struct {
-  unsigned long long cacheHits, asyncCompiles, asyncEnqueues, alreadyPending;
-  unsigned long long queueFull, compileFailed, publishFailed, instanceDisabled;
-  unsigned readyEntries, pendingEntries, queueApproxSize, reserved;
-} ejit_taskpool_stats_t;
-extern unsigned ejit_taskpool_pending_count(void);
-extern int ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
-static void ejit_drain_taskpool(void) {
-  while (ejit_taskpool_pending_count() > 0)
-    ;
-}
-#else
-#define EJIT_INIT_CFG (0)
-static void ejit_drain_taskpool(void) {}
-#endif
 
 //===-- 测试 -----------------------------------------------------------------===//
 
@@ -130,7 +83,9 @@ int main(int argc, char **argv) {
     printf(" %s", argv[i]);
   printf("\n\n");
 
-  ejit_init(EJIT_INIT_CFG);
+  ejit_config_t cfg;
+  ejit_default_config(&cfg);
+  ejit_init(&cfg);
 
   // 为每个外部输入的 cellIdx 设置数据并激活
   for (int i = 1; i < argc; i++) {
@@ -174,13 +129,13 @@ int main(int argc, char **argv) {
 #else
   ejit_stats_t s1;
   ejit_get_stats(&s1);
-  check("entries == n_unique", (int)s1.entries == n_unique,
-        "entries=%u expected=%d", s1.entries, n_unique);
+  check("entries == n_unique", (int)s1.entryCount == n_unique,
+        "entries=%zu expected=%d", s1.entryCount, n_unique);
   check("misses >= n_unique", s1.misses >= (uint64_t)n_unique,
         "misses=%llu expected>=%d",
         (unsigned long long)s1.misses, n_unique);
-  printf("  stats: entries=%u hits=%llu misses=%llu\n",
-         s1.entries, (unsigned long long)s1.hits, (unsigned long long)s1.misses);
+  printf("  stats: entries=%zu hits=%llu misses=%llu\n",
+         s1.entryCount, (unsigned long long)s1.hits, (unsigned long long)s1.misses);
 #endif
 
   // --- 第二轮: 再次调用相同 cellIdx (全部应该 hit) ---
@@ -215,16 +170,16 @@ int main(int argc, char **argv) {
   ejit_stats_t s2;
   ejit_get_stats(&s2);
   // entries 不变，hits 增加
-  check("entries unchanged", (int)s2.entries == n_unique,
-        "entries=%u (was %u)", s2.entries, s1.entries);
+  check("entries unchanged", (int)s2.entryCount == n_unique,
+        "entries=%zu (was %zu)", s2.entryCount, s1.entryCount);
   check("hits increased", s2.hits >= s1.hits + (uint64_t)n_unique,
         "hits=%llu (was %llu)",
         (unsigned long long)s2.hits, (unsigned long long)s1.hits);
   check("misses unchanged", (int)s2.misses == (int)s1.misses,
         "misses=%llu (was %llu)",
         (unsigned long long)s2.misses, (unsigned long long)s1.misses);
-  printf("  stats: entries=%u hits=%llu misses=%llu\n",
-         s2.entries, (unsigned long long)s2.hits, (unsigned long long)s2.misses);
+  printf("  stats: entries=%zu hits=%llu misses=%llu\n",
+         s2.entryCount, (unsigned long long)s2.hits, (unsigned long long)s2.misses);
 #endif
 
   // --- 第三轮: 修改某个 cellIdx 的数据，deactivate → 重新 JIT ---
@@ -238,7 +193,7 @@ int main(int argc, char **argv) {
     unsigned tp_entries_before = tp2.readyEntries;
 #else
     uint64_t misses_before = s2.misses;
-    uint64_t entries_before = s2.entries;
+    size_t entries_before = s2.entryCount;
 #endif
 
     // 把 cellType 改成 0xEC (原来可能是 0xFD)
@@ -267,9 +222,9 @@ int main(int argc, char **argv) {
     check("new miss triggered", s3.misses > misses_before,
           "misses %llu -> %llu",
           (unsigned long long)misses_before, (unsigned long long)s3.misses);
-    check("entries stable after recompile", s3.entries == entries_before,
-          "entries=%u (was %u: old evicted, new added)",
-          s3.entries, entries_before);
+    check("entries stable after recompile", s3.entryCount == entries_before,
+          "entries=%zu (was %zu: old evicted, new added)",
+          s3.entryCount, entries_before);
 #endif
   }
 

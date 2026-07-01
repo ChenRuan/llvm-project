@@ -17,56 +17,54 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+#include "ejit_test_helpers.h"
 
 //===-- 外部 API (声明提前，供辅助函数使用) ----------------------------------===//
+// ejit_config_t / ejit_stats_t / ejit_taskpool_stats_t / enums / drain helper
+// come from ejit_test_helpers.h (ABI-matching EJitRuntime.h).
 
-extern int  ejit_init(const void *cfg);
-extern int  ejit_activate(const char *name, unsigned char idx);
-extern int  ejit_deactivate(const char *name, unsigned char idx);
-extern int  ejit_is_active(const char *name, unsigned char idx);
 extern void ejit_shutdown(void);
-
-typedef struct { size_t entryCount; size_t totalCodeSize; size_t maxSize; unsigned long long hits, misses, evictions; } ejit_stats_t;
-extern int ejit_get_stats(ejit_stats_t *stats);
 
 //===-- 结构体定义 (多类型 may_const) -----------------------------------------===//
 
 struct PhyConfig {
-    __attribute__((ejit_may_const)) uint32_t phyMode;   // TDD/FDD
-    __attribute__((ejit_may_const)) uint32_t carrierFreq;
-    __attribute__((ejit_may_const)) uint32_t bandwidth;
+    ejit_may_const uint32_t phyMode;   // TDD/FDD
+    ejit_may_const uint32_t carrierFreq;
+    ejit_may_const uint32_t bandwidth;
     uint32_t rxGain;                                     // 可变
     uint32_t txPower;
 };
 
 struct CellConfig {
-    __attribute__((ejit_may_const)) uint32_t cellType;
-    __attribute__((ejit_may_const)) uint32_t cellId;
-    __attribute__((ejit_may_const)) uint32_t pci;        // Physical Cell ID
+    ejit_may_const uint32_t cellType;
+    ejit_may_const uint32_t cellId;
+    ejit_may_const uint32_t pci;        // Physical Cell ID
     uint32_t trafficLoad;
     struct {
-        __attribute__((ejit_may_const)) uint32_t freqBand;
-        __attribute__((ejit_may_const)) uint32_t antennaPorts;
+        ejit_may_const uint32_t freqBand;
+        ejit_may_const uint32_t antennaPorts;
         uint32_t currentPower;
     } rf;
 };
 
 struct TrpConfig {
-    __attribute__((ejit_may_const)) uint32_t trpType;
-    __attribute__((ejit_may_const)) uint32_t beamCount;
+    ejit_may_const uint32_t trpType;
+    ejit_may_const uint32_t beamCount;
     uint32_t activeBeams;
 };
 
 struct SliceConfig {
-    __attribute__((ejit_may_const)) uint32_t sliceType;  // eMBB/URLLC/mMTC
-    __attribute__((ejit_may_const)) uint32_t priority;
-    __attribute__((ejit_may_const)) float    latencyTarget;
+    ejit_may_const uint32_t sliceType;  // eMBB/URLLC/mMTC
+    ejit_may_const uint32_t priority;
+    ejit_may_const float    latencyTarget;
     uint32_t throughput;
 };
 
 //===-- 全局变量: 多数组共享同一时间窗名 -----------------------------------------===//
 
-__attribute__((ejit_period("static"))) struct PhyConfig g_phyCfg;
+ejit_period(static) struct PhyConfig g_phyCfg;
 
 #define N_CELL  16
 #define M_TRP   8
@@ -74,12 +72,12 @@ __attribute__((ejit_period("static"))) struct PhyConfig g_phyCfg;
 #define P_CARRIER 4
 
 // cell 时间窗: 两个数组共享 "cell" 名称
-__attribute__((ejit_period_arr("cell"))) struct CellConfig  g_cellCfg[N_CELL];
-__attribute__((ejit_period_arr("cell"))) struct PhyConfig   g_cellPhy[N_CELL];
+ejit_period_arr(cell) struct CellConfig  g_cellCfg[N_CELL];
+ejit_period_arr(cell) struct PhyConfig   g_cellPhy[N_CELL];
 
-__attribute__((ejit_period_arr("trp")))  struct TrpConfig   g_trpCfg[M_TRP];
-__attribute__((ejit_period_arr("slice"))) struct SliceConfig g_sliceCfg[K_SLICE];
-__attribute__((ejit_period_arr("carrier"))) struct PhyConfig  g_carrierCfg[P_CARRIER];
+ejit_period_arr(trp)  struct TrpConfig   g_trpCfg[M_TRP];
+ejit_period_arr(slice) struct SliceConfig g_sliceCfg[K_SLICE];
+ejit_period_arr(carrier) struct PhyConfig  g_carrierCfg[P_CARRIER];
 
 //===-- 场景 A: 4 维度 max (cell + trp + slice + carrier) ---------------------===//
 
@@ -87,12 +85,12 @@ __attribute__((ejit_period_arr("carrier"))) struct PhyConfig  g_carrierCfg[P_CAR
  * 极限测试: 同时依赖 4 个时间窗数组 (SPEC4 规定的最大值)。
  * JIT 时 4 个维度参数的运行值确定，对应的 may_const 字段全部特化。
  */
-__attribute__((ejit_entry))
+ejit_entry
 int process_multi_dim(
-    __attribute__((ejit_period_arr_ind("cell")))    uint8_t cellIdx,
-    __attribute__((ejit_period_arr_ind("trp")))     uint8_t trpIdx,
-    __attribute__((ejit_period_arr_ind("slice")))   uint8_t sliceIdx,
-    __attribute__((ejit_period_arr_ind("carrier"))) uint8_t carrierIdx)
+    ejit_period_arr_ind(cell)    uint8_t cellIdx,
+    ejit_period_arr_ind(trp)     uint8_t trpIdx,
+    ejit_period_arr_ind(slice)   uint8_t sliceIdx,
+    ejit_period_arr_ind(carrier) uint8_t carrierIdx)
 {
     int result = 0;
 
@@ -155,9 +153,9 @@ int process_multi_dim(
 
 //===-- 场景 B: 循环 + switch + early return ---------------------------------===//
 
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t process_all_trps(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t cellIdx)
+    ejit_period_arr_ind(cell) uint8_t cellIdx)
 {
     uint32_t total = 0;
     uint32_t cellType = g_cellCfg[cellIdx].cellType;
@@ -190,9 +188,9 @@ uint32_t process_all_trps(
 /**
  * 小循环 + may_const 界限: JIT 在 L3 优化等级可完全展开。
  */
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t process_slice_loop(
-    __attribute__((ejit_period_arr_ind("slice"))) uint8_t sliceIdx)
+    ejit_period_arr_ind(slice) uint8_t sliceIdx)
 {
     uint32_t sum = 0;
 
@@ -222,11 +220,11 @@ uint32_t process_slice_loop(
  * 生命周期函数有多个 return 点。
  * PASS4 必须在每个 return 前插入 activate (逆序)。
  */
-__attribute__((ejit_period_lc("cell")))
-__attribute__((ejit_period_lc("trp")))
+ejit_period_lc(cell)
+ejit_period_lc(trp)
 int reconfig_cell_trp(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t cellIdx,
-    __attribute__((ejit_period_arr_ind("trp")))  uint8_t trpIdx,
+    ejit_period_arr_ind(cell) uint8_t cellIdx,
+    ejit_period_arr_ind(trp)  uint8_t trpIdx,
     uint32_t newCellType,
     uint32_t newTrpType)
 {
@@ -254,9 +252,9 @@ int reconfig_cell_trp(
  * 即使只修改非 may_const 字段，如果标记了 ejit_period_lc，
  * 仍然触发 deactivate/activate。
  */
-__attribute__((ejit_period_lc("trp")))
+ejit_period_lc(trp)
 void update_trp_power(
-    __attribute__((ejit_period_arr_ind("trp"))) uint8_t trpIdx,
+    ejit_period_arr_ind(trp) uint8_t trpIdx,
     uint32_t power)
 {
     g_trpCfg[trpIdx].activeBeams = power;  // 非 may_const 字段
@@ -328,7 +326,9 @@ int main(int argc, char **argv)
            cellIdx, trpIdx, sliceIdx, carrierIdx);
 
     init_globals();
-    ejit_init(0);
+    ejit_config_t cfg;
+    ejit_default_config(&cfg);
+    ejit_init(&cfg);
     activate_all();
 
     // --- 场景 A: 4 维度 ---
@@ -425,14 +425,31 @@ int main(int argc, char **argv)
     printf("  after:  activeBeams=%u\n\n", g_trpCfg[trpIdx].activeBeams);
 
     // JIT Statistics
+    ejit_drain_taskpool();
     {
+        printf("--- JIT Stats ---\n");
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+        ejit_taskpool_stats_t ts; memset(&ts, 0, sizeof(ts));
+        ejit_taskpool_get_stats(&ts);
+        printf("  ready: %u  hits: %llu  compiles: %llu\n",
+               ts.readyEntries, (unsigned long long)ts.cacheHits,
+               (unsigned long long)ts.asyncCompiles);
+        printf("  JIT: %s\n", ts.asyncCompiles > 0 ? "ACTIVE" : "AOT-FALLBACK-ONLY");
+        if (ts.asyncCompiles == 0) {
+            printf("  FAIL: async path produced no compiles (silent AOT)\n");
+        }
+#else
         ejit_stats_t s;
         ejit_get_stats(&s);
-        printf("--- JIT Stats ---\n");
         printf("  entries: %zu  codeSize: %zu\n", s.entryCount, s.totalCodeSize);
         printf("  hits: %llu  misses: %llu  evictions: %llu\n",
-               s.hits, s.misses, s.evictions);
+               (unsigned long long)s.hits, (unsigned long long)s.misses,
+               (unsigned long long)s.evictions);
         printf("  JIT: %s\n", s.entryCount > 0 ? "ACTIVE" : "AOT-FALLBACK-ONLY");
+        if (s.entryCount == 0) {
+            printf("  FAIL: no JIT entries (silent AOT)\n");
+        }
+#endif
     }
 
     ejit_shutdown();

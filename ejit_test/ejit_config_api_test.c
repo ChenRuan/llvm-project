@@ -17,82 +17,33 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "ejit_test_helpers.h"
+
 //===-- 数据结构 -------------------------------------------------------------===//
 
 struct CellCfg {
-  __attribute__((ejit_may_const)) uint32_t cellType;
+  ejit_may_const uint32_t cellType;
   uint32_t counter;
 };
 #define N 8
-__attribute__((ejit_period_arr("cell"))) struct CellCfg g_cells[N];
+ejit_period_arr(cell) struct CellCfg g_cells[N];
 
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t check_cell(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t ci)
+    ejit_period_arr_ind(cell) uint8_t ci)
 {
   if (g_cells[ci].cellType == 0xFD) return 100;
   return 0;
 }
 
 //===-- 运行时 API -----------------------------------------------------------===//
+// ejit_config_t / ejit_stats_t / ejit_taskpool_stats_t / enums / drain helper
+// come from ejit_test_helpers.h (ABI-matching EJitRuntime.h). Only the
+// ejit_error_t getter + the EJIT_OK_C alias (this test's historical name for
+// EJIT_OK) remain local.
 
-typedef enum { EJIT_OK_C = 0 } ejit_status_t;
-typedef enum { EJIT_COMPILE_SYNC = 0, EJIT_COMPILE_ASYNC = 1 } ejit_compile_mode_t;
-typedef enum { EJIT_OPT_L1 = 1, EJIT_OPT_L2 = 2, EJIT_OPT_L3 = 3 } ejit_opt_level_t;
-
-typedef struct {
-  ejit_compile_mode_t compileMode;
-  ejit_opt_level_t optLevel;
-  size_t maxCodeMemory;
-  size_t maxDataMemory;
-  size_t maxCacheEntries;
-  size_t maxCacheSize;
-  bool enableLogger;
-  const char *dumpJITDir;
-} ejit_config_t;
-
-typedef struct {
-  size_t entryCount;
-  size_t totalCodeSize;
-  size_t maxSize;
-  uint64_t hits;
-  uint64_t misses;
-  uint64_t evictions;
-} ejit_stats_t;
-
-typedef struct {
-  int code;
-  const char *message;
-  const char *funcName;
-} ejit_error_t;
-
-extern ejit_status_t ejit_init(const ejit_config_t *cfg);
-extern void ejit_shutdown(void);
-extern ejit_status_t ejit_activate(const char *n, unsigned char i);
-extern ejit_status_t ejit_deactivate(const char *n, unsigned char i);
-extern bool ejit_is_active(const char *n, unsigned char i);
-extern void ejit_clear_cache(void);
-extern void ejit_invalidate(const char *n, unsigned char i);
-extern ejit_status_t ejit_get_stats(ejit_stats_t *s);
-
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-typedef struct {
-  unsigned long long cacheHits, asyncCompiles, asyncEnqueues, alreadyPending;
-  unsigned long long queueFull, compileFailed, publishFailed, instanceDisabled;
-  unsigned readyEntries, pendingEntries, queueApproxSize, reserved;
-} ejit_taskpool_stats_t;
-extern unsigned ejit_taskpool_pending_count(void);
-extern int ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
-static void ejit_drain_taskpool(void) {
-  while (ejit_taskpool_pending_count() > 0)
-    ;
-}
-#else
-static void ejit_drain_taskpool(void) {}
-#endif
 extern const ejit_error_t *ejit_get_last_error(void);
-extern void ejit_set_compile_mode(ejit_compile_mode_t m);
-extern ejit_compile_mode_t ejit_get_compile_mode(void);
+#define EJIT_OK_C EJIT_OK
 
 //===-- 断言 -----------------------------------------------------------------===//
 

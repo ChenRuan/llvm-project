@@ -13,30 +13,33 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
+
+#include "ejit_test_helpers.h"
 
 //===-- 数据结构: 6 个 may_const 字段 -----------------------------------------===//
 
 struct CellCfg {
-  __attribute__((ejit_may_const)) uint32_t cellType;   // 分支条件
-  __attribute__((ejit_may_const)) uint32_t priority;    // 分支条件
-  __attribute__((ejit_may_const)) uint32_t maxPower;    // 阈值
-  __attribute__((ejit_may_const)) uint32_t minPower;    // 阈值
-  __attribute__((ejit_may_const)) uint32_t bandWidth;   // 乘数
-  __attribute__((ejit_may_const)) uint32_t timeSlot;    // 除数
+  ejit_may_const uint32_t cellType;   // 分支条件
+  ejit_may_const uint32_t priority;    // 分支条件
+  ejit_may_const uint32_t maxPower;    // 阈值
+  ejit_may_const uint32_t minPower;    // 阈值
+  ejit_may_const uint32_t bandWidth;   // 乘数
+  ejit_may_const uint32_t timeSlot;    // 除数
   uint32_t result;  // 非 may_const: 写入目标
 };
 
 #define N 16
-__attribute__((ejit_period_arr("cell"))) struct CellCfg g_cfg[N];
+ejit_period_arr(cell) struct CellCfg g_cfg[N];
 
 //===-- JIT entry: 循环中大量访问 may_const 字段 -----------------------------===//
 
 #define LOOP_ITERS 20000000ULL  // 20M 次迭代
 
-__attribute__((ejit_entry))
+ejit_entry
 uint64_t compute_cell(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t ci)
+    ejit_period_arr_ind(cell) uint8_t ci)
 {
   uint64_t sum = 0;
   struct CellCfg *p = &g_cfg[ci];
@@ -80,23 +83,7 @@ uint64_t compute_cell_nojit(uint8_t ci)
 
 //===-- 运行时 API -----------------------------------------------------------===//
 
-extern int ejit_init(const void *cfg);
-extern int ejit_activate(const char *name, unsigned char idx);
-extern int ejit_deactivate(const char *name, unsigned char idx);
-extern int ejit_is_active(const char *name, unsigned char idx);
 extern void ejit_shutdown(void);
-
-typedef struct {
-  uint32_t entries;
-  uint64_t codeSize;
-  uint64_t maxSize;
-  uint64_t hits;
-  uint64_t misses;
-  uint64_t evictions;
-  uint32_t active;
-} ejit_stats_t;
-
-extern int ejit_get_stats(ejit_stats_t *s);
 
 //===-- 计时 -----------------------------------------------------------------===//
 
@@ -125,7 +112,9 @@ int main(int argc, char **argv) {
   g_cfg[ci].timeSlot  = 3;
   g_cfg[ci].result    = 0;
 
-  ejit_init(0);
+  ejit_config_t cfg;
+  ejit_default_config(&cfg);
+  ejit_init(&cfg);
 
   printf("--- Pure AOT (无 attribute, 无 wrapper 开销) ---\n");
 
@@ -177,10 +166,23 @@ int main(int argc, char **argv) {
     }
   }
 
+  ejit_drain_taskpool();
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  ejit_taskpool_stats_t ts; memset(&ts, 0, sizeof(ts));
+  ejit_taskpool_get_stats(&ts);
+  printf("\n  JIT stats: ready=%u hits=%llu compiles=%llu\n",
+         ts.readyEntries, (unsigned long long)ts.cacheHits,
+         (unsigned long long)ts.asyncCompiles);
+  if (ts.asyncCompiles == 0)
+    printf("  FAIL: async path produced no compiles (silent AOT)\n");
+#else
   ejit_stats_t s;
   ejit_get_stats(&s);
-  printf("\n  JIT stats: entries=%u hits=%llu misses=%llu\n",
-         s.entries, (unsigned long long)s.hits, (unsigned long long)s.misses);
+  printf("\n  JIT stats: entries=%zu hits=%llu misses=%llu\n",
+         s.entryCount, (unsigned long long)s.hits, (unsigned long long)s.misses);
+  if (s.entryCount == 0)
+    printf("  FAIL: no JIT entries (silent AOT)\n");
+#endif
 
   ejit_shutdown();
 

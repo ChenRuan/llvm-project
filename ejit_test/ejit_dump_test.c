@@ -15,7 +15,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+#include "ejit_test_helpers.h"
 
 //===--- Data types --------------------------------------------------------===//
 
@@ -71,17 +71,7 @@ static int file_contains(const char *path, const char *pattern) {
   return strstr(buf, pattern) != NULL;
 }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-// In a taskpool build the JIT compile (and therefore the IR dump) runs on the
-// async worker, so the dump files only exist after the in-flight compile has
-// drained. Spin until the taskpool has no pending work before inspecting files.
-static void ejit_drain_taskpool(void) {
-  while (ejit_taskpool_pending_count() > 0)
-    ;
-}
-#else
-static void ejit_drain_taskpool(void) {}
-#endif
+// ejit_drain_taskpool comes from ejit_test_helpers.h (bounded, SHARED-guarded).
 
 //===--- Main --------------------------------------------------------------===//
 
@@ -108,15 +98,7 @@ int main(int argc, char **argv) {
   printf("cellIdx=%d  dumpDir=%s\n\n", cellIdx, dumpDir);
 
   ejit_config_t cfg;
-  memset(&cfg, 0, sizeof(cfg));
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  // Async mode so the shared taskpool worker starts during ejit_init and
-  // actually compiles (and dumps IR); a Sync init leaves the taskpool Off.
-  cfg.compileMode = EJIT_COMPILE_ASYNC;
-#else
-  cfg.compileMode = EJIT_COMPILE_SYNC;
-#endif
-  cfg.optLevel = EJIT_OPT_L2;
+  ejit_default_config(&cfg);
   cfg.dumpJITDir = dumpDir;
 
   ejit_status_t st = ejit_init(&cfg);

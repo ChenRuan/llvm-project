@@ -24,68 +24,36 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "ejit_test_helpers.h"
+
 //===-- 外部 API ------------------------------------------------------------===//
+// ejit_config_t / ejit_stats_t / ejit_taskpool_stats_t / enums / drain helper
+// come from ejit_test_helpers.h (ABI-matching EJitRuntime.h).
 
-typedef enum { EJIT_OK = 0 } ejit_status_t;
-typedef enum { EJIT_COMPILE_SYNC = 0, EJIT_COMPILE_ASYNC = 1 } ejit_compile_mode_t;
-typedef enum { EJIT_OPT_L1 = 1, EJIT_OPT_L2 = 2, EJIT_OPT_L3 = 3 } ejit_opt_level_t;
-
-typedef struct {
-  ejit_compile_mode_t compileMode;
-  ejit_opt_level_t optLevel;
-  size_t maxCodeMemory, maxDataMemory, maxCacheEntries, maxCacheSize;
-  bool enableLogger;
-  const char *dumpJITDir;
-} ejit_config_t;
-
-typedef struct {
-  size_t entryCount, totalCodeSize, maxSize;
-  unsigned long long hits, misses, evictions;
-} ejit_stats_t;
-
-extern ejit_status_t ejit_init(const ejit_config_t *cfg);
-extern void          ejit_shutdown(void);
-extern ejit_status_t ejit_activate(const char *name, unsigned char idx);
-extern ejit_status_t ejit_get_stats(ejit_stats_t *s);
-
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-typedef struct {
-  unsigned long long cacheHits, asyncCompiles, asyncEnqueues, alreadyPending;
-  unsigned long long queueFull, compileFailed, publishFailed, instanceDisabled;
-  unsigned readyEntries, pendingEntries, queueApproxSize, reserved;
-} ejit_taskpool_stats_t;
-extern unsigned ejit_taskpool_pending_count(void);
-extern int ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
-static void ejit_drain_taskpool(void) {
-  while (ejit_taskpool_pending_count() > 0)
-    ;
-}
-#else
-static void ejit_drain_taskpool(void) {}
-#endif
+extern void ejit_shutdown(void);
 
 //===-- 数据结构 -------------------------------------------------------------===//
 
 struct DevInfo {
-    __attribute__((ejit_may_const)) uint32_t type;      // 1=BBU, 2=RRU, 3=AAU
-    __attribute__((ejit_may_const)) uint32_t maxPower;
-    __attribute__((ejit_may_const)) uint32_t channels;
+    ejit_may_const uint32_t type;      // 1=BBU, 2=RRU, 3=AAU
+    ejit_may_const uint32_t maxPower;
+    ejit_may_const uint32_t channels;
     uint32_t uptime;
 };
 
 struct CarrCfg {
-    __attribute__((ejit_may_const)) uint32_t freqBand;
-    __attribute__((ejit_may_const)) uint32_t bandwidth;
-    __attribute__((ejit_may_const)) bool     mimo;
+    ejit_may_const uint32_t freqBand;
+    ejit_may_const uint32_t bandwidth;
+    ejit_may_const bool     mimo;
     uint32_t txPower;
 };
 
 //===-- 全局变量 -------------------------------------------------------------===//
 
-__attribute__((ejit_period("static"))) struct DevInfo g_dev;
+ejit_period(static) struct DevInfo g_dev;
 
 #define N_CARR 8
-__attribute__((ejit_period_arr("carrier"))) struct CarrCfg g_carr[N_CARR];
+ejit_period_arr(carrier) struct CarrCfg g_carr[N_CARR];
 
 //===-- always_inline helper (L2 内敛目标) ----------------------------------===//
 
@@ -101,9 +69,9 @@ static inline uint32_t mimo_gain(uint32_t pwr, bool mimo) {
 
 //===-- ejit_entry ----------------------------------------------------------===//
 
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t process_carr(
-    __attribute__((ejit_period_arr_ind("carrier"))) uint8_t ci)
+    ejit_period_arr_ind(carrier) uint8_t ci)
 {
     uint32_t r = 0;
 
@@ -214,7 +182,8 @@ int main(int argc, char **argv)
     else { printf("[NOT ACTIVE]\n"); failures++; }
 #else
     ejit_stats_t sf; memset(&sf,0,sizeof(sf)); ejit_get_stats(&sf);
-    printf("\nJIT: entries=%zu misses=%llu  ", sf.entryCount, sf.misses);
+    printf("\nJIT: entries=%zu misses=%llu  ", sf.entryCount,
+           (unsigned long long)sf.misses);
     if (sf.entryCount > 0) printf("[ACTIVE]\n");
     else { printf("[NOT ACTIVE]\n"); failures++; }
 #endif

@@ -18,12 +18,15 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+#include "ejit_test_helpers.h"
 
 //===-- 2 层嵌套 -------------------------------------------------------------===//
 
 struct InnerCfg {
-  __attribute__((ejit_may_const)) uint32_t mode;
-  __attribute__((ejit_may_const)) uint32_t gain;
+  ejit_may_const uint32_t mode;
+  ejit_may_const uint32_t gain;
   uint32_t reserved;
 };
 
@@ -33,18 +36,18 @@ struct MidCfg {
 };
 
 struct OuterCfg {
-  __attribute__((ejit_may_const)) uint32_t type;
+  ejit_may_const uint32_t type;
   struct MidCfg mid;
   uint32_t extra;
 };
 
 #define N 8
-__attribute__((ejit_period_arr("cell"))) struct OuterCfg g_outer[N];
+ejit_period_arr(cell) struct OuterCfg g_outer[N];
 
 //===-- 3 层嵌套 -------------------------------------------------------------===//
 
 struct Level3 {
-  __attribute__((ejit_may_const)) uint32_t value;
+  ejit_may_const uint32_t value;
 };
 
 struct Level2 {
@@ -57,17 +60,17 @@ struct Level1 {
 };
 
 struct RootCfg {
-  __attribute__((ejit_may_const)) uint32_t root_type;
+  ejit_may_const uint32_t root_type;
   struct Level1 l1;
 };
 
-__attribute__((ejit_period_arr("cell"))) struct RootCfg g_root[N];
+ejit_period_arr(cell) struct RootCfg g_root[N];
 
 //===-- JIT entry: 2 层嵌套访问 3 个 may_const -------------------------------===//
 
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t check_2level(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t ci)
+    ejit_period_arr_ind(cell) uint8_t ci)
 {
   struct OuterCfg *p = &g_outer[ci];
 
@@ -83,9 +86,9 @@ uint32_t check_2level(
 
 //===-- JIT entry: 3 层嵌套访问 ---------------------------------------------===//
 
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t check_3level(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t ci)
+    ejit_period_arr_ind(cell) uint8_t ci)
 {
   struct RootCfg *p = &g_root[ci];
 
@@ -100,10 +103,7 @@ uint32_t check_3level(
 }
 
 //===-- 运行时 API -----------------------------------------------------------===//
-
-extern int ejit_init(const void *cfg);
-extern int ejit_activate(const char *name, unsigned char idx);
-extern int ejit_deactivate(const char *name, unsigned char idx);
+// 来自 ejit_test_helpers.h (ABI-matching EJitRuntime.h).
 extern void ejit_shutdown(void);
 
 //===-- 断言 -----------------------------------------------------------------===//
@@ -120,7 +120,9 @@ int main(int argc, char **argv) {
   printf("=== EJIT Nested Struct may_const Test ===\n");
   printf("cellIdx=%u\n\n", ci);
 
-  ejit_init(0);
+  ejit_config_t cfg;
+  ejit_default_config(&cfg);
+  ejit_init(&cfg);
 
   //===-- 2 层嵌套: AA + 55 → gain*2 ---------------------------------------===//
   printf("--- 2层嵌套 (type=0xAA, mode=0x55, gain=30) ---\n");
@@ -188,6 +190,19 @@ int main(int argc, char **argv) {
 
   r = check_3level(ci);
   T(r == 77, "check_3level(%u) default = %u (expected v=77)", ci, r);
+
+  // Verify the async path actually compiled (not silent AOT fallback).
+  ejit_drain_taskpool();
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  {
+    ejit_taskpool_stats_t ts; memset(&ts, 0, sizeof(ts));
+    ejit_taskpool_get_stats(&ts);
+    if (ts.asyncCompiles == 0) {
+      printf("FAIL: async path produced no compiles (silent AOT)\n");
+      g_fail++;
+    }
+  }
+#endif
 
   ejit_shutdown();
 

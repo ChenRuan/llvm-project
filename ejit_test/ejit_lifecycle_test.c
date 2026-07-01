@@ -20,57 +20,49 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "ejit_test_helpers.h"
+
 //===-- 两个共享相同 period name 的结构体数组 -------------------------------===//
 
 struct CellCfg {
-  __attribute__((ejit_may_const)) uint32_t cellType;
+  ejit_may_const uint32_t cellType;
   uint32_t trafficLoad;
 };
 
 struct CellPhy {
-  __attribute__((ejit_may_const)) uint32_t phyCellId;
+  ejit_may_const uint32_t phyCellId;
   uint32_t rssi;
 };
 
 struct SingleCfg {
-  __attribute__((ejit_may_const)) uint32_t value;
+  ejit_may_const uint32_t value;
   uint32_t padding;
 };
 
 #define N 8
-__attribute__((ejit_period_arr("cell"))) struct CellCfg g_cellCfg[N];
-__attribute__((ejit_period_arr("cell"))) struct CellPhy g_cellPhy[N];
-__attribute__((ejit_period_arr("single"))) struct SingleCfg g_singleCfg[N];
+ejit_period_arr(cell) struct CellCfg g_cellCfg[N];
+ejit_period_arr(cell) struct CellPhy g_cellPhy[N];
+ejit_period_arr(single) struct SingleCfg g_singleCfg[N];
 
-__attribute__((ejit_period("static"))) uint32_t g_sysVer;
+ejit_period(static) uint32_t g_sysVer;
 
 //===-- JIT entry: 访问两个数组的 may_const ---------------------------------===//
 
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t read_both(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t ci)
+    ejit_period_arr_ind(cell) uint8_t ci)
 {
   return g_cellCfg[ci].cellType + g_cellPhy[ci].phyCellId;
 }
 
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t read_single(
-    __attribute__((ejit_period_arr_ind("single"))) uint8_t ci)
+    ejit_period_arr_ind(single) uint8_t ci)
 {
   return g_singleCfg[ci].value;
 }
 
-//===-- 运行时 API (完整声明) -----------------------------------------------===//
-
-extern int ejit_init(const void *cfg);
-extern void ejit_shutdown(void);
-extern int ejit_activate(const char *name, unsigned char idx);
-extern int ejit_deactivate(const char *name, unsigned char idx);
-extern int ejit_activate_array(const char *name, void *ptr, unsigned char idx);
-extern int ejit_deactivate_array(const char *name, void *ptr, unsigned char idx);
-extern int ejit_activate_all(const char *name);
-extern int ejit_deactivate_all(const char *name);
-extern bool ejit_is_active(const char *name, unsigned char idx);
+//===-- 运行时 API (完整声明来自 EJitRuntime.h) -----------------------------===//
 
 //===-- 断言 -----------------------------------------------------------------===//
 

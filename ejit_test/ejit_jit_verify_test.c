@@ -19,33 +19,35 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "ejit_test_helpers.h"
+
 //===-- EJIT 属性 -----------------------------------------------------------===//
 
 struct CellCfg {
-  __attribute__((ejit_may_const)) uint32_t cellType;
-  __attribute__((ejit_may_const)) uint32_t cellId;
+  ejit_may_const uint32_t cellType;
+  ejit_may_const uint32_t cellId;
   uint32_t trafficLoad;
 };
 
 struct TrpCfg {
-  __attribute__((ejit_may_const)) uint32_t trpType;
+  ejit_may_const uint32_t trpType;
   uint32_t activeBeams;
 };
 
-__attribute__((ejit_period("static"))) uint32_t g_sysVer;
+ejit_period(static) uint32_t g_sysVer;
 
 #define N_CELL 16
-__attribute__((ejit_period_arr("cell"))) struct CellCfg g_cellCfg[N_CELL];
+ejit_period_arr(cell) struct CellCfg g_cellCfg[N_CELL];
 
 #define M_TRP 8
-__attribute__((ejit_period_arr("trp"))) struct TrpCfg g_trpCfg[M_TRP];
+ejit_period_arr(trp) struct TrpCfg g_trpCfg[M_TRP];
 
 //===-- JIT entry 函数 -----------------------------------------------------===//
 
 // 单维 cellIdx: 分支依赖于 may_const 字段
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t jit_cell_check(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t cellIdx)
+    ejit_period_arr_ind(cell) uint8_t cellIdx)
 {
   // JIT 应替换 cellType 为常量并折叠此分支
   if (g_cellCfg[cellIdx].cellType == 0xFD)
@@ -55,10 +57,10 @@ uint32_t jit_cell_check(
 }
 
 // 多维 cellIdx + trpIdx: 复合条件
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t jit_cell_trp_check(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t cellIdx,
-    __attribute__((ejit_period_arr_ind("trp")))  uint8_t trpIdx)
+    ejit_period_arr_ind(cell) uint8_t cellIdx,
+    ejit_period_arr_ind(trp)  uint8_t trpIdx)
 {
   uint32_t ct = g_cellCfg[cellIdx].cellType;
   uint32_t tt = g_trpCfg[trpIdx].trpType;
@@ -70,61 +72,11 @@ uint32_t jit_cell_trp_check(
 }
 
 //===-- 运行时 API ---------------------------------------------------------===//
+// ejit_config_t / ejit_stats_t / ejit_taskpool_stats_t / ejit_drain_taskpool
+// come from ejit_test_helpers.h (single source of truth, ABI-matching
+// EJitRuntime.h). Only the test-specific entry-point decls remain here.
 
-extern int ejit_init(const void *cfg);
-extern int ejit_activate(const char *name, unsigned char idx);
-extern int ejit_deactivate(const char *name, unsigned char idx);
-extern int ejit_is_active(const char *name, unsigned char idx);
 extern void ejit_shutdown(void);
-
-// ejit_stats_t
-typedef struct {
-  uint32_t entries;
-  uint64_t codeSize;
-  uint64_t maxSize;
-  uint64_t hits;
-  uint64_t misses;
-  uint64_t evictions;
-  uint32_t active;
-} ejit_stats_t;
-
-extern int ejit_get_stats(ejit_stats_t *stats);
-
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-// In a shared-taskpool build the async AOT wrapper drives
-// ejit_taskpool_compile_or_get instead of the legacy LRU ABI, and the single
-// cross-core worker is started ONLY by owner election inside ejit_init when the
-// compile mode is Async. A mode flip after a Sync init cannot start the
-// owner-controlled worker, so the test must initialize in Async mode (matching
-// the canonical ejit_config_t ABI) to exercise the JIT at all.
-typedef struct {
-  int compileMode;          // ejit_compile_mode_t: 1 = EJIT_COMPILE_ASYNC
-  int optLevel;             // ejit_opt_level_t:    2 = EJIT_OPT_L2
-  size_t maxCodeMemory, maxDataMemory, maxCacheEntries, maxCacheSize;
-  _Bool enableLogger, forceStaticRegistry;
-  const char *dumpJITDir;
-} ejit_async_config_t;
-static const ejit_async_config_t ejit_async_cfg = {
-    .compileMode = 1, .optLevel = 2,
-    .maxCodeMemory = 512 * 1024, .maxDataMemory = 256 * 1024,
-    .maxCacheEntries = 64, .maxCacheSize = 1024 * 1024,
-};
-#define EJIT_INIT_CFG (&ejit_async_cfg)
-typedef struct {
-  unsigned long long cacheHits, asyncCompiles, asyncEnqueues, alreadyPending;
-  unsigned long long queueFull, compileFailed, publishFailed, instanceDisabled;
-  unsigned readyEntries, pendingEntries, queueApproxSize, reserved;
-} ejit_taskpool_stats_t;
-extern unsigned ejit_taskpool_pending_count(void);
-extern int ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
-static void ejit_drain_taskpool(void) {
-  while (ejit_taskpool_pending_count() > 0)
-    ;
-}
-#else
-#define EJIT_INIT_CFG (0)
-static void ejit_drain_taskpool(void) {}
-#endif
 
 //===-- 断言 ---------------------------------------------------------------===//
 
@@ -155,8 +107,11 @@ int main(int argc, char **argv)
   g_cellCfg[ci].trafficLoad = 0;
   g_trpCfg[ti].trpType = 1;
 
-  // Init EJIT
-  int rc = ejit_init(EJIT_INIT_CFG);
+  // Init EJIT (ejit_default_config picks ASYNC under EJIT_SRE_SHARED_TASKPOOL,
+  // SYNC otherwise — matching the canonical ejit_config_t ABI).
+  ejit_config_t cfg;
+  ejit_default_config(&cfg);
+  int rc = ejit_init(&cfg);
   VERIFY(rc == 0, "ejit_init returned %d", rc);
 
   ejit_activate("cell", ci);
@@ -181,8 +136,8 @@ int main(int argc, char **argv)
 #else
   ejit_stats_t s1;
   ejit_get_stats(&s1);
-  printf("  stats: entries=%u hits=%llu misses=%llu\n", s1.entries, (unsigned long long)s1.hits, (unsigned long long)s1.misses);
-  VERIFY(s1.entries >= 1, "JIT entries >= 1 (actual %u)", s1.entries);
+  printf("  stats: entries=%zu hits=%llu misses=%llu\n", s1.entryCount, (unsigned long long)s1.hits, (unsigned long long)s1.misses);
+  VERIFY(s1.entryCount >= 1, "JIT entries >= 1 (actual %zu)", s1.entryCount);
   VERIFY(s1.misses >= 1, "JIT misses >= 1 (actual %llu)", (unsigned long long)s1.misses);
 #endif
 
@@ -204,7 +159,7 @@ int main(int argc, char **argv)
 #else
   ejit_stats_t s2;
   ejit_get_stats(&s2);
-  printf("  stats: entries=%u hits=%llu misses=%llu\n", s2.entries, (unsigned long long)s2.hits, (unsigned long long)s2.misses);
+  printf("  stats: entries=%zu hits=%llu misses=%llu\n", s2.entryCount, (unsigned long long)s2.hits, (unsigned long long)s2.misses);
   VERIFY(s2.hits >= 1, "Cache hits >= 1 (actual %llu)", (unsigned long long)s2.hits);
 #endif
 
@@ -227,8 +182,8 @@ int main(int argc, char **argv)
 #else
   ejit_stats_t s3;
   ejit_get_stats(&s3);
-  printf("  stats: entries=%u hits=%llu misses=%llu\n", s3.entries, (unsigned long long)s3.hits, (unsigned long long)s3.misses);
-  VERIFY(s3.entries >= 2, "JIT entries >= 2 (2 functions, actual %u)", s3.entries);
+  printf("  stats: entries=%zu hits=%llu misses=%llu\n", s3.entryCount, (unsigned long long)s3.hits, (unsigned long long)s3.misses);
+  VERIFY(s3.entryCount >= 2, "JIT entries >= 2 (2 functions, actual %zu)", s3.entryCount);
 #endif
 
   //=== 验证 4: 不同 cellIdx 产生不同 specialization ===
@@ -257,8 +212,8 @@ int main(int argc, char **argv)
 #else
     ejit_stats_t s4;
     ejit_get_stats(&s4);
-    printf("  stats: entries=%u hits=%llu misses=%llu\n", s4.entries, (unsigned long long)s4.hits, (unsigned long long)s4.misses);
-    VERIFY(s4.entries >= 3, "JIT entries increased (>=3, actual %u)", s4.entries);
+    printf("  stats: entries=%zu hits=%llu misses=%llu\n", s4.entryCount, (unsigned long long)s4.hits, (unsigned long long)s4.misses);
+    VERIFY(s4.entryCount >= 3, "JIT entries increased (>=3, actual %zu)", s4.entryCount);
     VERIFY(s4.misses >= 3, "JIT misses increased (>=3, actual %llu)", (unsigned long long)s4.misses);
 #endif
   }

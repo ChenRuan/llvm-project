@@ -25,28 +25,31 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+#include "ejit_test_helpers.h"
 
 //===-- 场景 A: 单维 cellIdx 外部输入，分支折叠 -----------------------------===//
 
 struct CellCfg {
-  __attribute__((ejit_may_const)) uint32_t cellType;
-  __attribute__((ejit_may_const)) uint32_t cellId;
+  ejit_may_const uint32_t cellType;
+  ejit_may_const uint32_t cellId;
   uint32_t trafficLoad;
 };
 
-__attribute__((ejit_period(("static")))) uint32_t g_sysVer;
+ejit_period(static) uint32_t g_sysVer;
 
 #define N_CELL 8
-__attribute__((ejit_period_arr("cell"))) struct CellCfg g_cellCfg[N_CELL];
+ejit_period_arr(cell) struct CellCfg g_cellCfg[N_CELL];
 
 //===-- 场景 A: 分支折叠验证 ------------------------------------------------===//
 // 调用: process_cell_a(cellIdx)
 // 验证: g_cellCfg[cellIdx].cellType 被常量替换后分支正确折叠
 //       trafficLoad 的变化 = (cellType==特定值 ? 100 : 200)
 
-__attribute__((ejit_entry))
+ejit_entry
 void process_cell_a(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t cellIdx)
+    ejit_period_arr_ind(cell) uint8_t cellIdx)
 {
   if (g_cellCfg[cellIdx].cellType == 0xFD) {         // 253
     g_cellCfg[cellIdx].trafficLoad += 100;
@@ -58,20 +61,20 @@ void process_cell_a(
 //===-- 场景 B: 多维 cellIdx + trpIdx 外部输入 -----------------------------===//
 
 struct TrpCfg {
-  __attribute__((ejit_may_const)) uint32_t trpType;
+  ejit_may_const uint32_t trpType;
   uint32_t activeBeams;
 };
 
 #define M_TRP 8
-__attribute__((ejit_period_arr("trp"))) struct TrpCfg g_trpCfg[M_TRP];
+ejit_period_arr(trp) struct TrpCfg g_trpCfg[M_TRP];
 
 // 调用: process_cell_trp(cellIdx, trpIdx)
 // 验证: 两个 may_const 字段都被替换，复合条件被折叠
 
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t process_cell_trp(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t cellIdx,
-    __attribute__((ejit_period_arr_ind("trp")))  uint8_t trpIdx)
+    ejit_period_arr_ind(cell) uint8_t cellIdx,
+    ejit_period_arr_ind(trp)  uint8_t trpIdx)
 {
   uint32_t ct = g_cellCfg[cellIdx].cellType;
   uint32_t tt = g_trpCfg[trpIdx].trpType;
@@ -90,25 +93,25 @@ uint32_t process_cell_trp(
 //===-- 场景 C: 嵌套结构体 may_const 字段 -----------------------------------===//
 
 struct InnerCfg {
-  __attribute__((ejit_may_const)) uint32_t mode;
+  ejit_may_const uint32_t mode;
   uint32_t reserved;
 };
 
 struct OuterCfg {
-  __attribute__((ejit_may_const)) uint32_t type;
+  ejit_may_const uint32_t type;
   struct InnerCfg inner;
   uint32_t extra;
 };
 
 #define N_OUTER 4
-__attribute__((ejit_period_arr("outer"))) struct OuterCfg g_outerCfg[N_OUTER];
+ejit_period_arr(outer) struct OuterCfg g_outerCfg[N_OUTER];
 
 // 调用: process_outer(cellIdx)
 // 验证: 外层和内层 may_const 字段都能被正确替换
 
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t process_outer(
-    __attribute__((ejit_period_arr_ind("outer"))) uint8_t idx)
+    ejit_period_arr_ind(outer) uint8_t idx)
 {
   uint32_t t = g_outerCfg[idx].type;
   uint32_t m = g_outerCfg[idx].inner.mode;
@@ -120,11 +123,7 @@ uint32_t process_outer(
 }
 
 //===-- 运行时 API ---------------------------------------------------------===//
-
-extern int ejit_init(const void *cfg);
-extern int ejit_activate(const char *name, unsigned char idx);
-extern int ejit_deactivate(const char *name, unsigned char idx);
-extern int ejit_is_active(const char *name, unsigned char idx);
+// 来自 ejit_test_helpers.h (ABI-matching EJitRuntime.h).
 extern void ejit_shutdown(void);
 
 //===-- 测试辅助 -----------------------------------------------------------===//
@@ -184,7 +183,9 @@ int main(int argc, char **argv) {
   printf("cellIdx = %u, trpIdx = %u\n\n", ci, ti);
 
   // 初始化运行时
-  int rc = ejit_init(0);
+  ejit_config_t cfg;
+  ejit_default_config(&cfg);
+  int rc = ejit_init(&cfg);
   if (rc != 0) { printf("ejit_init FAIL: %d\n", rc); return 1; }
 
   // 初始化测试数据
@@ -266,6 +267,19 @@ int main(int argc, char **argv) {
   printf("\n=== 场景 C: process_outer(idx=%u) ===\n", (unsigned)(ci % N_OUTER));
   uint32_t result_c = process_outer(ci % N_OUTER);
   CHECK_EQ(result_c, 777u, "C: outer/inner may_const both match");
+
+  // Verify the async path actually compiled (not silent AOT fallback).
+  ejit_drain_taskpool();
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  {
+    ejit_taskpool_stats_t ts; memset(&ts, 0, sizeof(ts));
+    ejit_taskpool_get_stats(&ts);
+    if (ts.asyncCompiles == 0) {
+      printf("FAIL: async path produced no compiles (silent AOT)\n");
+      g_failures++;
+    }
+  }
+#endif
 
   // 关闭
   ejit_shutdown();

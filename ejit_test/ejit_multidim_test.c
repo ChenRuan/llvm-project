@@ -14,23 +14,26 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+#include "ejit_test_helpers.h"
 
 //===-- 2D 周期数组 -----------------------------------------------------------===//
 
 struct SlotCfg {
-  __attribute__((ejit_may_const)) uint32_t slotType;
-  __attribute__((ejit_may_const)) uint32_t priority;
+  ejit_may_const uint32_t slotType;
+  ejit_may_const uint32_t priority;
   uint32_t usageCount;
 };
 
 #define N_ROWS  4
 #define N_COLS  8
-__attribute__((ejit_period_arr("cell"))) struct SlotCfg g_slots[N_ROWS][N_COLS];
+ejit_period_arr(cell) struct SlotCfg g_slots[N_ROWS][N_COLS];
 
 //===-- 2D 嵌套结构体数组 -----------------------------------------------------===//
 
 struct Inner2D {
-  __attribute__((ejit_may_const)) uint32_t mode;
+  ejit_may_const uint32_t mode;
   uint32_t pad;
 };
 
@@ -39,13 +42,13 @@ struct Outer2D {
   uint32_t flags;
 };
 
-__attribute__((ejit_period_arr("cell"))) struct Outer2D g_outer2d[N_ROWS][N_COLS];
+ejit_period_arr(cell) struct Outer2D g_outer2d[N_ROWS][N_COLS];
 
 //===-- JIT entry: 2D flat struct access ------------------------------------===//
 
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t classify_slot(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t ci)
+    ejit_period_arr_ind(cell) uint8_t ci)
 {
   uint32_t sum = 0;
   // 遍历二维数组的第二维 — JIT 应把 may_const 替换为常量
@@ -62,9 +65,9 @@ uint32_t classify_slot(
 
 //===-- JIT entry: 2D nested struct access ----------------------------------===//
 
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t check_outer2d(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t ci)
+    ejit_period_arr_ind(cell) uint8_t ci)
 {
   // 访问 g_outer2d[ci][3].inner.mode
   uint32_t m = g_outer2d[ci][3].inner.mode;
@@ -74,10 +77,7 @@ uint32_t check_outer2d(
 }
 
 //===-- 运行时 API -----------------------------------------------------------===//
-
-extern int ejit_init(const void *cfg);
-extern int ejit_activate(const char *name, unsigned char idx);
-extern int ejit_deactivate(const char *name, unsigned char idx);
+// 来自 ejit_test_helpers.h (ABI-matching EJitRuntime.h).
 extern void ejit_shutdown(void);
 
 //===-- 断言 -----------------------------------------------------------------===//
@@ -94,7 +94,9 @@ int main(int argc, char **argv) {
   printf("=== EJIT Multi-Dim Array Test ===\n");
   printf("cellIdx=%u\n\n", ci);
 
-  ejit_init(0);
+  ejit_config_t cfg;
+  ejit_default_config(&cfg);
+  ejit_init(&cfg);
 
   //===-- 场景 A: 2D flat struct，遍历第二维 --------------------------------===//
   printf("--- A: 2D classify_slot(ci=%u) ---\n", ci);
@@ -154,6 +156,19 @@ int main(int argc, char **argv) {
   ejit_activate("cell", ci);
   r = check_outer2d(ci);
   T(r == 0, "check_outer2d(%u) mode=0x00 = %u (expected 0)", ci, r);
+
+  // Verify the async path actually compiled (not silent AOT fallback).
+  ejit_drain_taskpool();
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  {
+    ejit_taskpool_stats_t ts; memset(&ts, 0, sizeof(ts));
+    ejit_taskpool_get_stats(&ts);
+    if (ts.asyncCompiles == 0) {
+      printf("FAIL: async path produced no compiles (silent AOT)\n");
+      g_fail++;
+    }
+  }
+#endif
 
   ejit_shutdown();
 

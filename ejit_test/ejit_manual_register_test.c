@@ -10,18 +10,21 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+#include "ejit_test_helpers.h"
 
 struct CellCfg {
-  __attribute__((ejit_may_const)) uint32_t cellType;
+  ejit_may_const uint32_t cellType;
   uint32_t trafficLoad;
 };
 
-__attribute__((ejit_period_arr("cell")))
+ejit_period_arr(cell)
 struct CellCfg g_cellCfg[4] = {{1,100},{2,200},{3,300},{4,400}};
 
-__attribute__((ejit_entry))
+ejit_entry
 uint32_t jit_check_cell_type(
-    __attribute__((ejit_period_arr_ind("cell"))) uint8_t cellIndex)
+    ejit_period_arr_ind(cell) uint8_t cellIndex)
 {
   if (g_cellCfg[cellIndex].cellType == 1) return 10;
   if (g_cellCfg[cellIndex].cellType == 2) return 20;
@@ -35,11 +38,13 @@ int main(int argc, char **argv) {
   int failures = 0;
 
   // Constructor path is disabled at compile time (-enable-ejit-global-ctors=false).
-  // ejit_init falls back to __ejit_registry_*[] static tables.
-extern int ejit_init(const void *config);
-extern int ejit_activate(const char *name, unsigned char idx);
-extern void ejit_shutdown(void);
-  ejit_init(0);
+  // ejit_init falls back to __ejit_registry_*[] static tables, so the config
+  // must set forceStaticRegistry=true. Runtime API comes from ejit_test_helpers.h.
+  extern void ejit_shutdown(void);
+  ejit_config_t cfg;
+  ejit_default_config(&cfg);
+  cfg.forceStaticRegistry = true;
+  ejit_init(&cfg);
 
   // Activate cell[0] (cellType=1 → expect 10)
   ejit_activate("cell", idx0);
@@ -60,6 +65,19 @@ extern void ejit_shutdown(void);
     printf("FAIL: cell[%u]=%u, expected 30\n", idx2, v2);
     failures++;
   }
+
+  // Verify the async path actually compiled (not silent AOT fallback).
+  ejit_drain_taskpool();
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  {
+    ejit_taskpool_stats_t ts; memset(&ts, 0, sizeof(ts));
+    ejit_taskpool_get_stats(&ts);
+    if (ts.asyncCompiles == 0) {
+      printf("FAIL: async path produced no compiles (silent AOT)\n");
+      failures++;
+    }
+  }
+#endif
 
   ejit_shutdown();
   printf("OK: ejit_shutdown\n");

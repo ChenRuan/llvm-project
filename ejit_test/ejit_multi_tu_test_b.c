@@ -10,16 +10,18 @@
 
 #include <stdint.h>
 
+#include "ejit_test_helpers.h"
+
 struct BCfg {
-  __attribute__((ejit_may_const)) uint32_t kind;
+  ejit_may_const uint32_t kind;
   uint32_t y;
 };
 
 #define N_B 8
-__attribute__((ejit_period_arr("bcell"))) struct BCfg g_bCfg[N_B];
+ejit_period_arr(bcell) struct BCfg g_bCfg[N_B];
 
-__attribute__((ejit_entry))
-uint32_t jit_b(__attribute__((ejit_period_arr_ind("bcell"))) uint8_t i)
+ejit_entry
+uint32_t jit_b(ejit_period_arr_ind(bcell) uint8_t i)
 {
   // JIT 应把 g_bCfg[i].kind 替换为常量并折叠此分支
   if (g_bCfg[i].kind == 0xBB)

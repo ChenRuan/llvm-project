@@ -15,7 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+#include "ejit_test_helpers.h"
 
 //===--- Data types --------------------------------------------------------===//
 
@@ -138,10 +138,9 @@ int main(int argc, char **argv) {
   printf("=== EJIT Pointer Period Test ===\n");
   printf("cellIdx=%d\n\n", cellIdx);
 
-  // Initialize EJIT
+  // Initialize EJIT (ejit_default_config picks ASYNC under SHARED, SYNC otherwise).
   ejit_config_t cfg;
-  memset(&cfg, 0, sizeof(cfg));
-  cfg.compileMode = EJIT_COMPILE_SYNC;
+  ejit_default_config(&cfg);
 
   ejit_status_t st = ejit_init(&cfg);
   CHECK(st == EJIT_OK, "ejit_init");
@@ -275,6 +274,20 @@ int main(int argc, char **argv) {
   int r9 = test_ptr_period();
   printf("  result=%d\n", r9);
   CHECK(r9 == 6400, "ptr_period static implicit");
+
+  // Verify the async path actually compiled (not silent AOT fallback).
+  ejit_drain_taskpool();
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  {
+    ejit_taskpool_stats_t ts;
+    memset(&ts, 0, sizeof(ts));
+    ejit_taskpool_get_stats(&ts);
+    if (ts.asyncCompiles == 0) {
+      printf("  FAIL: async path produced no compiles (silent AOT)\n");
+      g_failures++;
+    }
+  }
+#endif
 
   // Shutdown
   ejit_shutdown();

@@ -20,21 +20,23 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "ejit_test_helpers.h"
+
 //===-- 周期数组配置 ---------------------------------------------------------===//
 
 struct LoopFoldCfg {
-  __attribute__((ejit_may_const)) uint32_t outer_n;
-  __attribute__((ejit_may_const)) uint32_t inner_n;
+  ejit_may_const uint32_t outer_n;
+  ejit_may_const uint32_t inner_n;
 };
 
 #define N 16
-__attribute__((ejit_period_arr("loopfold"))) struct LoopFoldCfg g_loopfold[N];
+ejit_period_arr(loopfold) struct LoopFoldCfg g_loopfold[N];
 
 //===-- JIT entry: 嵌套循环，应折叠为常量 -----------------------------------===//
 
-__attribute__((ejit_entry))
+ejit_entry
 uint64_t fold_loop(
-    __attribute__((ejit_period_arr_ind("loopfold"))) uint8_t ci)
+    ejit_period_arr_ind(loopfold) uint8_t ci)
 {
   uint64_t sum = 0;
   for (uint32_t i = 0; i < g_loopfold[ci].outer_n; i++)
@@ -44,47 +46,12 @@ uint64_t fold_loop(
 }
 
 //===-- 运行时 API -----------------------------------------------------------===//
+// ejit_config_t / ejit_stats_t / ejit_taskpool_stats_t / enums / drain helper
+// come from ejit_test_helpers.h (ABI-matching EJitRuntime.h). When the async
+// AOT wrapper is active, compiles bypass the legacy LRU cache: ejit_get_stats()
+// returns zeros, so use the taskpool stats API and drain before sampling.
 
-typedef enum { EJIT_OK = 0 }             ejit_status_t;
-typedef enum { EJIT_COMPILE_SYNC = 0, EJIT_COMPILE_ASYNC = 1 } ejit_compile_mode_t;
-typedef enum { EJIT_OPT_L1 = 1, EJIT_OPT_L2 = 2, EJIT_OPT_L3 = 3 } ejit_opt_level_t;
-
-typedef struct {
-  ejit_compile_mode_t compileMode;
-  ejit_opt_level_t    optLevel;
-  size_t maxCodeMemory, maxDataMemory, maxCacheEntries, maxCacheSize;
-  bool   enableLogger;
-  const char *dumpJITDir;
-} ejit_config_t;
-
-typedef struct {
-  size_t entryCount, totalCodeSize, maxSize;
-  unsigned long long hits, misses, evictions;
-} ejit_stats_t;
-
-extern ejit_status_t ejit_init(const ejit_config_t *cfg);
-extern void          ejit_shutdown(void);
-extern ejit_status_t ejit_activate(const char *name, unsigned char idx);
-extern ejit_status_t ejit_get_stats(ejit_stats_t *s);
-
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-// When the async AOT wrapper is active, compiles bypass the legacy LRU cache.
-// ejit_get_stats() returns zeros; use the taskpool stats API instead and spin
-// until all in-flight compiles finish before sampling the counters.
-typedef struct {
-  unsigned long long cacheHits, asyncCompiles, asyncEnqueues, alreadyPending;
-  unsigned long long queueFull, compileFailed, publishFailed, instanceDisabled;
-  unsigned readyEntries, pendingEntries, queueApproxSize, reserved;
-} ejit_taskpool_stats_t;
-extern unsigned ejit_taskpool_pending_count(void);
-extern int ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
-static void ejit_drain_taskpool(void) {
-  while (ejit_taskpool_pending_count() > 0)
-    ;
-}
-#else
-static void ejit_drain_taskpool(void) {}
-#endif
+extern void ejit_shutdown(void);
 
 //===-- 断言 -----------------------------------------------------------------===//
 
