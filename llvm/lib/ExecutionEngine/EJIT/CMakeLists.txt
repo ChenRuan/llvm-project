@@ -49,6 +49,9 @@ endif()
 set(EJIT_TARGET_COMPONENTS "")
 foreach(_t ${LLVM_TARGETS_TO_BUILD})
   list(APPEND EJIT_TARGET_COMPONENTS ${_t}CodeGen ${_t}Desc ${_t}Info)
+  if(_t STREQUAL "AArch64")
+    list(APPEND EJIT_TARGET_COMPONENTS AArch64AsmParser)
+  endif()
 endforeach()
 
 set(EJIT_SOURCES

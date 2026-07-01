@@ -47,6 +47,7 @@ void initializeEJitTargets() {
     LLVMInitializeAArch64Target();
     LLVMInitializeAArch64TargetMC();
     LLVMInitializeAArch64AsmPrinter();
+    LLVMInitializeAArch64AsmParser();
     return;
   }
 #endif
@@ -72,6 +73,7 @@ void initializeEJitTargets() {
   InitializeAllTargets();
   InitializeAllTargetMCs();
   InitializeAllAsmPrinters();
+  InitializeAllAsmParsers();
 }
 
 } // namespace

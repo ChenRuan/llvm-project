@@ -94,7 +94,8 @@ _set_min_libs() {
     ${_l}/libLLVMCore.a ${_l}/libLLVMSupport.a ${_l}/libLLVMDemangle.a
     ${_l}/libLLVMBinaryFormat.a ${_l}/libLLVMBitReader.a ${_l}/libLLVMBitstreamReader.a
     ${_l}/libLLVMAnalysis.a ${_l}/libLLVMScalarOpts.a ${_l}/libLLVMInstCombine.a
-    ${_l}/libLLVMipo.a ${_l}/libLLVMTransformUtils.a ${_l}/libLLVMCodeGen.a
+    ${_l}/libLLVMipo.a ${_l}/libLLVMTransformUtils.a ${_l}/libLLVMVectorize.a
+    ${_l}/libLLVMCodeGen.a
     ${_l}/libLLVMCodeGenTypes.a ${_l}/libLLVMTarget.a ${_l}/libLLVMTargetParser.a
     ${_l}/libLLVMSelectionDAG.a ${_l}/libLLVMAsmPrinter.a ${_l}/libLLVMMC.a
     ${_l}/libLLVMObject.a ${_l}/libLLVMProfileData.a ${_l}/libLLVMExecutionEngine.a
@@ -117,6 +118,7 @@ _set_min_libs() {
     aarch64)
       MIN_LIBS="${MIN_LIBS_COMMON}
         ${_l}/libLLVMAArch64CodeGen.a ${_l}/libLLVMAArch64Desc.a
+        ${_l}/libLLVMAArch64AsmParser.a
         ${_l}/libLLVMAArch64Info.a ${_l}/libLLVMAArch64Utils.a"
       ;;
   esac
@@ -172,6 +174,7 @@ ALL_TESTS=(
   ejit_external_idx_test
   ejit_fold_loop_test
   ejit_jit_verify_test
+  ejit_inline_asm_test
   ejit_likely_test
   ejit_lifecycle_test
   ejit_multidim_test
@@ -214,6 +217,7 @@ TEST_ARGS[ejit_fold_loop_test]="0"
 TEST_ARGS[ejit_opt_level_test]="L2"
 TEST_ARGS[ejit_multiversion_test]="0 3 7"
 TEST_ARGS[ejit_jit_verify_test]="0 1 5"
+TEST_ARGS[ejit_inline_asm_test]=""
 TEST_ARGS[ejit_likely_test]="0 1 7"
 TEST_ARGS[ejit_external_idx_test]="3 1"
 TEST_ARGS[ejit_lifecycle_test]="3 7 2"
