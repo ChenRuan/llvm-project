@@ -120,6 +120,43 @@ typedef struct {
 
 extern int ejit_get_stats(ejit_stats_t *stats);
 
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+#include <string.h>
+// In a shared-taskpool build the async AOT wrapper drives
+// ejit_taskpool_compile_or_get instead of the legacy LRU ABI, and the single
+// cross-core worker is started ONLY by owner election inside ejit_init when the
+// compile mode is Async. A mode flip after a Sync init cannot start the
+// owner-controlled worker, so the test must initialize in Async mode (matching
+// the canonical ejit_config_t ABI) to exercise the JIT at all.
+typedef struct {
+  int compileMode;          // ejit_compile_mode_t: 1 = EJIT_COMPILE_ASYNC
+  int optLevel;             // ejit_opt_level_t:    2 = EJIT_OPT_L2
+  size_t maxCodeMemory, maxDataMemory, maxCacheEntries, maxCacheSize;
+  _Bool enableLogger, forceStaticRegistry;
+  const char *dumpJITDir;
+} ejit_async_config_t;
+static const ejit_async_config_t ejit_async_cfg = {
+    .compileMode = 1, .optLevel = 2,
+    .maxCodeMemory = 512 * 1024, .maxDataMemory = 256 * 1024,
+    .maxCacheEntries = 64, .maxCacheSize = 1024 * 1024,
+};
+#define EJIT_INIT_CFG (&ejit_async_cfg)
+typedef struct {
+  unsigned long long cacheHits, asyncCompiles, asyncEnqueues, alreadyPending;
+  unsigned long long queueFull, compileFailed, publishFailed, instanceDisabled;
+  unsigned readyEntries, pendingEntries, queueApproxSize, reserved;
+} ejit_taskpool_stats_t;
+extern unsigned ejit_taskpool_pending_count(void);
+extern int ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
+static void ejit_drain_taskpool(void) {
+  while (ejit_taskpool_pending_count() > 0)
+    ;
+}
+#else
+#define EJIT_INIT_CFG (0)
+static void ejit_drain_taskpool(void) {}
+#endif
+
 //===-- 断言 ---------------------------------------------------------------===//
 
 static int g_failures = 0;
@@ -149,7 +186,7 @@ int main(int argc, char **argv)
     g_cellCfg[i].trafficLoad = 0;
   }
 
-  int rc = ejit_init(0);
+  int rc = ejit_init(EJIT_INIT_CFG);
   VERIFY(rc == 0, "ejit_init returned %d", rc);
   ejit_activate("cell", ci);
 
@@ -187,11 +224,22 @@ int main(int argc, char **argv)
 
   // JIT 编译确实发生 (修复前根本无法编译到这里)
   printf("\n--- JIT Stats ---\n");
+  ejit_drain_taskpool();
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  ejit_taskpool_stats_t tp; memset(&tp, 0, sizeof(tp));
+  ejit_taskpool_get_stats(&tp);
+  printf("  ready=%u  hits=%llu  compiles=%llu\n",
+         tp.readyEntries, (unsigned long long)tp.cacheHits,
+         (unsigned long long)tp.asyncCompiles);
+  VERIFY(tp.asyncCompiles >= 1, "JIT compiles >= 1 (actual %llu)",
+         (unsigned long long)tp.asyncCompiles);
+#else
   ejit_stats_t s;
   ejit_get_stats(&s);
   printf("  entries=%u  hits=%llu  misses=%llu\n",
          s.entries, (unsigned long long)s.hits, (unsigned long long)s.misses);
   VERIFY(s.entries >= 1, "JIT entries >= 1 (actual %u)", s.entries);
+#endif
 
   ejit_shutdown();
   printf("\n=== %s (%d failure(s)) ===\n",

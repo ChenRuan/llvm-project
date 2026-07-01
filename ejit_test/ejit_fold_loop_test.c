@@ -45,8 +45,8 @@ uint64_t fold_loop(
 
 //===-- 运行时 API -----------------------------------------------------------===//
 
-typedef enum { EJIT_OK = 0 }            ejit_status_t;
-typedef enum { EJIT_COMPILE_SYNC = 0 } ejit_compile_mode_t;
+typedef enum { EJIT_OK = 0 }             ejit_status_t;
+typedef enum { EJIT_COMPILE_SYNC = 0, EJIT_COMPILE_ASYNC = 1 } ejit_compile_mode_t;
 typedef enum { EJIT_OPT_L1 = 1, EJIT_OPT_L2 = 2, EJIT_OPT_L3 = 3 } ejit_opt_level_t;
 
 typedef struct {
@@ -66,6 +66,25 @@ extern ejit_status_t ejit_init(const ejit_config_t *cfg);
 extern void          ejit_shutdown(void);
 extern ejit_status_t ejit_activate(const char *name, unsigned char idx);
 extern ejit_status_t ejit_get_stats(ejit_stats_t *s);
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+// When the async AOT wrapper is active, compiles bypass the legacy LRU cache.
+// ejit_get_stats() returns zeros; use the taskpool stats API instead and spin
+// until all in-flight compiles finish before sampling the counters.
+typedef struct {
+  unsigned long long cacheHits, asyncCompiles, asyncEnqueues, alreadyPending;
+  unsigned long long queueFull, compileFailed, publishFailed, instanceDisabled;
+  unsigned readyEntries, pendingEntries, queueApproxSize, reserved;
+} ejit_taskpool_stats_t;
+extern unsigned ejit_taskpool_pending_count(void);
+extern int ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
+static void ejit_drain_taskpool(void) {
+  while (ejit_taskpool_pending_count() > 0)
+    ;
+}
+#else
+static void ejit_drain_taskpool(void) {}
+#endif
 
 //===-- 断言 -----------------------------------------------------------------===//
 
@@ -91,7 +110,12 @@ int main(int argc, char **argv) {
   // 显式选择 L3 — 仅 L3 引入循环 pass (LoopSimplify/Unroll/IndVarSimplify/...)
   ejit_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  // Async mode so the shared taskpool worker starts during ejit_init.
+  cfg.compileMode     = EJIT_COMPILE_ASYNC;
+#else
   cfg.compileMode     = EJIT_COMPILE_SYNC;
+#endif
   cfg.optLevel        = EJIT_OPT_L3;
   cfg.maxCodeMemory   = 512 * 1024;
   cfg.maxDataMemory   = 256 * 1024;
@@ -101,14 +125,37 @@ int main(int argc, char **argv) {
   T(ejit_init(&cfg) == EJIT_OK, "ejit_init(L3)");
   ejit_activate("loopfold", ci);
 
+  // First call: in async mode this enqueues the compile and returns via the AOT
+  // fallback (the JIT specialization is not ready yet).
   uint64_t r = fold_loop(ci);
   T(r == EXPECTED, "fold_loop(%u) = %llu (expected %llu)",
     ci, (unsigned long long)r, (unsigned long long)EXPECTED);
 
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  ejit_drain_taskpool();
+  ejit_taskpool_stats_t tp; memset(&tp, 0, sizeof(tp));
+  ejit_taskpool_get_stats(&tp);
+  T(tp.asyncCompiles > 0, "JIT active (async_compiles=%llu)",
+    (unsigned long long)tp.asyncCompiles);
+
+  // Now that the specialization is compiled and published, call again. This
+  // call is served from the JIT cache (cacheHits increments), so it validates
+  // that the JIT-specialized loop fold returns the same correct value — not
+  // just the AOT fallback.
+  uint64_t rj = fold_loop(ci);
+  ejit_taskpool_stats_t tp2; memset(&tp2, 0, sizeof(tp2));
+  ejit_taskpool_get_stats(&tp2);
+  T(rj == EXPECTED, "fold_loop(%u) [JIT] = %llu (expected %llu)",
+    ci, (unsigned long long)rj, (unsigned long long)EXPECTED);
+  T(tp2.cacheHits > tp.cacheHits,
+    "2nd call served from JIT cache (cacheHits %llu -> %llu)",
+    (unsigned long long)tp.cacheHits, (unsigned long long)tp2.cacheHits);
+#else
   ejit_stats_t s;
   memset(&s, 0, sizeof(s));
   ejit_get_stats(&s);
   T(s.entryCount > 0, "JIT active (entries=%zu)", s.entryCount);
+#endif
 
   ejit_shutdown();
 
