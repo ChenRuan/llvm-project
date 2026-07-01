@@ -24,7 +24,7 @@ The resulting ejit.o (~30-40 MB) can replace all individual LLVM .a files
 when linking EJIT test binaries.
 """
 
-import subprocess as sp, os, sys, re, argparse, struct, glob
+import subprocess as sp, os, sys, re, argparse, struct, glob, shutil
 
 
 # ── per-architecture configuration ──────────────────────────────────────────
@@ -98,11 +98,19 @@ def build_symbol_index(build_dir):
 # ── objcopy helpers ──────────────────────────────────────────────────────────
 
 def _find_objcopy(build_dir):
-    """Return (tool_path, is_llvm) for the best available objcopy."""
+    """Return (tool_path, is_llvm) for the best available objcopy.
+
+    Prefer the build's llvm-objcopy (handles extended ELF with >65280
+    sections), then llvm-objcopy on PATH, and finally fall back to GNU
+    objcopy when no llvm-objcopy is available.
+    """
     llvm_oc = os.path.join(build_dir, "bin", "llvm-objcopy")
     if os.path.exists(llvm_oc):
         return llvm_oc, True
-    return "llvm-objcopy", True
+    if shutil.which("llvm-objcopy"):
+        return "llvm-objcopy", True
+    # No llvm-objcopy anywhere; fall back to GNU objcopy.
+    return "objcopy", False
 
 
 def _try_strip_arm_mapping_symbols(merged_o, work_dir, build_dir):
