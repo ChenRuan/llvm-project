@@ -23,16 +23,14 @@ using namespace llvm::ejit;
 // The leading-dot section names are not valid C identifiers, so the linker
 // does NOT auto-synthesize the __start_/__stop_ bounds — a linker script must
 // define these four symbols and bracket the sections (see the example
-// llvm/lib/ExecutionEngine/EJIT/ejit_registry.ld). They are declared weak so a
-// program with no ejit_entry functions (or no script) resolves them to null
-// and walks an empty range. This replaces the old single external
-// __ejit_registry_*[] arrays, which produced duplicate-symbol link errors
-// across multiple TUs.
+// llvm/lib/ExecutionEngine/EJIT/ejit_registry.ld).  This replaces the old
+// single external __ejit_registry_*[] arrays, which produced duplicate-symbol
+// link errors across multiple TUs.
 extern "C" {
-extern const ejit_reg_entry_t __start_ejit_bitcode[] __attribute__((weak));
-extern const ejit_reg_entry_t __stop_ejit_bitcode[] __attribute__((weak));
-extern const ejit_reg_entry_t __start_ejit_period[] __attribute__((weak));
-extern const ejit_reg_entry_t __stop_ejit_period[] __attribute__((weak));
+extern const ejit_reg_entry_t __start_ejit_bitcode[];
+extern const ejit_reg_entry_t __stop_ejit_bitcode[];
+extern const ejit_reg_entry_t __start_ejit_period[];
+extern const ejit_reg_entry_t __stop_ejit_period[];
 }
 
 namespace {
