@@ -63,14 +63,14 @@ enum class PeriodState { Inactive, Active };
 
 /// Manages activate/deactivate state of time-window period instances.
 ///
-/// Two activation granularities:
-///   - period-level: ejit_activate("cell", 3) → activates ALL arrays under "cell"
-///     at index 3 (fans out to registered arrays).
-///   - array-level:  ejit_activate_array("cell", &g_cellCfg, 3) → activates only
-///     g_cellCfg at index 3 (other arrays under "cell" unaffected).
+/// Activation is keyed by lifecycle/period name + instance index only:
+///   - ejit_activate("cell", 3) → activates ALL arrays under "cell" at index 3
+///     (fans out to every array registered under that period name).
 ///
-/// isActive() returns true if ANY array under the period name at the given
-/// cellIdx is active (period-level semantics for JIT compile decision).
+/// There is no array-pointer dimension in the active state: if multiple arrays
+/// share the same period name, activation is name-level for that period
+/// instance. isActive() returns true if the period name is active at the given
+/// cellIdx.
 class EJitRuntimeState {
 public:
 #ifdef EJIT_FREESTANDING
@@ -81,10 +81,6 @@ public:
   /// Period-level activation: activates all arrays registered under periodName.
   void activate(const std::string &periodName, uint8_t cellIdx);
   void deactivate(const std::string &periodName, uint8_t cellIdx);
-
-  /// Array-level activation: activates only the specific array.
-  void activateArray(void *arrayPtr, uint8_t cellIdx);
-  void deactivateArray(void *arrayPtr, uint8_t cellIdx);
 
   void activateAll(const std::string &periodName);
   void deactivateAll(const std::string &periodName);

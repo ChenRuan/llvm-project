@@ -1306,10 +1306,10 @@ TEST(EJitWorkerTest, StopUnstartedWorkerIsSafe) {
 }
 
 //===----------------------------------------------------------------------===//
-// Array-level control-plane wiring (EJit::activateArray/deactivateArray, the
-// single-vs-multi-array clean-reject rule, and the version semantics) is tested
-// end-to-end through the public EJit / C ABI in EJitRuntimeTest.cpp
-// (EJitTaskpoolArray.*), since proving the wiring requires a real EJit
-// instance. A bare SwitchController test here could not distinguish array-level
-// from period-level behavior and was removed.
+// Lifecycle control-plane wiring (EJit::activate/deactivate keyed by lifecycle
+// name + instance index, and the version semantics) is tested end-to-end
+// through the public EJit / C ABI in EJitRuntimeTest.cpp (EJitTaskpoolArray.*),
+// since proving the wiring requires a real EJit instance. A bare
+// SwitchController test here could not distinguish the name-level control-plane
+// behavior and was removed.
 //===----------------------------------------------------------------------===//

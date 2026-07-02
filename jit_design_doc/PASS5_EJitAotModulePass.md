@@ -299,8 +299,8 @@ static void addEmbeddedJITPasses(const PassBuilder &PB,
 ; CHECK: define internal void @ejit_auto_register
 ; CHECK: call void @ejit_register_period_array
 ; CHECK: call ptr @ejit_compile_or_get
-; CHECK: call void @ejit_deactivate_array
-; CHECK: call void @ejit_activate_array
+; CHECK: call void @ejit_deactivate
+; CHECK: call void @ejit_activate
 ; 注意: @__ejit_bitcode 和 ejit_register_bitcode 调用由早期 EJitRegisterBitcodePass 生成
 ```
 

@@ -619,7 +619,7 @@ ORC LLJIT / JITLink：目标代码生成 + 符号解析 + code memory finalize</
 
         <rect x="100" y="270" width="760" height="48" rx="10" fill="#ebf2fa" stroke="#3182ce" />
         <text x="132" y="300" class="svg-label">ejit_period_lc(name)</text>
-        <text x="292" y="300" class="svg-small">函数入口自动 deactivate_array；每个 return 前自动 activate_array。</text>
+        <text x="292" y="300" class="svg-small">函数入口自动 deactivate；每个 return 前自动 activate。</text>
       </svg>
     </div>
     <div class="warn">异步编译特别需要版本检查：任务开始时看到的 period 版本，发布时必须仍然有效；否则应丢弃编译结果，避免过期常量进入 cache。</div>

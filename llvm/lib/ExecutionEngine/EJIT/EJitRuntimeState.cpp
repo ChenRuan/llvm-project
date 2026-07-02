@@ -89,37 +89,6 @@ void EJitRuntimeState::deactivate(const std::string &periodName,
   }
 }
 
-void EJitRuntimeState::activateArray(void *arrayPtr, uint8_t cellIdx) {
-  if (!registry_.getArrayByBaseAddr(arrayPtr)) {
-    EJIT_DIAG("runtimeState activateArray FAIL: arrayPtr=%p not registered",
-              arrayPtr);
-    assert(registry_.getArrayByBaseAddr(arrayPtr) &&
-           "activateArray: arrayPtr is not a registered period array");
-  }
-  EJIT_DIAG("runtimeState activateArray ptr=%p cellIdx=%u", arrayPtr, cellIdx);
-#ifndef EJIT_FREESTANDING
-  std::lock_guard<decltype(mutex_)> lock(mutex_);
-#endif
-  arrayStates_[reinterpret_cast<uintptr_t>(arrayPtr)][cellIdx] =
-      PeriodState::Active;
-}
-
-void EJitRuntimeState::deactivateArray(void *arrayPtr, uint8_t cellIdx) {
-  if (!registry_.getArrayByBaseAddr(arrayPtr)) {
-    EJIT_DIAG("runtimeState deactivateArray FAIL: arrayPtr=%p not registered",
-              arrayPtr);
-    assert(registry_.getArrayByBaseAddr(arrayPtr) &&
-           "deactivateArray: arrayPtr is not a registered period array");
-  }
-  EJIT_DIAG("runtimeState deactivateArray ptr=%p cellIdx=%u", arrayPtr,
-            cellIdx);
-#ifndef EJIT_FREESTANDING
-  std::lock_guard<decltype(mutex_)> lock(mutex_);
-#endif
-  arrayStates_[reinterpret_cast<uintptr_t>(arrayPtr)][cellIdx] =
-      PeriodState::Inactive;
-}
-
 void EJitRuntimeState::activateAll(const std::string &periodName) {
   EJIT_DIAG("runtimeState activateAll period=%s", periodName.c_str());
 #ifndef EJIT_FREESTANDING

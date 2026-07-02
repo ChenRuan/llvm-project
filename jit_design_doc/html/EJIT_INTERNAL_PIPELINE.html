@@ -58,7 +58,7 @@ Code Cache / fallback AOT</div>
       <tr><td>PASS1 <code>EJitRegisterBitcode</code></td><td>标准优化前</td><td>提取 <code>ejit_entry</code> 闭包，保留 metadata，嵌入 bitcode，自动注册外部符号</td><td><code>@__ejit_bitcode</code>、registry bitcode entries</td></tr>
       <tr><td>PASS2 <code>EJitRegisterPeriod</code></td><td>非 LTO 优化前 / LTO 优化后</td><td>扫描 period/static metadata，生成注册调用或静态表</td><td>period registry entries</td></tr>
       <tr><td>PASS3 <code>EJitWrapperGen</code></td><td>同上</td><td>在原函数入口插入 cache key 计算、runtime 调用、dispatch/fallback</td><td><code>jit_dispatch</code>、<code>jit_fallback</code></td></tr>
-      <tr><td>PASS4 <code>EJitPeriodHandler</code></td><td>同上</td><td>生命周期函数入口/出口插入 deactivate/activate</td><td><code>ejit_deactivate_array</code>、<code>ejit_activate_array</code></td></tr>
+      <tr><td>PASS4 <code>EJitPeriodHandler</code></td><td>同上</td><td>生命周期函数入口/出口插入 deactivate/activate</td><td><code>ejit_deactivate</code>、<code>ejit_activate</code></td></tr>
       <tr><td>PASS5 <code>EJitAotModulePass</code></td><td>协调</td><td>按序运行 PASS2-4，快速跳过无 EJIT metadata 模块</td><td>AOT pipeline 封装</td></tr>
     </table>
   </section>

@@ -30,10 +30,10 @@
 ; CHECK: call i32 @ejit_taskpool_compile_or_get(i32 {{.*}}, ptr {{.*}}, i32 0, ptr {{.*}}, ptr {{.*}})
 
 ; CHECK: define{{.*}}@update_config
-; CHECK: call void @ejit_deactivate_array
-; CHECK: call void @ejit_deactivate_array
-; CHECK: call void @ejit_activate_array
-; CHECK: call void @ejit_activate_array
+; CHECK: call void @ejit_deactivate
+; CHECK: call void @ejit_deactivate
+; CHECK: call void @ejit_activate
+; CHECK: call void @ejit_activate
 
 ; CHECK: define internal void @ejit_auto_register()
 ; CHECK: call void @ejit_register_period_array(ptr {{.*}}, ptr {{.*}}, ptr @cell_cfg, i64 10)

@@ -334,7 +334,7 @@ void process_board(void) {
   <p>The <code>static</code> time window represents global config that does not change during JIT runtime; it does not require calling <code>ejit_activate</code>.</p>
 
   <h3>3.3 Array time window: <code>ejit_period_arr(name)</code></h3>
-  <p>Multiple global arrays can share the same time-window name. Calling <code>ejit_activate("cell", idx)</code> activates the same index across all arrays of that name; to activate only one array, use <code>ejit_activate_array</code>.</p>
+  <p>Multiple global arrays can share the same time-window name. Calling <code>ejit_activate("cell", idx)</code> activates the same index across all arrays of that name. Active state is keyed by time-window name + instance index only; there is no array-pointer dimension, so if multiple arrays share a name, activation applies to that period instance as a whole.</p>
 
 <pre><code class="language-c">struct CellConfig { ejit_may_const uint32_t mode; };
 struct CellState  { ejit_may_const uint32_t state; };
@@ -343,10 +343,7 @@ ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
 ejit_period_arr(cell) struct CellState  g_cellState[16];
 
 // activate g_cellCfg[3] and g_cellState[3]
-ejit_activate("cell", 3);
-
-// activate only g_cellCfg[3]
-ejit_activate_array("cell", g_cellCfg, 3);</code></pre>
+ejit_activate("cell", 3);</code></pre>
 
   <h3>3.4 Multi-dimension specialization</h3>
   <p>A single <code>ejit_entry</code> function can declare up to 4 time-window array indices. The runtime cache key encodes the high 32 bits as the function index and the low 4 bytes as the dimension values.</p>
@@ -417,19 +414,14 @@ void update_both(ejit_period_arr_ind(cell) uint8_t cellIdx,
 <pre><code class="language-c">ejit_status_t ejit_activate(const char *periodName, uint8_t cellIdx);
 ejit_status_t ejit_deactivate(const char *periodName, uint8_t cellIdx);
 
-ejit_status_t ejit_activate_array(const char *periodName, void *arrayPtr,
-                                  uint8_t cellIdx);
-ejit_status_t ejit_deactivate_array(const char *periodName, void *arrayPtr,
-                                    uint8_t cellIdx);
-
 ejit_status_t ejit_activate_all(const char *periodName);
 ejit_status_t ejit_deactivate_all(const char *periodName);
 bool ejit_is_active(const char *periodName, uint8_t cellIdx);</code></pre>
 
   <ul>
     <li><code>activate(name, idx)</code>: activates the <code>idx</code> instance across all arrays of that name.</li>
-    <li><code>activate_array(name, ptr, idx)</code>: activates only the instance for the given array pointer.</li>
     <li><code>deactivate</code>: marks the time window invalid and invalidates cache entries that depend on that instance.</li>
+    <li>Active state is keyed by name + instance index only; the array-level APIs <code>ejit_activate_array</code> / <code>ejit_deactivate_array</code> were removed (the product does not need array-level lifecycle activation).</li>
     <li>If same-named arrays have different lengths, out-of-bounds arrays are skipped; the user should still keep business indices valid.</li>
   </ul>
 
@@ -573,7 +565,7 @@ build_release_x86/bin/clang -O2 -g \
       <tr><td><code>@__ejit_bitcode</code></td><td>The embedded bitcode is in a dedicated section</td></tr>
       <tr><td><code>ejit_compile_or_get</code></td><td>The wrapper entry calls the runtime</td></tr>
       <tr><td><code>jit_dispatch</code> / <code>jit_fallback</code></td><td>A JIT dispatch path and an AOT fallback path exist</td></tr>
-      <tr><td><code>ejit_deactivate_array</code> / <code>ejit_activate_array</code></td><td>Lifecycle-function entry/exit instrumentation</td></tr>
+      <tr><td><code>ejit_deactivate</code> / <code>ejit_activate</code></td><td>Lifecycle-function entry/exit instrumentation</td></tr>
     </tbody>
   </table>
 

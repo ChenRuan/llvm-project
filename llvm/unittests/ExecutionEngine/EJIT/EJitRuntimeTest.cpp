@@ -733,30 +733,6 @@ TEST(EJit, TaskpoolRegistrationFrozenAfterConstruction) {
 }
 #endif // EJIT_SRE_TASKPOOL
 
-#ifndef EJIT_SRE_TASKPOOL
-// Finding (一) non-taskpool regression: a lifecycle that owns MULTIPLE arrays
-// keeps faithful per-array semantics — an array-level op affects only the named
-// array, never the other arrays of the same period.
-TEST(EJit, MultiArrayArrayLevelOnlyAffectsTarget) {
-  EJit ejit(Config{});
-  int cellsA[8], cellsB[8];
-  // Legacy build: runtime registration is open, so register two arrays under
-  // the same period directly on this instance.
-  EXPECT_TRUE(ejit.registerPeriodArray("cell", "cellsA", cellsA, 8));
-  EXPECT_TRUE(ejit.registerPeriodArray("cell", "cellsB", cellsB, 8));
-
-  // Activate only cellsB[3]; the period reports active because cellsB is.
-  EXPECT_TRUE(ejit.activateArray("cell", cellsB, 3));
-  EXPECT_TRUE(ejit.isActive("cell", 3));
-  // Deactivating cellsA[3] must NOT touch cellsB[3] (no period-wide widening).
-  EXPECT_TRUE(ejit.deactivateArray("cell", cellsA, 3));
-  EXPECT_TRUE(ejit.isActive("cell", 3)); // cellsB still active
-  // Now deactivate cellsB[3]: the period becomes inactive.
-  EXPECT_TRUE(ejit.deactivateArray("cell", cellsB, 3));
-  EXPECT_FALSE(ejit.isActive("cell", 3));
-}
-#endif // !EJIT_SRE_TASKPOOL
-
 //===----------------------------------------------------------------------===//
 // C API tests with runtime-dynamic cellIdx (T3-21)
 //===----------------------------------------------------------------------===//
@@ -767,8 +743,6 @@ extern ejit_status_test_t ejit_init(const void *config);
 extern void ejit_shutdown(void);
 extern ejit_status_test_t ejit_activate(const char *, uint8_t);
 extern ejit_status_test_t ejit_deactivate(const char *, uint8_t);
-extern ejit_status_test_t ejit_activate_array(const char *, void *, uint8_t);
-extern ejit_status_test_t ejit_deactivate_array(const char *, void *, uint8_t);
 extern bool ejit_is_active(const char *, uint8_t);
 extern void ejit_invalidate(const char *, uint8_t);
 extern void ejit_clear_cache(void);
@@ -951,7 +925,7 @@ TEST(EJitCApiTaskpool, RegistrationFrozenAfterInit) {
 
 // Finding (一/五): a lifecycle registered BEFORE init (constructor-phase path)
 // drives both the time-window state and the SwitchController via the public
-// C ABI; array-level control targets exactly one (dimType, instance).
+// C ABI. Activation is keyed by lifecycle name + instance index only.
 TEST(EJitCApiTaskpool, PreInitLifecycleActivateAndArraySync) {
   // Start from a fully clean process state so "cell" gets a deterministic slot
   // and no leaked error sink fails ejit_init, regardless of test order.
@@ -971,25 +945,17 @@ TEST(EJitCApiTaskpool, PreInitLifecycleActivateAndArraySync) {
   EXPECT_EQ(ejit_deactivate("cell", 7), EJIT_OK_C);
   EXPECT_FALSE(ejit_is_active("cell", 7));
 
-  // Array-level control: registered array + matching period.
-  EXPECT_EQ(ejit_activate_array("cell", cellArr, 5), EJIT_OK_C);
-  EXPECT_TRUE(ejit_is_active("cell", 5));
-  EXPECT_EQ(ejit_deactivate_array("cell", cellArr, 5), EJIT_OK_C);
-  EXPECT_FALSE(ejit_is_active("cell", 5));
-
-  // Unregistered array pointer, period mismatch, and unknown period all fail.
-  int stray[4];
-  EXPECT_NE(ejit_activate_array("cell", stray, 0), EJIT_OK_C);
-  EXPECT_NE(ejit_activate_array("wrong", cellArr, 0), EJIT_OK_C);
-  EXPECT_NE(ejit_deactivate_array("cell", stray, 0), EJIT_OK_C);
+  // An unknown period name is rejected and mutates nothing.
+  EXPECT_NE(ejit_activate("wrong", 0), EJIT_OK_C);
+  EXPECT_FALSE(ejit_is_active("wrong", 0));
   ejit_shutdown();
 }
 
-// Finding (一): array-level control through the PUBLIC EJit API on a
-// SINGLE-array lifecycle syncs the time-window state AND the taskpool
-// SwitchController; the version bumps only on a real flip. This proves the EJit
-// wiring, not just the SwitchController in isolation.
-TEST(EJitTaskpoolArray, SingleArraySyncsSwitchController) {
+// Finding (一): name-level activate/deactivate through the PUBLIC EJit API
+// syncs the time-window state AND the taskpool SwitchController; the version
+// bumps only on a real flip. This proves the EJit wiring, not just the
+// SwitchController in isolation.
+TEST(EJitTaskpoolArray, NameLevelSyncsSwitchController) {
   resetTaskpoolRegState();
   uint32_t slot = 0xFFFFFFFFu;
   ejit_register_lifecycle("cell", &slot);
@@ -1006,53 +972,25 @@ TEST(EJitTaskpoolArray, SingleArraySyncsSwitchController) {
 
   uint32_t v0 = sw.getInstanceVersion(dt, 5);
   EXPECT_TRUE(sw.isInstanceEnabled(dt, 5)); // default enabled
-  // deactivateArray: RuntimeState inactive + SwitchController disabled + v+1.
-  EXPECT_TRUE(ejit.deactivateArray("cell", cellArr, 5));
+  // deactivate: RuntimeState inactive + SwitchController disabled + v+1.
+  EXPECT_TRUE(ejit.deactivate("cell", 5));
   EXPECT_FALSE(ejit.isActive("cell", 5));
   EXPECT_FALSE(sw.isInstanceEnabled(dt, 5));
   EXPECT_EQ(sw.getInstanceVersion(dt, 5), v0 + 1);
-  // activateArray: RuntimeState active + SwitchController enabled + v+1.
-  EXPECT_TRUE(ejit.activateArray("cell", cellArr, 5));
+  // activate: RuntimeState active + SwitchController enabled + v+1.
+  EXPECT_TRUE(ejit.activate("cell", 5));
   EXPECT_TRUE(ejit.isActive("cell", 5));
   EXPECT_TRUE(sw.isInstanceEnabled(dt, 5));
   EXPECT_EQ(sw.getInstanceVersion(dt, 5), v0 + 2);
   // Redundant activate: no flip, no version bump.
-  EXPECT_TRUE(ejit.activateArray("cell", cellArr, 5));
+  EXPECT_TRUE(ejit.activate("cell", 5));
   EXPECT_EQ(sw.getInstanceVersion(dt, 5), v0 + 2);
   resetTaskpoolRegState();
 }
 
-// Finding (一): a MULTI-array lifecycle cannot be expressed by
-// (dimType, instanceId), so array-level control is CLEAN-REJECTED — neither the
+// Finding (一): an unknown period name is cleanly rejected — neither the
 // RuntimeState nor the SwitchController (nor the version) changes.
-TEST(EJitTaskpoolArray, MultiArrayCleanReject) {
-  resetTaskpoolRegState();
-  uint32_t slot = 0xFFFFFFFFu;
-  ejit_register_lifecycle("cell", &slot);
-  ASSERT_NE(slot, 0xFFFFFFFFu);
-  static int cellsA[16], cellsB[16];
-  ejit_register_period_array("cell", "cellsA", cellsA, 16);
-  ejit_register_period_array("cell", "cellsB", cellsB, 16);
-  EJit ejit(Config{});
-  ASSERT_FALSE(ejit.initFailed());
-  EJitTaskPool *tp = ejit.taskPool();
-  ASSERT_NE(tp, nullptr);
-  uint32_t dt = EJitLifecycleRegistry::instance().lookup("cell");
-  EJitSwitchController &sw = tp->switchController();
-
-  uint32_t v0 = sw.getInstanceVersion(dt, 3);
-  EXPECT_FALSE(ejit.deactivateArray("cell", cellsA, 3)); // 2 arrays -> reject
-  EXPECT_FALSE(ejit.activateArray("cell", cellsB, 3));
-  // Nothing changed anywhere.
-  EXPECT_TRUE(sw.isInstanceEnabled(dt, 3));
-  EXPECT_EQ(sw.getInstanceVersion(dt, 3), v0);
-  EXPECT_FALSE(ejit.isActive("cell", 3));
-  resetTaskpoolRegState();
-}
-
-// Finding (一): mismatched period or unregistered array pointer are rejected
-// with no state change (single-array lifecycle isolates the reject reason).
-TEST(EJitTaskpoolArray, MismatchAndUnregisteredReject) {
+TEST(EJitTaskpoolArray, UnknownPeriodCleanReject) {
   resetTaskpoolRegState();
   uint32_t slot = 0xFFFFFFFFu;
   ejit_register_lifecycle("cell", &slot);
@@ -1065,15 +1003,13 @@ TEST(EJitTaskpoolArray, MismatchAndUnregisteredReject) {
   ASSERT_NE(tp, nullptr);
   uint32_t dt = EJitLifecycleRegistry::instance().lookup("cell");
   EJitSwitchController &sw = tp->switchController();
-  uint32_t v0 = sw.getInstanceVersion(dt, 2);
 
-  int stray[4];
-  EXPECT_FALSE(ejit.activateArray("cell", stray, 2));    // unregistered ptr
-  EXPECT_FALSE(ejit.activateArray("wrong", cellArr, 2)); // period mismatch
-  EXPECT_FALSE(ejit.deactivateArray("cell", stray, 2));
+  uint32_t v0 = sw.getInstanceVersion(dt, 2);
+  EXPECT_FALSE(ejit.activate("wrong", 2));   // unknown lifecycle -> reject
+  EXPECT_FALSE(ejit.deactivate("wrong", 2));
   EXPECT_TRUE(sw.isInstanceEnabled(dt, 2));
   EXPECT_EQ(sw.getInstanceVersion(dt, 2), v0);
-  EXPECT_FALSE(ejit.isActive("cell", 2));
+  EXPECT_FALSE(ejit.isActive("wrong", 2));
   resetTaskpoolRegState();
 }
 

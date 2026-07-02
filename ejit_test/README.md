@@ -71,8 +71,8 @@ After compilation, check these LLVM IR features:
 | Bitcode embedding | `ejit.bitcode` | `@__ejit_bitcode` in dedicated section |
 | Auto-registration | `ejit_auto_register` | In `@llvm.global_ctors` |
 | Auto symbol reg | `ejit_register_symbol` | External symbols auto-registered |
-| Lifecycle deactivate | `ejit_deactivate_array` | At ejit_period_lc function entry |
-| Lifecycle activate | `ejit_activate_array` | At ejit_period_lc function exits |
+| Lifecycle deactivate | `ejit_deactivate` | At ejit_period_lc function entry |
+| Lifecycle activate | `ejit_activate` | At ejit_period_lc function exits |
 
 ## Architecture
 

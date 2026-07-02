@@ -6,8 +6,9 @@
 //
 //===----------------------------------------------------------------------===//
 //
-//  PASS4: Insert ejit_deactivate_array at function entry and
-//  ejit_activate_array before every return in ejit_period_lc functions.
+//  PASS4: Insert ejit_deactivate at function entry and ejit_activate before
+//  every return in ejit_period_lc functions. Activation is keyed by
+//  lifecycle/period name + instance index only (no array-pointer dimension).
 //
 //===----------------------------------------------------------------------===//
 
@@ -126,11 +127,13 @@ EJitPeriodHandlerPass::run(Module &M, ModuleAnalysisManager &AM) {
   auto *I32Ty = Type::getInt32Ty(Ctx);
   auto *VoidTy = Type::getVoidTy(Ctx);
 
-  // Declare runtime functions (only if we have lc functions)
-  M.getOrInsertFunction(FN_DEACTIVATE_ARRAY,
-      FunctionType::get(VoidTy, {PtrTy, PtrTy, I32Ty}, false));
-  M.getOrInsertFunction(FN_ACTIVATE_ARRAY,
-      FunctionType::get(VoidTy, {PtrTy, PtrTy, I32Ty}, false));
+  // Declare runtime functions (only if we have lc functions). Activation is
+  // name-level: (const char *periodName, uint8_t cellIdx). The cellIdx is
+  // widened to i32 in IR to match the register ABI used at the call site.
+  M.getOrInsertFunction(FN_DEACTIVATE,
+      FunctionType::get(VoidTy, {PtrTy, I32Ty}, false));
+  M.getOrInsertFunction(FN_ACTIVATE,
+      FunctionType::get(VoidTy, {PtrTy, I32Ty}, false));
 
   for (Function *F : LcFuncs) {
     auto LcInfos = collectLifecycleInfo(M, *F);
@@ -148,8 +151,8 @@ EJitPeriodHandlerPass::run(Module &M, ModuleAnalysisManager &AM) {
       }
     }
 
-    FunctionCallee DeactivateFn = M.getFunction(FN_DEACTIVATE_ARRAY);
-    FunctionCallee ActivateFn = M.getFunction(FN_ACTIVATE_ARRAY);
+    FunctionCallee DeactivateFn = M.getFunction(FN_DEACTIVATE);
+    FunctionCallee ActivateFn = M.getFunction(FN_ACTIVATE);
 
     // Insert deactivate at entry (after allocas, before first real instruction)
     BasicBlock &EntryBB = F->getEntryBlock();
@@ -160,13 +163,10 @@ EJitPeriodHandlerPass::run(Module &M, ModuleAnalysisManager &AM) {
     for (auto &LC : LcInfos) {
       IRBuilder<> Builder(InsertPt);
       Value *PN = Builder.CreateGlobalString(LC.PeriodName);
-      Value *AP = LC.ArrayGV
-          ? Builder.CreateBitCast(LC.ArrayGV, PtrTy)
-          : ConstantPointerNull::get(PtrTy);
       // Use the actual argument value, not the argument index.
       // LC.ArgIndex is the position of the ejit_period_arr_ind parameter.
       Value *Idx = Builder.CreateZExtOrTrunc(F->getArg(LC.ArgIndex), I32Ty);
-      Builder.CreateCall(DeactivateFn, {PN, AP, Idx});
+      Builder.CreateCall(DeactivateFn, {PN, Idx});
     }
 
     // Insert activate before each return (same order as deactivate)
@@ -179,11 +179,8 @@ EJitPeriodHandlerPass::run(Module &M, ModuleAnalysisManager &AM) {
       for (auto &LC : LcInfos) {
         IRBuilder<> Builder(RI);
         Value *PN = Builder.CreateGlobalString(LC.PeriodName);
-        Value *AP = LC.ArrayGV
-            ? Builder.CreateBitCast(LC.ArrayGV, PtrTy)
-            : ConstantPointerNull::get(PtrTy);
         Value *Idx = Builder.CreateZExtOrTrunc(F->getArg(LC.ArgIndex), I32Ty);
-        Builder.CreateCall(ActivateFn, {PN, AP, Idx});
+        Builder.CreateCall(ActivateFn, {PN, Idx});
       }
     }
 

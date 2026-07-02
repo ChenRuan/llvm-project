@@ -93,19 +93,14 @@ void ejit_shutdown(void);</code></pre>
 <pre><code class="language-c">ejit_status_t ejit_activate(const char *periodName, uint8_t cellIdx);
 ejit_status_t ejit_deactivate(const char *periodName, uint8_t cellIdx);
 
-ejit_status_t ejit_activate_array(const char *periodName, void *arrayPtr,
-                                  uint8_t cellIdx);
-ejit_status_t ejit_deactivate_array(const char *periodName, void *arrayPtr,
-                                    uint8_t cellIdx);
-
 ejit_status_t ejit_activate_all(const char *periodName);
 ejit_status_t ejit_deactivate_all(const char *periodName);
 bool ejit_is_active(const char *periodName, uint8_t cellIdx);</code></pre>
+    <p>Active state is keyed by lifecycle/period name + instance index only; there is no array-pointer dimension. The array-level APIs <code>ejit_activate_array</code> / <code>ejit_deactivate_array</code> were removed because the product does not need array-level lifecycle activation; if multiple arrays share the same period name, activation applies to that period instance as a whole.</p>
     <table>
       <tr><th>API</th><th>Semantics</th><th>Typical use</th></tr>
       <tr><td><code>activate</code></td><td>Activates a given index across all arrays of the named period</td><td><code>ejit_activate("cell", 3)</code></td></tr>
       <tr><td><code>deactivate</code></td><td>Invalidates an index of the named period and triggers cache invalidation</td><td>Before manually modifying config</td></tr>
-      <tr><td><code>activate_array</code></td><td>Activates only a specific array</td><td>Multiple arrays under the same period but only updating one</td></tr>
       <tr><td><code>activate_all</code></td><td>Activates all instances of a period</td><td>Batch activation after initialization</td></tr>
       <tr><td><code>is_active</code></td><td>Query state</td><td>Debugging / assertions</td></tr>
     </table>

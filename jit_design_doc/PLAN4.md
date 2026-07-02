@@ -264,21 +264,17 @@ static void ejit_auto_register(void) {
 
 ```cpp
 // 时间窗激活状态
-// 支持两种粒度:
-//   - period 级: ejit_activate(name, idx) 激活该名称下所有数组
-//   - array 级: ejit_activate_array(name, ptr, idx) 激活指定数组
+// 激活仅以生命周期/period name + 实例 index 为键 (无数组指针维度):
+//   - ejit_activate(name, idx) 激活该名称下所有数组的第 idx 个实例
 struct PeriodInstance {
     std::string periodName;
     int cellIdx;
     PeriodState state;
     uint64_t activateTime;
-
-    // 按数组粒度激活时使用:
-    // period 级激活时 arrayInfo == nullptr (表示该名称下所有数组)
-    // array 级激活时 arrayInfo 指向具体数组
-    PeriodArrayInfo* arrayInfo = nullptr;
 };
 ```
+
+> **移除说明**: 早期版本提供数组级生命周期激活 `ejit_activate_array(name, ptr, idx)` / `ejit_deactivate_array(...)`（以及 `EJit::activateArray` / `EJitRuntimeState::activateArray` 等），已被移除，因为产品不需要数组级生命周期激活。异步 / 共享 taskpool 的热路径中激活状态以 `(lifecycle, instance)` 为键，不携带数组指针维度。引入数组指针维度会增加热路径复杂度、跨核同虚拟地址假设、测试与缓存语义成本。若多个数组共享同一 period name，激活是 name 级别的（针对该 period 实例整体）。
 
 **时间窗模型说明**：
 
@@ -294,13 +290,9 @@ struct PeriodInstance {
 ```
 ejit_activate("cell", 3):
   1. 从 PeriodArrayRegistry 查找 periodName="cell" 的所有数组
-  2. 记录 (periodName="cell", cellIdx=3, arrayInfo=null) → Active
+  2. 记录 (periodName="cell", cellIdx=3) → Active
   3. 含义: 该名称下所有数组在 idx=3 都视为已激活
-
-ejit_activate_array("cell", &g_cellCfg, 3):
-  1. 从 PeriodArrayRegistry 查找 periodName="cell" 且 baseAddr=&g_cellCfg 的数组
-  2. 记录 (periodName="cell", cellIdx=3, arrayInfo=&g_cellCfg_info) → Active
-  3. 含义: 仅 g_cellCfg 在 idx=3 视为已激活
+     (激活以 name + index 为键，若多个数组共享同一 name，整体生效)
 
 JIT 编译时检查:
   - 函数依赖 "cell" + "trp" 两个 period
@@ -765,9 +757,6 @@ public:
     void deactivate(const char* periodName, int cellIdx);
 
     // 激活数组指定实例 (显式传入数组指针)
-    void activate_array(const char* periodName, void* arrayPtr, int cellIdx);
-    void deactivate_array(const char* periodName, void* arrayPtr, int cellIdx);
-
     // 激活时间窗所有实例
     void activate_all(const char* periodName);
     void deactivate_all(const char* periodName);
@@ -826,8 +815,6 @@ struct Error {
 | ------------------------------------------------- | -------------------------------- |
 | `activate(periodName, cellIdx)`                   | 激活指定时间窗实例，记录基地址映射                |
 | `deactivate(periodName, cellIdx)`                 | 去激活指定时间窗实例，触发缓存失效                |
-| `activate_array(periodName, arrayPtr, cellIdx)`   | 激活指定时间窗名称下指定数组的指定实例              |
-| `deactivate_array(periodName, arrayPtr, cellIdx)` | 标记指定时间窗名称下指定数组的指定实例进入 invalid 状态 |
 | `activate_all(periodName)`                        | 激活指定时间窗名称下的所有数组实例                |
 | `deactivate_all(periodName)`                      | 标记指定时间窗名称下的所有数组实例进入 invalid 状态   |
 | `warmup(periodName, cellIdx)`                     | 预热：提前编译指定实例，减少首次调用延迟             |
@@ -889,11 +876,9 @@ void ejit_set_compile_mode(ejit_compile_mode_t mode);
 ejit_compile_mode_t ejit_get_compile_mode(void);
 
 // 生命周期 API (用户可见，对应 SPEC4.md 3.3)
+// 激活仅以生命周期/period name + 实例 index 为键，无数组指针维度。
 void ejit_activate(const char* periodName, int cellIdx);
 void ejit_deactivate(const char* periodName, int cellIdx);
-
-ejit_status_t ejit_activate_array(const char* periodName, void* arrayPtr, int cellIdx);
-void ejit_deactivate_array(const char* periodName, void* arrayPtr, int cellIdx);
 
 ejit_status_t ejit_activate_all(const char* periodName);
 void ejit_deactivate_all(const char* periodName);

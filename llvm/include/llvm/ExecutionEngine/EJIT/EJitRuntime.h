@@ -125,13 +125,11 @@ void ejit_register_lifecycle(const char *lifecycleName, uint32_t *slotOut);
 // funcIndex global; a capacity failure is recorded so ejit_init can fail.
 void ejit_register_funcindex(const char *funcName, uint32_t *slotOut);
 
-// Lifecycle
+// Lifecycle. Activation is keyed by lifecycle/period name + instance index
+// only; there is no array-pointer dimension in the active state (a period name
+// with multiple arrays is activated as a whole for that instance).
 ejit_status_t ejit_activate(const char *periodName, uint8_t cellIdx);
 ejit_status_t ejit_deactivate(const char *periodName, uint8_t cellIdx);
-ejit_status_t ejit_activate_array(const char *periodName, void *arrayPtr,
-                                  uint8_t cellIdx);
-ejit_status_t ejit_deactivate_array(const char *periodName, void *arrayPtr,
-                                    uint8_t cellIdx);
 ejit_status_t ejit_activate_all(const char *periodName);
 ejit_status_t ejit_deactivate_all(const char *periodName);
 bool ejit_is_active(const char *periodName, uint8_t cellIdx);

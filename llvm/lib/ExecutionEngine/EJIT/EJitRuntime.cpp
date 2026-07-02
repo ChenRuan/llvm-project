@@ -258,36 +258,6 @@ ejit_status_t ejit_deactivate(const char *periodName, uint8_t cellIdx) {
   return EJIT_OK;
 }
 
-ejit_status_t ejit_activate_array(const char *periodName, void *arrayPtr,
-                                  uint8_t cellIdx) {
-  EJIT_DIAG("activate_array(%s,%u) ptr=%p", periodName, cellIdx, arrayPtr);
-  if (!gEJIT) {
-    EJIT_DIAG("activate_array(%s,%u) failed: not initialized", periodName,
-              cellIdx);
-    return EJIT_ERR_NOT_ACTIVE;
-  }
-  // Validation is unified in EJit::activateArray (registered array + matching
-  // period + registered lifecycle in a taskpool build) so it stays consistent
-  // with the SwitchController sync. No duplicate pre-checks here.
-  if (!gEJIT->activateArray(periodName, arrayPtr, cellIdx))
-    return EJIT_ERR_INVALID_PARAM;
-  return EJIT_OK;
-}
-
-ejit_status_t ejit_deactivate_array(const char *periodName, void *arrayPtr,
-                                    uint8_t cellIdx) {
-  EJIT_DIAG("deactivate_array(%s,%u) ptr=%p", periodName, cellIdx, arrayPtr);
-  if (!gEJIT) {
-    EJIT_DIAG("deactivate_array(%s,%u) failed: not initialized", periodName,
-              cellIdx);
-    return EJIT_ERR_NOT_ACTIVE;
-  }
-  if (!gEJIT->deactivateArray(periodName, arrayPtr, cellIdx))
-    return EJIT_ERR_INVALID_PARAM;
-  gEJIT->invalidateByPeriod(periodName, cellIdx);
-  return EJIT_OK;
-}
-
 ejit_status_t ejit_activate_all(const char *periodName) {
   EJIT_DIAG("activate_all(%s)", periodName);
   if (!gEJIT) {

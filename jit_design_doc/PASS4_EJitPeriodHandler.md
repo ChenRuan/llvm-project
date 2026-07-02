@@ -10,14 +10,16 @@
 
 ## 1. 概述
 
-EJitPeriodHandlerPass 负责处理 `ejit_period_lc` (lifecycle) 属性标记的函数。在这些函数的入口插入 `ejit_deactivate_array` 调用，在所有出口点插入 `ejit_activate_array` 调用。这确保在修改时间窗数据期间，相关时间窗处于 deactive 状态，防止其他线程读到不一致的数据或触发对旧值的 JIT 编译。
+EJitPeriodHandlerPass 负责处理 `ejit_period_lc` (lifecycle) 属性标记的函数。在这些函数的入口插入 `ejit_deactivate(periodName, idx)` 调用，在所有出口点插入 `ejit_activate(periodName, idx)` 调用。这确保在修改时间窗数据期间，相关时间窗处于 deactive 状态，防止其他线程读到不一致的数据或触发对旧值的 JIT 编译。
+
+> **移除说明**: 早期设计在函数入口/出口插入数组级的 `ejit_deactivate_array` / `ejit_activate_array`（携带数组指针参数）。该数组级生命周期激活已被移除，因为产品不需要它；异步 / 共享 taskpool 的热路径中激活状态以 `(lifecycle, instance)` 为键，不携带数组指针维度。PASS4 现在仅发出 name 级别的 `ejit_deactivate(periodName, idx)` / `ejit_activate(periodName, idx)`。若同一 period name 关联多个数组，激活对该 period 实例整体生效。
 
 ### 1.1 核心职责
 
 - 定位所有带 `!{"ejit_period_lc", !"periodName"}` metadata 的函数
 - 识别函数参数中对应 `ejit_period_arr_ind(periodName)` 的参数
-- 在函数入口（第一条指令之前）插入 `ejit_deactivate_array` 调用
-- 在函数所有出口点（return 指令之前）插入 `ejit_activate_array` 调用
+- 在函数入口（第一条指令之前）插入 `ejit_deactivate(periodName, idx)` 调用
+- 在函数所有出口点（return 指令之前）插入 `ejit_activate(periodName, idx)` 调用
 - 支持一个函数标记多个 `ejit_period_lc`（多时间窗管理）
 - 处理 early return 场景 — 所有 return 指令前都需插入
 
@@ -81,8 +83,8 @@ define void @update_both(i32 %cellIdx, i32 %trpIdx) #0 {
 1. CollectLifecycleFunctions(M) → 收集所有 ejit_period_lc 函数及其 metadata
 2. ForEach lifecycleFunc:
      ParseLifecycleInfo(funcMeta) → 解析 periodName → argIdx 映射
-3. InsertDeactivateAtEntry(func, lifecycleInfo) → 入口插入 deactivate_array
-4. InsertActivateAtExits(func, lifecycleInfo) → 所有 return 前插入 activate_array
+3. InsertDeactivateAtEntry(func, lifecycleInfo) → 入口插入 deactivate
+4. InsertActivateAtExits(func, lifecycleInfo) → 所有 return 前插入 activate
 ```
 
 ### 3.2 详细伪代码
@@ -92,7 +94,6 @@ PreservedAnalyses EJitPeriodHandlerPass::run(Module& M, ModuleAnalysisManager& A
     struct LifecycleInfo {
         std::string periodName;
         unsigned argIdx;         // ejit_period_arr_ind 参数索引
-        Value* arrayPtr;         // 可选: 对应全局数组的指针 (arcname 版本)
     };
     std::vector<std::pair<Function*, std::vector<LifecycleInfo>>> lcFuncs;
 
@@ -115,7 +116,7 @@ PreservedAnalyses EJitPeriodHandlerPass::run(Module& M, ModuleAnalysisManager& A
                 // 查找对应的 ejit_period_arr_ind 参数
                 int argIdx = findPeriodArrIndArg(MD, periodName);
                 if (argIdx >= 0) {
-                    lcInfo.push_back({periodName, (unsigned)argIdx, nullptr});
+                    lcInfo.push_back({periodName, (unsigned)argIdx});
                 }
             }
         }
@@ -156,26 +157,18 @@ void insertDeactivateAtEntry(Function* F,
     }
 
     // 声明运行时函数
-    Function* deactivateFn = getOrDeclareDeactivateArray(M);
+    Function* deactivateFn = getOrDeclareDeactivate(M);
 
-    // 为每个 lc 时间窗插入 deactivate_array 调用
+    // 为每个 lc 时间窗插入 deactivate 调用
     // 调用顺序: metadata 中出现顺序 (与 activate 配对)
     for (auto& lcInfo : lcInfoList) {
-        // 参数: periodName 字符串 + arrayPtr + cellIdx
+        // 参数: periodName 字符串 + cellIdx (name + index，无数组指针维度)
         Value* periodNameStr = Builder.CreateGlobalStringPtr(lcInfo.periodName);
         Value* argVal = F->getArg(lcInfo.argIdx);
 
-        // 确定对应的全局数组指针
-        // 从 metadata 推断: ejit_period_arr_ind 关联的 periodName → 同名 ejit_period_arr 全局变量
-        Value* arrayPtr = getArrayPtrForPeriod(M, lcInfo.periodName);
-        // 若找不到对应数组，arrayPtr = null (fallback 到 period 级 deactivate)
-        if (!arrayPtr) {
-            arrayPtr = ConstantPointerNull::get(PointerType::getUnqual(Ctx));
-        }
-
         Value* cellIdx = Builder.CreateZExtOrTrunc(argVal, Type::getInt32Ty(Ctx));
 
-        Builder.CreateCall(deactivateFn, {periodNameStr, arrayPtr, cellIdx});
+        Builder.CreateCall(deactivateFn, {periodNameStr, cellIdx});
     }
 }
 ```
@@ -186,7 +179,7 @@ void insertDeactivateAtEntry(Function* F,
 void insertActivateAtExits(Function* F,
                             const std::vector<LifecycleInfo>& lcInfoList) {
     LLVMContext& Ctx = F->getContext();
-    Function* activateFn = getOrDeclareActivateArray(M);
+    Function* activateFn = getOrDeclareActivate(M);
 
     // 收集所有 return 指令
     std::vector<ReturnInst*> returnInsts;
@@ -206,46 +199,17 @@ void insertActivateAtExits(Function* F,
         for (auto& lcInfo : lcInfoList) {
             Value* periodNameStr = Builder.CreateGlobalStringPtr(lcInfo.periodName);
             Value* argVal = F->getArg(lcInfo.argIdx);
-            Value* arrayPtr = getArrayPtrForPeriod(M, lcInfo.periodName);
-            if (!arrayPtr) {
-                arrayPtr = ConstantPointerNull::get(PointerType::getUnqual(Ctx));
-            }
             Value* cellIdx = Builder.CreateZExtOrTrunc(argVal, Type::getInt32Ty(Ctx));
 
-            Builder.CreateCall(activateFn, {periodNameStr, arrayPtr, cellIdx});
+            Builder.CreateCall(activateFn, {periodNameStr, cellIdx});
         }
     }
 }
 ```
 
-### 3.5 全局数组指针查找
+### 3.5 激活粒度（name + index only）
 
-```cpp
-Value* getArrayPtrForPeriod(Module& M, const std::string& periodName) {
-    // 查找与 periodName 匹配的 ejit_period_arr 全局变量
-    // 遍历所有全局变量的 ejit.metadata:
-    //   找 !{"ejit_period_arr", !"<periodName>" ...}
-
-    for (GlobalVariable& GV : M.globals()) {
-        MDNode* MD = GV.getMetadata("ejit.metadata");
-        if (!MD) continue;
-
-        for (const MDOperand& Op : MD->operands()) {
-            MDNode* Entry = cast<MDNode>(Op);
-            StringRef tag = cast<MDString>(Entry->getOperand(0))->getString();
-            if (tag == "ejit_period_arr") {
-                StringRef pn = cast<MDString>(Entry->getOperand(1))->getString();
-                if (pn == periodName) {
-                    // 返回指向该数组的 i8* 指针
-                    return ConstantExpr::getBitCast(&GV,
-                        PointerType::getUnqual(M.getContext()));
-                }
-            }
-        }
-    }
-    return nullptr;
-}
-```
+激活状态仅以 periodName + cellIdx 为键，不再需要查找对应的全局数组指针。若同一 periodName 关联多个 `ejit_period_arr` 数组，`ejit_activate(periodName, idx)` 对该 period 实例整体生效（name 级别）。因此 PASS4 不再需要 `getArrayPtrForPeriod` 之类的数组指针推断。
 
 ---
 
@@ -265,15 +229,11 @@ entry:
 define void @update_cell(i32 %cellIdx) {
 entry:
   ; === 入口: deactivate ===
-  call void @ejit_deactivate_array(ptr @".str.cell",
-                                    ptr bitcast ([16 x %CellConfig]* @g_cellCfg to ptr),
-                                    i32 %cellIdx)
+  call void @ejit_deactivate(ptr @".str.cell", i32 %cellIdx)
   ; === 原函数体 ===
   ; ...
   ; === 出口: activate ===
-  call void @ejit_activate_array(ptr @".str.cell",
-                                  ptr bitcast ([16 x %CellConfig]* @g_cellCfg to ptr),
-                                  i32 %cellIdx)
+  call void @ejit_activate(ptr @".str.cell", i32 %cellIdx)
   ret void
 }
 ```
@@ -299,8 +259,8 @@ early_exit:
 define void @update_both(i32 %cellIdx, i32 %trpIdx) {
 entry:
   ; deactivate 按 metadata 出现顺序 (cell 先, trp 后)
-  call void @ejit_deactivate_array(ptr @".str.cell", ptr bitcast (%CellConfig* @g_cellCfg to ptr), i32 %cellIdx)
-  call void @ejit_deactivate_array(ptr @".str.trp",  ptr bitcast (%TrpConfig* @g_trpCfg to ptr),   i32 %trpIdx)
+  call void @ejit_deactivate(ptr @".str.cell", i32 %cellIdx)
+  call void @ejit_deactivate(ptr @".str.trp",  i32 %trpIdx)
 
   %cmp = icmp slt i32 %cellIdx, 0
   br i1 %cmp, label %early_exit, label %body
@@ -308,26 +268,26 @@ entry:
 body:
   ; ... 函数体 ...
   ; activate 同序 (cell 先, trp 后，与 deactivate 顺序一致)
-  call void @ejit_activate_array(ptr @".str.cell", ptr bitcast (%CellConfig* @g_cellCfg to ptr), i32 %cellIdx)
-  call void @ejit_activate_array(ptr @".str.trp",  ptr bitcast (%TrpConfig* @g_trpCfg to ptr),   i32 %trpIdx)
+  call void @ejit_activate(ptr @".str.cell", i32 %cellIdx)
+  call void @ejit_activate(ptr @".str.trp",  i32 %trpIdx)
   ret void
 
 early_exit:
   ; 所有 return 前均插入 activate (同样同序)
-  call void @ejit_activate_array(ptr @".str.cell", ptr bitcast (%CellConfig* @g_cellCfg to ptr), i32 %cellIdx)
-  call void @ejit_activate_array(ptr @".str.trp",  ptr bitcast (%TrpConfig* @g_trpCfg to ptr),   i32 %trpIdx)
+  call void @ejit_activate(ptr @".str.cell", i32 %cellIdx)
+  call void @ejit_activate(ptr @".str.trp",  i32 %trpIdx)
   ret void
 }
 ```
 
-### 4.3 无对应数组的时间窗 (period 级 activate)
+### 4.3 name 级激活（无数组指针维度）
 
 ```llvm
-; 当找不到与 periodName 匹配的 ejit_period_arr 全局变量时
-; 使用 null 作为 arrayPtr，运行时做 period 级 activate/deactivate
-call void @ejit_deactivate_array(ptr @".str.custom_p", ptr null, i32 %idx)
+; 激活仅以 periodName + cellIdx 为键，无论该 periodName 关联一个还是多个数组
+; 都使用相同的 name 级调用（对该 period 实例整体生效）
+call void @ejit_deactivate(ptr @".str.custom_p", i32 %idx)
 ; ...
-call void @ejit_activate_array(ptr @".str.custom_p", ptr null, i32 %idx)
+call void @ejit_activate(ptr @".str.custom_p", i32 %idx)
 ```
 
 ---
@@ -345,12 +305,11 @@ struct LifecycleFuncInfo {
 struct PeriodAssociation {
     std::string periodName;      // ejit_period_lc 参数
     unsigned paramIdx;           // 对应的 ejit_period_arr_ind 参数索引
-    GlobalVariable* periodArr;   // 关联的全局数组 (可为 null)
 };
 
-// 运行时 API 声明
-// void ejit_deactivate_array(const char* periodName, void* arrayPtr, int cellIdx);
-// void ejit_activate_array(const char* periodName, void* arrayPtr, int cellIdx);
+// 运行时 API 声明 (name + index，无数组指针维度)
+// void ejit_deactivate(const char* periodName, uint8_t cellIdx);
+// void ejit_activate(const char* periodName, uint8_t cellIdx);
 ```
 
 ---
@@ -360,7 +319,6 @@ struct PeriodAssociation {
 | 错误场景 | 处理策略 |
 |---------|---------|
 | ejit_period_lc 无对应 ejit_period_arr_ind | 跳过（Sema 已处理） |
-| 找不到对应 period 全局变量 | 传 null 作为 arrayPtr，运行时做 period 级操作 |
 | alloca 干扰入口点定位 | 跳过 alloca 指令，在第一条非 alloca 后插入 |
 | 无 return 指令的函数 | 不应发生（well-formed IR 至少有一个 return / unreachable） |
 | unreachable 指令 | 不插入（unreachable 不是正常出口） |
@@ -380,7 +338,7 @@ EJitPeriodHandlerPass    →  处理生命周期函数 (本 Pass - 最后一步)
 | 依赖项 | 说明 |
 |--------|------|
 | ejit.metadata | Clang CodeGen 生成的函数 + 全局变量 metadata |
-| ejit_deactivate_array / ejit_activate_array | 运行时库提供的外部符号 |
+| ejit_deactivate / ejit_activate | 运行时库提供的外部符号 (name + index) |
 | 全局数组 IR 变量 | 从 Module 中查找 (不需要前序 Pass 的预处理) |
 
 ---
@@ -395,19 +353,19 @@ EJitPeriodHandlerPass    →  处理生命周期函数 (本 Pass - 最后一步)
 
 ; 测试场景:
 ; TEST 1: 单 ejit_period_lc + 单出口
-;   CHECK: call void @ejit_deactivate_array
+;   CHECK: call void @ejit_deactivate
 ;   CHECK: ret void
-;   CHECK: call void @ejit_activate_array
+;   CHECK: call void @ejit_activate
 ;
 ; TEST 2: 多 ejit_period_lc (cell + trp) + 多出口
-;   CHECK-DAG: call void @ejit_deactivate_array(ptr @".str.cell"
-;   CHECK-DAG: call void @ejit_deactivate_array(ptr @".str.trp"
-;   CHECK-DAG: call void @ejit_activate_array(ptr @".str.cell"
-;   CHECK-DAG: call void @ejit_activate_array(ptr @".str.trp"
+;   CHECK-DAG: call void @ejit_deactivate(ptr @".str.cell"
+;   CHECK-DAG: call void @ejit_deactivate(ptr @".str.trp"
+;   CHECK-DAG: call void @ejit_activate(ptr @".str.cell"
+;   CHECK-DAG: call void @ejit_activate(ptr @".str.trp"
 ;   验证同序: activate 顺序与 deactivate 一致 (cell 先 trp 后)
 ;
 ; TEST 3: 无 ejit_period_lc 函数的 Module
-;   CHECK-NOT: call void @ejit_deactivate_array
+;   CHECK-NOT: call void @ejit_deactivate
 ;
 ; TEST 4: 所有 return 前均有 activate
 ;   计数 check: activate 出现次数 = return 指令数 × period 数
@@ -420,7 +378,6 @@ EJitPeriodHandlerPass    →  处理生命周期函数 (本 Pass - 最后一步)
 | deactivate/activate 配对 | 计数检查 |
 | 逆序配对 | 检查 activate 的插入顺序 |
 | 多出口完整性 | 检查所有 return 前均有 activate |
-| arrayPtr 正确性 | 检查 bitcast 指向正确的全局变量 |
 | 无 lifecycle 函数的 Module | 不做修改 |
 
 ---
@@ -435,7 +392,7 @@ EJitPeriodHandlerPass    →  处理生命周期函数 (本 Pass - 最后一步)
 
 4. **noreturn 函数**: 如果函数有 unreachable terminator（如调用 `abort()` 后），不插入 activate。因为 deactivate 永久生效是没有意义的，应该让 Sema 警告这种情况。
 
-5. **运行时接口选择**: 当前计划使用 `ejit_deactivate_array` / `ejit_activate_array`（数组级）。如果未来需要 period 级接口（`ejit_activate(periodName, cellIdx)`），可通过传 null arrayPtr 切换。
+5. **运行时接口选择**: 使用 name 级接口 `ejit_deactivate(periodName, cellIdx)` / `ejit_activate(periodName, cellIdx)`。激活状态仅以 `(lifecycle, instance)` 为键，不携带数组指针维度；早期的数组级接口 `ejit_activate_array` / `ejit_deactivate_array` 已移除。
 
 ---
 
