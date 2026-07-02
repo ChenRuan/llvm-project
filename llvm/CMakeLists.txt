@@ -564,6 +564,35 @@ if(EJIT_SRE_DIAG)
   add_definitions(-DEJIT_SRE_DIAG)
 endif()
 
+#===-- EmbeddedJIT SRE product profile -----------------------------------===#
+# Product profile for the currently validated SRE deployment shape. This is a
+# high-level build preset, not a replacement for the lower-level switches: the
+# individual options remain available for bring-up and bisecting.
+#
+# Included:
+#   - standard backend trimming for size
+#   - SRE code pool + enable_ex sealing
+#   - taskpool scheduler
+#   - cross-core shared taskpool
+#
+# Intentionally NOT included:
+#   - EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL (still a separate riskier trim)
+#   - EJIT_SRE_SHARED_CODE_POINTERS (requires platform same-VA/coherency proof)
+option(EJIT_SRE_PROFILE
+  "Enable the SRE product profile: backend trim + SRE code pool + shared taskpool" OFF)
+if(EJIT_SRE_PROFILE)
+  set(EJIT_TRIM_LLVM_BACKEND ON CACHE BOOL
+      "Trim LLVM backend pieces used by EJIT" FORCE)
+  set(EJIT_SRE_CODE_POOL ON CACHE BOOL
+      "Use the EmbeddedJIT SRE code pool" FORCE)
+  set(EJIT_SRE_TASKPOOL ON CACHE BOOL
+      "Enable the EmbeddedJIT SRE taskpool scheduler" FORCE)
+  set(EJIT_SRE_SHARED_TASKPOOL ON CACHE BOOL
+      "Enable the EmbeddedJIT cross-core shared taskpool" FORCE)
+  message(STATUS "EmbeddedJIT: SRE product profile enabled "
+                 "(backend trim + code pool + shared taskpool)")
+endif()
+
 option(EJIT_TRIM_LLVM_BACKEND "Trim LLVM backend pieces used by EJIT: disable heavyweight debug info, GlobalISel, and optional AArch64 SME/SVE passes" OFF)
 if(EJIT_TRIM_LLVM_BACKEND)
   add_definitions(-DEJIT_TRIM_LLVM_BACKEND)

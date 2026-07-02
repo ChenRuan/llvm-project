@@ -1,7 +1,7 @@
 # EmbeddedJIT Macro / Build-Switch Matrix
 
-**Status**: Phase 2 — documentation + build-entry aggregation + centralized
-SRE default constants.
+**Status**: Phase 3 — documentation + build-entry aggregation + centralized
+SRE default constants + official SRE product profile.
 **Scope**: This document inventories the EmbeddedJIT (EJIT) compile-time macros
 and the `build.sh` / CMake switches that drive them, classifies them, and
 records why several macros cannot be deleted yet. It is intentionally
@@ -10,6 +10,10 @@ any macro, and does **not** alter the meaning of any existing CMake option.
 Phase 2 additionally centralizes SRE-facing default constants in
 `EJitSreConfig.h`, so adapter `.cpp` files do not each carry their own fallback
 `#ifndef` blocks.
+Phase 3 adds one stable product entry point, `EJIT_SRE_PROFILE`, for the SRE
+deployment shape that has now been validated: standard backend trim + SRE code
+pool + taskpool + shared taskpool. Lower-level macros remain available for
+bring-up, bisection, and platform validation.
 
 > **Baseline note (important)**: This document is based on `ejit_dev_spec4`,
 > which already contains the cross-core shared taskpool implementation. Shared
@@ -44,15 +48,15 @@ which defeats the size and freestanding goals of EmbeddedJIT.
 | Macro | Driven by | Why it must stay a compile-time macro |
 |-------|-----------|----------------------------------------|
 | `EJIT_FREESTANDING` | CMake `EJIT_FREESTANDING` (+ `build.sh --freestanding`) | Removes OS threads, file I/O, and logging; swaps in bare-metal mutex behavior and excludes `EJitSyncCompiler.cpp` / `EJitAsyncCompiler.cpp` from the library. It also flips `<future>`/`std::promise` guards in JITLink headers. A runtime flag cannot un-link `std::thread`. **52 `#ifdef` sites.** |
-| `EJIT_SRE_TASKPOOL` | CMake `EJIT_SRE_TASKPOOL` (+ `build.sh --sre-taskpool`) | Compiles the taskpool sources (`EJitTaskPool.cpp`, `EJitSreQueue.cpp`, `EJitWorker.cpp`, `EJitSreTask_*.cpp`) into the library and reroutes `ejit_compile_or_get`. Toggling it changes which translation units exist. **23 `#ifdef` sites.** |
-| `EJIT_SRE_SHARED_TASKPOOL` | CMake `EJIT_SRE_SHARED_TASKPOOL` (+ `build.sh --sre-shared-taskpool`) | Enables the cross-core shared taskpool layer: shared state, owner election, shared queue/cache/dedup/control state, and single-worker coordination. It requires `EJIT_SRE_TASKPOOL=ON` and changes runtime wiring, so it must remain compile-time until the shared path is fully productized. |
-| `EJIT_SRE_CODE_POOL` | CMake `EJIT_SRE_CODE_POOL` (+ `build.sh --sre-code-pool`) | Routes JIT code memory through the SRE 2 MiB code pools and (implicitly) enables `EJIT_SRE_ENABLE_EX` RX sealing. Changes the memory-manager path used to hand back executable pointers. **9 `#ifdef` sites.** |
-| `EJIT_TRIM_LLVM_BACKEND` | CMake `EJIT_TRIM_LLVM_BACKEND` | Disables heavyweight debug-info / GlobalISel / optional AArch64 SME-SVE passes at build time. Purely a link/size decision. |
+| `EJIT_SRE_TASKPOOL` | CMake `EJIT_SRE_TASKPOOL` (+ `build.sh --sre-taskpool`; implied by `EJIT_SRE_PROFILE`) | Compiles the taskpool sources (`EJitTaskPool.cpp`, `EJitSreQueue.cpp`, `EJitWorker.cpp`, `EJitSreTask_*.cpp`) into the library and reroutes `ejit_compile_or_get`. Toggling it changes which translation units exist. **23 `#ifdef` sites.** |
+| `EJIT_SRE_SHARED_TASKPOOL` | CMake `EJIT_SRE_SHARED_TASKPOOL` (+ `build.sh --sre-shared-taskpool`; implied by `EJIT_SRE_PROFILE`) | Enables the cross-core shared taskpool layer: shared state, owner election, shared queue/cache/dedup/control state, and single-worker coordination. It requires `EJIT_SRE_TASKPOOL=ON` and changes runtime wiring, so it remains compile-time even though it is now part of the product SRE profile. |
+| `EJIT_SRE_CODE_POOL` | CMake `EJIT_SRE_CODE_POOL` (+ `build.sh --sre-code-pool`; implied by `EJIT_SRE_PROFILE`) | Routes JIT code memory through the SRE 2 MiB code pools and (implicitly) enables `EJIT_SRE_ENABLE_EX` RX sealing. Changes the memory-manager path used to hand back executable pointers. **9 `#ifdef` sites.** |
+| `EJIT_TRIM_LLVM_BACKEND` | CMake `EJIT_TRIM_LLVM_BACKEND` (+ `build.sh --trim-llvm-backend`; implied by `EJIT_SRE_PROFILE`) | Disables heavyweight debug-info / GlobalISel / optional AArch64 SME-SVE passes at build time. Purely a link/size decision. |
 | `EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL` | CMake option (+ `build.sh --trim-llvm-backend-experimental`) | Bare-metal backend trim (non-ELF formats, non-AArch64 targets, DWARF/CFI). Implies `EJIT_TRIM_LLVM_BACKEND`. Build-time only. |
 | `EJIT_SRE_SHARED_TASKPOOL_PLATFORM` | CMake-derived define when `EJIT_SRE_SHARED_TASKPOOL=ON` and `EJIT_FREESTANDING=ON` | Selects the real platform-facing shared-taskpool hooks instead of host/test seams. It affects core-id/current-core behavior and shared-section expectations, so it is not a runtime flag. |
 | `EJIT_DEFAULT_TRIPLE` (from `EJIT_DEFAULT_TARGET_TRIPLE`) | EJIT lib CMake (+ `build.sh --target-triple=`) | Baked-in target triple that replaces host detection; required by freestanding. It is a compile-time string define on `LLVMEJIT`. |
 
-**Rule**: none of these may be deleted or runtime-ized in Phase 2.
+**Rule**: none of these may be deleted or runtime-ized in Phase 3.
 
 ---
 
@@ -73,31 +77,34 @@ runtime-ized in Phase 2.
 | `EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE` | CMake (+ `build.sh --sre-taskpool-worker-stack-size=`) | `1048576` | Shared worker stack size. It is already a build parameter but still participates in platform task creation and should not be changed by macro cleanup. |
 | `EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS` | CMake `EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS` | `16` | Fixed-slot shared cache size. Static shared-state layout depends on it. |
 
-**Rule**: leave as compile-time; do not runtime-ize a batch of these in Phase 2.
+**Rule**: leave as compile-time; do not runtime-ize a batch of these in Phase 3.
 
 ---
 
-## 4. Category C — Macros that could be ALIASED / AGGREGATED later
+## 4. Category C — Product profile and aggregate aliases
 
 These are not deletable, but callers frequently want to enable them **together**
-for a given bring-up scenario. Phase 1 added `build.sh` convenience aliases that
-bundle them (see [§6](#6-aggregate-convenience-switches-buildsh-only)); the
-underlying CMake options and macro semantics are unchanged.
+for the SRE product build. Phase 3 promotes that stable combination into the
+official `EJIT_SRE_PROFILE` CMake option and the matching
+`build.sh --ejit-sre-profile` entry.
 
 | Underlying CMake option | Existing explicit `build.sh` flag | Bundled by aggregate profile |
 |-------------------------|-----------------------------------|------------------------------|
-| `EJIT_SRE_CODE_POOL` | `--sre-code-pool` / `--no-sre-code-pool` | `--ejit-sre-code-pool-profile`, `--ejit-sre-async-profile` |
+| `EJIT_TRIM_LLVM_BACKEND` | `--trim-llvm-backend` | `--ejit-sre-profile`, `--ejit-sre-async-profile` |
+| `EJIT_SRE_CODE_POOL` | `--sre-code-pool` / `--no-sre-code-pool` | `--ejit-sre-code-pool-profile`, `--ejit-sre-profile`, `--ejit-sre-async-profile` |
 | `EJIT_SRE_TASKPOOL` | `--sre-taskpool` / `--no-sre-taskpool` | `--ejit-sre-profile`, `--ejit-sre-async-profile` |
-| `EJIT_SRE_SHARED_TASKPOOL` | `--sre-shared-taskpool` / `--no-sre-shared-taskpool` | Not bundled in Phase 2; enable explicitly so cross-core behavior is never switched on by surprise. |
-| `EJIT_SRE_SHARED_CODE_POINTERS` | `--sre-shared-code-pointers` / `--no-sre-shared-code-pointers` | Not bundled in Phase 2; requires platform same-VA and per-core executable permission/coherency validation. |
+| `EJIT_SRE_SHARED_TASKPOOL` | `--sre-shared-taskpool` / `--no-sre-shared-taskpool` | `--ejit-sre-profile`, `--ejit-sre-async-profile` |
+| `EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL` | `--trim-llvm-backend-experimental` | Not bundled; it is still a riskier trim for explicit size experiments. |
+| `EJIT_SRE_SHARED_CODE_POINTERS` | `--sre-shared-code-pointers` / `--no-sre-shared-code-pointers` | Not bundled; requires platform same-VA and per-core executable permission/coherency validation. |
 
 ---
 
 ## 5. Shared-taskpool cleanup boundary
 
 The shared taskpool exists in this baseline and has already been exercised on
-target hardware. That makes it a poor candidate for a first-round macro
-cleanup. In this phase:
+target hardware. In Phase 3 it is part of the stable SRE product profile, but
+the underlying implementation split remains intentionally unchanged. In this
+phase:
 
 - do not merge `EJitTaskPool` and `EJitSharedTaskPool`;
 - do not remove `EJIT_SRE_SHARED_TASKPOOL`;
@@ -106,9 +113,9 @@ cleanup. In this phase:
 - do not change owner election, shared queue, shared cache, dedup, activation
   state, worker startup, or code-permission behavior.
 
-Future cleanup can introduce a facade or higher-level build profile after the
-shared path has a stable product configuration, but that is intentionally out of
-scope for this conservative cleanup phase.
+Future cleanup can introduce a facade or merge plain taskpool/shared-taskpool
+internals after more product soak time. This phase only adds the high-level
+profile entry and keeps the working implementation shape intact.
 
 ---
 
@@ -191,21 +198,24 @@ Recorded for completeness; not wired to a CMake option and **not** changed here.
 
 `build.sh` parses flags **left to right**; for any switch that maps to the same
 underlying variable, **the last occurrence on the command line wins**. This is
-the only precedence rule and it applies uniformly to explicit flags and to the
-Phase-1 aggregate profiles.
+the normal precedence rule for explicit flags and aggregate profiles.
 
 Consequences:
 
-- Aggregate profiles (`--ejit-sre-profile`, `--ejit-sre-async-profile`,
-  `--ejit-sre-code-pool-profile`) simply *set* the same `EJIT_SRE_*` variables
-  that the explicit flags set. They add **no** new macro and change **no** macro
-  meaning.
+- `--ejit-sre-profile` is the SRE product profile. It sets
+  `EJIT_SRE_PROFILE=ON` and expands to the same stable product components:
+  standard backend trim, SRE code pool, taskpool, and shared taskpool.
+- `--ejit-sre-async-profile` is kept as a compatibility alias for the same
+  product profile. Sync vs async is still selected at runtime.
+- `--ejit-sre-code-pool-profile` remains a narrow code-pool-only alias for
+  bring-up.
 - To override one feature of a profile, place the explicit flag **after** the
-  profile. Examples:
+  profile. `build.sh` will then drop `EJIT_SRE_PROFILE=ON` and pass the
+  lower-level choices directly to CMake. Examples:
 
   ```bash
-  # taskpool + code pool, but force code pool back off:
-  ./build.sh release aarch64 --ejit-sre-async-profile --no-sre-code-pool
+  # product profile, but force shared taskpool back off for bisection:
+  ./build.sh release aarch64 --ejit-sre-profile --no-sre-shared-taskpool
 
   # code pool only, but also enable taskpool:
   ./build.sh release aarch64 --ejit-sre-code-pool-profile --sre-taskpool
@@ -214,26 +224,25 @@ Consequences:
 - Old explicit flags remain fully supported and are the recommended way to be
   unambiguous. Profiles are conveniences, not replacements.
 
-### 9.1 Aggregate profile expansions (Phase 1)
+### 9.1 Aggregate profile expansions (Phase 3)
 
-| Aggregate flag | Expands to (existing switches only) |
+| Aggregate flag | Expands to |
 |----------------|-------------------------------------|
 | `--ejit-sre-code-pool-profile` | `EJIT_SRE_CODE_POOL=ON` |
-| `--ejit-sre-profile` | `EJIT_SRE_TASKPOOL=ON` |
-| `--ejit-sre-async-profile` | `EJIT_SRE_TASKPOOL=ON` + `EJIT_SRE_CODE_POOL=ON` |
+| `--ejit-sre-profile` | `EJIT_SRE_PROFILE=ON`, `EJIT_TRIM_LLVM_BACKEND=ON`, `EJIT_SRE_CODE_POOL=ON`, `EJIT_SRE_TASKPOOL=ON`, `EJIT_SRE_SHARED_TASKPOOL=ON` |
+| `--ejit-sre-async-profile` | Compatibility alias for `--ejit-sre-profile` |
 
 > **Async note**: sync vs async is a **runtime** choice (`ejit_set_compile_mode`
 > / `Config.compileMode`), not a build macro. `--ejit-sre-async-profile` only
-> bundles the *build* features typically needed for the async SRE bring-up
-> (taskpool scheduler + sealed code pool); it does not itself select async at
-> runtime and it defines no new macro.
+> bundles the *build* features needed for the SRE product path; it does not
+> itself select async at runtime.
 
 ---
 
 ## 10. Runtime behavior statement
 
-Phase 2 changes are **documentation**, **pure `build.sh` convenience aliases**,
-and **centralized SRE default constants**. No CMake option semantics change, no
-macro is added or removed, and the default build (`./build.sh <debug|release>
-<arch>` with no EJIT flags) uses the same values as before. **Runtime behavior
-is unchanged.**
+Phase 3 changes add a product build entry point but do not delete the lower-level
+macros and do not change the default build (`./build.sh <debug|release> <arch>`
+with no EJIT flags). Runtime behavior changes only for builds that explicitly
+enable `EJIT_SRE_PROFILE` / `--ejit-sre-profile`, where the intended SRE product
+path is selected as a bundle.
