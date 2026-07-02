@@ -2,6 +2,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitLibcallStubs.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/Bitcode/BitcodeReader.h"
@@ -126,6 +127,17 @@ EJitOrcEngine::Create(const Config &config,
   }
 
   engine->P->J = std::move(*J);
+
+  // Override the default error reporter (logErrorsToStdErr → errs() →
+  // raw_fd_ostream) with a bare-metal-safe version using EJIT_DIAG.  On
+  // SRE / bare-metal the default reporter crashes because raw_fd_ostream
+  // internally calls POSIX I/O (open / write / isatty) whose GOT/PLT
+  // entries may be unmapped.  EJIT_DIAG uses SRE_printf / std::printf
+  // which are always available on the target.
+  engine->P->J->getExecutionSession().setErrorReporter(
+      [](Error Err) {
+        EJIT_DIAG("JIT error: %s", toString(std::move(Err)).c_str());
+      });
 
   // Create persistent optimizer — analysis managers are registered once here
   // and reused across compilations (cleared between runs).
@@ -276,8 +288,12 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     if (globalSymbols.count(P->J->mangleAndIntern(name)))
       continue;
     auto it = P->userSymbols.find(name);
-    if (it == P->userSymbols.end())
+    if (it == P->userSymbols.end()) {
+      if (!F.isIntrinsic())
+        EJIT_DIAG("loadBitcode: unresolved external func not registered: %s",
+                  name.c_str());
       continue;
+    }
     globalSymbols[P->J->mangleAndIntern(name)] =
         orc::ExecutorSymbolDef(orc::ExecutorAddr::fromPtr(it->second),
                                JITSymbolFlags::Exported);
@@ -289,12 +305,28 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     if (globalSymbols.count(P->J->mangleAndIntern(name)))
       continue;
     auto it = P->userSymbols.find(name);
-    if (it == P->userSymbols.end())
+    if (it == P->userSymbols.end()) {
+      EJIT_DIAG("loadBitcode: unresolved external global not registered: %s",
+                name.c_str());
       continue;
+    }
     globalSymbols[P->J->mangleAndIntern(name)] =
         orc::ExecutorSymbolDef(orc::ExecutorAddr::fromPtr(it->second),
                                JITSymbolFlags::Exported);
   }
+
+  // Provide codegen-synthesized runtime symbols (memset/memcpy/memmove/memcmp
+  // and the stack-protector guard/fail) that the AOT symbol collector cannot
+  // register because they are never present as IR declarations — the JIT
+  // back-end lowers the llvm.mem* intrinsics and -fstack-protector attributes
+  // into references to them. On freestanding targets process-symbol lookup is
+  // disabled, so without these every JIT compilation fails at link time.
+  // They go into the spec JITDylib (which is isolated: it does not link back
+  // to the main JITDylib) so each specialization resolves them locally.
+  for (const LibcallSymbol &LCS : getLibcallSymbols())
+    globalSymbols[P->J->mangleAndIntern(LCS.name)] =
+        orc::ExecutorSymbolDef(orc::ExecutorAddr::fromPtr(LCS.addr),
+                               JITSymbolFlags::Exported);
 
   // Define all collected symbols in the spec JITDylib before loading the
   // IR module so the JIT linker can resolve external references.

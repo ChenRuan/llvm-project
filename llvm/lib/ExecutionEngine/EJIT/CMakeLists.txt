@@ -56,6 +56,7 @@ set(EJIT_SOURCES
   EJitRuntime.cpp
   EJitRegistryTable.c
   EJitOrcEngine.cpp
+  EJitLibcallStubs.cpp
   EJitCompileDriver.cpp
   EJitCache.cpp
   EJitRuntimeState.cpp
