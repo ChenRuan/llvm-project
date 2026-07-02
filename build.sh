@@ -28,7 +28,19 @@
 #   --sre-shared-taskpool / --no-sre-shared-taskpool  cross-core shared taskpool, single shared worker (default OFF; needs --sre-taskpool)
 #   --sre-taskpool-worker-stack-size=<bytes>  shared worker task stack size (default: 1048576)
 #   --sre-shared-code-pointers / --no-sre-shared-code-pointers  allow non-owner cores to read shared cache fnPtrs (default OFF; needs platform same-VA + cache coherence)
+#   --ejit-sre-code-pool-profile   convenience alias: --sre-code-pool
+#   --ejit-sre-profile             convenience alias: --sre-taskpool
+#   --ejit-sre-async-profile       convenience alias: --sre-taskpool + --sre-code-pool
+#                                  (async vs sync is still a runtime choice; this
+#                                   alias only bundles the build features and adds
+#                                   no new macro)
 #   -h              show help
+#
+# Aggregate profiles are pure convenience entries that expand into the existing
+# --sre-* switches; they add no new macro and change no macro semantics. Flags
+# are applied left-to-right and the last occurrence wins, so an explicit flag
+# placed after a profile overrides that part of the profile. See
+# jit_design_doc/EJIT_MACRO_MATRIX.md §8 for the authoritative precedence rules.
 #===----------------------------------------------------------------------===#
 
 set -euo pipefail
@@ -284,7 +296,7 @@ EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=1048576
 EJIT_SRE_SHARED_CODE_POINTERS=OFF
 
 if [[ "${1:-}" = "-h" || "${1:-}" = "--help" ]]; then
-  sed -n '2,29p' "$0"
+  sed -n '2,40p' "$0"
   exit 0
 fi
 
@@ -311,8 +323,14 @@ while [[ $# -gt 0 ]]; do
     --sre-taskpool-worker-stack-size=*) EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE="${1#--sre-taskpool-worker-stack-size=}" ;;
     --sre-shared-code-pointers) EJIT_SRE_SHARED_CODE_POINTERS=ON ;;
     --no-sre-shared-code-pointers) EJIT_SRE_SHARED_CODE_POINTERS=OFF ;;
+    # Aggregate convenience profiles. Pure aliases: they only set the same
+    # EJIT_SRE_* variables the explicit --sre-* flags set (no new macro, no
+    # changed semantics). Applied left-to-right; a later explicit flag overrides.
+    --ejit-sre-code-pool-profile) EJIT_SRE_CODE_POOL=ON ;;
+    --ejit-sre-profile) EJIT_SRE_TASKPOOL=ON ;;
+    --ejit-sre-async-profile) EJIT_SRE_TASKPOOL=ON; EJIT_SRE_CODE_POOL=ON ;;
     -h|--help)
-      sed -n '2,29p' "$0"
+      sed -n '2,40p' "$0"
       exit 0
       ;;
     *) err "Unknown argument: $1"; exit 1 ;;
