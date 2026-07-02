@@ -791,6 +791,7 @@ void TargetPassConfig::addPrintPass(const std::string &Banner) {
 }
 
 void TargetPassConfig::addVerifyPass(const std::string &Banner) {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   bool Verify = VerifyMachineCode == cl::BOU_TRUE;
 #ifdef EXPENSIVE_CHECKS
   if (VerifyMachineCode == cl::BOU_UNSET)
@@ -798,6 +799,9 @@ void TargetPassConfig::addVerifyPass(const std::string &Banner) {
 #endif
   if (Verify)
     PM->add(createMachineVerifierPass(Banner));
+#else
+  (void)Banner;
+#endif
 }
 
 void TargetPassConfig::addDebugifyPass() {

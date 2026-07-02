@@ -414,6 +414,7 @@ FunctionPass *llvm::createMachineVerifierPass(const std::string &Banner) {
   return new MachineVerifierLegacyPass(Banner);
 }
 
+#ifndef EJIT_TRIM_LLVM_BACKEND
 void llvm::verifyMachineFunction(const std::string &Banner,
                                  const MachineFunction &MF) {
   // TODO: Use MFAM after porting below analyses.
@@ -442,6 +443,27 @@ bool MachineFunction::verify(LiveIntervals *LiveInts, SlotIndexes *Indexes,
                          /*LiveStks=*/nullptr, Indexes, OS, AbortOnError)
       .verify(*this);
 }
+#else
+void llvm::verifyMachineFunction(const std::string &Banner,
+                                 const MachineFunction &MF) {}
+
+bool MachineFunction::verify(Pass *p, const char *Banner, raw_ostream *OS,
+                             bool AbortOnError) const {
+  return true;
+}
+
+bool MachineFunction::verify(MachineFunctionAnalysisManager &MFAM,
+                             const char *Banner, raw_ostream *OS,
+                             bool AbortOnError) const {
+  return true;
+}
+
+bool MachineFunction::verify(LiveIntervals *LiveInts, SlotIndexes *Indexes,
+                             const char *Banner, raw_ostream *OS,
+                             bool AbortOnError) const {
+  return true;
+}
+#endif // EJIT_TRIM_LLVM_BACKEND
 
 void MachineVerifier::verifySlotIndexes() const {
   if (Indexes == nullptr)

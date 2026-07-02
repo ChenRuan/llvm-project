@@ -168,6 +168,11 @@ CodeGenTargetMachineImpl::createMCStreamer(raw_pwrite_stream &Out,
 
   switch (FileType) {
   case CodeGenFileType::AssemblyFile: {
+#ifdef EJIT_TRIM_LLVM_BACKEND
+    return make_error<StringError>(
+        "textual assembly output unavailable in EJIT_TRIM_LLVM_BACKEND build",
+        inconvertibleErrorCode());
+#else
     std::unique_ptr<MCInstPrinter> InstPrinter(getTarget().createMCInstPrinter(
         getTargetTriple(),
         Options.MCOptions.OutputAsmVariant.value_or(MAI.getAssemblerDialect()),
@@ -189,6 +194,7 @@ CodeGenTargetMachineImpl::createMCStreamer(raw_pwrite_stream &Out,
         std::move(MAB));
     AsmStreamer.reset(S);
     break;
+#endif
   }
   case CodeGenFileType::ObjectFile: {
     // Create the code emitter for the target if it exists.  If not, .o file

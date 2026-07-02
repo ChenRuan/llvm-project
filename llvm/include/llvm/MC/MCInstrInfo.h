@@ -70,6 +70,10 @@ public:
   /// Returns the name for the instructions with the given opcode.
   StringRef getName(unsigned Opcode) const {
     assert(Opcode < NumOpcodes && "Invalid opcode!");
+#ifdef EJIT_TRIM_LLVM_BACKEND
+    if (!InstrNameData || !InstrNameIndices)
+      return StringRef();
+#endif
     return StringRef(&InstrNameData[InstrNameIndices[Opcode]]);
   }
 
