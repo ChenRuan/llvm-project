@@ -33,6 +33,7 @@ Integration tests for the EmbeddedJIT JIT compilation system.
 | `ejit_complex_test` | 4-dimension, multi-array, external cellIdx, early-return |
 | `ejit_config_api_test` | Config, stats, cache, compile-mode API validation |
 | `ejit_external_idx_test` | External cellIdx with multi-dim arrays |
+| `ejit_inline_asm_test` | AArch64 inline asm inside an `ejit_entry` function |
 | `ejit_jit_verify_test` | JIT correctness: constant folding, dead branch elimination |
 | `ejit_lifecycle_test` | ejit_period_lc: deactivate/activate pairing |
 | `ejit_multidim_test` | 2D multi-dim array with external cellIdx |
