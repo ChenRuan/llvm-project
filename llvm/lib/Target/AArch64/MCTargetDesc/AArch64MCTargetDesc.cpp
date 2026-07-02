@@ -378,6 +378,7 @@ static MCAsmInfo *createAArch64MCAsmInfo(const MCRegisterInfo &MRI,
   return MAI;
 }
 
+#ifndef EJIT_TRIM_LLVM_BACKEND
 static MCInstPrinter *createAArch64MCInstPrinter(const Triple &T,
                                                  unsigned SyntaxVariant,
                                                  const MCAsmInfo &MAI,
@@ -390,6 +391,7 @@ static MCInstPrinter *createAArch64MCInstPrinter(const Triple &T,
 
   return nullptr;
 }
+#endif // EJIT_TRIM_LLVM_BACKEND
 
 #ifndef EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL
 static MCStreamer *
@@ -560,7 +562,9 @@ LLVMInitializeAArch64TargetMC() {
                                                createAArch64NullTargetStreamer);
 
     // Register the MCInstPrinter.
+#ifndef EJIT_TRIM_LLVM_BACKEND
     TargetRegistry::RegisterMCInstPrinter(*T, createAArch64MCInstPrinter);
+#endif
   }
 
   // Register the asm backend.
