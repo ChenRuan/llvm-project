@@ -36,8 +36,8 @@
 
 ; PASS4 output: lifecycle handler
 ; CHECK: define void @lc_handler(i32 %cell_idx)
-; CHECK: call void @ejit_deactivate_array(ptr {{.*}}, ptr @cell_data, i32 %cell_idx)
-; CHECK: call void @ejit_activate_array(ptr {{.*}}, ptr @cell_data, i32 %cell_idx)
+; CHECK: call void @ejit_deactivate(ptr {{.*}}, i32 %cell_idx)
+; CHECK: call void @ejit_activate(ptr {{.*}}, i32 %cell_idx)
 
 ; PASS2 output: period registration declarations and auto_register body
 ; CHECK: declare void @ejit_register_period_array(ptr, ptr, ptr, i64)
@@ -53,8 +53,8 @@
 ; CHECK: declare void @ejit_taskpool_release_read(i32)
 ; CHECK: declare void @ejit_register_lifecycle(ptr, ptr)
 ; CHECK: declare void @ejit_register_funcindex(ptr, ptr)
-; CHECK: declare void @ejit_deactivate_array(ptr, ptr, i32)
-; CHECK: declare void @ejit_activate_array(ptr, ptr, i32)
+; CHECK: declare void @ejit_deactivate(ptr, i32)
+; CHECK: declare void @ejit_activate(ptr, i32)
 
 
 @cell_data = global [16 x i32] zeroinitializer, !ejit.metadata !10

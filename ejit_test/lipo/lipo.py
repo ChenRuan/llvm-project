@@ -346,7 +346,7 @@ def doit_gc_merge(args):
     ejit_api = [
         "ejit_init", "ejit_shutdown", "ejit_activate", "ejit_deactivate",
         "ejit_activate_all", "ejit_deactivate_all", "ejit_is_active",
-        "ejit_activate_array", "ejit_deactivate_array", "ejit_get_stats",
+        "ejit_get_stats",
         "ejit_register_symbol", "ejit_register_bitcode",
         "ejit_register_period_array", "ejit_register_static_var",
         "ejit_clear_cache", "ejit_compile_or_get", "ejit_invalidate",

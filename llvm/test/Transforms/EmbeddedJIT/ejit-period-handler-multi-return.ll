@@ -6,13 +6,13 @@
 ; --- Single lifecycle, multiple returns ---
 ; CHECK: define i32 @lc_multi_return(i32 %cell_idx)
 ; CHECK: entry:
-; CHECK: call void @ejit_deactivate_array(ptr {{.*}}, ptr @cells, i32 %cell_idx)
+; CHECK: call void @ejit_deactivate(ptr {{.*}}, i32 %cell_idx)
 ; CHECK: icmp eq i32 %cell_idx, 0
-; CHECK: call void @ejit_activate_array(ptr {{.*}}, ptr @cells, i32 %cell_idx)
+; CHECK: call void @ejit_activate(ptr {{.*}}, i32 %cell_idx)
 ; CHECK: ret i32 10
-; CHECK: call void @ejit_activate_array(ptr {{.*}}, ptr @cells, i32 %cell_idx)
+; CHECK: call void @ejit_activate(ptr {{.*}}, i32 %cell_idx)
 ; CHECK: ret i32 20
-; CHECK: call void @ejit_activate_array(ptr {{.*}}, ptr @cells, i32 %cell_idx)
+; CHECK: call void @ejit_activate(ptr {{.*}}, i32 %cell_idx)
 ; CHECK: ret i32 30
 
 define i32 @lc_multi_return(i32 %cell_idx) !ejit.metadata !30 {
@@ -37,14 +37,14 @@ normal_ret:
 ; --- Multi-lifecycle, multiple returns with same-order activate ---
 ; CHECK: define void @lc_multi_multi_ret(i32 %cell_idx, i32 %trp_idx)
 ; CHECK: entry:
-; CHECK: call void @ejit_deactivate_array(ptr {{.*}}, ptr @cells, i32 %cell_idx)
-; CHECK: call void @ejit_deactivate_array(ptr {{.*}}, ptr @trps, i32 %trp_idx)
+; CHECK: call void @ejit_deactivate(ptr {{.*}}, i32 %cell_idx)
+; CHECK: call void @ejit_deactivate(ptr {{.*}}, i32 %trp_idx)
 ; CHECK: icmp eq i32 %cell_idx, 0
-; CHECK: call void @ejit_activate_array(ptr {{.*}}, ptr @cells, i32 %cell_idx)
-; CHECK: call void @ejit_activate_array(ptr {{.*}}, ptr @trps, i32 %trp_idx)
+; CHECK: call void @ejit_activate(ptr {{.*}}, i32 %cell_idx)
+; CHECK: call void @ejit_activate(ptr {{.*}}, i32 %trp_idx)
 ; CHECK: ret void
-; CHECK: call void @ejit_activate_array(ptr {{.*}}, ptr @cells, i32 %cell_idx)
-; CHECK: call void @ejit_activate_array(ptr {{.*}}, ptr @trps, i32 %trp_idx)
+; CHECK: call void @ejit_activate(ptr {{.*}}, i32 %cell_idx)
+; CHECK: call void @ejit_activate(ptr {{.*}}, i32 %trp_idx)
 ; CHECK: ret void
 
 define void @lc_multi_multi_ret(i32 %cell_idx, i32 %trp_idx) !ejit.metadata !40 {
@@ -61,8 +61,8 @@ normal:
 
 ; --- No lifecycle function — pass should do nothing ---
 ; CHECK: define void @not_lc(i32 %idx)
-; CHECK-NOT: ejit_deactivate_array
-; CHECK-NOT: ejit_activate_array
+; CHECK-NOT: ejit_deactivate
+; CHECK-NOT: ejit_activate
 ; CHECK: ret void
 
 define void @not_lc(i32 %idx) {

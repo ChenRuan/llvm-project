@@ -182,7 +182,7 @@ int main(int argc, char **argv)
     update_cell_config(ci2);
     printf("    修改后: g_cellCfg[%u].cellType = 0x%x, cellId = %d\n",
            ci2, g_cellCfg[ci2].cellType, g_cellCfg[ci2].cellId);
-    printf("    (PASS4 应在函数入口插入 deactivate_array, 出口插入 activate_array)\n\n");
+    printf("    (PASS4 应在函数入口插入 deactivate, 出口插入 activate)\n\n");
 
     printf("[6] 多时间窗生命周期: update_all_config(%u, %u)...\n", ci, ti);
     printf("    修改前: g_cellCfg[%u].cellType=0x%x, g_trpCfg[%u].trpType=%d\n",

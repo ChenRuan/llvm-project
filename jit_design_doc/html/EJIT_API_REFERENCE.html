@@ -94,19 +94,14 @@ void ejit_shutdown(void);</code></pre>
 <pre><code class="language-c">ejit_status_t ejit_activate(const char *periodName, uint8_t cellIdx);
 ejit_status_t ejit_deactivate(const char *periodName, uint8_t cellIdx);
 
-ejit_status_t ejit_activate_array(const char *periodName, void *arrayPtr,
-                                  uint8_t cellIdx);
-ejit_status_t ejit_deactivate_array(const char *periodName, void *arrayPtr,
-                                    uint8_t cellIdx);
-
 ejit_status_t ejit_activate_all(const char *periodName);
 ejit_status_t ejit_deactivate_all(const char *periodName);
 bool ejit_is_active(const char *periodName, uint8_t cellIdx);</code></pre>
+    <p>激活状态仅以时间窗/生命周期名称 + 实例 index 为键，没有数组指针维度。数组级接口 <code>ejit_activate_array</code> / <code>ejit_deactivate_array</code> 已移除，因为产品不需要数组级生命周期激活；若多个数组共享同一 period name，激活对该 period 实例整体生效。</p>
     <table>
       <tr><th>接口</th><th>语义</th><th>典型使用</th></tr>
       <tr><td><code>activate</code></td><td>激活同名 period 下所有数组的某个下标</td><td><code>ejit_activate("cell", 3)</code></td></tr>
       <tr><td><code>deactivate</code></td><td>使同名 period 下某个下标失效并触发缓存失效</td><td>手动修改配置前</td></tr>
-      <tr><td><code>activate_array</code></td><td>只激活指定数组</td><td>同名 period 多数组但只更新其中一个</td></tr>
       <tr><td><code>activate_all</code></td><td>激活某 period 所有实例</td><td>初始化后批量激活</td></tr>
       <tr><td><code>is_active</code></td><td>查询状态</td><td>调试/断言</td></tr>
     </table>

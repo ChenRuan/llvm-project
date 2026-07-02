@@ -77,7 +77,7 @@ __attribute__((ejit_period_arr("cell")))
 #define ejit_period_arr(x) __attribute__((ejit_period_arr(#x)))
 ```
 
-**语义**: 定义全局变量数组所属的时间窗数组。时间窗数组管理具有相同业务概念但状态独立的多个实例，每个实例可独立控制时间窗状态。多个不同数组可使用相同的 `name`（即同一时间窗名称），此时 `ejit_activate(name, idx)` 会同时激活该名称下所有数组的第 idx 个实例；`ejit_activate_array(name, ptr, idx)` 仅激活指定数组。
+**语义**: 定义全局变量数组所属的时间窗数组。时间窗数组管理具有相同业务概念但状态独立的多个实例，每个实例可独立控制时间窗状态。多个不同数组可使用相同的 `name`（即同一时间窗名称），此时 `ejit_activate(name, idx)` 会同时激活该名称下所有数组的第 idx 个实例。激活状态仅以时间窗名称 + 实例 index 为键，不存在数组指针维度：若多个数组共享同一时间窗名称，激活是 name 级别的（针对该 period 实例整体）。
 
 ```c
 struct CellConfig {
@@ -244,13 +244,13 @@ typedef struct {
 |-----|------|
 | `ejit_activate(period_name, cell_idx)` | 激活指定时间窗名称下所有数组的第 `cell_idx` 个实例 |
 | `ejit_deactivate(period_name, cell_idx)` | 标记指定时间窗名称下所有数组的第 `cell_idx` 个实例失效 |
-| `ejit_activate_array(period_name, array_ptr, cell_idx)` | 激活指定时间窗名称下**指定数组**的第 `cell_idx` 个实例 |
-| `ejit_deactivate_array(period_name, array_ptr, cell_idx)` | 标记指定时间窗名称下指定数组的第 `cell_idx` 个实例失效 |
 | `ejit_activate_all(period_name)` | 激活指定时间窗名称下所有数组的所有实例 |
 | `ejit_deactivate_all(period_name)` | 标记指定时间窗名称下所有数组的所有实例失效 |
 | `ejit_is_active(period_name, cell_idx)` | 检查时间窗实例是否激活 |
 
-**`ejit_activate` vs `ejit_activate_array`**: 同一时间窗名称可关联多个 `ejit_period_arr` 数组。`ejit_activate` 按 name + index 激活该名称下所有数组的对应实例；`ejit_activate_array` 通过额外传入数组指针，仅激活指定数组。
+**激活粒度（name + index only）**: 激活状态仅以时间窗/生命周期名称 + 实例 index 为键，不存在公开的数组指针维度。同一时间窗名称可关联多个 `ejit_period_arr` 数组，`ejit_activate` 按 name + index 激活该名称下所有数组的对应实例（即 name 级别）。
+
+> **移除说明**: 早期版本提供的 `ejit_activate_array(period_name, array_ptr, cell_idx)` / `ejit_deactivate_array(...)`（数组级生命周期激活）已被移除，因为产品不需要数组级生命周期激活。异步 / 共享 taskpool 的热路径中激活状态以 `(lifecycle, instance)` 为键，不携带数组指针维度。若引入数组指针维度，将增加热路径复杂度、跨核同虚拟地址（same-VA）假设、测试与缓存语义的成本，收益却为零。
 
 **数组越界行为**: `ejit_activate(period_name, cell_idx)` 激活该名称下所有数组的第 `cell_idx` 个实例。若不同数组大小不同（如 `g_cellCfg[16]` 和 `g_cellCfg2[8]`），`cell_idx` 对较小数组越界时，该数组实例被**静默跳过**（不报错，不激活），仅激活大小足够的数组实例。`cellIdx` 类型为 `uint8_t`，由类型系统保证非负；`cellIdx >= 数组大小` 时对超出数组进行静默跳过。
 
@@ -318,7 +318,7 @@ void* ejit_compile_or_get(uint64_t cacheKey,
 - JIT 失败 → 继续执行原函数逻辑（fallback）
 
 **生命周期函数插桩要求**:
-- 对标记 `ejit_period_lc` 的函数，函数入口插入 `ejit_deactivate_array`，函数出口插入 `ejit_activate_array`
+- 对标记 `ejit_period_lc` 的函数，函数入口插入 `ejit_deactivate(periodName, idx)`，函数出口插入 `ejit_activate(periodName, idx)`（name + index，无数组指针维度）
 
 ### 4.2 JIT 运行期行为
 

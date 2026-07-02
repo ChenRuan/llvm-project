@@ -331,7 +331,7 @@ void process_board(void) {
   <p><code>static</code> 时间窗代表 JIT 运行期不变的全局配置，不需要调用 <code>ejit_activate</code>。</p>
 
   <h3>3.3 数组时间窗：<code>ejit_period_arr(name)</code></h3>
-  <p>多个全局数组可以使用同一个时间窗名称。调用 <code>ejit_activate("cell", idx)</code> 会激活该名称下所有数组的同一下标；若只想激活某一个数组，使用 <code>ejit_activate_array</code>。</p>
+  <p>多个全局数组可以使用同一个时间窗名称。调用 <code>ejit_activate("cell", idx)</code> 会激活该名称下所有数组的同一下标。激活状态仅以时间窗名称 + 实例 index 为键，没有数组指针维度；若多个数组共享同一时间窗名称，激活对该 period 实例整体生效。</p>
 
 <pre><code class="language-c">struct CellConfig { ejit_may_const uint32_t mode; };
 struct CellState  { ejit_may_const uint32_t state; };
@@ -340,10 +340,7 @@ ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
 ejit_period_arr(cell) struct CellState  g_cellState[16];
 
 // 激活 g_cellCfg[3] 和 g_cellState[3]
-ejit_activate("cell", 3);
-
-// 只激活 g_cellCfg[3]
-ejit_activate_array("cell", g_cellCfg, 3);</code></pre>
+ejit_activate("cell", 3);</code></pre>
 
   <h3>3.4 多维特化</h3>
   <p>一个 <code>ejit_entry</code> 函数最多可声明 4 个时间窗数组下标。运行时 cache key 使用高 32 位函数索引 + 低 4 字节维度值编码。</p>
@@ -414,19 +411,14 @@ void update_both(ejit_period_arr_ind(cell) uint8_t cellIdx,
 <pre><code class="language-c">ejit_status_t ejit_activate(const char *periodName, uint8_t cellIdx);
 ejit_status_t ejit_deactivate(const char *periodName, uint8_t cellIdx);
 
-ejit_status_t ejit_activate_array(const char *periodName, void *arrayPtr,
-                                  uint8_t cellIdx);
-ejit_status_t ejit_deactivate_array(const char *periodName, void *arrayPtr,
-                                    uint8_t cellIdx);
-
 ejit_status_t ejit_activate_all(const char *periodName);
 ejit_status_t ejit_deactivate_all(const char *periodName);
 bool ejit_is_active(const char *periodName, uint8_t cellIdx);</code></pre>
 
   <ul>
     <li><code>activate(name, idx)</code>：激活该名称下所有数组的 <code>idx</code> 实例。</li>
-    <li><code>activate_array(name, ptr, idx)</code>：只激活指定数组指针对应的实例。</li>
     <li><code>deactivate</code>：标记时间窗失效，并使依赖该实例的缓存条目失效。</li>
+    <li>激活仅以时间窗名称 + 实例 index 为键；数组级接口 <code>ejit_activate_array</code> / <code>ejit_deactivate_array</code> 已移除（产品不需要数组级生命周期激活）。</li>
     <li>如果同名数组长度不同，越界数组会被跳过；用户仍应保证业务下标合法。</li>
   </ul>
 
@@ -570,7 +562,7 @@ build_release_x86/bin/clang -O2 -g \
       <tr><td><code>@__ejit_bitcode</code></td><td>嵌入 bitcode 位于专用 section</td></tr>
       <tr><td><code>ejit_compile_or_get</code></td><td>wrapper 入口调用运行时</td></tr>
       <tr><td><code>jit_dispatch</code> / <code>jit_fallback</code></td><td>存在 JIT 分发路径和 AOT fallback 路径</td></tr>
-      <tr><td><code>ejit_deactivate_array</code> / <code>ejit_activate_array</code></td><td>生命周期函数入口/出口插桩</td></tr>
+      <tr><td><code>ejit_deactivate</code> / <code>ejit_activate</code></td><td>生命周期函数入口/出口插桩</td></tr>
     </tbody>
   </table>
 

@@ -61,8 +61,11 @@ constexpr const char *FN_COMPILE_OR_GET = "ejit_compile_or_get";
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET =
     "ejit_taskpool_compile_or_get";
 constexpr const char *FN_TASKPOOL_RELEASE_READ = "ejit_taskpool_release_read";
-constexpr const char *FN_DEACTIVATE_ARRAY = "ejit_deactivate_array";
-constexpr const char *FN_ACTIVATE_ARRAY = "ejit_activate_array";
+// Lifecycle activation is keyed by period/lifecycle name + instance index only.
+// PASS4 emits these name-level calls at ejit_period_lc entry/exit; there is no
+// array-pointer dimension in the active-state hot path.
+constexpr const char *FN_DEACTIVATE = "ejit_deactivate";
+constexpr const char *FN_ACTIVATE = "ejit_activate";
 
 //===----------------------------------------------------------------------===//
 // Constructor priority (lower = later; 65535 runs last)

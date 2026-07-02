@@ -37,15 +37,6 @@ public:
   bool activate(const std::string &periodName, uint8_t cellIdx);
   bool deactivate(const std::string &periodName, uint8_t cellIdx);
 
-  // Lifecycle — array-level (single array only). Validates that arrayPtr is a
-  // registered period array whose period matches periodName; in a taskpool
-  // build it also requires a registered lifecycle and syncs the taskpool
-  // SwitchController. Returns false (changing no state) on any mismatch.
-  bool activateArray(const std::string &periodName, void *arrayPtr,
-                     uint8_t cellIdx);
-  bool deactivateArray(const std::string &periodName, void *arrayPtr,
-                       uint8_t cellIdx);
-
   bool activateAll(const std::string &periodName);
   bool deactivateAll(const std::string &periodName);
   bool isActive(const std::string &periodName, uint8_t cellIdx) const;

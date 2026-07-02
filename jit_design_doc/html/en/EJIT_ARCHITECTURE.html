@@ -621,7 +621,7 @@ ORC LLJIT / JITLink: target codegen + symbol resolution + code memory finalize</
 
         <rect x="100" y="270" width="760" height="48" rx="10" fill="#ebf2fa" stroke="#3182ce" />
         <text x="132" y="300" class="svg-label">ejit_period_lc(name)</text>
-        <text x="292" y="300" class="svg-small">auto deactivate_array at entry; auto activate_array before every return.</text>
+        <text x="292" y="300" class="svg-small">auto deactivate at entry; auto activate before every return.</text>
       </svg>
     </div>
     <div class="warn">Async compilation especially needs version checks: the period version seen when the task started must still be valid at publish time; otherwise the compile result should be discarded to avoid stale constants entering the cache.</div>

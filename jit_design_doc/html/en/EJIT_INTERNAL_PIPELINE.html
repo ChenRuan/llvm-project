@@ -57,7 +57,7 @@ Code Cache / fallback AOT</div>
       <tr><td>PASS1 <code>EJitRegisterBitcode</code></td><td>Before standard optimization</td><td>Extract the <code>ejit_entry</code> closure, preserve metadata, embed bitcode, auto-register external symbols</td><td><code>@__ejit_bitcode</code>, registry bitcode entries</td></tr>
       <tr><td>PASS2 <code>EJitRegisterPeriod</code></td><td>Before non-LTO optimization / after LTO optimization</td><td>Scan period/static metadata, generate registration calls or a static table</td><td>period registry entries</td></tr>
       <tr><td>PASS3 <code>EJitWrapperGen</code></td><td>Same</td><td>Insert cache key computation, runtime call, dispatch/fallback at the original function entry</td><td><code>jit_dispatch</code>, <code>jit_fallback</code></td></tr>
-      <tr><td>PASS4 <code>EJitPeriodHandler</code></td><td>Same</td><td>Insert deactivate/activate at lifecycle function entry/exit</td><td><code>ejit_deactivate_array</code>, <code>ejit_activate_array</code></td></tr>
+      <tr><td>PASS4 <code>EJitPeriodHandler</code></td><td>Same</td><td>Insert deactivate/activate at lifecycle function entry/exit</td><td><code>ejit_deactivate</code>, <code>ejit_activate</code></td></tr>
       <tr><td>PASS5 <code>EJitAotModulePass</code></td><td>Coordination</td><td>Run PASS2-4 in order; quickly skip modules without EJIT metadata</td><td>AOT pipeline wrapper</td></tr>
     </table>
   </section>
