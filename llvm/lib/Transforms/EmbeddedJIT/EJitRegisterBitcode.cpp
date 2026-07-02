@@ -50,12 +50,29 @@ static void collectEntryFunctions(Module &M,
   }
 }
 
+static const GlobalVariable *findRootGV(const Value *V, APInt &Offset,
+                                        const DataLayout &DL);
+
+/// Resolve a value to the underlying GlobalVariable it references, walking
+/// through bitcasts, addrspacecasts and constant-offset GEP chains (mirrors
+/// findRootGV). This is the single definition of "this operand references a
+/// global", shared by the closure collector and both symbol-registration
+/// emitters. Keeping them on one helper avoids the class of bug where a
+/// global is kept in the extracted bitcode (as an external declaration) by
+/// the collector but never registered by the emitters — which the JIT linker
+/// then fails to resolve.
+static GlobalVariable *rootGlobal(Value *V, const DataLayout &DL) {
+  APInt Offset;
+  return const_cast<GlobalVariable *>(findRootGV(V, Offset, DL));
+}
+
 static void collectReferencedGlobals(Function &F,
                                      SetVector<GlobalVariable *> &Globals) {
+  const DataLayout &DL = F.getParent()->getDataLayout();
   for (BasicBlock &BB : F)
     for (Instruction &I : BB)
       for (Value *Op : I.operands())
-        if (auto *GV = dyn_cast<GlobalVariable>(Op->stripPointerCasts()))
+        if (auto *GV = rootGlobal(Op, DL))
           Globals.insert(GV);
 }
 
@@ -307,6 +324,7 @@ static void generateSymbolRegisters(
     const SetVector<Function *> &ClosureFuncs,
     Function *AutoReg) {
   LLVMContext &Ctx = M.getContext();
+  const DataLayout &DL = M.getDataLayout();
   auto *VoidTy = Type::getVoidTy(Ctx);
   auto *PtrTy = PointerType::getUnqual(Ctx);
 
@@ -340,19 +358,20 @@ static void generateSymbolRegisters(
           }
         }
         // External global variable references. Skip constants (compiler-
-        // generated strings etc.) — they're embedded in the bitcode.
+        // generated strings etc.) — they're embedded in the bitcode. Resolve
+        // through bitcasts/GEPs via rootGlobal so every global the collector
+        // kept in the extracted bitcode is actually registered here.
         for (Use &U : I.operands()) {
-          if (auto *GV = dyn_cast<GlobalVariable>(U.get())) {
-            if (GV->isConstant())
-              continue;
-            if (GV->isDeclaration() || !isPeriodVar(*GV)) {
-              std::string Name = GV->getName().str();
-              if (registered.insert(Name).second) {
-                IRBuilder<> Builder(InsertBefore);
-                Builder.CreateCall(M.getFunction("ejit_register_symbol"),
-                    {Builder.CreateGlobalString(Name),
-                     Builder.CreateBitCast(GV, PtrTy)});
-              }
+          auto *GV = rootGlobal(U.get(), DL);
+          if (!GV || GV->isConstant())
+            continue;
+          if (GV->isDeclaration() || !isPeriodVar(*GV)) {
+            std::string Name = GV->getName().str();
+            if (registered.insert(Name).second) {
+              IRBuilder<> Builder(InsertBefore);
+              Builder.CreateCall(M.getFunction("ejit_register_symbol"),
+                  {Builder.CreateGlobalString(Name),
+                   Builder.CreateBitCast(GV, PtrTy)});
             }
           }
         }
@@ -474,28 +493,32 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
     }
   }
 
-  // Global variable symbol entries
+  // Global variable symbol entries. Resolve through bitcasts/GEPs via
+  // rootGlobal so registration matches what collectReferencedGlobals kept in
+  // the extracted bitcode.
   SmallPtrSet<const GlobalVariable *, 4> GVsDone;
+  const DataLayout &DL = M.getDataLayout();
   for (Function *F : ClosureFuncs) {
     for (const BasicBlock &BB : *F) {
       for (const Instruction &I : BB) {
         for (const Value *Op : I.operands()) {
-          if (const GlobalVariable *GV = dyn_cast<GlobalVariable>(Op)) {
-            if (!GV->isConstant() && !GV->getName().starts_with("llvm.") &&
-                GVsDone.insert(GV).second) {
-              Constant *NameStr = ConstantDataArray::getString(Ctx, GV->getName(), true);
-              auto *NameGV = new GlobalVariable(M, NameStr->getType(), true,
-                  GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
-              Entries.push_back(ConstantStruct::get(EntryTy, {
-                  ConstantInt::get(I32Ty, 3),                // EJIT_REG_SYMBOL
-                  ConstantExpr::getBitCast(NameGV, PtrTy),   // name1 string
-                  ConstantPointerNull::get(PtrTy),
-                  ConstantExpr::getBitCast(
-                      const_cast<GlobalVariable *>(GV), PtrTy),
-                  ConstantInt::get(I64Ty, 0),
-              }));
-            }
-          }
+          const GlobalVariable *GV =
+              rootGlobal(const_cast<Value *>(Op), DL);
+          if (!GV || GV->isConstant() || GV->getName().starts_with("llvm."))
+            continue;
+          if (!GVsDone.insert(GV).second)
+            continue;
+          Constant *NameStr = ConstantDataArray::getString(Ctx, GV->getName(), true);
+          auto *NameGV = new GlobalVariable(M, NameStr->getType(), true,
+              GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
+          Entries.push_back(ConstantStruct::get(EntryTy, {
+              ConstantInt::get(I32Ty, 3),                // EJIT_REG_SYMBOL
+              ConstantExpr::getBitCast(NameGV, PtrTy),   // name1 string
+              ConstantPointerNull::get(PtrTy),
+              ConstantExpr::getBitCast(
+                  const_cast<GlobalVariable *>(GV), PtrTy),
+              ConstantInt::get(I64Ty, 0),
+          }));
         }
       }
     }
