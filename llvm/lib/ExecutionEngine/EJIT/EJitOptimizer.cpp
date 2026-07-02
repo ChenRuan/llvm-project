@@ -41,8 +41,8 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
   L1FPM_.addPass(ADCEPass());
   L1FPM_.addPass(SimplifyCFGPass());
 
-  // L2: SimplifyCFG cleanup after inlining.
-  L2FPM_.addPass(SimplifyCFGPass());
+  // L2: reserved for post-inline cleanup.
+  // TODO: populate once inlining is re-enabled in runPipeline.
 
   // L3: LoopSimplify → FullUnroll → IndVarSimplify → LoopDeletion →
   //     Promote → SCCP → SimplifyCFG.
