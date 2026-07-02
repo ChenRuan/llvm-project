@@ -1,6 +1,7 @@
 //===-- EJitSreTask_sre.cpp - SRE task implementation shim ---------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSreConfig.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSreTask.h"
 
 #ifdef EJIT_FREESTANDING
@@ -27,28 +28,6 @@ struct TSK_INIT_PARAM_S {
 };
 
 namespace {
-
-#ifndef EJIT_SRE_TASK_PRIORITY
-#define EJIT_SRE_TASK_PRIORITY 20u
-#endif
-
-// Worker task stack size: the SINGLE source of truth is the CMake option
-// EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE (default 1 MiB, defined whenever
-// EJIT_SRE_TASKPOOL is ON). The LLVM optimize/codegen/ORC/JITLink pipeline runs
-// on THIS stack, so 64 KiB is not enough. The fallback below exists ONLY for a
-// non-CMake compile; CMake builds always pass -D so it is never used there.
-#ifndef EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE
-#define EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE (1024u * 1024u)
-#endif
-static_assert(EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE > 0u,
-              "worker stack size must be non-zero");
-static_assert(
-    EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE % 16u == 0u,
-    "worker stack size must be 16-byte aligned (AArch64 SP alignment)");
-static_assert(
-    static_cast<unsigned long long>(EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE) <=
-        0xFFFFFFFFull,
-    "worker stack size must fit the 32-bit TSK_INIT_PARAM_S.uwStackSize");
 
 constexpr uint32_t kSreOk = 0;
 constexpr const char kDefaultTaskName[] = "ejit_worker";
@@ -90,10 +69,10 @@ bool EJitSreTask::create(EJitSreTask &out, EntryFn entry, void *ctx,
 
   TSK_INIT_PARAM_S init{};
   init.pfnTaskEntry = &taskTrampoline;
-  init.usTaskPrio = static_cast<TSK_PRIOR_T>(EJIT_SRE_TASK_PRIORITY);
+  init.usTaskPrio = static_cast<TSK_PRIOR_T>(sre_config::kTaskPriority);
   init.auwArgs[0] = static_cast<TSK_ARG_T>(reinterpret_cast<uintptr_t>(entry));
   init.auwArgs[1] = static_cast<TSK_ARG_T>(reinterpret_cast<uintptr_t>(ctx));
-  init.uwStackSize = static_cast<uint32_t>(EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE);
+  init.uwStackSize = sre_config::kWorkerStackSize;
   init.pcName = name ? name : kDefaultTaskName;
   EJIT_DIAG("platform task stack size=%u bytes",
             static_cast<unsigned>(init.uwStackSize));

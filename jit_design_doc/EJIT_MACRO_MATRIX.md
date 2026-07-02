@@ -1,16 +1,20 @@
 # EmbeddedJIT Macro / Build-Switch Matrix
 
-**Status**: Phase 1 — documentation + build-entry aggregation only.
+**Status**: Phase 2 — documentation + build-entry aggregation + centralized
+SRE default constants.
 **Scope**: This document inventories the EmbeddedJIT (EJIT) compile-time macros
 and the `build.sh` / CMake switches that drive them, classifies them, and
 records why several macros cannot be deleted yet. It is intentionally
 non-invasive: it does **not** change any runtime behavior, does **not** remove
 any macro, and does **not** alter the meaning of any existing CMake option.
+Phase 2 additionally centralizes SRE-facing default constants in
+`EJitSreConfig.h`, so adapter `.cpp` files do not each carry their own fallback
+`#ifndef` blocks.
 
 > **Baseline note (important)**: This document is based on `ejit_dev_spec4`,
 > which already contains the cross-core shared taskpool implementation. Shared
 > taskpool macros are therefore documented as real, load-bearing bring-up
-> switches. Phase 1 does **not** delete, fold, runtime-ize, or otherwise alter
+> switches. Phase 2 does **not** delete, fold, runtime-ize, or otherwise alter
 > those paths.
 
 ---
@@ -48,7 +52,7 @@ which defeats the size and freestanding goals of EmbeddedJIT.
 | `EJIT_SRE_SHARED_TASKPOOL_PLATFORM` | CMake-derived define when `EJIT_SRE_SHARED_TASKPOOL=ON` and `EJIT_FREESTANDING=ON` | Selects the real platform-facing shared-taskpool hooks instead of host/test seams. It affects core-id/current-core behavior and shared-section expectations, so it is not a runtime flag. |
 | `EJIT_DEFAULT_TRIPLE` (from `EJIT_DEFAULT_TARGET_TRIPLE`) | EJIT lib CMake (+ `build.sh --target-triple=`) | Baked-in target triple that replaces host detection; required by freestanding. It is a compile-time string define on `LLVMEJIT`. |
 
-**Rule**: none of these may be deleted or runtime-ized in Phase 1.
+**Rule**: none of these may be deleted or runtime-ized in Phase 2.
 
 ---
 
@@ -56,8 +60,8 @@ which defeats the size and freestanding goals of EmbeddedJIT.
 
 These are integers that size fixed tables / pools. They could *in principle*
 migrate to a runtime config struct later, but only after the owning subsystem's
-data structures stop using them for static sizing. They are **not** touched in
-Phase 1.
+data structures stop using them for static sizing. They are **not**
+runtime-ized in Phase 2.
 
 | Macro | Driven by | Default | Future note |
 |-------|-----------|---------|-------------|
@@ -69,14 +73,14 @@ Phase 1.
 | `EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE` | CMake (+ `build.sh --sre-taskpool-worker-stack-size=`) | `1048576` | Shared worker stack size. It is already a build parameter but still participates in platform task creation and should not be changed by macro cleanup. |
 | `EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS` | CMake `EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS` | `16` | Fixed-slot shared cache size. Static shared-state layout depends on it. |
 
-**Rule**: leave as compile-time; do not runtime-ize a batch of these in Phase 1.
+**Rule**: leave as compile-time; do not runtime-ize a batch of these in Phase 2.
 
 ---
 
 ## 4. Category C — Macros that could be ALIASED / AGGREGATED later
 
 These are not deletable, but callers frequently want to enable them **together**
-for a given bring-up scenario. Phase 1 adds `build.sh` convenience aliases that
+for a given bring-up scenario. Phase 1 added `build.sh` convenience aliases that
 bundle them (see [§6](#6-aggregate-convenience-switches-buildsh-only)); the
 underlying CMake options and macro semantics are unchanged.
 
@@ -84,8 +88,8 @@ underlying CMake options and macro semantics are unchanged.
 |-------------------------|-----------------------------------|------------------------------|
 | `EJIT_SRE_CODE_POOL` | `--sre-code-pool` / `--no-sre-code-pool` | `--ejit-sre-code-pool-profile`, `--ejit-sre-async-profile` |
 | `EJIT_SRE_TASKPOOL` | `--sre-taskpool` / `--no-sre-taskpool` | `--ejit-sre-profile`, `--ejit-sre-async-profile` |
-| `EJIT_SRE_SHARED_TASKPOOL` | `--sre-shared-taskpool` / `--no-sre-shared-taskpool` | Not bundled in Phase 1; enable explicitly so cross-core behavior is never switched on by surprise. |
-| `EJIT_SRE_SHARED_CODE_POINTERS` | `--sre-shared-code-pointers` / `--no-sre-shared-code-pointers` | Not bundled in Phase 1; requires platform same-VA and per-core executable permission/coherency validation. |
+| `EJIT_SRE_SHARED_TASKPOOL` | `--sre-shared-taskpool` / `--no-sre-shared-taskpool` | Not bundled in Phase 2; enable explicitly so cross-core behavior is never switched on by surprise. |
+| `EJIT_SRE_SHARED_CODE_POINTERS` | `--sre-shared-code-pointers` / `--no-sre-shared-code-pointers` | Not bundled in Phase 2; requires platform same-VA and per-core executable permission/coherency validation. |
 
 ---
 
@@ -104,11 +108,30 @@ cleanup. In this phase:
 
 Future cleanup can introduce a facade or higher-level build profile after the
 shared path has a stable product configuration, but that is intentionally out of
-scope for this documentation/build-entry-only phase.
+scope for this conservative cleanup phase.
 
 ---
 
-## 6. Bring-up macros that CANNOT be deleted yet (justification)
+## 6. Centralized SRE defaults introduced in Phase 2
+
+`llvm/include/llvm/ExecutionEngine/EJIT/EJitSreConfig.h` is the single local
+header for SRE-facing default constants:
+
+- `EJIT_SRE_CODE_POOL_SIZE`
+- `EJIT_SRE_CODE_POOL_PTNO`
+- `EJIT_SRE_CODE_POOL_MID`
+- `EJIT_SRE_TASK_PRIORITY`
+- `EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE`
+- fixed page-size constants used by the SRE adapter (`2MiB`, `4KiB`)
+
+This is a code-layout cleanup only. The CMake cache variables and compile-time
+macros remain the source of values, and the generated binary sees the same
+constants as before. The goal is to avoid repeating fallback `#ifndef` blocks
+and magic defaults in multiple SRE adapter files.
+
+---
+
+## 7. Bring-up macros that CANNOT be deleted yet (justification)
 
 The task specifically asks why the following cannot be removed. Note that some
 are compile-time paths still under active bring-up and some are simply not
@@ -147,7 +170,7 @@ present here.
 
 ---
 
-## 7. Other compile-time defines observed (manual / test-only)
+## 8. Other compile-time defines observed (manual / test-only)
 
 Recorded for completeness; not wired to a CMake option and **not** changed here.
 
@@ -164,7 +187,7 @@ Recorded for completeness; not wired to a CMake option and **not** changed here.
 
 ---
 
-## 8. `build.sh` flag precedence (authoritative)
+## 9. `build.sh` flag precedence (authoritative)
 
 `build.sh` parses flags **left to right**; for any switch that maps to the same
 underlying variable, **the last occurrence on the command line wins**. This is
@@ -191,7 +214,7 @@ Consequences:
 - Old explicit flags remain fully supported and are the recommended way to be
   unambiguous. Profiles are conveniences, not replacements.
 
-### 8.1 Aggregate profile expansions (Phase 1)
+### 9.1 Aggregate profile expansions (Phase 1)
 
 | Aggregate flag | Expands to (existing switches only) |
 |----------------|-------------------------------------|
@@ -207,9 +230,10 @@ Consequences:
 
 ---
 
-## 9. Runtime behavior statement
+## 10. Runtime behavior statement
 
-Phase 1 changes are **documentation** plus **pure `build.sh` convenience
-aliases**. No CMake option semantics change, no macro is added or removed, and
-the default build (`./build.sh <debug|release> <arch>` with no EJIT flags) is
-byte-for-byte identical to before. **Runtime behavior is unchanged.**
+Phase 2 changes are **documentation**, **pure `build.sh` convenience aliases**,
+and **centralized SRE default constants**. No CMake option semantics change, no
+macro is added or removed, and the default build (`./build.sh <debug|release>
+<arch>` with no EJIT flags) uses the same values as before. **Runtime behavior
+is unchanged.**

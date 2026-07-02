@@ -22,30 +22,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
-
-#ifndef EJIT_SRE_CODE_POOL_SIZE
-#define EJIT_SRE_CODE_POOL_SIZE                                                \
-  (static_cast<unsigned long long>(2) * 1024 * 1024)
-#endif
-
-#ifndef EJIT_SRE_CODE_POOL_PTNO
-#define EJIT_SRE_CODE_POOL_PTNO 8
-#endif
-
-// Memory module id passed to SRE_MemDbgAlloc. Not architecturally significant
-// for the pool; overridable if a deployment needs a specific id.
-#ifndef EJIT_SRE_CODE_POOL_MID
-#define EJIT_SRE_CODE_POOL_MID 0
-#endif
-
-namespace {
-constexpr unsigned long long kSrePoolSize = EJIT_SRE_CODE_POOL_SIZE;
-constexpr unsigned char kSrePtNo =
-    static_cast<unsigned char>(EJIT_SRE_CODE_POOL_PTNO);
-constexpr unsigned kSreMid = static_cast<unsigned>(EJIT_SRE_CODE_POOL_MID);
-constexpr size_t k2MiB = static_cast<size_t>(2) * 1024 * 1024;
-constexpr size_t k4KiB = static_cast<size_t>(4) * 1024;
-} // namespace
+#include "llvm/ExecutionEngine/EJIT/EJitSreConfig.h"
 
 //===----------------------------------------------------------------------===//
 // Platform primitives (declaration only — defined by the platform/business)
@@ -75,21 +52,23 @@ extern "C" void *SRE_MemDbgAlloc(unsigned int mid, unsigned char ptNo,
 std::unique_ptr<llvm::ejit::EJitCodePoolManager>
 llvm::ejit::makeSreCodePoolManager() {
   EJitCodePoolManager::Options Opts;
-  Opts.poolSize = static_cast<size_t>(kSrePoolSize);
-  Opts.poolAlign = k2MiB; // large-page / split granularity
+  Opts.poolSize = static_cast<size_t>(sre_config::kCodePoolSize);
+  Opts.poolAlign = sre_config::k2MiB; // large-page / split granularity
   Opts.minCodeAlign = 64;
   EJIT_DIAG("makeSreCodePoolManager: poolSize=%llu poolAlign=%zu",
-            kSrePoolSize, k2MiB);
+            sre_config::kCodePoolSize, sre_config::k2MiB);
 #ifdef EJIT_CODE_POOL_4K_SEAL
   // Adapt to the platform's 4K execute-permission interface: the 2MiB pool is
   // split into 4K mappings at creation and sealed one 4KiB page at a time.
   Opts.fourKSeal = true;
-  Opts.sealPageSize = k4KiB;
+  Opts.sealPageSize = sre_config::k4KiB;
 #endif
 
   auto RawAlloc = [](size_t Bytes) -> void * {
-    return SRE_MemDbgAlloc(kSreMid, kSrePtNo, static_cast<unsigned long>(Bytes),
-                           __func__, __LINE__);
+    return SRE_MemDbgAlloc(sre_config::kCodePoolMid,
+                           sre_config::kCodePoolPtNo,
+                           static_cast<unsigned long>(Bytes), __func__,
+                           __LINE__);
   };
 
   auto Seal = [](void *Va) -> unsigned {
@@ -130,7 +109,8 @@ bool llvm::ejit::prepareSreCodeForCurrentCore(const void *FnPtr) {
     return false;
   }
   const auto Address = reinterpret_cast<uintptr_t>(FnPtr);
-  const auto PoolBase = Address & ~(static_cast<uintptr_t>(k2MiB) - 1);
+  const auto PoolBase =
+      Address & ~(static_cast<uintptr_t>(sre_config::k2MiB) - 1);
   unsigned Rc = ejit_sre_enable_ex(1, static_cast<unsigned long long>(PoolBase));
   if (Rc != 0) {
     EJIT_DIAG("prepareSreCode FAIL: enable_ex poolBase=0x%llx rc=%u",
