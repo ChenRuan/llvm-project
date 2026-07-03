@@ -12,9 +12,14 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
+#include <map>
+#include <mutex>
 #include <map>
 
 #ifdef EJIT_SRE_CODE_POOL
@@ -50,7 +55,84 @@ struct EJitOrcEngine::Impl {
   std::string dumpJITDir;
   /// Persistent optimizer — analysis managers are registered once and reused.
   std::unique_ptr<EJitOptimizer> optimizer;
+  /// TargetMachine used for the name-filtered ASM diagnostic dump (created
+  /// once from the same JITTargetMachineBuilder the JIT compiles with, so the
+  /// emitted assembly matches the real JIT output). Null if creation failed.
+  std::unique_ptr<TargetMachine> dumpTM;
 };
+
+// Process-wide function-name filter for the IR+ASM diagnostic dump. Set via
+// ejit_dump_func() / setDumpFuncFilter(). Read in the IR transform layer.
+// A diagnostic: set before triggering the compile of interest; concurrent
+// set/read is benign (worst case a missed or extra dump).
+static std::string gDumpFuncFilter;
+
+void setDumpFuncFilter(const std::string &name) { gDumpFuncFilter = name; }
+
+/// Emit a multi-line blob (IR or ASM) through EJIT_DIAG, one line per call,
+/// under a labeled header. Bare-metal-safe (no file I/O — the existing
+/// dumpJITDir path uses raw_fd_ostream which crashes on SRE/bare-metal).
+static void dumpLines(const char *label, const std::string &s) {
+  EJIT_DIAG("=== %s ===", label);
+  StringRef rest(s);
+  while (!rest.empty()) {
+    auto [line, next] = rest.split('\n');
+    if (!line.empty())
+      EJIT_DIAG("  %.*s", static_cast<int>(line.size()), line.data());
+    rest = next;
+  }
+}
+
+/// Saved IR+ASM for a captured specialization (latest per function name).
+struct DumpEntry {
+  uint64_t cacheKey = 0;
+  std::string IR;
+  std::string ASM;
+};
+
+// Process-wide store of captured IR+ASM, filled by the IR transform layer
+// (worker thread) when the filter matches, read by ejit_print_dumped() (user
+// thread). Guarded by gDumpMutex.
+static std::mutex gDumpMutex;
+static std::map<std::string, DumpEntry> gDumpStore;
+
+/// Called from the IR transform layer when the filter matches: save the
+/// post-optimization IR and emitted ASM for later selective printing.
+static void captureDump(const std::string &fnName, uint64_t cacheKey,
+                        std::string IR, std::string ASM) {
+  std::lock_guard<std::mutex> lock(gDumpMutex);
+  gDumpStore[fnName] = DumpEntry{cacheKey, std::move(IR), std::move(ASM)};
+}
+
+/// Print the saved IR+ASM for \p name (or all saved entries when \p name is
+/// null/empty) through EJIT_DIAG, one line per IR/ASM line. Names with no
+/// saved capture are reported as missing.
+void printDumped(const char *name) {
+  std::lock_guard<std::mutex> lock(gDumpMutex);
+  auto emit = [&](const std::string &fnName, const DumpEntry &e) {
+    dumpLines(("dump IR func=" + fnName + " key=0x" +
+               Twine::utohexstr(e.cacheKey).str())
+                  .c_str(),
+              e.IR);
+    if (!e.ASM.empty())
+      dumpLines(("dump ASM func=" + fnName + " key=0x" +
+                 Twine::utohexstr(e.cacheKey).str())
+                    .c_str(),
+                e.ASM);
+  };
+  if (name && name[0]) {
+    auto it = gDumpStore.find(name);
+    if (it != gDumpStore.end())
+      emit(it->first, it->second);
+    else
+      EJIT_DIAG("print_dumped: no saved IR/ASM for func=%s", name);
+  } else {
+    if (gDumpStore.empty())
+      EJIT_DIAG("print_dumped: nothing saved");
+    for (auto &kv : gDumpStore)
+      emit(kv.first, kv.second);
+  }
+}
 
 EJitOrcEngine::EJitOrcEngine() : P(std::make_unique<Impl>()) {}
 EJitOrcEngine::~EJitOrcEngine() = default;
@@ -86,6 +168,14 @@ EJitOrcEngine::Create(const Config &config,
 
   // Use Large code model so JITLink can generate 64-bit absolute relocations.
   JTMBOrErr->setCodeModel(CodeModel::Large);
+
+  // Build a TargetMachine (same options the JIT compiles with) for the
+  // name-filtered ASM diagnostic dump. Failure is non-fatal — the dump is
+  // simply unavailable.
+  if (auto TMOrErr = JTMBOrErr->createTargetMachine())
+    engine->P->dumpTM = std::move(*TMOrErr);
+  else
+    consumeError(TMOrErr.takeError());
 
   orc::LLJITBuilder Builder;
   Builder.setJITTargetMachineBuilder(*JTMBOrErr);
@@ -205,6 +295,36 @@ EJitOrcEngine::Create(const Config &config,
             llvm::raw_fd_ostream OS(path, EC);
             if (!EC)
               M.print(OS, nullptr);
+          }
+
+          // Name-filtered IR+ASM capture for later selective printing. Filter
+          // set via ejit_dump_func(); captured entries printed on demand via
+          // ejit_print_dumped(). Bare-metal-safe (strings only, no
+          // raw_fd_ostream). Captures the post-optimization IR and the emitted
+          // assembly (from the same TargetMachine the JIT compiles with).
+          if (!gDumpFuncFilter.empty() && ctx->fnName == gDumpFuncFilter) {
+            std::string IR;
+            raw_string_ostream IOS(IR);
+            M.print(IOS, nullptr);
+            IOS.flush();
+
+            std::string Asm;
+            if (engine->P->dumpTM) {
+              SmallVector<char, 0> AsmBuf;
+              raw_svector_ostream AOS(AsmBuf);
+              legacy::PassManager PM;
+              if (!engine->P->dumpTM->addPassesToEmitFile(
+                      PM, AOS, /*DwoOut=*/nullptr,
+                      CodeGenFileType::AssemblyFile)) {
+                PM.run(M);
+                Asm.assign(AsmBuf.begin(), AsmBuf.end());
+              } else {
+                EJIT_DIAG("dump ASM func=%s: target cannot emit assembly",
+                          ctx->fnName.c_str());
+              }
+            }
+            captureDump(ctx->fnName, ctx->cacheKey, std::move(IR),
+                        std::move(Asm));
           }
         });
         return std::move(TSM);

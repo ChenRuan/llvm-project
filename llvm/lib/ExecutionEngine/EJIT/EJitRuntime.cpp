@@ -7,6 +7,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
+#include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #ifdef EJIT_SRE_TASKPOOL
@@ -702,6 +703,17 @@ void ejit_taskpool_print_compiled() {
 #else
   EJIT_DIAG("print_compiled: shared taskpool not enabled");
 #endif
+}
+
+void ejit_dump_func(const char *name) {
+  std::string filter = (name && name[0]) ? std::string(name) : std::string();
+  EJIT_DIAG("dump_func filter=%s", filter.empty() ? "(off)" : filter.c_str());
+  setDumpFuncFilter(filter);
+}
+
+void ejit_print_dumped(const char *name) {
+  EJIT_DIAG("print_dumped name=%s", (name && name[0]) ? name : "(all)");
+  printDumped(name);
 }
 
 // Sentinel returned when no owner core is elected (e.g. not initialized or the

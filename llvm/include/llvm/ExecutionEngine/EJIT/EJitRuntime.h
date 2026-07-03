@@ -186,6 +186,21 @@ void ejit_taskpool_print_stats();
 void ejit_taskpool_print_compiled();
 uint32_t ejit_taskpool_get_worker_core();
 
+/// Enable name-filtered JIT IR+ASM capture. When \p name is non-null and
+/// non-empty, the next time a specialization whose entry name exactly matches
+/// \p name is JIT-compiled, the engine saves (in memory) its post-optimization
+/// IR and emitted assembly for later printing. Pass NULL or "" to disable
+/// further capture (already-saved entries are retained). For performance
+/// analysis of individual functions.
+void ejit_dump_func(const char *name);
+
+/// Print the saved IR+ASM for \p name (or all saved entries when \p name is
+/// NULL or "") through the platform log, one line per IR/ASM line, labeled
+/// "dump IR func=..." / "dump ASM func=...". Names with no saved capture are
+/// reported as missing. Paired with ejit_dump_func(): capture at compile
+/// time, print selectively later.
+void ejit_print_dumped(const char *name);
+
 // Cache
 void ejit_clear_cache(void);
 void ejit_invalidate(const char *periodName, uint8_t cellIdx);
