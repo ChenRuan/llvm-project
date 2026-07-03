@@ -32,6 +32,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
 #endif
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+#include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
+#endif
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -81,6 +84,9 @@ using DumpMutexType = std::mutex;
 // ejit_dump_func() / setDumpFuncFilter(). Read in the IR transform layer.
 // A diagnostic: set before triggering the compile of interest; concurrent
 // set/read is benign (worst case a missed or extra dump).
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+EJitSharedTaskPoolState *gDumpSharedState = nullptr;
+#endif
 static std::string gDumpFuncFilter;
 
 void setDumpFuncFilter(const std::string &name) {
@@ -88,6 +94,78 @@ void setDumpFuncFilter(const std::string &name) {
   EJIT_DIAG("set_dump_filter value=%s &filter=%p",
             gDumpFuncFilter.empty() ? "(off)" : gDumpFuncFilter.c_str(),
             (void *)&gDumpFuncFilter);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (gDumpSharedState) {
+    EJitSharedDumpState &D = gDumpSharedState->dump;
+    uint32_t expected = 0;
+    while (!D.lock.compareExchange(expected, 1))
+      expected = 0;
+    uint32_t len = 0;
+    if (!name.empty()) {
+      while (len + 1 < kEJitSharedDumpNameBytes && len < name.size()) {
+        D.filterName[len] = name[len];
+        ++len;
+      }
+    }
+    D.filterName[len] = 0;
+    D.filterLen = len;
+    D.resultValid.storeRelease(0);
+    D.resultNameLen = 0;
+    D.irSize = 0;
+    D.asmSize = 0;
+    D.truncated.storeRelease(0);
+    D.filterEnabled.storeRelease(len ? 1u : 0u);
+    D.lock.storeRelease(0);
+    EJIT_DIAG("set_dump_filter shared enabled=%u len=%u &shared=%p",
+              len ? 1u : 0u, len, (void *)gDumpSharedState);
+  }
+#endif
+}
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+void setDumpSharedState(EJitSharedTaskPoolState *state) {
+  gDumpSharedState = state;
+  EJIT_DIAG("set_dump_shared_state state=%p", (void *)state);
+}
+
+static void sharedDumpLock(EJitSharedDumpState &D) {
+  uint32_t expected = 0;
+  while (!D.lock.compareExchange(expected, 1))
+    expected = 0;
+}
+
+static void sharedDumpUnlock(EJitSharedDumpState &D) {
+  D.lock.storeRelease(0);
+}
+
+static bool getSharedDumpFilter(std::string &out) {
+  if (!gDumpSharedState)
+    return false;
+  EJitSharedDumpState &D = gDumpSharedState->dump;
+  sharedDumpLock(D);
+  bool enabled = D.filterEnabled.loadAcquire() != 0;
+  if (enabled) {
+    uint32_t len = D.filterLen;
+    if (len >= kEJitSharedDumpNameBytes)
+      len = kEJitSharedDumpNameBytes - 1;
+    out.assign(D.filterName, D.filterName + len);
+  }
+  sharedDumpUnlock(D);
+  return enabled;
+}
+#else
+void setDumpSharedState(EJitSharedTaskPoolState * /*state*/) {}
+#endif
+
+static bool getActiveDumpFilter(std::string &out) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (getSharedDumpFilter(out))
+    return true;
+#endif
+  if (gDumpFuncFilter.empty())
+    return false;
+  out = gDumpFuncFilter;
+  return true;
 }
 
 /// Saved IR+ASM for a captured specialization (latest per function name).
@@ -105,33 +183,126 @@ struct DumpEntry {
 static DumpMutexType gDumpMutex;
 static std::map<std::string, DumpEntry> gDumpStore;
 
-/// Emit a multi-line blob (IR or ASM) through EJIT_DIAG. SRE-safe: no lambda,
-/// no Twine, no raw_fd_ostream. Splits on '\n' and chunks each line to a small
-/// fixed width so a single EJIT_DIAG/SRE_printf call stays bounded.
-static void dumpLinesSafe(const char *label, const std::string &s) {
-  EJIT_DIAG("=== %s begin size=%u ===", label, (unsigned)s.size());
-  const char *data = s.data();
-  size_t n = s.size();
+static void dumpBytesSafe(const char *label, const char *data, size_t n) {
+  EJIT_DIAG("=== %s begin size=%u ===", label, (unsigned)n);
   size_t i = 0;
   unsigned lineNo = 0;
   while (i < n) {
     size_t lineEnd = i;
     while (lineEnd < n && data[lineEnd] != '\n')
       ++lineEnd;
-    // Chunk this (possibly empty) line into <= 180-char pieces.
     size_t pos = i;
-    do {
-      size_t chunk = lineEnd - pos;
-      if (chunk > 180)
-        chunk = 180;
-      EJIT_DIAG("%s:%u: %.*s", label, lineNo, (int)chunk, data + pos);
-      pos += chunk;
-    } while (pos < lineEnd);
+    if (pos == lineEnd) {
+      EJIT_DIAG("%s:%u: ", label, lineNo);
+    } else {
+      while (pos < lineEnd) {
+        size_t chunk = lineEnd - pos;
+        if (chunk > 180)
+          chunk = 180;
+        EJIT_DIAG("%s:%u: %.*s", label, lineNo, (int)chunk, data + pos);
+        pos += chunk;
+      }
+    }
     ++lineNo;
-    i = lineEnd + 1; // skip the '\n'
+    i = lineEnd + 1;
   }
+  (void)lineNo;
   EJIT_DIAG("=== %s end lines=%u ===", label, lineNo);
 }
+
+/// Emit a multi-line blob (IR or ASM) through EJIT_DIAG. SRE-safe: no lambda,
+/// no Twine, no raw_fd_ostream. Splits on '\n' and chunks each line to a small
+/// fixed width so a single EJIT_DIAG/SRE_printf call stays bounded.
+static void dumpLinesSafe(const char *label, const std::string &s) {
+  dumpBytesSafe(label, s.data(), s.size());
+}
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+static uint32_t copyDumpBytes(char *dst, uint32_t cap, const char *src,
+                              size_t size, bool &truncated) {
+  if (cap == 0)
+    return 0;
+  uint32_t n = 0;
+  while (n + 1 < cap && n < size) {
+    dst[n] = src[n];
+    ++n;
+  }
+  dst[n] = 0;
+  truncated = size >= cap;
+  return n;
+}
+
+static void captureSharedDump(const std::string &fnName, uint64_t cacheKey,
+                              const std::string &IR, const std::string &ASM) {
+  if (!gDumpSharedState)
+    return;
+  EJitSharedDumpState &D = gDumpSharedState->dump;
+  sharedDumpLock(D);
+  bool nameTrunc = false;
+  bool irTrunc = false;
+  bool asmTrunc = false;
+  D.resultValid.storeRelease(0);
+  D.resultNameLen =
+      copyDumpBytes(D.resultName, kEJitSharedDumpNameBytes, fnName.data(),
+                    fnName.size(), nameTrunc);
+  D.irSize =
+      copyDumpBytes(D.ir, kEJitSharedDumpTextBytes, IR.data(), IR.size(),
+                    irTrunc);
+  D.asmSize = copyDumpBytes(D.asmText, kEJitSharedDumpTextBytes, ASM.data(),
+                            ASM.size(), asmTrunc);
+  D.keyHi = (uint32_t)(cacheKey >> 32);
+  D.keyLo = (uint32_t)(cacheKey & 0xffffffffu);
+  D.truncated.storeRelease((nameTrunc ? 4u : 0u) | (irTrunc ? 1u : 0u) |
+                           (asmTrunc ? 2u : 0u));
+  D.resultValid.storeRelease(1);
+  sharedDumpUnlock(D);
+  EJIT_DIAG("capture shared func=%s ir=%u asm=%u trunc=0x%x &shared=%p",
+            fnName.c_str(), (unsigned)IR.size(), (unsigned)ASM.size(),
+            (nameTrunc ? 4u : 0u) | (irTrunc ? 1u : 0u) |
+                (asmTrunc ? 2u : 0u),
+            (void *)gDumpSharedState);
+}
+
+static bool printSharedDumped(const char *name) {
+  if (!gDumpSharedState)
+    return false;
+  EJitSharedDumpState &D = gDumpSharedState->dump;
+  sharedDumpLock(D);
+  bool valid = D.resultValid.loadAcquire() != 0;
+  if (!valid) {
+    EJIT_DIAG("print_dumped shared: nothing saved &shared=%p",
+              (void *)gDumpSharedState);
+    sharedDumpUnlock(D);
+    return false;
+  }
+  bool hasName = name && name[0];
+  bool match = true;
+  if (hasName) {
+    uint32_t i = 0;
+    while (i < D.resultNameLen && name[i] && name[i] == D.resultName[i])
+      ++i;
+    match = (i == D.resultNameLen && name[i] == 0);
+  }
+  if (!match) {
+    EJIT_DIAG("print_dumped shared miss name=%s stored=%s ir=%u asm=%u",
+              name ? name : "(null)", D.resultName, D.irSize, D.asmSize);
+    sharedDumpUnlock(D);
+    return false;
+  }
+  uint32_t trunc = D.truncated.loadAcquire();
+  (void)trunc;
+  EJIT_DIAG("print_dumped shared hit requested=%s stored=%s key_hi=0x%08x "
+            "key_lo=0x%08x ir_size=%u asm_size=%u trunc=0x%x",
+            hasName ? name : "(all)", D.resultName, D.keyHi, D.keyLo, D.irSize,
+            D.asmSize, trunc);
+  if (D.irSize)
+    dumpBytesSafe("dump IR", D.ir, D.irSize);
+  if (D.asmSize)
+    dumpBytesSafe("dump ASM", D.asmText, D.asmSize);
+  sharedDumpUnlock(D);
+  return true;
+}
+#endif
 
 /// Called from the IR transform layer when the filter matches: save the
 /// post-optimization IR and emitted ASM for later selective printing.
@@ -144,6 +315,10 @@ static void captureDump(const std::string &fnName, uint64_t cacheKey,
   EJIT_DIAG("capture store_size before=%u", (unsigned)gDumpStore.size());
   gDumpStore[fnName] = DumpEntry{cacheKey, std::move(IR), std::move(ASM)};
   EJIT_DIAG("capture store_size after=%u", (unsigned)gDumpStore.size());
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  const DumpEntry &E = gDumpStore[fnName];
+  captureSharedDump(fnName, cacheKey, E.IR, E.ASM);
+#endif
 }
 
 /// Print one stored entry: header (name, key hi/lo, IR/ASM sizes) followed by
@@ -153,6 +328,8 @@ static void printOneDumpSafe(const char *requestedName,
                              const DumpEntry &e) {
   uint32_t keyHi = (uint32_t)(e.cacheKey >> 32);
   uint32_t keyLo = (uint32_t)(e.cacheKey & 0xffffffffu);
+  (void)keyHi;
+  (void)keyLo;
   EJIT_DIAG("print_dumped hit requested=%s stored=%s key_hi=0x%08x "
             "key_lo=0x%08x ir_size=%u asm_size=%u",
             requestedName ? requestedName : "(all)", storedName.c_str(), keyHi,
@@ -170,6 +347,10 @@ void printDumped(const char *name) {
   EJIT_DIAG("print_dumped enter name=%s &filter=%p &store=%p",
             (name && name[0]) ? name : "(all)", (void *)&gDumpFuncFilter,
             (void *)&gDumpStore);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (printSharedDumped(name))
+    return;
+#endif
   std::lock_guard<DumpMutexType> lock(gDumpMutex);
   EJIT_DIAG("print_dumped store_size=%u", (unsigned)gDumpStore.size());
   if (name && name[0]) {
@@ -181,11 +362,13 @@ void printDumped(const char *name) {
                 (unsigned)gDumpStore.size());
       unsigned idx = 0;
       for (auto &kv : gDumpStore) {
+        (void)kv;
         EJIT_DIAG("stored[%u]=%s ir=%u asm=%u", idx, kv.first.c_str(),
                   (unsigned)kv.second.IR.size(),
                   (unsigned)kv.second.ASM.size());
         ++idx;
       }
+      (void)idx;
     }
   } else {
     if (gDumpStore.empty())
@@ -310,6 +493,7 @@ EJitOrcEngine::Create(const Config &config,
                                  JITSymbolFlags::Exported);
     if (!symMap.empty()) {
       size_t n = symMap.size();
+      (void)n;
       if (auto Err = JD.define(orc::absoluteSymbols(std::move(symMap))))
         EJIT_DIAG("create: define %zu static var(s) FAILED: %s", n,
                   toString(std::move(Err)).c_str());
@@ -367,12 +551,12 @@ EJitOrcEngine::Create(const Config &config,
           // raw_fd_ostream). Captures the post-optimization IR and the emitted
           // assembly (from the same TargetMachine the JIT compiles with).
           {
-            bool match = !gDumpFuncFilter.empty() &&
-                         ctx->fnName == gDumpFuncFilter;
+            std::string DumpFilter;
+            bool hasFilter = getActiveDumpFilter(DumpFilter);
+            bool match = hasFilter && ctx->fnName == DumpFilter;
             EJIT_DIAG("dump check filter=%s fn=%s key_hi=0x%08x key_lo=0x%08x "
                       "match=%d &filter=%p",
-                      gDumpFuncFilter.empty() ? "(off)"
-                                              : gDumpFuncFilter.c_str(),
+                      hasFilter ? DumpFilter.c_str() : "(off)",
                       ctx->fnName.c_str(), (uint32_t)(ctx->cacheKey >> 32),
                       (uint32_t)(ctx->cacheKey & 0xffffffffu), match ? 1 : 0,
                       (void *)&gDumpFuncFilter);
@@ -558,6 +742,7 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
   // IR module so the JIT linker can resolve external references.
   if (!globalSymbols.empty()) {
     size_t nGlobals = globalSymbols.size();
+    (void)nGlobals;
     if (auto Err = JDOrErr->define(
             orc::absoluteSymbols(std::move(globalSymbols))))
       EJIT_DIAG("loadBitcode key=0x%016lx: define %zu global(s) FAILED: %s",
