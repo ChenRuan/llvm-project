@@ -276,12 +276,43 @@ static void dumpExtractedBitcode(const Module &M, StringRef Dir) {
     WriteBitcodeToFile(M, BC);
 }
 
+/// Diagnostic: count globals carrying !ejit.metadata, and within that the
+/// period_arr / may_const_field tags. Gated on EJitDumpBitcodeDir so it only
+/// runs when the dump is enabled. Used to pinpoint where the struct-field
+/// pass's GV metadata is lost during extraction (clone → preOptimize →
+/// externalization).
+static void logEJitGlobalMeta(const char *label, const Module &M) {
+  if (EJitDumpBitcodeDir.empty())
+    return;
+  unsigned withMeta = 0, periodArr = 0, mayConstField = 0;
+  for (const GlobalVariable &GV : M.globals()) {
+    MDNode *MD = GV.getMetadata(MD_EJIT_METADATA);
+    if (!MD)
+      continue;
+    ++withMeta;
+    for (const MDOperand &Op : MD->operands()) {
+      auto *Sub = dyn_cast<MDNode>(Op.get());
+      if (!Sub || Sub->getNumOperands() < 2)
+        continue;
+      if (auto *Tag = dyn_cast<MDString>(Sub->getOperand(0))) {
+        if (Tag->getString() == TAG_EJIT_PERIOD_ARR)
+          ++periodArr;
+        else if (Tag->getString() == TAG_EJIT_MAY_CONST_FIELD)
+          ++mayConstField;
+      }
+    }
+  }
+  errs() << "ejit-register-bitcode: " << label
+         << " globals=" << M.global_size() << " withMeta=" << withMeta
+         << " periodArr=" << periodArr << " mayConstField=" << mayConstField
+         << "\n";
+}
+
 static std::string extractAndSerialize(Module &M,
     const SetVector<Function *> &Funcs,
     const SetVector<GlobalVariable *> &Globals) {
 
   auto Extracted = CloneModule(M);
-
   DenseSet<StringRef> FuncNames;
   for (Function *F : Funcs)
     FuncNames.insert(F->getName());
@@ -316,7 +347,9 @@ static std::string extractAndSerialize(Module &M,
   // Pre-optimize the extracted bitcode to reduce JIT compilation pressure.
   // InstCombine + Mem2Reg + SimplifyCFG folds constant chains, promotes
   // allocas, and cleans up dead branches before serialization.
+  logEJitGlobalMeta("extract-after-clone", *Extracted);
   preOptimizeBitcode(*Extracted);
+  logEJitGlobalMeta("extract-after-preOpt", *Extracted);
 
   // Convert kept non-constant global definitions to external declarations
   // so the JIT linker resolves them from the host process. Constants (e.g.
@@ -328,6 +361,7 @@ static std::string extractAndSerialize(Module &M,
     GV.setInitializer(nullptr);
     GV.setLinkage(GlobalValue::ExternalLinkage);
   }
+  logEJitGlobalMeta("extract-after-extern", *Extracted);
 
   // Optionally dump the extracted module for debugging (e.g. to confirm an
   // ejit_entry function is emitted as a definition, not a declaration).
