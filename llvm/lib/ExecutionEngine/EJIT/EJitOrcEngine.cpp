@@ -243,6 +243,17 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     }
   }
 
+  // ejit_entry functions may have internal linkage (e.g. declared `static` in
+  // source). ORC's IR layer excludes local-linkage symbols from the JITDylib
+  // symbol table (Layer.cpp: hasLocalLinkage() skip), so a static entry is
+  // invisible to lookup ("symbol not found", no materialization). The function
+  // being compiled (origFnName) is the JIT lookup target — force it to
+  // external linkage so ORC registers and can materialize it. Spec JITDylibs
+  // are isolated, so this cannot collide with other specializations.
+  if (Function *EntryF = (*ModuleOrErr)->getFunction(origFnName))
+    if (!EntryF->isDeclaration() && EntryF->hasLocalLinkage())
+      EntryF->setLinkage(GlobalValue::ExternalLinkage);
+
   // Collect global variable addresses from the registry for symbols
   // that appear as external declarations in the bitcode module.
   orc::SymbolMap globalSymbols;
