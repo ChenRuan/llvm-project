@@ -22,6 +22,13 @@ Override with --cxx / --ld for cross-compilation.
 
 The resulting ejit.o (~30-40 MB) can replace all individual LLVM .a files
 when linking EJIT test binaries.
+
+When the EJIT ASM diagnostic dump (ejit_dump_func / ejit_print_dumped) is
+enabled on SRE, also add ejit_test/stubs/ejit_sre_format_stubs.o to the final
+SRE link/merge command alongside ejit.o. The assembly emitter formats text into
+an in-memory raw_svector_ostream and therefore needs working buffer formatting
+(snprintf/vsnprintf); that stub supplies it. It is intentionally NOT merged into
+ejit.o here so host builds keep using the platform libc.
 """
 
 import subprocess as sp, os, sys, re, argparse, struct, glob
@@ -348,7 +355,8 @@ def doit_gc_merge(args):
         "ejit_register_lifecycle", "ejit_register_funcindex",
         "ejit_taskpool_compile_or_get", "ejit_taskpool_release_read",
         "ejit_taskpool_set_instance_enabled", "ejit_taskpool_pending_count",
-        "ejit_taskpool_get_stats", "ejit_taskpool_print_stats", "ejit_taskpool_get_worker_core"
+        "ejit_taskpool_get_stats", "ejit_taskpool_print_stats", "ejit_taskpool_get_worker_core",
+        "ejit_taskpool_print_compiled", "ejit_dump_func", "ejit_print_dumped"
     ]
 
     defined = set()
