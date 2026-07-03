@@ -660,6 +660,50 @@ void ejit_taskpool_print_stats() {
   EJIT_DIAG("  reserved         = %u", s.reserved);
 }
 
+void ejit_taskpool_print_compiled() {
+  if (!gEJIT) {
+    EJIT_DIAG("print_compiled: not initialized");
+    return;
+  }
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
+  if (!sp || !sp->state()) {
+    EJIT_DIAG("print_compiled: no shared taskpool / state");
+    return;
+  }
+  EJitModuleLoader &loader = gEJIT->moduleLoader();
+  EJIT_DIAG("compiled functions:");
+  sp->forEachCompiled(
+      [](uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+         void *fnPtr, void *ctx) {
+#ifdef EJIT_DIAG_ENABLE
+        const auto &loader = *static_cast<EJitModuleLoader *>(ctx);
+        const std::string &name = loader.getFuncNameByFuncIdx(funcIndex);
+        EJIT_DIAG("  funcIdx=%u name=%s numDims=%u "
+                  "dims=[%u:%u,%u:%u,%u:%u,%u:%u] fn=%p",
+                  funcIndex, name.empty() ? "<unknown>" : name.c_str(), numDims,
+                  numDims > 0 ? dims[0].dimType : 0,
+                  numDims > 0 ? dims[0].instanceId : 0,
+                  numDims > 1 ? dims[1].dimType : 0,
+                  numDims > 1 ? dims[1].instanceId : 0,
+                  numDims > 2 ? dims[2].dimType : 0,
+                  numDims > 2 ? dims[2].instanceId : 0,
+                  numDims > 3 ? dims[3].dimType : 0,
+                  numDims > 3 ? dims[3].instanceId : 0, fnPtr);
+#else
+        (void)funcIndex;
+        (void)dims;
+        (void)numDims;
+        (void)fnPtr;
+        (void)ctx;
+#endif
+      },
+      &loader);
+#else
+  EJIT_DIAG("print_compiled: shared taskpool not enabled");
+#endif
+}
+
 // Sentinel returned when no owner core is elected (e.g. not initialized or the
 // shared taskpool has not bound state). Distinct from any valid core id.
 constexpr uint32_t kEJitInvalidOwnerCore = 0xFFFFFFFFu;

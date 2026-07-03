@@ -126,6 +126,10 @@ public:
   const EJitSharedTaskPool *sharedTaskPool() const;
 #endif
 
+  /// Access the module loader (for funcIndex → funcName resolution in
+  /// diagnostics). Always constructed; valid for the lifetime of the instance.
+  EJitModuleLoader &moduleLoader() { return *moduleLoader_; }
+
 private:
   Config config_;
   std::unique_ptr<EJitRuntimeState> runtimeState_;

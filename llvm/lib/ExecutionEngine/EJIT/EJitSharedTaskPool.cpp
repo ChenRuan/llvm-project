@@ -85,6 +85,37 @@ uint32_t EJitSharedTaskPool::instanceVersion(uint32_t dimType,
   return state_->version[dimType][instanceId].loadAcquire();
 }
 
+void EJitSharedTaskPool::forEachCompiled(CompiledFuncCallback cb,
+                                         void *ctx) const {
+  if (!state_ || !cb)
+    return;
+  for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b) {
+    EJitSharedCacheBucket &B = state_->buckets[b];
+    // Acquire the per-bucket read lock; retry briefly if a writer is
+    // mid-publish, then skip the bucket if still contended (diagnostic — a
+    // missing entry here just means it was being updated this instant).
+    bool locked = false;
+    for (int retry = 0; retry < 16; ++retry) {
+      if (bucketTryRead(B)) {
+        locked = true;
+        break;
+      }
+      cpuRelax();
+    }
+    if (!locked)
+      continue;
+    for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+      const EJitSharedCacheSlot &slot = B.slots[s];
+      if (static_cast<EJitSharedSlotState>(slot.state.loadAcquire()) !=
+          EJitSharedSlotState::Ready)
+        continue;
+      void *fn = reinterpret_cast<void *>(slot.fnPtr.loadAcquire());
+      cb(slot.funcIndex, slot.dims, slot.numDims, fn, ctx);
+    }
+    bucketReadRelease(B);
+  }
+}
+
 bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,
                                             uint32_t instanceId, bool enabled) {
   if (!state_ || dimType >= kEJitSharedDimTypes ||

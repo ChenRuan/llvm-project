@@ -183,6 +183,7 @@ typedef struct {
 ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
 
 void ejit_taskpool_print_stats();
+void ejit_taskpool_print_compiled();
 uint32_t ejit_taskpool_get_worker_core();
 
 // Cache
