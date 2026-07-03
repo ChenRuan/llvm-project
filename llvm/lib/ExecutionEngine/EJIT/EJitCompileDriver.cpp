@@ -317,13 +317,13 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
   for (unsigned i = 0; i < dimCount; ++i) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
     // Cross-core: gate on the SHARED enabled bit (the one the producer's
-    // ejit_activate writes), NOT the owner-private runtimeState_. In an
-    // owner!=producer split the worker compiles on the owner core, whose
-    // private runtimeState_ is empty (the owner never calls activate_all), so
-    // the legacy gate would reject every compile. The shared SwitchController
-    // defaults to active; a deactivate flips the bit + bumps version. Race
-    // protection during compilation is handled by runCompile's version
-    // checkpoints (cp1/cp2), not this gate.
+    // ejit_activate writes), NOT the owner-private runtimeState_. The shared
+    // SwitchController defaults to INACTIVE (initSharedStorage sets enabled=0),
+    // matching the non-shared path: a period instance must be explicitly
+    // ejit_activate'd before the JIT will compile it. activate flips 0->1 +
+    // bumps version; deactivate flips 1->0 + bumps version. Race protection
+    // during compilation is handled by runCompile's version checkpoints
+    // (cp1/cp2), not this gate.
     uint32_t dt = meta.dimTypes[i];
     if (dt == kEJitInvalidDimType || !sharedPool_.isInstanceActive(dt, dims[i])) {
       EJIT_DIAG("compile SKIP key=0x%016lx func=%s: period %s[%u] not active",

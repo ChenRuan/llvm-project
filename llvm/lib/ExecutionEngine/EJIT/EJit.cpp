@@ -334,11 +334,12 @@ bool EJit::activate(const std::string &periodName, uint8_t cellIdx) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
     // Cross-core: activation is a SHARED fact. Write the shared enabled/version
     // (visible to the owner worker, which compiles on a different core). The
-    // owner-private runtimeState_ is NOT the JIT gate's source of truth here —
-    // in an owner!=producer split the owner never calls activate_all, so its
-    // private state would be empty and every compile would be gated out. The
-    // shared SwitchController defaults to active; setEnabled(true) is a no-op
-    // until a prior deactivate flipped the bit.
+    // owner-private runtimeState_ is NOT the JIT gate's source of truth here.
+    // The shared SwitchController defaults to INACTIVE (enabled=0), so the
+    // producer MUST call ejit_activate before the owner will compile a given
+    // period instance. setEnabled(true) flips 0->1 + bumps version on first
+    // activate; it is a no-op while already active, until a deactivate flips
+    // the bit back.
     if (EJitSharedTaskPool *sp = sharedTaskPool())
       sp->setInstanceEnabled(dt, cellIdx, /*enabled=*/true);
 #else
