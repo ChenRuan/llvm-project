@@ -72,6 +72,12 @@ void EJitStructFieldPass::initFromModule(Module &M) {
   }
 
   mapsBuilt_ = true;
+#ifdef EJIT_DIAG_ENABLE
+  EJIT_DIAG("struct-field initFromModule module=%s globals=%zu "
+            "gvPeriod=%zu mayConstField=%zu",
+            M.getName().str().c_str(), M.global_size(), gvPeriodMap_.size(),
+            mayConstFieldMap_.size());
+#endif
 }
 
 //===----------------------------------------------------------------------===//
@@ -326,6 +332,44 @@ tryReplaceIndirect(LoadInst *LI, const Value *PtrOp,
 // Public interface
 //===----------------------------------------------------------------------===//
 
+#ifdef EJIT_DIAG_ENABLE
+/// Classify why a may_const load was NOT replaced by any pattern, for
+/// diagnostics. One EJIT_DIAG line per failed load. Reasons:
+///   no-root-gv        — pointer not rooted at a GlobalVariable (opaque/indirect)
+///   gv-not-in-map     — root GV has no ejit.metadata (not a period var)
+///   base-unresolved   — GV is a period var but not registered at runtime
+///   non-const-offset  — GEP index not folded to a constant
+///   unsupported-type  — createConstantFromMemory cannot build the load type
+static void logReplaceFailure(LoadInst *LI, const GVPeriodMap &gvMap,
+                              PeriodArrayRegistry &reg,
+                              const DataLayout &DL) {
+  Value *Ptr = LI->getPointerOperand();
+  const GlobalVariable *GV = findRootGV(Ptr);
+  if (!GV) {
+    EJIT_DIAG("  may_const load NOT replaced: no-root-gv");
+    return;
+  }
+  auto it = gvMap.find(GV);
+  if (it == gvMap.end()) {
+    EJIT_DIAG("  may_const load NOT replaced: gv-not-in-map gv=%s",
+              GV->getName().str().c_str());
+    return;
+  }
+  if (!resolveBase(GV, it->second, reg)) {
+    EJIT_DIAG("  may_const load NOT replaced: base-unresolved gv=%s",
+              GV->getName().str().c_str());
+    return;
+  }
+  if (!accumulateFullOffset(DL, Ptr)) {
+    EJIT_DIAG("  may_const load NOT replaced: non-const-offset gv=%s",
+              GV->getName().str().c_str());
+    return;
+  }
+  EJIT_DIAG("  may_const load NOT replaced: unsupported-type gv=%s",
+            GV->getName().str().c_str());
+}
+#endif
+
 PreservedAnalyses
 EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   Module *M = F.getParent();
@@ -347,15 +391,24 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   // 2. Scan all loads and collect replacements.
   struct Replacement { LoadInst *LI; Constant *ConstVal; };
   SmallVector<Replacement, 16> replacements;
+#ifdef EJIT_DIAG_ENABLE
+  size_t totalLoads = 0, mayConstLoads = 0;
+#endif
 
   for (BasicBlock &BB : F) {
     for (Instruction &I : BB) {
       auto *LI = dyn_cast<LoadInst>(&I);
       if (!LI)
         continue;
+#ifdef EJIT_DIAG_ENABLE
+      ++totalLoads;
+#endif
 
       if (!isMayConstLoad(LI, mayConstFieldMap_, DL))
         continue;
+#ifdef EJIT_DIAG_ENABLE
+      ++mayConstLoads;
+#endif
 
       Value *PtrOp = LI->getPointerOperand();
 
@@ -376,6 +429,10 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       if (C)
         replacements.push_back({LI, C});
+#ifdef EJIT_DIAG_ENABLE
+      else
+        logReplaceFailure(LI, gvPeriodMap_, registry_, DL);
+#endif
     }
   }
 
@@ -389,6 +446,10 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 
   EJIT_DIAG("struct-field run func=%s replaced=%zu", F.getName().str().c_str(),
             replacements.size());
+#ifdef EJIT_DIAG_ENABLE
+  EJIT_DIAG("  loads total=%zu may_const=%zu replaced=%zu", totalLoads,
+            mayConstLoads, replacements.size());
+#endif
   LLVM_DEBUG(if (changed) dbgs() << "ejit-struct-field: replaced "
                                  << replacements.size() << " load(s) in "
                                  << F.getName() << "\n");
