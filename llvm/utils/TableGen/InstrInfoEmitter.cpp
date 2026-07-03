@@ -980,8 +980,14 @@ void InstrInfoEmitter::run(raw_ostream &OS) {
   Timer.startTimer("Emit initialization routine");
   OS << "static inline void Init" << TargetName
      << "MCInstrInfo(MCInstrInfo *II) {\n";
-  OS << "  II->InitMCInstrInfo(" << TargetName << "Descs.Insts, " << TargetName
-     << "InstrNameIndices, " << TargetName << "InstrNameData, ";
+  OS << "  II->InitMCInstrInfo(" << TargetName << "Descs.Insts,\n"
+     << "#ifdef EJIT_TRIM_LLVM_BACKEND\n"
+     << "                      nullptr, nullptr,\n"
+     << "#else\n"
+     << "                      " << TargetName << "InstrNameIndices, "
+     << TargetName << "InstrNameData,\n"
+     << "#endif\n"
+     << "                      ";
   if (HasDeprecationFeatures)
     OS << TargetName << "InstrDeprecationFeatures, ";
   else
@@ -1042,8 +1048,14 @@ void InstrInfoEmitter::run(raw_ostream &OS) {
         "CatchRetOpcode, unsigned ReturnOpcode)\n"
      << "  : TargetInstrInfo(CFSetupOpcode, CFDestroyOpcode, CatchRetOpcode, "
         "ReturnOpcode) {\n"
-     << "  InitMCInstrInfo(" << TargetName << "Descs.Insts, " << TargetName
-     << "InstrNameIndices, " << TargetName << "InstrNameData, ";
+     << "  InitMCInstrInfo(" << TargetName << "Descs.Insts,\n"
+     << "#ifdef EJIT_TRIM_LLVM_BACKEND\n"
+     << "                  nullptr, nullptr,\n"
+     << "#else\n"
+     << "                  " << TargetName << "InstrNameIndices, "
+     << TargetName << "InstrNameData,\n"
+     << "#endif\n"
+     << "                  ";
   if (HasDeprecationFeatures)
     OS << TargetName << "InstrDeprecationFeatures, ";
   else
