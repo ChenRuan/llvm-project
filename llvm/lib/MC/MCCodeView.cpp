@@ -30,6 +30,7 @@ void CodeViewContext::finish() {
     StrTabFragment->setContents(StrTab);
 }
 
+#ifndef EJIT_TRIM_LLVM_BACKEND
 /// This is a valid number for use with .cv_loc if we've already seen a .cv_file
 /// for it.
 bool CodeViewContext::isValidFileNumber(unsigned FileNumber) const {
@@ -70,6 +71,11 @@ bool CodeViewContext::addFile(MCStreamer &OS, unsigned FileNumber,
 
   return true;
 }
+#else
+bool CodeViewContext::isValidFileNumber(unsigned) const { return false; }
+bool CodeViewContext::addFile(MCStreamer &, unsigned, StringRef,
+                              ArrayRef<uint8_t>, uint8_t) { return false; }
+#endif // EJIT_TRIM_LLVM_BACKEND
 
 MCCVFunctionInfo *CodeViewContext::getCVFunctionInfo(unsigned FuncId) {
   if (FuncId >= Functions.size())
@@ -131,6 +137,7 @@ void CodeViewContext::recordCVLoc(MCContext &Ctx, const MCSymbol *Label,
       Label, FunctionId, FileNo, Line, Column, PrologueEnd, IsStmt});
 }
 
+#ifndef EJIT_TRIM_LLVM_BACKEND
 std::pair<StringRef, unsigned> CodeViewContext::addToStringTable(StringRef S) {
   auto Insertion =
       StringTable.insert(std::make_pair(S, unsigned(StrTab.size())));
@@ -143,6 +150,11 @@ std::pair<StringRef, unsigned> CodeViewContext::addToStringTable(StringRef S) {
   }
   return Ret;
 }
+#else
+std::pair<StringRef, unsigned> CodeViewContext::addToStringTable(StringRef) {
+  return {};
+}
+#endif // EJIT_TRIM_LLVM_BACKEND
 
 unsigned CodeViewContext::getStringTableOffset(StringRef S) {
   // A string table offset of zero is always the empty string.

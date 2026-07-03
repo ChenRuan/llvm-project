@@ -1749,6 +1749,7 @@ MCSymbol *MCAsmStreamer::getDwarfLineTableSymbol(unsigned CUID) {
 bool MCAsmStreamer::emitCVFileDirective(unsigned FileNo, StringRef Filename,
                                         ArrayRef<uint8_t> Checksum,
                                         unsigned ChecksumKind) {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   if (!getContext().getCVContext().addFile(*this, FileNo, Filename, Checksum,
                                            ChecksumKind))
     return false;
@@ -1767,6 +1768,9 @@ bool MCAsmStreamer::emitCVFileDirective(unsigned FileNo, StringRef Filename,
 
   EmitEOL();
   return true;
+#else
+  return false;
+#endif
 }
 
 bool MCAsmStreamer::emitCVFuncIdDirective(unsigned FuncId) {

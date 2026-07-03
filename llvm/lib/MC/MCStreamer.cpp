@@ -276,18 +276,27 @@ MCDwarfFrameInfo *MCStreamer::getCurrentDwarfFrameInfo() {
 bool MCStreamer::emitCVFileDirective(unsigned FileNo, StringRef Filename,
                                      ArrayRef<uint8_t> Checksum,
                                      unsigned ChecksumKind) {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   return getContext().getCVContext().addFile(*this, FileNo, Filename, Checksum,
                                              ChecksumKind);
+#else
+  return false;
+#endif
 }
 
 bool MCStreamer::emitCVFuncIdDirective(unsigned FunctionId) {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   return getContext().getCVContext().recordFunctionId(FunctionId);
+#else
+  return false;
+#endif
 }
 
 bool MCStreamer::emitCVInlineSiteIdDirective(unsigned FunctionId,
                                              unsigned IAFunc, unsigned IAFile,
                                              unsigned IALine, unsigned IACol,
                                              SMLoc Loc) {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   if (getContext().getCVContext().getCVFunctionInfo(IAFunc) == nullptr) {
     getContext().reportError(Loc, "parent function id not introduced by "
                                   ".cv_func_id or .cv_inline_site_id");
@@ -296,6 +305,9 @@ bool MCStreamer::emitCVInlineSiteIdDirective(unsigned FunctionId,
 
   return getContext().getCVContext().recordInlinedCallSiteId(
       FunctionId, IAFunc, IAFile, IALine, IACol);
+#else
+  return false;
+#endif
 }
 
 void MCStreamer::emitCVLocDirective(unsigned FunctionId, unsigned FileNo,
@@ -305,6 +317,7 @@ void MCStreamer::emitCVLocDirective(unsigned FunctionId, unsigned FileNo,
 
 bool MCStreamer::checkCVLocSection(unsigned FuncId, unsigned FileNo,
                                    SMLoc Loc) {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   CodeViewContext &CVC = getContext().getCVContext();
   MCCVFunctionInfo *FI = CVC.getCVFunctionInfo(FuncId);
   if (!FI) {
@@ -323,6 +336,9 @@ bool MCStreamer::checkCVLocSection(unsigned FuncId, unsigned FileNo,
     return false;
   }
   return true;
+#else
+  return false;
+#endif
 }
 
 void MCStreamer::emitCVLinetableDirective(unsigned FunctionId,

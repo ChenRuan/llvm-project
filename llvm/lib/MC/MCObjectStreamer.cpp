@@ -531,6 +531,7 @@ void MCObjectStreamer::emitCVLocDirective(unsigned FunctionId, unsigned FileNo,
                                           unsigned Line, unsigned Column,
                                           bool PrologueEnd, bool IsStmt,
                                           StringRef FileName, SMLoc Loc) {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   // Validate the directive.
   if (!checkCVLocSection(FunctionId, FileNo, Loc))
     return;
@@ -541,44 +542,57 @@ void MCObjectStreamer::emitCVLocDirective(unsigned FunctionId, unsigned FileNo,
   getContext().getCVContext().recordCVLoc(getContext(), LineSym, FunctionId,
                                           FileNo, Line, Column, PrologueEnd,
                                           IsStmt);
+#endif
 }
 
 void MCObjectStreamer::emitCVLinetableDirective(unsigned FunctionId,
                                                 const MCSymbol *Begin,
                                                 const MCSymbol *End) {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   getContext().getCVContext().emitLineTableForFunction(*this, FunctionId, Begin,
                                                        End);
   this->MCStreamer::emitCVLinetableDirective(FunctionId, Begin, End);
+#endif
 }
 
 void MCObjectStreamer::emitCVInlineLinetableDirective(
     unsigned PrimaryFunctionId, unsigned SourceFileId, unsigned SourceLineNum,
     const MCSymbol *FnStartSym, const MCSymbol *FnEndSym) {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   getContext().getCVContext().emitInlineLineTableForFunction(
       *this, PrimaryFunctionId, SourceFileId, SourceLineNum, FnStartSym,
       FnEndSym);
   this->MCStreamer::emitCVInlineLinetableDirective(
       PrimaryFunctionId, SourceFileId, SourceLineNum, FnStartSym, FnEndSym);
+#endif
 }
 
 void MCObjectStreamer::emitCVDefRangeDirective(
     ArrayRef<std::pair<const MCSymbol *, const MCSymbol *>> Ranges,
     StringRef FixedSizePortion) {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   getContext().getCVContext().emitDefRange(*this, Ranges, FixedSizePortion);
   // Attach labels that were pending before we created the defrange fragment to
   // the beginning of the new fragment.
   this->MCStreamer::emitCVDefRangeDirective(Ranges, FixedSizePortion);
+#endif
 }
 
 void MCObjectStreamer::emitCVStringTableDirective() {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   getContext().getCVContext().emitStringTable(*this);
+#endif
 }
 void MCObjectStreamer::emitCVFileChecksumsDirective() {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   getContext().getCVContext().emitFileChecksums(*this);
+#endif
 }
 
 void MCObjectStreamer::emitCVFileChecksumOffsetDirective(unsigned FileNo) {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   getContext().getCVContext().emitFileChecksumOffset(*this, FileNo);
+#endif
 }
 
 void MCObjectStreamer::emitBytes(StringRef Data) {

@@ -1329,6 +1329,7 @@ std::tuple<const MCSymbol *, uint64_t, const MCSymbol *,
 AArch64AsmPrinter::getCodeViewJumpTableInfo(int JTI,
                                             const MachineInstr *BranchInstr,
                                             const MCSymbol *BranchLabel) const {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   const auto AFI = MF->getInfo<AArch64FunctionInfo>();
   const auto Base = AArch64FI->getJumpTableEntryPCRelSymbol(JTI);
   codeview::JumpTableEntrySize EntrySize;
@@ -1346,6 +1347,9 @@ AArch64AsmPrinter::getCodeViewJumpTableInfo(int JTI,
     llvm_unreachable("Unexpected jump table entry size");
   }
   return std::make_tuple(Base, 0, BranchLabel, EntrySize);
+#else
+  return {};
+#endif
 }
 
 void AArch64AsmPrinter::emitFunctionEntryLabel() {
