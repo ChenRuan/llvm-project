@@ -633,10 +633,15 @@ void EJitSharedTaskPool::releaseRead(uint32_t bucketIndex) {
 namespace {
 // Field-by-field init so it is correct on raw, uninitialized shared memory
 // (never relies on a C++ constructor having run on the blob).
+//
+// enabled defaults to 0 (inactive): a period instance must be explicitly
+// activated via ejit_activate before the JIT will compile it. This matches
+// the non-shared EJitRuntimeState::isActive default (no entry => inactive).
+// setInstanceEnabled(true) flips 0->1 and bumps version on first activate.
 void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
   for (uint32_t d = 0; d < kEJitSharedDimTypes; ++d)
     for (uint32_t i = 0; i < kEJitSharedInstances; ++i) {
-      st->enabled[d][i].storeRelaxed(1);
+      st->enabled[d][i].storeRelaxed(0);
       st->version[d][i].storeRelaxed(0);
     }
   st->mode.storeRelaxed(mode);
