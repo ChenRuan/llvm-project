@@ -25,11 +25,14 @@
 // TU defined ejit_entry functions: previously every such TU emitted a strong
 // __ejit_registry_*[] definition under the same external name.
 //
-// EJit.cpp declares the __start_/__stop_ symbols as weak, so a program with no
-// ejit_entry functions (sections absent) resolves them to null and walks an
-// empty range. No default array definitions are needed here; this file is
-// retained only as documentation of the registry layout. The header include
-// keeps the translation unit non-empty (ISO C forbids an empty TU).
+// EJit.cpp declares the __start_/__stop_ symbols weak in hosted builds
+// (!EJIT_FREESTANDING), so a program with no ejit_entry functions (sections
+// absent) resolves them to null and walks an empty range. In freestanding
+// builds (EJIT_FREESTANDING) they are strong (weak would create a GOT
+// relocation), so a linker script MUST define them. No default array
+// definitions are needed here; this file is retained only as documentation of
+// the registry layout. The header include keeps the translation unit
+// non-empty (ISO C forbids an empty TU).
 //
 //===----------------------------------------------------------------------===//
 

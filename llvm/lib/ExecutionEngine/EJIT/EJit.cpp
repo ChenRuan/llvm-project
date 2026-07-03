@@ -26,11 +26,25 @@ using namespace llvm::ejit;
 // llvm/lib/ExecutionEngine/EJIT/ejit_registry.ld).  This replaces the old
 // single external __ejit_registry_*[] arrays, which produced duplicate-symbol
 // link errors across multiple TUs.
+//
+// Hosted builds (!EJIT_FREESTANDING): the bounds are declared weak so a
+// program with no ejit_entry functions — or no linker script — resolves them
+// to null and walks an empty range (no link error). Freestanding builds
+// (EJIT_FREESTANDING): the bounds are strong, because the weak attribute
+// creates a GOT relocation that is undesirable on bare-metal; a linker script
+// MUST therefore define them.
 extern "C" {
+#ifndef EJIT_FREESTANDING
+extern const ejit_reg_entry_t __start_ejit_bitcode[] __attribute__((weak));
+extern const ejit_reg_entry_t __stop_ejit_bitcode[] __attribute__((weak));
+extern const ejit_reg_entry_t __start_ejit_period[] __attribute__((weak));
+extern const ejit_reg_entry_t __stop_ejit_period[] __attribute__((weak));
+#else
 extern const ejit_reg_entry_t __start_ejit_bitcode[];
 extern const ejit_reg_entry_t __stop_ejit_bitcode[];
 extern const ejit_reg_entry_t __start_ejit_period[];
 extern const ejit_reg_entry_t __stop_ejit_period[];
+#endif
 }
 
 namespace {
