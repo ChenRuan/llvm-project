@@ -281,6 +281,10 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
 
   // Resolve undefined function symbols from user-registered table.
   // Required for bare-metal where dynamic lookup (dlsym) is unavailable.
+  // Throttle diagnostics: tally unresolved externals and emit a single
+  // summary line per load (below) instead of one line per symbol.
+  size_t unresolvedFuncs = 0;
+  size_t unresolvedGlobals = 0;
   for (Function &F : (*ModuleOrErr)->functions()) {
     if (!F.isDeclaration() || F.getName().empty())
       continue;
@@ -290,8 +294,7 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     auto it = P->userSymbols.find(name);
     if (it == P->userSymbols.end()) {
       if (!F.isIntrinsic())
-        EJIT_DIAG("loadBitcode: unresolved external func not registered: %s",
-                  name.c_str());
+        ++unresolvedFuncs;
       continue;
     }
     globalSymbols[P->J->mangleAndIntern(name)] =
@@ -306,14 +309,18 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
       continue;
     auto it = P->userSymbols.find(name);
     if (it == P->userSymbols.end()) {
-      EJIT_DIAG("loadBitcode: unresolved external global not registered: %s",
-                name.c_str());
+      ++unresolvedGlobals;
       continue;
     }
     globalSymbols[P->J->mangleAndIntern(name)] =
         orc::ExecutorSymbolDef(orc::ExecutorAddr::fromPtr(it->second),
                                JITSymbolFlags::Exported);
   }
+  if (unresolvedFuncs || unresolvedGlobals)
+    EJIT_DIAG("loadBitcode: %zu unresolved external(s) not registered "
+              "(%zu funcs, %zu globals)",
+              unresolvedFuncs + unresolvedGlobals, unresolvedFuncs,
+              unresolvedGlobals);
 
   // Provide codegen-synthesized runtime symbols (memset/memcpy/memmove/memcmp
   // and the stack-protector guard/fail) that the AOT symbol collector cannot
