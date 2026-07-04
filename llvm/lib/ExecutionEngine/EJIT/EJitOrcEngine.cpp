@@ -18,6 +18,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <map>
 #include <string>
 
@@ -595,7 +596,13 @@ EJitOrcEngine::Create(const Config &config,
                         PM, AOS, /*DwoOut=*/nullptr,
                         CodeGenFileType::AssemblyFile)) {
                   EJIT_DIAG_DEBUG("dump asm PM.run begin fn=%s", ctx->fnName.c_str());
-                  PM.run(M);
+                  // Clone M before running codegen so this diagnostic ASM emit
+                  // path cannot perturb the live module handed back to the JIT
+                  // for real compilation (codegen is IR-read-only in theory,
+                  // but target passes are not guaranteed to never touch IR).
+                  // The clone is local to this diagnostic path and discarded.
+                  std::unique_ptr<Module> MClone = CloneModule(M);
+                  PM.run(*MClone);
                   EJIT_DIAG_DEBUG("dump asm PM.run end fn=%s", ctx->fnName.c_str());
                   Asm.assign(AsmBuf.begin(), AsmBuf.end());
                   EJIT_DIAG_DEBUG("dump asm size=%u fn=%s", (unsigned)Asm.size(),
