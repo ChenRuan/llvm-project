@@ -112,7 +112,7 @@ EJit::EJit(const Config &config) : config_(config) {
   EJitLogger *logger = nullptr;
 #endif
   compileDriver_ = std::make_unique<EJitCompileDriver>(
-      config, *cache_, *runtimeState_, *moduleLoader_, logger);
+      config_, *cache_, *runtimeState_, *moduleLoader_, logger);
 
   // Consume registration data from the staging store (constructor path).
   StoredData data = EJitRegistrationStore::instance().consume();
