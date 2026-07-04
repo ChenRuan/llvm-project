@@ -10,8 +10,32 @@ using namespace llvm::ejit;
 void PeriodArrayRegistry::registerArray(const std::string &periodName,
                                         const std::string &varName,
                                         void *baseAddr, size_t size) {
-  EJIT_DIAG("registry registerArray period=%s var=%s base=%p size=%zu",
-            periodName.c_str(), varName.c_str(), baseAddr, size);
+  // Idempotent: the constructor path may register the same array twice
+  // (PASS1+PASS2 both add to global_ctors, or the static-registry walk
+  // revisits an entry). A repeat with identical (period, base, size) is a
+  // no-op (DEBUG only); a same-name conflict with different data is a clean
+  // rejection that keeps the first registration. This also prevents duplicate
+  // entries accumulating in arraysByPeriod_ (which would make activate fan out
+  // redundantly and getArrays() report ghosts).
+  auto existing = varNameIndex_.find(varName);
+  if (existing != varNameIndex_.end()) {
+    const PeriodArrayInfo &first = existing->second;
+    if (first.periodName == periodName && first.baseAddr == baseAddr &&
+        first.arraySize == size) {
+      EJIT_DIAG_DEBUG("registry registerArray idempotent skip period=%s "
+                      "var=%s base=%p size=%zu",
+                      periodName.c_str(), varName.c_str(), baseAddr, size);
+      return;
+    }
+    EJIT_DIAG("registry registerArray CONFLICT var=%s: kept first "
+              "(period=%s base=%p size=%zu), rejected (period=%s base=%p "
+              "size=%zu)",
+              varName.c_str(), first.periodName.c_str(), first.baseAddr,
+              first.arraySize, periodName.c_str(), baseAddr, size);
+    return;
+  }
+  EJIT_DIAG_VERBOSE("registry registerArray period=%s var=%s base=%p size=%zu",
+                    periodName.c_str(), varName.c_str(), baseAddr, size);
   PeriodArrayInfo info{varName, periodName, baseAddr, size};
   arraysByPeriod_[periodName].push_back(info);
   varNameIndex_[varName] = info;
@@ -20,8 +44,24 @@ void PeriodArrayRegistry::registerArray(const std::string &periodName,
 
 void PeriodArrayRegistry::registerStaticVar(const std::string &varName,
                                             void *varAddr) {
-  EJIT_DIAG("registry registerStaticVar var=%s addr=%p", varName.c_str(),
-            varAddr);
+  // Idempotent (see registerArray): a repeat with the same addr is a no-op;
+  // a same-name/different-addr conflict keeps the first registration and
+  // prevents staticVars_ from accumulating duplicates.
+  auto existing = staticVarIndex_.find(varName);
+  if (existing != staticVarIndex_.end()) {
+    if (existing->second == varAddr) {
+      EJIT_DIAG_DEBUG("registry registerStaticVar idempotent skip var=%s "
+                      "addr=%p",
+                      varName.c_str(), varAddr);
+      return;
+    }
+    EJIT_DIAG("registry registerStaticVar CONFLICT var=%s: kept addr=%p, "
+              "rejected addr=%p",
+              varName.c_str(), existing->second, varAddr);
+    return;
+  }
+  EJIT_DIAG_VERBOSE("registry registerStaticVar var=%s addr=%p",
+                    varName.c_str(), varAddr);
   staticVars_.push_back({varName, varAddr});
   staticVarIndex_[varName] = varAddr;
 }
@@ -60,8 +100,8 @@ PeriodArrayRegistry::getArrayByBaseAddr(void *addr) const {
 
 void EJitRuntimeState::activate(const std::string &periodName,
                                 uint8_t cellIdx) {
-  EJIT_DIAG("runtimeState activate period=%s cellIdx=%u", periodName.c_str(),
-            cellIdx);
+  EJIT_DIAG_DEBUG("runtimeState activate period=%s cellIdx=%u",
+                  periodName.c_str(), cellIdx);
 #ifndef EJIT_FREESTANDING
   std::lock_guard<decltype(mutex_)> lock(mutex_);
 #endif

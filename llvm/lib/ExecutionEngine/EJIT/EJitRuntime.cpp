@@ -110,7 +110,8 @@ void ejit_shutdown(void) {
 }
 
 void ejit_register_symbol(const char *name, void *addr) {
-  EJIT_DIAG("register_symbol name=%s addr=%p", name ? name : "<null>", addr);
+  EJIT_DIAG_VERBOSE("register_symbol name=%s addr=%p", name ? name : "<null>",
+                    addr);
   if (gEJIT) {
     gEJIT->registerSymbol(name, addr);
   } else {
@@ -121,9 +122,9 @@ void ejit_register_symbol(const char *name, void *addr) {
 
 void ejit_register_bitcode(const char *funcName, const uint8_t *bitcodeData,
                            uint64_t bitcodeSize) {
-  EJIT_DIAG("register_bitcode name=%s size=%llu",
-            funcName ? funcName : "<null>",
-            static_cast<unsigned long long>(bitcodeSize));
+  EJIT_DIAG_VERBOSE("register_bitcode name=%s size=%llu",
+                    funcName ? funcName : "<null>",
+                    static_cast<unsigned long long>(bitcodeSize));
   if (gEJIT) {
     // Post-init runtime registration: the void ABI cannot return a status, so a
     // rejection (null/zero payload, funcIndex capacity, conflicting payload) is
@@ -144,9 +145,10 @@ void ejit_register_bitcode(const char *funcName, const uint8_t *bitcodeData,
 
 void ejit_register_period_array(const char *periodName, const char *varName,
                                 void *baseAddr, uint64_t arraySize) {
-  EJIT_DIAG("register_period_array period=%s var=%s size=%llu",
-            periodName ? periodName : "<null>", varName ? varName : "<null>",
-            static_cast<unsigned long long>(arraySize));
+  EJIT_DIAG_VERBOSE("register_period_array period=%s var=%s size=%llu",
+                    periodName ? periodName : "<null>",
+                    varName ? varName : "<null>",
+                    static_cast<unsigned long long>(arraySize));
   if (gEJIT) {
     // Post-init: rejected once registration is frozen (taskpool); the void ABI
     // records the failure for observability and mutates nothing.
@@ -164,8 +166,8 @@ void ejit_register_period_array(const char *periodName, const char *varName,
 }
 
 void ejit_register_static_var(const char *varName, void *varAddr) {
-  EJIT_DIAG("register_static_var var=%s addr=%p",
-            varName ? varName : "<null>", varAddr);
+  EJIT_DIAG_VERBOSE("register_static_var var=%s addr=%p",
+                    varName ? varName : "<null>", varAddr);
   if (gEJIT) {
     if (!gEJIT->registerStaticVar(varName, varAddr)) {
       EJitRegistrationStore::instance().recordError(
@@ -191,7 +193,7 @@ void ejit_register_lifecycle(const char *lifecycleName, uint32_t *slotOut) {
               (const void *)lifecycleName, (void *)slotOut);
     return;
   }
-  EJIT_DIAG("register_lifecycle name=%s", lifecycleName);
+  EJIT_DIAG_VERBOSE("register_lifecycle name=%s", lifecycleName);
 #ifdef EJIT_SRE_TASKPOOL
   // Once a taskpool init has frozen registration, the worker reads the registry
   // lock-free: refuse to mutate it (leave *slotOut and the registry unchanged).
@@ -214,7 +216,8 @@ void ejit_register_lifecycle(const char *lifecycleName, uint32_t *slotOut) {
     EJIT_DIAG("register_lifecycle FAIL name=%s: dimType capacity exhausted",
               lifecycleName);
   } else {
-    EJIT_DIAG("register_lifecycle OK name=%s slot=%u", lifecycleName, slot);
+    EJIT_DIAG_VERBOSE("register_lifecycle OK name=%s slot=%u", lifecycleName,
+                      slot);
   }
 }
 
@@ -228,7 +231,7 @@ void ejit_register_funcindex(const char *funcName, uint32_t *slotOut) {
               (const void *)funcName, (void *)slotOut);
     return;
   }
-  EJIT_DIAG("register_funcindex name=%s", funcName);
+  EJIT_DIAG_VERBOSE("register_funcindex name=%s", funcName);
 #ifdef EJIT_SRE_TASKPOOL
   if (gEJIT && gEJIT->registrationFrozen()) {
     EJitRegistrationStore::instance().recordError(
@@ -248,7 +251,7 @@ void ejit_register_funcindex(const char *funcName, uint32_t *slotOut) {
     EJIT_DIAG("register_funcindex FAIL name=%s: funcIndex capacity exhausted",
               funcName);
   } else {
-    EJIT_DIAG("register_funcindex OK name=%s idx=%u", funcName, idx);
+    EJIT_DIAG_VERBOSE("register_funcindex OK name=%s idx=%u", funcName, idx);
   }
 }
 
