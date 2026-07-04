@@ -24,6 +24,27 @@ namespace ejit {
 
 class PeriodArrayRegistry;
 class EJitRuntimeState;
+struct EJitSharedTaskPoolState;
+
+/// Set a function-name filter for JIT IR+ASM diagnostic capture. When non-
+/// empty, the engine captures (saves in memory) the post-optimization IR and
+/// the emitted assembly of any specialization whose entry name exactly
+/// matches, the next time it is compiled. Empty/null disables further
+/// capture (already-captured entries are retained). Captured entries are
+/// printed on demand via printDumped(). Used for performance analysis.
+void setDumpFuncFilter(const std::string &name);
+
+/// Bind the optional shared taskpool dump state. In a shared-taskpool build this
+/// lets any core set the dump filter and print the last worker-captured IR/ASM
+/// result. Passing nullptr disables the shared path and falls back to the local
+/// process-static dump store.
+void setDumpSharedState(EJitSharedTaskPoolState *state);
+
+/// Print the saved IR+ASM for \p name (or all saved entries when \p name is
+/// null/empty) through EJIT_DIAG, one line per IR/ASM line. Names with no
+/// saved capture are reported as missing. Paired with setDumpFuncFilter():
+/// capture at compile time, print selectively later.
+void printDumped(const char *name);
 
 struct SpecializationContext {
   std::string fnName;

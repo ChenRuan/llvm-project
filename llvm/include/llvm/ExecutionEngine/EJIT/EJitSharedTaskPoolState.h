@@ -70,6 +70,12 @@
 #ifndef EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS
 #define EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS 16u
 #endif
+#ifndef EJIT_SRE_SHARED_DUMP_NAME_BYTES
+#define EJIT_SRE_SHARED_DUMP_NAME_BYTES 128u
+#endif
+#ifndef EJIT_SRE_SHARED_DUMP_TEXT_BYTES
+#define EJIT_SRE_SHARED_DUMP_TEXT_BYTES 65536u
+#endif
 
 namespace llvm {
 namespace ejit {
@@ -84,6 +90,10 @@ constexpr uint32_t kEJitSharedCacheBuckets = EJIT_SRE_TASKPOOL_BUCKETS;
 constexpr uint32_t kEJitSharedCacheSlots = EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS;
 constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
 constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
+constexpr uint32_t kEJitSharedDumpNameBytes =
+    EJIT_SRE_SHARED_DUMP_NAME_BYTES;
+constexpr uint32_t kEJitSharedDumpTextBytes =
+    EJIT_SRE_SHARED_DUMP_TEXT_BYTES;
 constexpr uint32_t kEJitSharedCacheLine = 64u;
 /// Execute-permission seal granularity (the platform's per-page enable_ex unit)
 /// and the large-page / split granularity. Fixed platform constants.
@@ -196,6 +206,34 @@ struct EJitSharedPoolSplit {
 };
 
 //===----------------------------------------------------------------------===//
+// EJitSharedDumpState: fixed-size cross-core diagnostic exchange.
+//
+// The owner worker captures IR/ASM in its private ORC path, but shell/debug
+// requests can arrive on a different core. std::map/std::string cannot live in
+// shared memory, so the shared path uses one bounded filter + one bounded
+// captured result. It is diagnostic-only: long IR/ASM is truncated instead of
+// blocking normal JIT progress.
+//===----------------------------------------------------------------------===//
+struct alignas(kEJitSharedCacheLine) EJitSharedDumpState {
+  EJitAtomicU32 lock;          ///< 0 free, 1 locked by filter/capture/print
+  EJitAtomicU32 filterEnabled; ///< 1 => filterName is active
+  EJitAtomicU32 resultValid;   ///< 1 => resultName/ir/asm contain a capture
+  EJitAtomicU32 truncated;     ///< bit0 IR truncated, bit1 ASM truncated
+  uint32_t filterLen;
+  uint32_t resultNameLen;
+  uint32_t irSize;
+  uint32_t asmSize;
+  uint32_t keyHi;
+  uint32_t keyLo;
+  uint32_t reserved0;
+  uint32_t reserved1;
+  char filterName[kEJitSharedDumpNameBytes];
+  char resultName[kEJitSharedDumpNameBytes];
+  char ir[kEJitSharedDumpTextBytes];
+  char asmText[kEJitSharedDumpTextBytes];
+};
+
+//===----------------------------------------------------------------------===//
 // EJitSharedCounters: lock-free statistics, all monotonic.
 //===----------------------------------------------------------------------===//
 struct EJitSharedCounters {
@@ -263,6 +301,9 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   alignas(kEJitSharedCacheLine)
       EJitSharedPoolSplit poolSplits[kEJitSharedPoolSlots];
 
+  //--- bounded cross-core IR/ASM dump diagnostics (own cache line)
+  alignas(kEJitSharedCacheLine) EJitSharedDumpState dump;
+
   //--- result cache (own cache line; each bucket is itself cache-line aligned)
   alignas(kEJitSharedCacheLine)
       EJitSharedCacheBucket buckets[kEJitSharedCacheBuckets];
@@ -310,6 +351,11 @@ static_assert(
         std::is_trivially_destructible<EJitSharedPoolSplit>::value &&
         std::is_trivially_default_constructible<EJitSharedPoolSplit>::value,
     "EJitSharedPoolSplit must be POD-style");
+static_assert(
+    std::is_standard_layout<EJitSharedDumpState>::value &&
+        std::is_trivially_destructible<EJitSharedDumpState>::value &&
+        std::is_trivially_default_constructible<EJitSharedDumpState>::value,
+    "EJitSharedDumpState must be POD-style");
 static_assert(alignof(EJitSharedTaskPoolState) == kEJitSharedCacheLine,
               "EJitSharedTaskPoolState must be cache-line aligned");
 static_assert(

@@ -49,8 +49,8 @@ bool EJitModuleLoader::registerBitcode(const std::string &funcName,
     // different payload is rejected (the original bitcode, funcIndex and any
     // live cache are kept) rather than silently swapped.
     if (It->second.data == data && It->second.size == size) {
-      EJIT_DIAG("bitcode register idempotent name=%s idx=%u", funcName.c_str(),
-                idx);
+      EJIT_DIAG_DEBUG("bitcode register idempotent name=%s idx=%u",
+                      funcName.c_str(), idx);
       return true;
     }
     EJIT_DIAG("bitcode register reject name=%s idx=%u: payload changed",
@@ -62,8 +62,9 @@ bool EJitModuleLoader::registerBitcode(const std::string &funcName,
   E.data = data;
   E.size = size;
   entriesByFuncIdx_.emplace(idx, std::move(E));
-  EJIT_DIAG("bitcode registered name=%s idx=%u data=%p size=%zu",
-            funcName.c_str(), idx, static_cast<const void *>(data), size);
+  EJIT_DIAG_VERBOSE("bitcode registered name=%s idx=%u data=%p size=%zu",
+                    funcName.c_str(), idx, static_cast<const void *>(data),
+                    size);
   return true;
 }
 
@@ -93,7 +94,7 @@ EJitModuleLoader::getOrCacheFuncMeta(uint32_t funcIdx) {
   if (it != funcMetaCache_.end())
     return it->second;
 
-  EJIT_DIAG("getOrCacheFuncMeta: building meta for funcIdx=%u", funcIdx);
+  EJIT_DIAG_DEBUG("getOrCacheFuncMeta: building meta for funcIdx=%u", funcIdx);
   FuncMeta &meta = funcMetaCache_[funcIdx];
   auto Eit = entriesByFuncIdx_.find(funcIdx);
   if (Eit == entriesByFuncIdx_.end()) {

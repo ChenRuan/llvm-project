@@ -53,6 +53,7 @@
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/BinaryFormat/ELF.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/IR/AttributeMask.h"
 #include "llvm/IR/CallingConv.h"
 #include "llvm/IR/DataLayout.h"
@@ -5460,8 +5461,25 @@ llvm::Constant *CodeGenModule::GetAddrOfGlobalVar(const VarDecl *D,
     Ty = getTypes().ConvertTypeForMem(ASTTy);
 
   StringRef MangledName = getMangledName(D);
-  return GetOrCreateLLVMGlobal(MangledName, Ty, ASTTy.getAddressSpace(), D,
-                               IsForDefinition);
+  llvm::Constant *Addr = GetOrCreateLLVMGlobal(MangledName, Ty,
+                                               ASTTy.getAddressSpace(), D,
+                                               IsForDefinition);
+
+  // EmbeddedJIT: emit !ejit.metadata for ejit_period/ejit_period_arr globals
+  // on EXTERN DECLARATIONS too, not only definitions. Using TUs reference
+  // these globals via inlined accessors (e.g. getData(idx)); without metadata
+  // on the extern decl, the extracted bitcode's @g_ptr lacks it and the JIT
+  // struct-field pass cannot recognize the period variable (gvPeriodMap_
+  // empty → replaced=0). EmitGlobalVarDefinition attaches it on the
+  // definition; this covers the declaration path. Guarded so a global that
+  // already has metadata (e.g. the definition was emitted first) is not
+  // re-worked.
+  if (auto *GV = dyn_cast<llvm::GlobalVariable>(Addr))
+    if ((D->hasAttr<EjitPeriodAttr>() || D->hasAttr<EjitPeriodArrAttr>()) &&
+        !GV->hasMetadata(llvm::ejit::MD_EJIT_METADATA))
+      emitEjitGlobalMetadata(*this, D, GV);
+
+  return Addr;
 }
 
 /// CreateRuntimeVariable - Create a new runtime global variable with the

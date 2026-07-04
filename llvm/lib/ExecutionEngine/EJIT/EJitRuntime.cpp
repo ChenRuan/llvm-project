@@ -7,6 +7,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
+#include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #ifdef EJIT_SRE_TASKPOOL
@@ -20,6 +21,19 @@ using namespace llvm;
 using namespace llvm::ejit;
 
 static EJit *gEJIT = nullptr;
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+static void bindDumpSharedStateFromRuntime() {
+  if (!gEJIT) {
+    setDumpSharedState(nullptr);
+    return;
+  }
+  if (EJitSharedTaskPool *sp = gEJIT->sharedTaskPool())
+    setDumpSharedState(sp->state());
+  else
+    setDumpSharedState(nullptr);
+}
+#endif
 
 static void parseConfig(const ejit_config_t *src, Config &dst) {
   if (!src)
@@ -76,6 +90,9 @@ ejit_status_t ejit_init(const ejit_config_t *config) {
     return st;
   }
 
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  bindDumpSharedStateFromRuntime();
+#endif
   EJIT_DIAG("initialized: mode=%d opt=%d cache=%zu entries=%u",
             (int)cfg.compileMode, (int)cfg.optLevel, cfg.maxCacheSize,
             (unsigned)cfg.maxCacheEntries);
@@ -84,13 +101,17 @@ ejit_status_t ejit_init(const ejit_config_t *config) {
 
 void ejit_shutdown(void) {
   EJIT_DIAG("shutting down");
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  setDumpSharedState(nullptr);
+#endif
   delete gEJIT;
   gEJIT = nullptr;
   EJIT_DIAG("shutdown complete");
 }
 
 void ejit_register_symbol(const char *name, void *addr) {
-  EJIT_DIAG("register_symbol name=%s addr=%p", name ? name : "<null>", addr);
+  EJIT_DIAG_VERBOSE("register_symbol name=%s addr=%p", name ? name : "<null>",
+                    addr);
   if (gEJIT) {
     gEJIT->registerSymbol(name, addr);
   } else {
@@ -101,9 +122,9 @@ void ejit_register_symbol(const char *name, void *addr) {
 
 void ejit_register_bitcode(const char *funcName, const uint8_t *bitcodeData,
                            uint64_t bitcodeSize) {
-  EJIT_DIAG("register_bitcode name=%s size=%llu",
-            funcName ? funcName : "<null>",
-            static_cast<unsigned long long>(bitcodeSize));
+  EJIT_DIAG_VERBOSE("register_bitcode name=%s size=%llu",
+                    funcName ? funcName : "<null>",
+                    static_cast<unsigned long long>(bitcodeSize));
   if (gEJIT) {
     // Post-init runtime registration: the void ABI cannot return a status, so a
     // rejection (null/zero payload, funcIndex capacity, conflicting payload) is
@@ -124,9 +145,10 @@ void ejit_register_bitcode(const char *funcName, const uint8_t *bitcodeData,
 
 void ejit_register_period_array(const char *periodName, const char *varName,
                                 void *baseAddr, uint64_t arraySize) {
-  EJIT_DIAG("register_period_array period=%s var=%s size=%llu",
-            periodName ? periodName : "<null>", varName ? varName : "<null>",
-            static_cast<unsigned long long>(arraySize));
+  EJIT_DIAG_VERBOSE("register_period_array period=%s var=%s size=%llu",
+                    periodName ? periodName : "<null>",
+                    varName ? varName : "<null>",
+                    static_cast<unsigned long long>(arraySize));
   if (gEJIT) {
     // Post-init: rejected once registration is frozen (taskpool); the void ABI
     // records the failure for observability and mutates nothing.
@@ -144,8 +166,8 @@ void ejit_register_period_array(const char *periodName, const char *varName,
 }
 
 void ejit_register_static_var(const char *varName, void *varAddr) {
-  EJIT_DIAG("register_static_var var=%s addr=%p",
-            varName ? varName : "<null>", varAddr);
+  EJIT_DIAG_VERBOSE("register_static_var var=%s addr=%p",
+                    varName ? varName : "<null>", varAddr);
   if (gEJIT) {
     if (!gEJIT->registerStaticVar(varName, varAddr)) {
       EJitRegistrationStore::instance().recordError(
@@ -171,7 +193,7 @@ void ejit_register_lifecycle(const char *lifecycleName, uint32_t *slotOut) {
               (const void *)lifecycleName, (void *)slotOut);
     return;
   }
-  EJIT_DIAG("register_lifecycle name=%s", lifecycleName);
+  EJIT_DIAG_VERBOSE("register_lifecycle name=%s", lifecycleName);
 #ifdef EJIT_SRE_TASKPOOL
   // Once a taskpool init has frozen registration, the worker reads the registry
   // lock-free: refuse to mutate it (leave *slotOut and the registry unchanged).
@@ -194,7 +216,8 @@ void ejit_register_lifecycle(const char *lifecycleName, uint32_t *slotOut) {
     EJIT_DIAG("register_lifecycle FAIL name=%s: dimType capacity exhausted",
               lifecycleName);
   } else {
-    EJIT_DIAG("register_lifecycle OK name=%s slot=%u", lifecycleName, slot);
+    EJIT_DIAG_VERBOSE("register_lifecycle OK name=%s slot=%u", lifecycleName,
+                      slot);
   }
 }
 
@@ -208,7 +231,7 @@ void ejit_register_funcindex(const char *funcName, uint32_t *slotOut) {
               (const void *)funcName, (void *)slotOut);
     return;
   }
-  EJIT_DIAG("register_funcindex name=%s", funcName);
+  EJIT_DIAG_VERBOSE("register_funcindex name=%s", funcName);
 #ifdef EJIT_SRE_TASKPOOL
   if (gEJIT && gEJIT->registrationFrozen()) {
     EJitRegistrationStore::instance().recordError(
@@ -228,7 +251,7 @@ void ejit_register_funcindex(const char *funcName, uint32_t *slotOut) {
     EJIT_DIAG("register_funcindex FAIL name=%s: funcIndex capacity exhausted",
               funcName);
   } else {
-    EJIT_DIAG("register_funcindex OK name=%s idx=%u", funcName, idx);
+    EJIT_DIAG_VERBOSE("register_funcindex OK name=%s idx=%u", funcName, idx);
   }
 }
 
@@ -299,8 +322,8 @@ void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn) {
   if (out_pfn)
     *out_pfn = result;
 
-  EJIT_DIAG("compile_or_get(key=0x%016lx) → %s", cacheKey,
-            result ? "JIT" : "NULL");
+  EJIT_DIAG_VERBOSE("compile_or_get(key=0x%016lx) → %s", cacheKey,
+                    result ? "JIT" : "NULL");
   return result;
 }
 
@@ -418,7 +441,8 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     *outFn = nullptr;
   if (outBucket)
     *outBucket = 0;
-  EJIT_DIAG("taskpool_compile_or_get func=%u dims=%u", funcIndex, numDims);
+  EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u dims=%u", funcIndex,
+                    numDims);
   if (!gEJIT) {
     EJIT_DIAG("taskpool_compile_or_get reject func=%u: not initialized",
               funcIndex);
@@ -464,15 +488,15 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     *outFn = r.fnPtr;
   if (outBucket)
     *outBucket = r.bucketIndex;
-  EJIT_DIAG("taskpool_compile_or_get func=%u status=%u fn=%p", funcIndex,
-            static_cast<unsigned>(r.status), r.fnPtr);
+  EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u status=%u fn=%p",
+                    funcIndex, static_cast<unsigned>(r.status), r.fnPtr);
   return taskpoolStatus(r.status);
 }
 
 void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
                                         uint32_t enabled) {
-  EJIT_DIAG("taskpool_set_instance_enabled dim=%u inst=%u enabled=%u", dimType,
-            instanceId, enabled);
+  EJIT_DIAG_VERBOSE("taskpool_set_instance_enabled dim=%u inst=%u enabled=%u",
+                    dimType, instanceId, enabled);
   if (!gEJIT) {
     EJIT_DIAG("taskpool_set_instance_enabled reject: not initialized");
     return;
@@ -630,6 +654,73 @@ void ejit_taskpool_print_stats() {
   EJIT_DIAG("  reserved         = %u", s.reserved);
 }
 
+void ejit_taskpool_print_compiled() {
+  if (!gEJIT) {
+    EJIT_DIAG("print_compiled: not initialized");
+    return;
+  }
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
+  if (!sp || !sp->state()) {
+    EJIT_DIAG("print_compiled: no shared taskpool / state");
+    return;
+  }
+  EJitModuleLoader &loader = gEJIT->moduleLoader();
+  EJIT_DIAG("compiled functions:");
+  sp->forEachCompiled(
+      [](uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+         void *fnPtr, void *ctx) {
+#ifdef EJIT_DIAG_ENABLE
+        const auto &loader = *static_cast<EJitModuleLoader *>(ctx);
+        const std::string &name = loader.getFuncNameByFuncIdx(funcIndex);
+        EJIT_DIAG("  funcIdx=%u name=%s numDims=%u "
+                  "dims=[%u:%u,%u:%u,%u:%u,%u:%u] fn=%p",
+                  funcIndex, name.empty() ? "<unknown>" : name.c_str(), numDims,
+                  numDims > 0 ? dims[0].dimType : 0,
+                  numDims > 0 ? dims[0].instanceId : 0,
+                  numDims > 1 ? dims[1].dimType : 0,
+                  numDims > 1 ? dims[1].instanceId : 0,
+                  numDims > 2 ? dims[2].dimType : 0,
+                  numDims > 2 ? dims[2].instanceId : 0,
+                  numDims > 3 ? dims[3].dimType : 0,
+                  numDims > 3 ? dims[3].instanceId : 0, fnPtr);
+#else
+        (void)funcIndex;
+        (void)dims;
+        (void)numDims;
+        (void)fnPtr;
+        (void)ctx;
+#endif
+      },
+      &loader);
+#else
+  EJIT_DIAG("print_compiled: shared taskpool not enabled");
+#endif
+}
+
+void ejit_dump_func(const char *name) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (gEJIT) {
+    if (EJitSharedTaskPool *sp = gEJIT->sharedTaskPool())
+      setDumpSharedState(sp->state());
+  }
+#endif
+  std::string filter = (name && name[0]) ? std::string(name) : std::string();
+  EJIT_DIAG("dump_func filter=%s", filter.empty() ? "(off)" : filter.c_str());
+  setDumpFuncFilter(filter);
+}
+
+void ejit_print_dumped(const char *name) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (gEJIT) {
+    if (EJitSharedTaskPool *sp = gEJIT->sharedTaskPool())
+      setDumpSharedState(sp->state());
+  }
+#endif
+  EJIT_DIAG("print_dumped name=%s", (name && name[0]) ? name : "(all)");
+  printDumped(name);
+}
+
 // Sentinel returned when no owner core is elected (e.g. not initialized or the
 // shared taskpool has not bound state). Distinct from any valid core id.
 constexpr uint32_t kEJitInvalidOwnerCore = 0xFFFFFFFFu;
@@ -652,5 +743,57 @@ uint32_t ejit_taskpool_get_worker_core() {
 #endif
 }
 #endif // EJIT_SRE_TASKPOOL
+
+//===----------------------------------------------------------------------===//
+// General diagnostics (available in every build, not only taskpool).
+//===----------------------------------------------------------------------===//
+
+void ejit_dump_all(bool enable) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (gEJIT) {
+    if (EJitSharedTaskPool *sp = gEJIT->sharedTaskPool())
+      setDumpSharedState(sp->state());
+  }
+#endif
+  // The "*" filter is a wildcard matched by every specialization in the IR
+  // transform layer (see getActiveDumpFilter / the capture condition). Capture
+  // is bounded by distinct function names; print with ejit_print_dumped(NULL).
+  EJIT_DIAG("dump_all enable=%u", enable ? 1u : 0u);
+  setDumpFuncFilter(enable ? std::string("*") : std::string());
+}
+
+void ejit_set_log_level(ejit_log_level_t level) {
+  int v = static_cast<int>(level);
+  if (v < EJIT_LOG_LVL_OFF)
+    v = EJIT_LOG_LVL_OFF;
+  if (v > EJIT_LOG_LVL_DEBUG)
+    v = EJIT_LOG_LVL_DEBUG;
+  gEJitDiagLevel = v;
+  EJIT_DIAG("log_level=%d", gEJitDiagLevel);
+}
+
+ejit_log_level_t ejit_get_log_level(void) {
+  return static_cast<ejit_log_level_t>(gEJitDiagLevel);
+}
+
+void ejit_print_registry(void) {
+  if (!gEJIT) {
+    EJIT_DIAG("print_registry: not initialized");
+    return;
+  }
+  gEJIT->printRegistry();
+}
+
+void ejit_print_func_meta(const char *funcName) {
+  if (!funcName || !funcName[0]) {
+    EJIT_DIAG("print_func_meta: null/empty name");
+    return;
+  }
+  if (!gEJIT) {
+    EJIT_DIAG("print_func_meta: not initialized");
+    return;
+  }
+  gEJIT->printFuncMeta(funcName);
+}
 
 } // extern "C"

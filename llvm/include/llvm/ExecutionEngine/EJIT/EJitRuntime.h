@@ -181,7 +181,71 @@ typedef struct {
 ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
 
 void ejit_taskpool_print_stats();
+void ejit_taskpool_print_compiled();
 uint32_t ejit_taskpool_get_worker_core();
+
+/// Enable name-filtered JIT IR+ASM capture. When \p name is non-null and
+/// non-empty, the next time a specialization whose entry name exactly matches
+/// \p name is JIT-compiled, the engine saves (in memory) its post-optimization
+/// IR and emitted assembly for later printing. Pass NULL or "" to disable
+/// further capture (already-saved entries are retained). The special name "*"
+/// is a wildcard that captures EVERY specialization (see ejit_dump_all). For
+/// performance analysis of individual functions.
+void ejit_dump_func(const char *name);
+
+/// Print the saved IR+ASM for \p name (or all saved entries when \p name is
+/// NULL or "") through the platform log, one line per IR/ASM line, labeled
+/// "dump IR func=..." / "dump ASM func=...". Names with no saved capture are
+/// reported as missing. Paired with ejit_dump_func(): capture at compile
+/// time, print selectively later.
+void ejit_print_dumped(const char *name);
+
+/// Convenience switch to capture IR+ASM for ALL JIT-compiled specializations
+/// (equivalent to ejit_dump_func("*")). When \p enable is true, every
+/// specialization's post-optimization IR and emitted assembly is saved (one
+/// entry per function name, overwritten on re-compile, so the store is bounded
+/// by the number of distinct entry functions); print later with
+/// ejit_print_dumped(NULL). When false, capture is disabled. NOTE: on a
+/// cross-core shared taskpool the captures live on the owner core (the one
+/// that runs the JIT worker); print from the owner core to see all entries,
+/// or use ejit_dump_func(name) for a single function whose capture is shared
+/// across cores.
+void ejit_dump_all(bool enable);
+
+/// Runtime diagnostic log level. Mirrors the EJIT_DIAG* macro thresholds.
+///   EJIT_LOG_OFF    — no diagnostic output
+///   EJIT_LOG_INFO   — key events (default): init, compile begin/OK/FAIL,
+///                      cache MISS, activation, errors, registration summary
+///   EJIT_LOG_VERBOSE — per-item detail: each registration, per-function
+///                      struct-field stats, per-call compile_or_get, taskpool
+///   EJIT_LOG_DEBUG  — internals: idempotent skips, per-load replacement
+///                      failures, dump mechanics
+typedef enum {
+  EJIT_LOG_OFF = 0,
+  EJIT_LOG_INFO = 1,
+  EJIT_LOG_VERBOSE = 2,
+  EJIT_LOG_DEBUG = 3,
+} ejit_log_level_t;
+
+/// Set the runtime diagnostic log level. Takes effect immediately for all
+/// subsequent EJIT_DIAG* output. Lower the level to reduce log volume in
+/// production; raise it to VERBOSE/DEBUG when diagnosing a problem.
+void ejit_set_log_level(ejit_log_level_t level);
+
+/// Current runtime diagnostic log level.
+ejit_log_level_t ejit_get_log_level(void);
+
+/// Print the registered registry through the platform log: every registered
+/// bitcode (funcIdx, name, size), period array (period, var, base, size),
+/// static var (var, addr), plus funcIndex/lifecycle counts. For verifying
+/// that AOT registration populated the runtime as expected.
+void ejit_print_registry(void);
+
+/// Print the !ejit.metadata of \p funcName (parsed from its registered
+/// bitcode): whether it is an ejit_entry, its period_arr_ind parameter slots,
+/// period arrays, and may_const field offsets. For diagnosing specialization
+/// parameter binding and constant-substitution eligibility.
+void ejit_print_func_meta(const char *funcName);
 
 // Cache
 void ejit_clear_cache(void);

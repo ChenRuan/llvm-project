@@ -160,6 +160,20 @@ public:
   void bind(EJitSharedTaskPoolState *state) { state_ = state; }
   EJitSharedTaskPoolState *state() const { return state_; }
 
+  /// Callback type for forEachCompiled: receives the funcIndex, its dim
+  /// identity (dimType:instanceId pairs, numDims entries), the compiled
+  /// function pointer, and the caller-provided context.
+  using CompiledFuncCallback = void (*)(uint32_t funcIndex,
+                                        const EJitDimPair *dims,
+                                        uint32_t numDims, void *fnPtr,
+                                        void *ctx);
+
+  /// Invoke \p cb once for every successfully compiled (Ready) cache entry.
+  /// For diagnostics (e.g. ejit_taskpool_print_compiled). Best-effort: a slot
+  /// mid-publish is skipped, and this is not a snapshot — concurrent publishes
+  /// may add entries during iteration.
+  void forEachCompiled(CompiledFuncCallback cb, void *ctx) const;
+
   //--- owner-only configuration (applied if this core wins election) ----------
   void setCompiler(CompileCallback fn, void *ctx) {
     compileFn_ = fn;

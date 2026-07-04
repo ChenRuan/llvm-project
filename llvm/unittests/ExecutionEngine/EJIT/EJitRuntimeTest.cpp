@@ -469,6 +469,59 @@ TEST(PeriodArrayRegistry, MultipleArraysSamePeriod) {
   EXPECT_EQ(arrs->size(), 2u);
 }
 
+// Idempotent registration: the constructor path may register the same array
+// twice (PASS1+PASS2 both add to global_ctors, or the static-registry walk
+// revisits an entry). A repeat with identical (period, base, size) must be a
+// no-op — it must NOT append a second entry to arraysByPeriod_ (which would
+// make activate fan out redundantly and getArrays() report ghosts).
+TEST(PeriodArrayRegistry, RegisterArrayIsIdempotent) {
+  PeriodArrayRegistry reg;
+  int data[4];
+  reg.registerArray("cell", "g_arr", data, 4);
+  reg.registerArray("cell", "g_arr", data, 4); // identical duplicate
+  reg.registerArray("cell", "g_arr", data, 4); // identical duplicate
+
+  const auto *arrs = reg.getArrays("cell");
+  ASSERT_NE(arrs, nullptr);
+  EXPECT_EQ(arrs->size(), 1u); // no duplicate entries
+  EXPECT_EQ(reg.getArrayInfo("g_arr")->baseAddr, (void *)data);
+}
+
+// A same-name conflict with a different base/size is rejected: the first
+// registration is kept and the second does not create a duplicate entry.
+TEST(PeriodArrayRegistry, RegisterArrayConflictKeepsFirst) {
+  PeriodArrayRegistry reg;
+  int a[4], b[4];
+  reg.registerArray("cell", "g_arr", a, 4);
+  reg.registerArray("cell", "g_arr", b, 4); // different base — conflict
+
+  const auto *arrs = reg.getArrays("cell");
+  ASSERT_NE(arrs, nullptr);
+  EXPECT_EQ(arrs->size(), 1u); // no duplicate
+  EXPECT_EQ(reg.getArrayInfo("g_arr")->baseAddr, (void *)a); // first kept
+}
+
+TEST(PeriodArrayRegistry, RegisterStaticVarIsIdempotent) {
+  PeriodArrayRegistry reg;
+  int val = 0;
+  reg.registerStaticVar("g_sv", &val);
+  reg.registerStaticVar("g_sv", &val); // identical duplicate
+  reg.registerStaticVar("g_sv", &val); // identical duplicate
+
+  EXPECT_EQ(reg.getStaticVars().size(), 1u); // no duplicate entries
+  EXPECT_EQ(reg.getStaticVarAddr("g_sv"), (void *)&val);
+}
+
+TEST(PeriodArrayRegistry, RegisterStaticVarConflictKeepsFirst) {
+  PeriodArrayRegistry reg;
+  int a = 0, b = 0;
+  reg.registerStaticVar("g_sv", &a);
+  reg.registerStaticVar("g_sv", &b); // different addr — conflict
+
+  EXPECT_EQ(reg.getStaticVars().size(), 1u); // no duplicate
+  EXPECT_EQ(reg.getStaticVarAddr("g_sv"), (void *)&a); // first kept
+}
+
 //===----------------------------------------------------------------------===//
 // EJitRuntimeState tests (T3-11)
 //===----------------------------------------------------------------------===//
@@ -751,6 +804,11 @@ extern void ejit_register_period_array(const char *, const char *, void *,
 extern void ejit_register_bitcode(const char *, const uint8_t *, uint64_t);
 extern void ejit_register_static_var(const char *, void *);
 extern void ejit_register_lifecycle(const char *, uint32_t *);
+extern void ejit_set_log_level(int level);
+extern int ejit_get_log_level(void);
+extern void ejit_dump_all(bool enable);
+extern void ejit_print_registry(void);
+extern void ejit_print_func_meta(const char *funcName);
 }
 
 // The "runtime-dynamic cellIdx" C-API tests below exercise the LEGACY model:
@@ -2833,4 +2891,51 @@ TEST(EJitCacheLifecycle, ReputAfterInvalidate) {
   int newVal = 99;
   cache.put(777, &newVal, 64, deps);
   EXPECT_EQ(cache.getOrNull(777), &newVal);
+}
+
+//===----------------------------------------------------------------------===//
+// Log level + diagnostics C-API (ejit_set_log_level, ejit_dump_all,
+// ejit_print_registry, ejit_print_func_meta)
+//===----------------------------------------------------------------------===//
+
+TEST(EJitDiagLogLevel, SetAndGet) {
+  // Default level is INFO (1).
+  EXPECT_EQ(ejit_get_log_level(), 1);
+  ejit_set_log_level(3); // DEBUG
+  EXPECT_EQ(ejit_get_log_level(), 3);
+  ejit_set_log_level(0); // OFF
+  EXPECT_EQ(ejit_get_log_level(), 0);
+  ejit_set_log_level(2); // VERBOSE
+  EXPECT_EQ(ejit_get_log_level(), 2);
+  // Restore the default so subsequent tests are unaffected.
+  ejit_set_log_level(1);
+  EXPECT_EQ(ejit_get_log_level(), 1);
+}
+
+TEST(EJitDiagLogLevel, ClampsOutOfRange) {
+  ejit_set_log_level(-5);
+  EXPECT_EQ(ejit_get_log_level(), 0);
+  ejit_set_log_level(99);
+  EXPECT_EQ(ejit_get_log_level(), 3);
+  ejit_set_log_level(1); // restore
+}
+
+// ejit_dump_all must not crash whether or not the runtime is initialized.
+TEST(EJitDumpAll, ToggleWithoutCrash) {
+  ejit_dump_all(true);
+  ejit_dump_all(false);
+}
+
+// Registry / func-meta prints must not crash on an uninitialized runtime and on
+// a missing name. (Output goes through EJIT_DIAG, which is a no-op when
+// EJIT_DIAG_ENABLE is undefined — the test only asserts it does not crash.)
+TEST(EJitDiagnostics, PrintRegistryUninitialized) {
+  // Not initialized: should report and return, not crash.
+  ejit_print_registry();
+}
+
+TEST(EJitDiagnostics, PrintFuncMetaMissingName) {
+  ejit_print_func_meta(nullptr); // null
+  ejit_print_func_meta("");      // empty
+  ejit_print_func_meta("does_not_exist");
 }
