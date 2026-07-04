@@ -1,6 +1,7 @@
 //===-- EJitOrcEngine.cpp - OrcJIT Engine Wrapper -------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
+#include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLibcallStubs.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
@@ -73,10 +74,30 @@ struct EJitOrcEngine::Impl {
 namespace llvm {
 namespace ejit {
 
-// Mutex type for the dump store. On SRE/freestanding std::mutex is unsafe or
-// unavailable, so use the bare-metal no-op mutex (single-threaded).
+// Mutex type for the dump store. On SRE/freestanding std::mutex is
+// unavailable and BareMetalMutex is a no-op, so use a real CAS spinlock (built
+// on the __atomic wrappers in EJitAtomic.h). gDumpStore is per-core (each core
+// has its own process image, so there is no cross-core race on it), but a
+// same-core overlap between the worker capture and a producer print must still
+// be guarded. Hosted builds keep std::mutex. The spinlock has a trivial
+// default constructor, so a static instance is zero-initialized (unlocked)
+// with no dynamic initializer — important for freestanding.
 #ifdef EJIT_FREESTANDING
-using DumpMutexType = BareMetalMutex;
+namespace {
+class DumpSpinLock {
+public:
+  void lock() {
+    uint32_t expected = 0;
+    while (!flag_.compareExchange(expected, 1u))
+      expected = 0;
+  }
+  void unlock() { flag_.storeRelease(0u); }
+
+private:
+  EJitAtomicU32 flag_;
+};
+} // namespace
+using DumpMutexType = DumpSpinLock;
 #else
 using DumpMutexType = std::mutex;
 #endif
