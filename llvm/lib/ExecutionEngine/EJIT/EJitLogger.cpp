@@ -3,6 +3,13 @@
 #include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 
+// Process-wide runtime log level (default INFO). Always defined, for both
+// hosted and freestanding builds. Raised via ejit_set_log_level() to recover
+// VERBOSE/DEBUG detail. Referenced by the EJIT_DIAG* macros; when
+// EJIT_DIAG_ENABLE is undefined the macros are no-ops and this symbol is
+// simply unused.
+int gEJitDiagLevel = EJIT_LOG_LVL_INFO;
+
 #ifndef EJIT_FREESTANDING
 
 #include <chrono>
