@@ -724,9 +724,12 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
   // Resolve undefined function symbols from user-registered table.
   // Required for bare-metal where dynamic lookup (dlsym) is unavailable.
   // Throttle diagnostics: tally unresolved externals and emit a single
-  // summary line per load (below) instead of one line per symbol.
+  // summary line per load (below) instead of one line per symbol; the
+  // individual names are listed at DEBUG for regression triage.
   size_t unresolvedFuncs = 0;
   size_t unresolvedGlobals = 0;
+  SmallVector<std::string, 16> unresolvedNames;
+  static constexpr size_t kMaxUnresolvedNames = 32;
   for (Function &F : (*ModuleOrErr)->functions()) {
     if (!F.isDeclaration() || F.getName().empty())
       continue;
@@ -735,8 +738,11 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
       continue;
     auto it = P->userSymbols.find(name);
     if (it == P->userSymbols.end()) {
-      if (!F.isIntrinsic())
+      if (!F.isIntrinsic()) {
         ++unresolvedFuncs;
+        if (unresolvedNames.size() < kMaxUnresolvedNames)
+          unresolvedNames.push_back("f:" + name);
+      }
       continue;
     }
     globalSymbols[P->J->mangleAndIntern(name)] =
@@ -752,6 +758,8 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     auto it = P->userSymbols.find(name);
     if (it == P->userSymbols.end()) {
       ++unresolvedGlobals;
+      if (unresolvedNames.size() < kMaxUnresolvedNames)
+        unresolvedNames.push_back("g:" + name);
       continue;
     }
     globalSymbols[P->J->mangleAndIntern(name)] =
@@ -763,6 +771,11 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
               "(%zu funcs, %zu globals)",
               unresolvedFuncs + unresolvedGlobals, unresolvedFuncs,
               unresolvedGlobals);
+  EJIT_DIAG_DEBUG("loadBitcode: %zu unresolved name(s) listed (of %zu total):",
+                  unresolvedNames.size(),
+                  unresolvedFuncs + unresolvedGlobals);
+  for (const std::string &n : unresolvedNames)
+    EJIT_DIAG_DEBUG("  %s", n.c_str());
 
   // Provide codegen-synthesized runtime symbols (memset/memcpy/memmove/memcmp
   // and the stack-protector guard/fail) that the AOT symbol collector cannot
