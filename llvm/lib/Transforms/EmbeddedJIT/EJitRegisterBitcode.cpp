@@ -31,6 +31,8 @@
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
@@ -38,6 +40,7 @@ using namespace llvm;
 using namespace llvm::ejit;
 
 extern cl::opt<bool> EnableEJitGlobalCtors;
+extern cl::opt<std::string> EJitDumpBitcodeDir;
 
 #define DEBUG_TYPE "ejit-register-bitcode"
 
@@ -239,12 +242,77 @@ static void preOptimizeBitcode(Module &M) {
 static void preOptimizeBitcode(Module &) {}
 #endif
 
+/// Dump the extracted bitcode module to EJitDumpBitcodeDir (if set) for
+/// debugging — e.g. to confirm an ejit_entry function is emitted as a
+/// definition rather than just a declaration. Parallel-safe under -j: the
+/// filename embeds the process id (distinct per concurrent clang) and the
+/// sanitized module name, so no two invocations share a file and writes
+/// never serialize. Writes both .ll (readable: grep "define @Fn" vs
+/// "declare @Fn") and .bc.
+static void dumpExtractedBitcode(const Module &M, StringRef Dir) {
+  if (Dir.empty())
+    return;
+  if (std::error_code EC = sys::fs::create_directories(Dir))
+    return;
+  std::string Stem;
+  StringRef Name = M.getName();
+  if (Name.empty())
+    Name = "ejit_module";
+  auto IsAlnum = [](char C) {
+    return (C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z') ||
+           (C >= '0' && C <= '9');
+  };
+  for (char C : Name)
+    Stem.push_back(IsAlnum(C) ? C : '_');
+  unsigned Pid = sys::Process::getProcessId();
+  std::string Base = (Twine(Dir) + "/" + Twine(Pid) + "_" + Stem).str();
+
+  std::error_code EC;
+  raw_fd_ostream LL(Base + ".ll", EC);
+  if (!EC)
+    M.print(LL, nullptr);
+  raw_fd_ostream BC(Base + ".bc", EC);
+  if (!EC)
+    WriteBitcodeToFile(M, BC);
+}
+
+/// Diagnostic: count globals carrying !ejit.metadata, and within that the
+/// period_arr / may_const_field tags. Gated on EJitDumpBitcodeDir so it only
+/// runs when the dump is enabled. Used to pinpoint where the struct-field
+/// pass's GV metadata is lost during extraction (clone → preOptimize →
+/// externalization).
+static void logEJitGlobalMeta(const char *label, const Module &M) {
+  if (EJitDumpBitcodeDir.empty())
+    return;
+  unsigned withMeta = 0, periodArr = 0, mayConstField = 0;
+  for (const GlobalVariable &GV : M.globals()) {
+    MDNode *MD = GV.getMetadata(MD_EJIT_METADATA);
+    if (!MD)
+      continue;
+    ++withMeta;
+    for (const MDOperand &Op : MD->operands()) {
+      auto *Sub = dyn_cast<MDNode>(Op.get());
+      if (!Sub || Sub->getNumOperands() < 2)
+        continue;
+      if (auto *Tag = dyn_cast<MDString>(Sub->getOperand(0))) {
+        if (Tag->getString() == TAG_EJIT_PERIOD_ARR)
+          ++periodArr;
+        else if (Tag->getString() == TAG_EJIT_MAY_CONST_FIELD)
+          ++mayConstField;
+      }
+    }
+  }
+  errs() << "ejit-register-bitcode: " << label
+         << " globals=" << M.global_size() << " withMeta=" << withMeta
+         << " periodArr=" << periodArr << " mayConstField=" << mayConstField
+         << "\n";
+}
+
 static std::string extractAndSerialize(Module &M,
     const SetVector<Function *> &Funcs,
     const SetVector<GlobalVariable *> &Globals) {
 
   auto Extracted = CloneModule(M);
-
   DenseSet<StringRef> FuncNames;
   for (Function *F : Funcs)
     FuncNames.insert(F->getName());
@@ -279,7 +347,9 @@ static std::string extractAndSerialize(Module &M,
   // Pre-optimize the extracted bitcode to reduce JIT compilation pressure.
   // InstCombine + Mem2Reg + SimplifyCFG folds constant chains, promotes
   // allocas, and cleans up dead branches before serialization.
+  logEJitGlobalMeta("extract-after-clone", *Extracted);
   preOptimizeBitcode(*Extracted);
+  logEJitGlobalMeta("extract-after-preOpt", *Extracted);
 
   // Convert kept non-constant global definitions to external declarations
   // so the JIT linker resolves them from the host process. Constants (e.g.
@@ -291,6 +361,13 @@ static std::string extractAndSerialize(Module &M,
     GV.setInitializer(nullptr);
     GV.setLinkage(GlobalValue::ExternalLinkage);
   }
+  logEJitGlobalMeta("extract-after-extern", *Extracted);
+
+  // Optionally dump the extracted module for debugging (e.g. to confirm an
+  // ejit_entry function is emitted as a definition, not a declaration).
+  // Parallel-safe: filename embeds PID + module name (see dumpExtractedBitcode).
+  if (!EJitDumpBitcodeDir.empty())
+    dumpExtractedBitcode(*Extracted, EJitDumpBitcodeDir);
 
   std::string Bitcode;
   raw_string_ostream OS(Bitcode);

@@ -12,9 +12,14 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
+#include <map>
+#include <mutex>
 #include <map>
 
 #ifdef EJIT_SRE_CODE_POOL
@@ -50,7 +55,84 @@ struct EJitOrcEngine::Impl {
   std::string dumpJITDir;
   /// Persistent optimizer — analysis managers are registered once and reused.
   std::unique_ptr<EJitOptimizer> optimizer;
+  /// TargetMachine used for the name-filtered ASM diagnostic dump (created
+  /// once from the same JITTargetMachineBuilder the JIT compiles with, so the
+  /// emitted assembly matches the real JIT output). Null if creation failed.
+  std::unique_ptr<TargetMachine> dumpTM;
 };
+
+// Process-wide function-name filter for the IR+ASM diagnostic dump. Set via
+// ejit_dump_func() / setDumpFuncFilter(). Read in the IR transform layer.
+// A diagnostic: set before triggering the compile of interest; concurrent
+// set/read is benign (worst case a missed or extra dump).
+static std::string gDumpFuncFilter;
+
+void setDumpFuncFilter(const std::string &name) { gDumpFuncFilter = name; }
+
+/// Emit a multi-line blob (IR or ASM) through EJIT_DIAG, one line per call,
+/// under a labeled header. Bare-metal-safe (no file I/O — the existing
+/// dumpJITDir path uses raw_fd_ostream which crashes on SRE/bare-metal).
+static void dumpLines(const char *label, const std::string &s) {
+  EJIT_DIAG("=== %s ===", label);
+  StringRef rest(s);
+  while (!rest.empty()) {
+    auto [line, next] = rest.split('\n');
+    if (!line.empty())
+      EJIT_DIAG("  %.*s", static_cast<int>(line.size()), line.data());
+    rest = next;
+  }
+}
+
+/// Saved IR+ASM for a captured specialization (latest per function name).
+struct DumpEntry {
+  uint64_t cacheKey = 0;
+  std::string IR;
+  std::string ASM;
+};
+
+// Process-wide store of captured IR+ASM, filled by the IR transform layer
+// (worker thread) when the filter matches, read by ejit_print_dumped() (user
+// thread). Guarded by gDumpMutex.
+static std::mutex gDumpMutex;
+static std::map<std::string, DumpEntry> gDumpStore;
+
+/// Called from the IR transform layer when the filter matches: save the
+/// post-optimization IR and emitted ASM for later selective printing.
+static void captureDump(const std::string &fnName, uint64_t cacheKey,
+                        std::string IR, std::string ASM) {
+  std::lock_guard<std::mutex> lock(gDumpMutex);
+  gDumpStore[fnName] = DumpEntry{cacheKey, std::move(IR), std::move(ASM)};
+}
+
+/// Print the saved IR+ASM for \p name (or all saved entries when \p name is
+/// null/empty) through EJIT_DIAG, one line per IR/ASM line. Names with no
+/// saved capture are reported as missing.
+void printDumped(const char *name) {
+  std::lock_guard<std::mutex> lock(gDumpMutex);
+  auto emit = [&](const std::string &fnName, const DumpEntry &e) {
+    dumpLines(("dump IR func=" + fnName + " key=0x" +
+               Twine::utohexstr(e.cacheKey).str())
+                  .c_str(),
+              e.IR);
+    if (!e.ASM.empty())
+      dumpLines(("dump ASM func=" + fnName + " key=0x" +
+                 Twine::utohexstr(e.cacheKey).str())
+                    .c_str(),
+                e.ASM);
+  };
+  if (name && name[0]) {
+    auto it = gDumpStore.find(name);
+    if (it != gDumpStore.end())
+      emit(it->first, it->second);
+    else
+      EJIT_DIAG("print_dumped: no saved IR/ASM for func=%s", name);
+  } else {
+    if (gDumpStore.empty())
+      EJIT_DIAG("print_dumped: nothing saved");
+    for (auto &kv : gDumpStore)
+      emit(kv.first, kv.second);
+  }
+}
 
 EJitOrcEngine::EJitOrcEngine() : P(std::make_unique<Impl>()) {}
 EJitOrcEngine::~EJitOrcEngine() = default;
@@ -86,6 +168,14 @@ EJitOrcEngine::Create(const Config &config,
 
   // Use Large code model so JITLink can generate 64-bit absolute relocations.
   JTMBOrErr->setCodeModel(CodeModel::Large);
+
+  // Build a TargetMachine (same options the JIT compiles with) for the
+  // name-filtered ASM diagnostic dump. Failure is non-fatal — the dump is
+  // simply unavailable.
+  if (auto TMOrErr = JTMBOrErr->createTargetMachine())
+    engine->P->dumpTM = std::move(*TMOrErr);
+  else
+    consumeError(TMOrErr.takeError());
 
   orc::LLJITBuilder Builder;
   Builder.setJITTargetMachineBuilder(*JTMBOrErr);
@@ -206,6 +296,36 @@ EJitOrcEngine::Create(const Config &config,
             if (!EC)
               M.print(OS, nullptr);
           }
+
+          // Name-filtered IR+ASM capture for later selective printing. Filter
+          // set via ejit_dump_func(); captured entries printed on demand via
+          // ejit_print_dumped(). Bare-metal-safe (strings only, no
+          // raw_fd_ostream). Captures the post-optimization IR and the emitted
+          // assembly (from the same TargetMachine the JIT compiles with).
+          if (!gDumpFuncFilter.empty() && ctx->fnName == gDumpFuncFilter) {
+            std::string IR;
+            raw_string_ostream IOS(IR);
+            M.print(IOS, nullptr);
+            IOS.flush();
+
+            std::string Asm;
+            if (engine->P->dumpTM) {
+              SmallVector<char, 0> AsmBuf;
+              raw_svector_ostream AOS(AsmBuf);
+              legacy::PassManager PM;
+              if (!engine->P->dumpTM->addPassesToEmitFile(
+                      PM, AOS, /*DwoOut=*/nullptr,
+                      CodeGenFileType::AssemblyFile)) {
+                PM.run(M);
+                Asm.assign(AsmBuf.begin(), AsmBuf.end());
+              } else {
+                EJIT_DIAG("dump ASM func=%s: target cannot emit assembly",
+                          ctx->fnName.c_str());
+              }
+            }
+            captureDump(ctx->fnName, ctx->cacheKey, std::move(IR),
+                        std::move(Asm));
+          }
         });
         return std::move(TSM);
       });
@@ -242,6 +362,17 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
         GV.setDSOLocal(false);
     }
   }
+
+  // ejit_entry functions may have internal linkage (e.g. declared `static` in
+  // source). ORC's IR layer excludes local-linkage symbols from the JITDylib
+  // symbol table (Layer.cpp: hasLocalLinkage() skip), so a static entry is
+  // invisible to lookup ("symbol not found", no materialization). The function
+  // being compiled (origFnName) is the JIT lookup target — force it to
+  // external linkage so ORC registers and can materialize it. Spec JITDylibs
+  // are isolated, so this cannot collide with other specializations.
+  if (Function *EntryF = (*ModuleOrErr)->getFunction(origFnName))
+    if (!EntryF->isDeclaration() && EntryF->hasLocalLinkage())
+      EntryF->setLinkage(GlobalValue::ExternalLinkage);
 
   // Collect global variable addresses from the registry for symbols
   // that appear as external declarations in the bitcode module.
@@ -281,6 +412,10 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
 
   // Resolve undefined function symbols from user-registered table.
   // Required for bare-metal where dynamic lookup (dlsym) is unavailable.
+  // Throttle diagnostics: tally unresolved externals and emit a single
+  // summary line per load (below) instead of one line per symbol.
+  size_t unresolvedFuncs = 0;
+  size_t unresolvedGlobals = 0;
   for (Function &F : (*ModuleOrErr)->functions()) {
     if (!F.isDeclaration() || F.getName().empty())
       continue;
@@ -290,8 +425,7 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     auto it = P->userSymbols.find(name);
     if (it == P->userSymbols.end()) {
       if (!F.isIntrinsic())
-        EJIT_DIAG("loadBitcode: unresolved external func not registered: %s",
-                  name.c_str());
+        ++unresolvedFuncs;
       continue;
     }
     globalSymbols[P->J->mangleAndIntern(name)] =
@@ -306,14 +440,18 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
       continue;
     auto it = P->userSymbols.find(name);
     if (it == P->userSymbols.end()) {
-      EJIT_DIAG("loadBitcode: unresolved external global not registered: %s",
-                name.c_str());
+      ++unresolvedGlobals;
       continue;
     }
     globalSymbols[P->J->mangleAndIntern(name)] =
         orc::ExecutorSymbolDef(orc::ExecutorAddr::fromPtr(it->second),
                                JITSymbolFlags::Exported);
   }
+  if (unresolvedFuncs || unresolvedGlobals)
+    EJIT_DIAG("loadBitcode: %zu unresolved external(s) not registered "
+              "(%zu funcs, %zu globals)",
+              unresolvedFuncs + unresolvedGlobals, unresolvedFuncs,
+              unresolvedGlobals);
 
   // Provide codegen-synthesized runtime symbols (memset/memcpy/memmove/memcmp
   // and the stack-protector guard/fail) that the AOT symbol collector cannot

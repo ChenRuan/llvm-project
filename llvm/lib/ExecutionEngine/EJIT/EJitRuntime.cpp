@@ -7,6 +7,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
+#include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #ifdef EJIT_SRE_TASKPOOL
@@ -628,6 +629,61 @@ void ejit_taskpool_print_stats() {
   EJIT_DIAG("  pendingEntries   = %u", s.pendingEntries);
   EJIT_DIAG("  queueApproxSize  = %u", s.queueApproxSize);
   EJIT_DIAG("  reserved         = %u", s.reserved);
+}
+
+void ejit_taskpool_print_compiled() {
+  if (!gEJIT) {
+    EJIT_DIAG("print_compiled: not initialized");
+    return;
+  }
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
+  if (!sp || !sp->state()) {
+    EJIT_DIAG("print_compiled: no shared taskpool / state");
+    return;
+  }
+  EJitModuleLoader &loader = gEJIT->moduleLoader();
+  EJIT_DIAG("compiled functions:");
+  sp->forEachCompiled(
+      [](uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+         void *fnPtr, void *ctx) {
+#ifdef EJIT_DIAG_ENABLE
+        const auto &loader = *static_cast<EJitModuleLoader *>(ctx);
+        const std::string &name = loader.getFuncNameByFuncIdx(funcIndex);
+        EJIT_DIAG("  funcIdx=%u name=%s numDims=%u "
+                  "dims=[%u:%u,%u:%u,%u:%u,%u:%u] fn=%p",
+                  funcIndex, name.empty() ? "<unknown>" : name.c_str(), numDims,
+                  numDims > 0 ? dims[0].dimType : 0,
+                  numDims > 0 ? dims[0].instanceId : 0,
+                  numDims > 1 ? dims[1].dimType : 0,
+                  numDims > 1 ? dims[1].instanceId : 0,
+                  numDims > 2 ? dims[2].dimType : 0,
+                  numDims > 2 ? dims[2].instanceId : 0,
+                  numDims > 3 ? dims[3].dimType : 0,
+                  numDims > 3 ? dims[3].instanceId : 0, fnPtr);
+#else
+        (void)funcIndex;
+        (void)dims;
+        (void)numDims;
+        (void)fnPtr;
+        (void)ctx;
+#endif
+      },
+      &loader);
+#else
+  EJIT_DIAG("print_compiled: shared taskpool not enabled");
+#endif
+}
+
+void ejit_dump_func(const char *name) {
+  std::string filter = (name && name[0]) ? std::string(name) : std::string();
+  EJIT_DIAG("dump_func filter=%s", filter.empty() ? "(off)" : filter.c_str());
+  setDumpFuncFilter(filter);
+}
+
+void ejit_print_dumped(const char *name) {
+  EJIT_DIAG("print_dumped name=%s", (name && name[0]) ? name : "(all)");
+  printDumped(name);
 }
 
 // Sentinel returned when no owner core is elected (e.g. not initialized or the
