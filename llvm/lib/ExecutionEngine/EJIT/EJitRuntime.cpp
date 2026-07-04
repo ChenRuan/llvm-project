@@ -699,24 +699,15 @@ void ejit_taskpool_print_compiled() {
 }
 
 void ejit_dump_func(const char *name) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (gEJIT) {
-    if (EJitSharedTaskPool *sp = gEJIT->sharedTaskPool())
-      setDumpSharedState(sp->state());
-  }
-#endif
+  // gDumpSharedState is bound once in ejit_init (and cleared in ejit_shutdown);
+  // no per-call rebind needed here.
   std::string filter = (name && name[0]) ? std::string(name) : std::string();
   EJIT_DIAG("dump_func filter=%s", filter.empty() ? "(off)" : filter.c_str());
   setDumpFuncFilter(filter);
 }
 
 void ejit_print_dumped(const char *name) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (gEJIT) {
-    if (EJitSharedTaskPool *sp = gEJIT->sharedTaskPool())
-      setDumpSharedState(sp->state());
-  }
-#endif
+  // gDumpSharedState is bound once in ejit_init; no per-call rebind needed.
   EJIT_DIAG("print_dumped name=%s", (name && name[0]) ? name : "(all)");
   printDumped(name);
 }
@@ -749,12 +740,7 @@ uint32_t ejit_taskpool_get_worker_core() {
 //===----------------------------------------------------------------------===//
 
 void ejit_dump_all(bool enable) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (gEJIT) {
-    if (EJitSharedTaskPool *sp = gEJIT->sharedTaskPool())
-      setDumpSharedState(sp->state());
-  }
-#endif
+  // gDumpSharedState is bound once in ejit_init; no per-call rebind needed.
   // The "*" filter is a wildcard matched by every specialization in the IR
   // transform layer (see getActiveDumpFilter / the capture condition). Capture
   // is bounded by distinct function names; print with ejit_print_dumped(NULL).
