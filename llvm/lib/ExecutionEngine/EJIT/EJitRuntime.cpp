@@ -761,4 +761,38 @@ void ejit_dump_all(bool enable) {
   setDumpFuncFilter(enable ? std::string("*") : std::string());
 }
 
+void ejit_set_log_level(ejit_log_level_t level) {
+  int v = static_cast<int>(level);
+  if (v < EJIT_LOG_LVL_OFF)
+    v = EJIT_LOG_LVL_OFF;
+  if (v > EJIT_LOG_LVL_DEBUG)
+    v = EJIT_LOG_LVL_DEBUG;
+  gEJitDiagLevel = v;
+  EJIT_DIAG("log_level=%d", gEJitDiagLevel);
+}
+
+ejit_log_level_t ejit_get_log_level(void) {
+  return static_cast<ejit_log_level_t>(gEJitDiagLevel);
+}
+
+void ejit_print_registry(void) {
+  if (!gEJIT) {
+    EJIT_DIAG("print_registry: not initialized");
+    return;
+  }
+  gEJIT->printRegistry();
+}
+
+void ejit_print_func_meta(const char *funcName) {
+  if (!funcName || !funcName[0]) {
+    EJIT_DIAG("print_func_meta: null/empty name");
+    return;
+  }
+  if (!gEJIT) {
+    EJIT_DIAG("print_func_meta: not initialized");
+    return;
+  }
+  gEJIT->printFuncMeta(funcName);
+}
+
 } // extern "C"

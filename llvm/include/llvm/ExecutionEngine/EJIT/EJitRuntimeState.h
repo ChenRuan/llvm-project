@@ -44,6 +44,13 @@ public:
 
   const std::vector<PeriodArrayInfo> *getArrays(const std::string &periodName) const;
   const std::vector<StaticVarInfo> &getStaticVars() const { return staticVars_; }
+  /// All period arrays grouped by period name. For diagnostics
+  /// (ejit_print_registry): iterating this exposes every registered array
+  /// without needing to know period names up front.
+  const std::unordered_map<std::string, std::vector<PeriodArrayInfo>> &
+  arraysByPeriod() const {
+    return arraysByPeriod_;
+  }
   const PeriodArrayInfo *getArrayInfo(const std::string &varName) const;
   void *getStaticVarAddr(const std::string &varName) const;
 

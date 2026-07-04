@@ -121,6 +121,15 @@ public:
   /// diagnostics). Always constructed; valid for the lifetime of the instance.
   EJitModuleLoader &moduleLoader() { return *moduleLoader_; }
 
+  /// Print the registered registry (bitcodes, period arrays, static vars) and
+  /// funcIndex/lifecycle counts through EJIT_DIAG. For ejit_print_registry().
+  void printRegistry() const;
+
+  /// Print the !ejit.metadata parsed from \p funcName's registered bitcode
+  /// (ejit_entry marker, period_arr_ind slots, period arrays, may_const field
+  /// offsets). For ejit_print_func_meta(). Non-const: caches func metadata.
+  void printFuncMeta(const std::string &funcName);
+
 private:
   Config config_;
   std::unique_ptr<EJitRuntimeState> runtimeState_;

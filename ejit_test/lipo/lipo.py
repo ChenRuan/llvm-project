@@ -358,6 +358,11 @@ def doit_gc_merge(args):
         "ejit_register_period_array", "ejit_register_static_var",
         "ejit_clear_cache", "ejit_compile_or_get", "ejit_invalidate",
         "ejit_set_compile_mode", "ejit_get_compile_mode", "ejit_get_last_error",
+        # General diagnostics (always available — defined outside the
+        # EJIT_SRE_TASKPOOL ifdef in EJitRuntime.cpp).
+        "ejit_set_log_level", "ejit_get_log_level",
+        "ejit_print_registry", "ejit_print_func_meta",
+        "ejit_dump_all",
     ]
     optional_api = [
         "ejit_register_lifecycle", "ejit_register_funcindex",

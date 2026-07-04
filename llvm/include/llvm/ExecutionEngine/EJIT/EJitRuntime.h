@@ -212,6 +212,41 @@ void ejit_print_dumped(const char *name);
 /// across cores.
 void ejit_dump_all(bool enable);
 
+/// Runtime diagnostic log level. Mirrors the EJIT_DIAG* macro thresholds.
+///   EJIT_LOG_OFF    — no diagnostic output
+///   EJIT_LOG_INFO   — key events (default): init, compile begin/OK/FAIL,
+///                      cache MISS, activation, errors, registration summary
+///   EJIT_LOG_VERBOSE — per-item detail: each registration, per-function
+///                      struct-field stats, per-call compile_or_get, taskpool
+///   EJIT_LOG_DEBUG  — internals: idempotent skips, per-load replacement
+///                      failures, dump mechanics
+typedef enum {
+  EJIT_LOG_OFF = 0,
+  EJIT_LOG_INFO = 1,
+  EJIT_LOG_VERBOSE = 2,
+  EJIT_LOG_DEBUG = 3,
+} ejit_log_level_t;
+
+/// Set the runtime diagnostic log level. Takes effect immediately for all
+/// subsequent EJIT_DIAG* output. Lower the level to reduce log volume in
+/// production; raise it to VERBOSE/DEBUG when diagnosing a problem.
+void ejit_set_log_level(ejit_log_level_t level);
+
+/// Current runtime diagnostic log level.
+ejit_log_level_t ejit_get_log_level(void);
+
+/// Print the registered registry through the platform log: every registered
+/// bitcode (funcIdx, name, size), period array (period, var, base, size),
+/// static var (var, addr), plus funcIndex/lifecycle counts. For verifying
+/// that AOT registration populated the runtime as expected.
+void ejit_print_registry(void);
+
+/// Print the !ejit.metadata of \p funcName (parsed from its registered
+/// bitcode): whether it is an ejit_entry, its period_arr_ind parameter slots,
+/// period arrays, and may_const field offsets. For diagnosing specialization
+/// parameter binding and constant-substitution eligibility.
+void ejit_print_func_meta(const char *funcName);
+
 // Cache
 void ejit_clear_cache(void);
 void ejit_invalidate(const char *periodName, uint8_t cellIdx);

@@ -2,6 +2,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
 #include "llvm/Config/Targets.h"
+#include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
@@ -11,6 +12,13 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/TargetParser/Triple.h"
 
@@ -657,3 +665,98 @@ const EJitSharedTaskPool *EJit::sharedTaskPool() const {
   return compileDriver_ ? compileDriver_->sharedTaskPool() : nullptr;
 }
 #endif
+
+void EJit::printRegistry() const {
+  const PeriodArrayRegistry &reg = runtimeState_->getRegistry();
+  EJIT_DIAG("registry: funcIndexes=%u lifecycles=%u",
+            EJitFuncRegistry::instance().count(),
+            EJitLifecycleRegistry::instance().count());
+
+  EJIT_DIAG("registry: bitcodes (%u):", EJitFuncRegistry::instance().count());
+  for (uint32_t idx = 0; idx < EJitFuncRegistry::instance().count(); ++idx) {
+    const std::string &name = moduleLoader_->getFuncNameByFuncIdx(idx);
+    if (name.empty())
+      continue;
+    auto bc = moduleLoader_->getBitcodeByFuncIdx(idx);
+    size_t sz = bc ? bc->size() : 0;
+    if (!bc)
+      consumeError(bc.takeError());
+    EJIT_DIAG("  idx=%u name=%s size=%zu", idx, name.c_str(), sz);
+  }
+
+  EJIT_DIAG("registry: period arrays:");
+  for (const auto &kv : reg.arraysByPeriod())
+    for (const auto &info : kv.second)
+      EJIT_DIAG("  period=%s var=%s base=%p size=%zu", kv.first.c_str(),
+                info.varName.c_str(), info.baseAddr, info.arraySize);
+
+  EJIT_DIAG("registry: static vars (%zu):", reg.getStaticVars().size());
+  for (const auto &sv : reg.getStaticVars())
+    EJIT_DIAG("  var=%s addr=%p", sv.varName.c_str(), sv.varAddr);
+}
+
+void EJit::printFuncMeta(const std::string &funcName) {
+  uint32_t idx = EJitFuncRegistry::instance().lookup(funcName);
+  if (idx == kEJitInvalidFuncIndex) {
+    EJIT_DIAG("func_meta: name=%s not registered", funcName.c_str());
+    return;
+  }
+  auto bc = moduleLoader_->getBitcodeByFuncIdx(idx);
+  if (!bc) {
+    EJIT_DIAG("func_meta: name=%s funcIdx=%u bitcode lookup error",
+              funcName.c_str(), idx);
+    consumeError(bc.takeError());
+    return;
+  }
+  auto Ctx = std::make_unique<LLVMContext>();
+  auto Buf = MemoryBuffer::getMemBuffer(*bc, "meta_" + std::to_string(idx) + ".bc");
+  auto MOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *Ctx);
+  if (!MOrErr) {
+    EJIT_DIAG("func_meta: name=%s funcIdx=%u parse bitcode error",
+              funcName.c_str(), idx);
+    consumeError(MOrErr.takeError());
+    return;
+  }
+  Function *F = (*MOrErr)->getFunction(funcName);
+  EJIT_DIAG("func_meta name=%s funcIdx=%u found=%d", funcName.c_str(), idx,
+            F && !F->isDeclaration() ? 1 : 0);
+  if (!F || F->isDeclaration()) {
+    EJIT_DIAG("  (no definition in bitcode)");
+    return;
+  }
+  MDNode *MD = F->getMetadata(MD_EJIT_METADATA);
+  if (!MD) {
+    EJIT_DIAG("  (no !ejit.metadata)");
+    return;
+  }
+  EJIT_DIAG("  ejit_entry=%d",
+            hasMDStringEntry(MD, TAG_EJIT_ENTRY) ? 1 : 0);
+  for (const MDOperand &Op : MD->operands()) {
+    auto *Sub = dyn_cast<MDNode>(Op.get());
+    if (!Sub || Sub->getNumOperands() == 0)
+      continue;
+    auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+    if (!Tag)
+      continue;
+    StringRef tag = Tag->getString();
+    // Render the remaining operands: MDString as their string, ConstantInt as
+    // its integer value, anything else as a placeholder.
+    std::string rest;
+    raw_string_ostream OS(rest);
+    for (unsigned i = 1; i < Sub->getNumOperands(); ++i) {
+      if (i > 1)
+        OS << ",";
+      if (auto *S = dyn_cast<MDString>(Sub->getOperand(i)))
+        OS << S->getString();
+      else if (auto *C = dyn_cast<ConstantAsMetadata>(Sub->getOperand(i)))
+        if (auto *CI = dyn_cast<ConstantInt>(C->getValue()))
+          OS << CI->getZExtValue();
+        else
+          OS << "?";
+      else
+        OS << "?";
+    }
+    OS.flush();
+    EJIT_DIAG("  %s %s", tag.str().c_str(), rest.c_str());
+  }
+}
