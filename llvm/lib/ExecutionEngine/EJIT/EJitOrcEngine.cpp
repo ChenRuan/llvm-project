@@ -91,7 +91,7 @@ static std::string gDumpFuncFilter;
 
 void setDumpFuncFilter(const std::string &name) {
   gDumpFuncFilter = name;
-  EJIT_DIAG("set_dump_filter value=%s &filter=%p",
+  EJIT_DIAG_DEBUG("set_dump_filter value=%s &filter=%p",
             gDumpFuncFilter.empty() ? "(off)" : gDumpFuncFilter.c_str(),
             (void *)&gDumpFuncFilter);
 #ifdef EJIT_SRE_SHARED_TASKPOOL
@@ -116,7 +116,7 @@ void setDumpFuncFilter(const std::string &name) {
     D.truncated.storeRelease(0);
     D.filterEnabled.storeRelease(len ? 1u : 0u);
     D.lock.storeRelease(0);
-    EJIT_DIAG("set_dump_filter shared enabled=%u len=%u &shared=%p",
+    EJIT_DIAG_DEBUG("set_dump_filter shared enabled=%u len=%u &shared=%p",
               len ? 1u : 0u, len, (void *)gDumpSharedState);
   }
 #endif
@@ -125,7 +125,7 @@ void setDumpFuncFilter(const std::string &name) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 void setDumpSharedState(EJitSharedTaskPoolState *state) {
   gDumpSharedState = state;
-  EJIT_DIAG("set_dump_shared_state state=%p", (void *)state);
+  EJIT_DIAG_DEBUG("set_dump_shared_state state=%p", (void *)state);
 }
 
 static void sharedDumpLock(EJitSharedDumpState &D) {
@@ -256,7 +256,7 @@ static void captureSharedDump(const std::string &fnName, uint64_t cacheKey,
                            (asmTrunc ? 2u : 0u));
   D.resultValid.storeRelease(1);
   sharedDumpUnlock(D);
-  EJIT_DIAG("capture shared func=%s ir=%u asm=%u trunc=0x%x &shared=%p",
+  EJIT_DIAG_DEBUG("capture shared func=%s ir=%u asm=%u trunc=0x%x &shared=%p",
             fnName.c_str(), (unsigned)IR.size(), (unsigned)ASM.size(),
             (nameTrunc ? 4u : 0u) | (irTrunc ? 1u : 0u) |
                 (asmTrunc ? 2u : 0u),
@@ -270,7 +270,7 @@ static bool printSharedDumped(const char *name) {
   sharedDumpLock(D);
   bool valid = D.resultValid.loadAcquire() != 0;
   if (!valid) {
-    EJIT_DIAG("print_dumped shared: nothing saved &shared=%p",
+    EJIT_DIAG_DEBUG("print_dumped shared: nothing saved &shared=%p",
               (void *)gDumpSharedState);
     sharedDumpUnlock(D);
     return false;
@@ -284,7 +284,7 @@ static bool printSharedDumped(const char *name) {
     match = (i == D.resultNameLen && name[i] == 0);
   }
   if (!match) {
-    EJIT_DIAG("print_dumped shared miss name=%s stored=%s ir=%u asm=%u",
+    EJIT_DIAG_DEBUG("print_dumped shared miss name=%s stored=%s ir=%u asm=%u",
               name ? name : "(null)", D.resultName, D.irSize, D.asmSize);
     sharedDumpUnlock(D);
     return false;
@@ -308,13 +308,13 @@ static bool printSharedDumped(const char *name) {
 /// post-optimization IR and emitted ASM for later selective printing.
 static void captureDump(const std::string &fnName, uint64_t cacheKey,
                         std::string IR, std::string ASM) {
-  EJIT_DIAG("capture enter func=%s ir_size=%u asm_size=%u &store=%p",
+  EJIT_DIAG_DEBUG("capture enter func=%s ir_size=%u asm_size=%u &store=%p",
             fnName.c_str(), (unsigned)IR.size(), (unsigned)ASM.size(),
             (void *)&gDumpStore);
   std::lock_guard<DumpMutexType> lock(gDumpMutex);
-  EJIT_DIAG("capture store_size before=%u", (unsigned)gDumpStore.size());
+  EJIT_DIAG_DEBUG("capture store_size before=%u", (unsigned)gDumpStore.size());
   gDumpStore[fnName] = DumpEntry{cacheKey, std::move(IR), std::move(ASM)};
-  EJIT_DIAG("capture store_size after=%u", (unsigned)gDumpStore.size());
+  EJIT_DIAG_DEBUG("capture store_size after=%u", (unsigned)gDumpStore.size());
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   const DumpEntry &E = gDumpStore[fnName];
   captureSharedDump(fnName, cacheKey, E.IR, E.ASM);
@@ -393,9 +393,9 @@ Expected<std::unique_ptr<EJitOrcEngine>>
 EJitOrcEngine::Create(const Config &config,
                       PeriodArrayRegistry &periodReg,
                       EJitRuntimeState &runtimeState) {
-  EJIT_DIAG("create: opt=%d dump=%s",
-            static_cast<int>(config.optLevel),
-            config.dumpJITDir.empty() ? "(off)" : config.dumpJITDir.c_str());
+  EJIT_DIAG_VERBOSE("create: opt=%d dump=%s",
+                    static_cast<int>(config.optLevel),
+                    config.dumpJITDir.empty() ? "(off)" : config.dumpJITDir.c_str());
   auto engine = std::unique_ptr<EJitOrcEngine>(new EJitOrcEngine());
   engine->P->periodReg = &periodReg;
   engine->P->runtimeState = &runtimeState;
@@ -504,8 +504,8 @@ EJitOrcEngine::Create(const Config &config,
                   toString(std::move(Err)).c_str());
     }
   }
-  EJIT_DIAG("create: static vars registered=%zu",
-            periodReg.getStaticVars().size());
+  EJIT_DIAG_VERBOSE("create: static vars registered=%zu",
+                    periodReg.getStaticVars().size());
 
   // Set up IR transform layer: runs the specialization pipeline during
   // JIT compilation (parameter substitution → InstCombine → StructFieldPass
@@ -587,21 +587,21 @@ EJitOrcEngine::Create(const Config &config,
               // ejit_test/stubs/ejit_sre_format_stubs.cpp into the SRE/lipo
               // image, or provide an equivalent platform vsnprintf.
               if (engine->P->dumpTM) {
-                EJIT_DIAG("dump asm begin fn=%s", ctx->fnName.c_str());
+                EJIT_DIAG_DEBUG("dump asm begin fn=%s", ctx->fnName.c_str());
                 SmallVector<char, 0> AsmBuf;
                 raw_svector_ostream AOS(AsmBuf);
                 legacy::PassManager PM;
                 if (!engine->P->dumpTM->addPassesToEmitFile(
                         PM, AOS, /*DwoOut=*/nullptr,
                         CodeGenFileType::AssemblyFile)) {
-                  EJIT_DIAG("dump asm PM.run begin fn=%s", ctx->fnName.c_str());
+                  EJIT_DIAG_DEBUG("dump asm PM.run begin fn=%s", ctx->fnName.c_str());
                   PM.run(M);
-                  EJIT_DIAG("dump asm PM.run end fn=%s", ctx->fnName.c_str());
+                  EJIT_DIAG_DEBUG("dump asm PM.run end fn=%s", ctx->fnName.c_str());
                   Asm.assign(AsmBuf.begin(), AsmBuf.end());
-                  EJIT_DIAG("dump asm size=%u fn=%s", (unsigned)Asm.size(),
+                  EJIT_DIAG_DEBUG("dump asm size=%u fn=%s", (unsigned)Asm.size(),
                             ctx->fnName.c_str());
                 } else {
-                  EJIT_DIAG("dump asm addPassesToEmitFile failed fn=%s",
+                  EJIT_DIAG_DEBUG("dump asm addPassesToEmitFile failed fn=%s",
                             ctx->fnName.c_str());
                 }
               }
@@ -620,8 +620,8 @@ EJitOrcEngine::Create(const Config &config,
 Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
                                        uint64_t cacheKey,
                                        const std::string &origFnName) {
-  EJIT_DIAG("loadBitcode key=0x%016lx func=%s size=%zu", cacheKey,
-            origFnName.c_str(), bitcodeData.size());
+  EJIT_DIAG_VERBOSE("loadBitcode key=0x%016lx func=%s size=%zu", cacheKey,
+                    origFnName.c_str(), bitcodeData.size());
   auto Ctx = std::make_unique<LLVMContext>();
   auto Buf = MemoryBuffer::getMemBuffer(
       bitcodeData, ("spec_" + std::to_string(cacheKey) + ".bc"));
@@ -767,7 +767,8 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
   }
 
   P->specDylibs[cacheKey] = &*JDOrErr;
-  EJIT_DIAG("loadBitcode OK key=0x%016lx func=%s", cacheKey, origFnName.c_str());
+  EJIT_DIAG_VERBOSE("loadBitcode OK key=0x%016lx func=%s", cacheKey,
+                    origFnName.c_str());
   return Error::success();
 }
 
@@ -811,8 +812,8 @@ Expected<void *> EJitOrcEngine::lookup(uint64_t cacheKey,
   }
 #endif
 
-  EJIT_DIAG("lookup OK key=0x%016lx name=%s ptr=%p", cacheKey, name.c_str(),
-            Ptr);
+  EJIT_DIAG_VERBOSE("lookup OK key=0x%016lx name=%s ptr=%p", cacheKey,
+                    name.c_str(), Ptr);
   return Ptr;
 }
 

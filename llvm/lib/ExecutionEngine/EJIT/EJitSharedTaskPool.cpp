@@ -418,7 +418,7 @@ EJitSharedPoolSplit *EJitSharedTaskPool::findOrClaimPoolSlot(uintptr_t base) {
 bool EJitSharedTaskPool::ensurePoolSplitForCurrentCore(uint32_t self,
                                                        uintptr_t poolBase,
                                                        uint64_t poolSize) {
-  EJIT_DIAG("ensurePoolSplit: core=%u poolBase=0x%llx size=%llu", self,
+  EJIT_DIAG_VERBOSE("ensurePoolSplit: core=%u poolBase=0x%llx size=%llu", self,
             static_cast<unsigned long long>(poolBase),
             static_cast<unsigned long long>(poolSize));
   // Cores beyond the 64-bit memo width cannot record split state, so they must
@@ -433,7 +433,7 @@ bool EJitSharedTaskPool::ensurePoolSplitForCurrentCore(uint32_t self,
 
   EJitSharedPoolSplit *P = findOrClaimPoolSlot(poolBase);
   if (!P) {
-    EJIT_DIAG("ensurePoolSplit fallback: core=%u poolBase=0x%llx split table full",
+    EJIT_DIAG_VERBOSE("ensurePoolSplit fallback: core=%u poolBase=0x%llx split table full",
               self, static_cast<unsigned long long>(poolBase));
     return false; // table full -> clean fallback.
   }
@@ -458,7 +458,7 @@ bool EJitSharedTaskPool::ensurePoolSplitForCurrentCore(uint32_t self,
     }
     bool done = (P->splitDoneMask.loadAcquire() & Bit) != 0;
     if (!done)
-      EJIT_DIAG("ensurePoolSplit fallback: core=%u poolBase=0x%llx peer split "
+      EJIT_DIAG_VERBOSE("ensurePoolSplit fallback: core=%u poolBase=0x%llx peer split "
                 "did not publish done", self,
                 static_cast<unsigned long long>(poolBase));
     return done;
@@ -480,7 +480,7 @@ bool EJitSharedTaskPool::ensurePoolSplitForCurrentCore(uint32_t self,
 
 bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
                                                    uint32_t self) {
-  EJIT_DIAG("prepareExec: core=%u fn=%p codeStart=0x%llx codeSize=%llu "
+  EJIT_DIAG_VERBOSE("prepareExec: core=%u fn=%p codeStart=0x%llx codeSize=%llu "
             "poolBase=0x%llx fourK=%u", self, R.fn,
             static_cast<unsigned long long>(R.codeStart),
             static_cast<unsigned long long>(R.codeSize),
@@ -503,7 +503,7 @@ bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
   // 4K page seal needs the real executable extent. A slot with no recorded
   // range (or a malformed one) is a clean fallback, never a guessed seal.
   if (R.codeStart == 0 || R.codeSize == 0 || R.poolBase == 0 || R.poolSize == 0) {
-    EJIT_DIAG("prepareExec fallback: core=%u fn=%p malformed range "
+    EJIT_DIAG_VERBOSE("prepareExec fallback: core=%u fn=%p malformed range "
               "(codeStart=0x%llx codeSize=%llu poolBase=0x%llx poolSize=%llu)",
               self, R.fn, static_cast<unsigned long long>(R.codeStart),
               static_cast<unsigned long long>(R.codeSize),
@@ -512,16 +512,16 @@ bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
     return false;
   }
   if (R.codeStart + R.codeSize < R.codeStart) { // code range overflow
-    EJIT_DIAG("prepareExec fallback: core=%u code range overflow", self);
+    EJIT_DIAG_VERBOSE("prepareExec fallback: core=%u code range overflow", self);
     return false;
   }
   if (R.poolBase + R.poolSize < R.poolBase) { // pool range overflow
-    EJIT_DIAG("prepareExec fallback: core=%u pool range overflow", self);
+    EJIT_DIAG_VERBOSE("prepareExec fallback: core=%u pool range overflow", self);
     return false;
   }
   if (R.codeStart < R.poolBase ||
       R.codeStart + R.codeSize > R.poolBase + R.poolSize) {
-    EJIT_DIAG("prepareExec fallback: core=%u code not inside pool", self);
+    EJIT_DIAG_VERBOSE("prepareExec fallback: core=%u code not inside pool", self);
     return false; // code must lie wholly inside its pool.
   }
 
@@ -543,7 +543,7 @@ bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
                 self, static_cast<unsigned long long>(VA));
       return false; // any page failure -> no callable pointer is returned.
     }
-  EJIT_DIAG("prepareExec OK: core=%u fn=%p pages=[0x%llx,0x%llx)", self, R.fn,
+  EJIT_DIAG_VERBOSE("prepareExec OK: core=%u fn=%p pages=[0x%llx,0x%llx)", self, R.fn,
             static_cast<unsigned long long>(PageStart),
             static_cast<unsigned long long>(PageEnd));
   return true;
@@ -891,10 +891,10 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
                                  uint32_t numDims, void *fallback) {
   CompileOrGetResult R;
   R.fnPtr = fallback;
-  EJIT_DIAG("shared taskpool request func=%u dims=%u fallback=%p", funcIndex,
+  EJIT_DIAG_VERBOSE("shared taskpool request func=%u dims=%u fallback=%p", funcIndex,
             numDims, fallback);
   if (!state_ || state_->initState.loadAcquire() != kReady) {
-    EJIT_DIAG("shared taskpool fallback func=%u: not Ready", funcIndex);
+    EJIT_DIAG_VERBOSE("shared taskpool fallback func=%u: not Ready", funcIndex);
     R.status = EJitCompileOrGetStatus::OffMode; // not Ready → clean fallback.
     return R;
   }
@@ -908,7 +908,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   for (uint32_t i = 0; i < numDims; ++i)
     if (!isInstanceEnabled(dims[i].dimType, dims[i].instanceId)) {
       state_->counters.instanceDisabled.fetchAdd(1);
-      EJIT_DIAG("shared taskpool disabled func=%u dim[%u]=(%u,%u)", funcIndex,
+      EJIT_DIAG_VERBOSE("shared taskpool disabled func=%u dim[%u]=(%u,%u)", funcIndex,
                 i, dims[i].dimType, dims[i].instanceId);
       R.status = EJitCompileOrGetStatus::InstanceDisabled;
       return R;
@@ -921,14 +921,14 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     R.fnPtr = Hit.fnPtr;
     R.bucketIndex = Hit.bucketIndex;
     R.hasReadToken = true;
-    EJIT_DIAG("shared taskpool hit func=%u bucket=%u fn=%p", funcIndex,
+    EJIT_DIAG_VERBOSE("shared taskpool hit func=%u bucket=%u fn=%p", funcIndex,
               Hit.bucketIndex, Hit.fnPtr);
     return R;
   }
   if (Hit.readyButNotShareable) {
     // The work is already done but this core may not read the cross-core
     // pointer; fall back cleanly WITHOUT re-enqueuing (avoids recompile churn).
-    EJIT_DIAG("shared taskpool fallback func=%u: ready but not shareable on this core",
+    EJIT_DIAG_VERBOSE("shared taskpool fallback func=%u: ready but not shareable on this core",
               funcIndex);
     R.status = EJitCompileOrGetStatus::OffMode;
     R.readyButNotShareable = true;
@@ -937,7 +937,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   // Off mode (§5.2 step 2).
   if (state_->mode.loadAcquire() ==
       static_cast<uint32_t>(EJitCompileMode::Off)) {
-    EJIT_DIAG("shared taskpool fallback func=%u: mode off", funcIndex);
+    EJIT_DIAG_VERBOSE("shared taskpool fallback func=%u: mode off", funcIndex);
     R.status = EJitCompileOrGetStatus::OffMode;
     return R;
   }
@@ -955,7 +955,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   switch (dedupMark(funcIndex, gen)) {
   case EJitDedupResult::AlreadyPending:
     state_->counters.alreadyPending.fetchAdd(1);
-    EJIT_DIAG("shared taskpool coalesced func=%u: already pending", funcIndex);
+    EJIT_DIAG_VERBOSE("shared taskpool coalesced func=%u: already pending", funcIndex);
     R.status = EJitCompileOrGetStatus::AlreadyPending;
     return R;
   case EJitDedupResult::InvalidFuncIndex:
@@ -973,7 +973,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     return R;
   }
   state_->counters.asyncEnqueues.fetchAdd(1);
-  EJIT_DIAG("shared taskpool enqueued func=%u gen=%u", funcIndex, gen);
+  EJIT_DIAG_VERBOSE("shared taskpool enqueued func=%u gen=%u", funcIndex, gen);
   R.status = EJitCompileOrGetStatus::EnqueuedPending;
   return R;
 }
@@ -982,7 +982,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
 // Consumer path (§5.3) — runs on the single owner worker (or a test driver).
 //===----------------------------------------------------------------------===//
 void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
-  EJIT_DIAG("shared worker compile begin func=%u dims=%u gen=%u", req.funcIndex,
+  EJIT_DIAG_VERBOSE("shared worker compile begin func=%u dims=%u gen=%u", req.funcIndex,
             req.numDims, req.generation);
   // Checkpoint 0 (spec §11): generation guard. A request enqueued under an
   // earlier generation (owner re-init in between) is dropped before compiling.
@@ -1036,7 +1036,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   case EJitPublishStatus::Published:
     state_->counters.asyncCompiles.fetchAdd(1);
     dedupClear(req.funcIndex, req.generation);
-    EJIT_DIAG("shared worker publish ok func=%u fn=%p", req.funcIndex, fn);
+    EJIT_DIAG_VERBOSE("shared worker publish ok func=%u fn=%p", req.funcIndex, fn);
     return;
   case EJitPublishStatus::VersionMismatch:
     if (releaseFn_)
@@ -1092,13 +1092,13 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
   case EJitSharedInitState::Failed:
   case EJitSharedInitState::Stopping:
   default:
-    EJIT_DIAG("shared worker exit: state=%u", st);
+    EJIT_DIAG_DEBUG("shared worker exit: state=%u", st);
     return EJitWorkerStep::Exit;
   }
 }
 
 void EJitSharedTaskPool::runWorkerLoop() {
-  EJIT_DIAG("shared worker loop enter");
+  EJIT_DIAG_VERBOSE("shared worker loop enter");
   // Loop until a terminal state. The worker is a PRODUCTION-lifetime task: it
   // never exits just because the owner is slightly slow to publish Ready (no
   // spin budget). On every non-consuming iteration — waiting through
@@ -1115,7 +1115,7 @@ void EJitSharedTaskPool::runWorkerLoop() {
       workerIdle();
     // Consumed: loop immediately, more work is likely queued.
   }
-  EJIT_DIAG("shared worker loop leave");
+  EJIT_DIAG_VERBOSE("shared worker loop leave");
 }
 
 void EJitSharedTaskPool::workerIdle() {

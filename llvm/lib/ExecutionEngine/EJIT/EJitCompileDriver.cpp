@@ -266,7 +266,7 @@ void *EJitCompileDriver::getOrCompile(uint64_t cacheKey) {
 
   // ── Hot path: single hash find ───────────────────────────────────────────
   if (void *cached = cache_.getOrNull(cacheKey)) {
-    EJIT_DIAG("cache HIT key=0x%016lx", cacheKey);
+    EJIT_DIAG_VERBOSE("cache HIT key=0x%016lx", cacheKey);
     return cached;
   }
 

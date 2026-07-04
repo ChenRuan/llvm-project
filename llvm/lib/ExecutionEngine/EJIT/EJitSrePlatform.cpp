@@ -78,8 +78,8 @@ llvm::ejit::makeSreCodePoolManager() {
   Opts.poolSize = static_cast<size_t>(kSrePoolSize);
   Opts.poolAlign = k2MiB; // large-page / split granularity
   Opts.minCodeAlign = 64;
-  EJIT_DIAG("makeSreCodePoolManager: poolSize=%llu poolAlign=%zu",
-            kSrePoolSize, k2MiB);
+  EJIT_DIAG_VERBOSE("makeSreCodePoolManager: poolSize=%llu poolAlign=%zu",
+                    kSrePoolSize, k2MiB);
 #ifdef EJIT_CODE_POOL_4K_SEAL
   // Adapt to the platform's 4K execute-permission interface: the 2MiB pool is
   // split into 4K mappings at creation and sealed one 4KiB page at a time.

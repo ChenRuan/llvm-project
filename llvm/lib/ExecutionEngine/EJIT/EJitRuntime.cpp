@@ -322,8 +322,8 @@ void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn) {
   if (out_pfn)
     *out_pfn = result;
 
-  EJIT_DIAG("compile_or_get(key=0x%016lx) → %s", cacheKey,
-            result ? "JIT" : "NULL");
+  EJIT_DIAG_VERBOSE("compile_or_get(key=0x%016lx) → %s", cacheKey,
+                    result ? "JIT" : "NULL");
   return result;
 }
 
@@ -441,7 +441,8 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     *outFn = nullptr;
   if (outBucket)
     *outBucket = 0;
-  EJIT_DIAG("taskpool_compile_or_get func=%u dims=%u", funcIndex, numDims);
+  EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u dims=%u", funcIndex,
+                    numDims);
   if (!gEJIT) {
     EJIT_DIAG("taskpool_compile_or_get reject func=%u: not initialized",
               funcIndex);
@@ -487,15 +488,15 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     *outFn = r.fnPtr;
   if (outBucket)
     *outBucket = r.bucketIndex;
-  EJIT_DIAG("taskpool_compile_or_get func=%u status=%u fn=%p", funcIndex,
-            static_cast<unsigned>(r.status), r.fnPtr);
+  EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u status=%u fn=%p",
+                    funcIndex, static_cast<unsigned>(r.status), r.fnPtr);
   return taskpoolStatus(r.status);
 }
 
 void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
                                         uint32_t enabled) {
-  EJIT_DIAG("taskpool_set_instance_enabled dim=%u inst=%u enabled=%u", dimType,
-            instanceId, enabled);
+  EJIT_DIAG_VERBOSE("taskpool_set_instance_enabled dim=%u inst=%u enabled=%u",
+                    dimType, instanceId, enabled);
   if (!gEJIT) {
     EJIT_DIAG("taskpool_set_instance_enabled reject: not initialized");
     return;

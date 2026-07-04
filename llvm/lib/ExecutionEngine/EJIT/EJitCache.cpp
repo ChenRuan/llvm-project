@@ -34,7 +34,7 @@ void *EJitCache::getOrNull(uint64_t cacheKey) {
 bool EJitCache::put(uint64_t cacheKey, void *funcPtr,
                     size_t codeSize,
                     ArrayRef<std::string> periodDeps) {
-  EJIT_DIAG("cache put key=0x%016lx fn=%p size=%zu deps=%zu", cacheKey, funcPtr,
+  EJIT_DIAG_VERBOSE("cache put key=0x%016lx fn=%p size=%zu deps=%zu", cacheKey, funcPtr,
             codeSize, periodDeps.size());
   std::unique_lock<decltype(mutex_)> lock(mutex_);
 
@@ -83,14 +83,14 @@ bool EJitCache::put(uint64_t cacheKey, void *funcPtr,
 
 void EJitCache::invalidateByPeriod(const std::string &periodName,
                                    uint8_t cellIdx) {
-  EJIT_DIAG("cache invalidate begin period=%s cellIdx=%u", periodName.c_str(),
+  EJIT_DIAG_VERBOSE("cache invalidate begin period=%s cellIdx=%u", periodName.c_str(),
             cellIdx);
   std::unique_lock<decltype(mutex_)> lock(mutex_);
   std::string dep = periodName + "=" + std::to_string(cellIdx);
 
   auto it = periodIndex_.find(dep);
   if (it == periodIndex_.end()) {
-    EJIT_DIAG("cache invalidate period=%s cellIdx=%u: no matching entries",
+    EJIT_DIAG_DEBUG("cache invalidate period=%s cellIdx=%u: no matching entries",
               periodName.c_str(), cellIdx);
     return;
   }
@@ -107,7 +107,7 @@ void EJitCache::invalidateByPeriod(const std::string &periodName,
   }
   periodIndex_.erase(it);
 
-  EJIT_DIAG("cache invalidate period=%s cellIdx=%u: %zu entries removed",
+  EJIT_DIAG_VERBOSE("cache invalidate period=%s cellIdx=%u: %zu entries removed",
            periodName.c_str(), cellIdx, removed);
   (void)removed;
 }
@@ -119,7 +119,7 @@ void EJitCache::clear() {
   lruList_.clear();
   periodIndex_.clear();
   currentTotalSize_ = 0;
-  EJIT_DIAG("cache cleared: %zu entries", cleared);
+  EJIT_DIAG_VERBOSE("cache cleared: %zu entries", cleared);
   (void)cleared;
 }
 
@@ -175,6 +175,6 @@ void EJitCache::evictLRU() {
 
   cache_.erase(it);
   evictions_++;
-  EJIT_DIAG("cache evict LRU key=0x%016lx: size=%zu entries=%zu/%zu",
+  EJIT_DIAG_VERBOSE("cache evict LRU key=0x%016lx: size=%zu entries=%zu/%zu",
            key, currentTotalSize_, cache_.size(), maxEntries_);
 }

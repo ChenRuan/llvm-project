@@ -99,9 +99,9 @@ void initializeEJitTargets() {
 } // namespace
 
 EJit::EJit(const Config &config) : config_(config) {
-  EJIT_DIAG("constructing: mode=%d opt=%d maxCache=%zu maxEntries=%u",
-            (int)config.compileMode, (int)config.optLevel, config.maxCacheSize,
-            (unsigned)config.maxCacheEntries);
+  EJIT_DIAG_VERBOSE("constructing: mode=%d opt=%d maxCache=%zu maxEntries=%u",
+                    (int)config.compileMode, (int)config.optLevel,
+                    config.maxCacheSize, (unsigned)config.maxCacheEntries);
 
   // Create all runtime components
   runtimeState_ = std::make_unique<EJitRuntimeState>();
@@ -272,8 +272,8 @@ EJit::EJit(const Config &config) : config_(config) {
   if (!initFailed_) {
     regPhase_ = RegistrationPhase::Frozen;
     if (config_.compileMode == CompileMode::Async) {
-      EJIT_DIAG("taskpool async init: engineReady=%u",
-                static_cast<unsigned>(engineReady));
+      EJIT_DIAG_VERBOSE("taskpool async init: engineReady=%u",
+                        static_cast<unsigned>(engineReady));
       if (!engineReady)
         recordInitError(EJIT_ERR_COMPILE_FAILED,
                         "Async mode requires a ready ORC engine", "");
@@ -292,7 +292,7 @@ EJit::EJit(const Config &config) : config_(config) {
       else
         EJIT_DIAG("taskpool async init complete: worker running");
     } else {
-      EJIT_DIAG("taskpool sync init complete: worker remains stopped");
+      EJIT_DIAG_VERBOSE("taskpool sync init complete: worker remains stopped");
     }
   }
 #else

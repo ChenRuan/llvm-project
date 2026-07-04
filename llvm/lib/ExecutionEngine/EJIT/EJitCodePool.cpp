@@ -46,9 +46,9 @@ EJitCodePoolManager::EJitCodePoolManager(Options Opts, RawAllocFn Alloc,
     if (Opts_.poolSize == 0)
       Opts_.poolSize = Opts_.poolAlign;
   }
-  EJIT_DIAG("code pool ctor: poolSize=%zu poolAlign=%zu minCodeAlign=%zu "
-            "fourKSeal=%u sealPage=%zu",
-            Opts_.poolSize, Opts_.poolAlign, Opts_.minCodeAlign,
+  EJIT_DIAG_VERBOSE("code pool ctor: poolSize=%zu poolAlign=%zu minCodeAlign=%zu "
+                    "fourKSeal=%u sealPage=%zu",
+                    Opts_.poolSize, Opts_.poolAlign, Opts_.minCodeAlign,
             static_cast<unsigned>(Opts_.fourKSeal), Opts_.sealPageSize);
 }
 

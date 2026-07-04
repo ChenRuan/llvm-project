@@ -116,8 +116,8 @@ void EJitRuntimeState::activate(const std::string &periodName,
 
 void EJitRuntimeState::deactivate(const std::string &periodName,
                                   uint8_t cellIdx) {
-  EJIT_DIAG("runtimeState deactivate period=%s cellIdx=%u", periodName.c_str(),
-            cellIdx);
+  EJIT_DIAG_DEBUG("runtimeState deactivate period=%s cellIdx=%u",
+                  periodName.c_str(), cellIdx);
 #ifndef EJIT_FREESTANDING
   std::lock_guard<decltype(mutex_)> lock(mutex_);
 #endif
@@ -130,7 +130,7 @@ void EJitRuntimeState::deactivate(const std::string &periodName,
 }
 
 void EJitRuntimeState::activateAll(const std::string &periodName) {
-  EJIT_DIAG("runtimeState activateAll period=%s", periodName.c_str());
+  EJIT_DIAG_DEBUG("runtimeState activateAll period=%s", periodName.c_str());
 #ifndef EJIT_FREESTANDING
   std::lock_guard<decltype(mutex_)> lock(mutex_);
 #endif
@@ -145,7 +145,7 @@ void EJitRuntimeState::activateAll(const std::string &periodName) {
 }
 
 void EJitRuntimeState::deactivateAll(const std::string &periodName) {
-  EJIT_DIAG("runtimeState deactivateAll period=%s", periodName.c_str());
+  EJIT_DIAG_DEBUG("runtimeState deactivateAll period=%s", periodName.c_str());
 #ifndef EJIT_FREESTANDING
   std::lock_guard<decltype(mutex_)> lock(mutex_);
 #endif
