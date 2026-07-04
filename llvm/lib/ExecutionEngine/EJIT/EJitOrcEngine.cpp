@@ -344,26 +344,31 @@ static void printOneDumpSafe(const char *requestedName,
 /// null/empty) through EJIT_DIAG, one line per IR/ASM line. Names with no
 /// saved capture are reported as missing.
 void printDumped(const char *name) {
-  EJIT_DIAG("print_dumped enter name=%s &filter=%p &store=%p",
+  EJIT_DIAG_DEBUG("print_dumped enter name=%s &filter=%p &store=%p",
             (name && name[0]) ? name : "(all)", (void *)&gDumpFuncFilter,
             (void *)&gDumpStore);
+  bool hasName = name && name[0];
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (printSharedDumped(name))
+  // A specific name may have been captured on another core: try the shared
+  // single-result first. For "print all" (name NULL/empty) skip the shared
+  // path — it holds only the latest capture — and iterate the local store,
+  // which keeps one entry per function name (every dump-all capture).
+  if (hasName && printSharedDumped(name))
     return;
 #endif
   std::lock_guard<DumpMutexType> lock(gDumpMutex);
-  EJIT_DIAG("print_dumped store_size=%u", (unsigned)gDumpStore.size());
-  if (name && name[0]) {
+  EJIT_DIAG_DEBUG("print_dumped store_size=%u", (unsigned)gDumpStore.size());
+  if (hasName) {
     auto it = gDumpStore.find(name);
     if (it != gDumpStore.end()) {
       printOneDumpSafe(name, it->first, it->second);
     } else {
-      EJIT_DIAG("print_dumped miss name=%s store_size=%u", name,
+      EJIT_DIAG_DEBUG("print_dumped miss name=%s store_size=%u", name,
                 (unsigned)gDumpStore.size());
       unsigned idx = 0;
       for (auto &kv : gDumpStore) {
         (void)kv;
-        EJIT_DIAG("stored[%u]=%s ir=%u asm=%u", idx, kv.first.c_str(),
+        EJIT_DIAG_DEBUG("stored[%u]=%s ir=%u asm=%u", idx, kv.first.c_str(),
                   (unsigned)kv.second.IR.size(),
                   (unsigned)kv.second.ASM.size());
         ++idx;
@@ -550,16 +555,22 @@ EJitOrcEngine::Create(const Config &config,
           // ejit_print_dumped(). Bare-metal-safe (strings only, no
           // raw_fd_ostream). Captures the post-optimization IR and the emitted
           // assembly (from the same TargetMachine the JIT compiles with).
+          // The filter value "*" is a wildcard: every specialization is captured
+          // (ejit_dump_all(true) sets it). The local gDumpStore keeps one entry
+          // per function name (overwritten on re-compile), so dump-all is
+          // bounded by the number of distinct entry functions; the cross-core
+          // shared result keeps only the latest capture (see ejit_print_dumped).
           {
             std::string DumpFilter;
             bool hasFilter = getActiveDumpFilter(DumpFilter);
-            bool match = hasFilter && ctx->fnName == DumpFilter;
-            EJIT_DIAG("dump check filter=%s fn=%s key_hi=0x%08x key_lo=0x%08x "
-                      "match=%d &filter=%p",
-                      hasFilter ? DumpFilter.c_str() : "(off)",
-                      ctx->fnName.c_str(), (uint32_t)(ctx->cacheKey >> 32),
-                      (uint32_t)(ctx->cacheKey & 0xffffffffu), match ? 1 : 0,
-                      (void *)&gDumpFuncFilter);
+            bool wildcard = hasFilter && DumpFilter == "*";
+            bool match = wildcard || (hasFilter && ctx->fnName == DumpFilter);
+            EJIT_DIAG_DEBUG("dump check filter=%s fn=%s key_hi=0x%08x "
+                            "key_lo=0x%08x match=%d wildcard=%d &filter=%p",
+                            hasFilter ? DumpFilter.c_str() : "(off)",
+                            ctx->fnName.c_str(), (uint32_t)(ctx->cacheKey >> 32),
+                            (uint32_t)(ctx->cacheKey & 0xffffffffu), match ? 1 : 0,
+                            wildcard ? 1 : 0, (void *)&gDumpFuncFilter);
             if (match) {
               // IR capture always runs first so it succeeds even if the ASM
               // diagnostic path is disabled or fails.

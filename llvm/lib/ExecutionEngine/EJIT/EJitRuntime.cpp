@@ -743,4 +743,22 @@ uint32_t ejit_taskpool_get_worker_core() {
 }
 #endif // EJIT_SRE_TASKPOOL
 
+//===----------------------------------------------------------------------===//
+// General diagnostics (available in every build, not only taskpool).
+//===----------------------------------------------------------------------===//
+
+void ejit_dump_all(bool enable) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (gEJIT) {
+    if (EJitSharedTaskPool *sp = gEJIT->sharedTaskPool())
+      setDumpSharedState(sp->state());
+  }
+#endif
+  // The "*" filter is a wildcard matched by every specialization in the IR
+  // transform layer (see getActiveDumpFilter / the capture condition). Capture
+  // is bounded by distinct function names; print with ejit_print_dumped(NULL).
+  EJIT_DIAG("dump_all enable=%u", enable ? 1u : 0u);
+  setDumpFuncFilter(enable ? std::string("*") : std::string());
+}
+
 } // extern "C"
