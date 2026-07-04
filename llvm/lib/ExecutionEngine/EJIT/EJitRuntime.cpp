@@ -22,6 +22,19 @@ using namespace llvm::ejit;
 
 static EJit *gEJIT = nullptr;
 
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+static void bindDumpSharedStateFromRuntime() {
+  if (!gEJIT) {
+    setDumpSharedState(nullptr);
+    return;
+  }
+  if (EJitSharedTaskPool *sp = gEJIT->sharedTaskPool())
+    setDumpSharedState(sp->state());
+  else
+    setDumpSharedState(nullptr);
+}
+#endif
+
 static void parseConfig(const ejit_config_t *src, Config &dst) {
   if (!src)
     return;
@@ -77,6 +90,9 @@ ejit_status_t ejit_init(const ejit_config_t *config) {
     return st;
   }
 
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  bindDumpSharedStateFromRuntime();
+#endif
   EJIT_DIAG("initialized: mode=%d opt=%d cache=%zu entries=%u",
             (int)cfg.compileMode, (int)cfg.optLevel, cfg.maxCacheSize,
             (unsigned)cfg.maxCacheEntries);
@@ -85,6 +101,9 @@ ejit_status_t ejit_init(const ejit_config_t *config) {
 
 void ejit_shutdown(void) {
   EJIT_DIAG("shutting down");
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  setDumpSharedState(nullptr);
+#endif
   delete gEJIT;
   gEJIT = nullptr;
   EJIT_DIAG("shutdown complete");
@@ -676,12 +695,24 @@ void ejit_taskpool_print_compiled() {
 }
 
 void ejit_dump_func(const char *name) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (gEJIT) {
+    if (EJitSharedTaskPool *sp = gEJIT->sharedTaskPool())
+      setDumpSharedState(sp->state());
+  }
+#endif
   std::string filter = (name && name[0]) ? std::string(name) : std::string();
   EJIT_DIAG("dump_func filter=%s", filter.empty() ? "(off)" : filter.c_str());
   setDumpFuncFilter(filter);
 }
 
 void ejit_print_dumped(const char *name) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (gEJIT) {
+    if (EJitSharedTaskPool *sp = gEJIT->sharedTaskPool())
+      setDumpSharedState(sp->state());
+  }
+#endif
   EJIT_DIAG("print_dumped name=%s", (name && name[0]) ? name : "(all)");
   printDumped(name);
 }

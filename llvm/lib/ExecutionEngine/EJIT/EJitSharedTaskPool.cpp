@@ -702,6 +702,26 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
     st->poolSplits[i].splitDoneMask.storeRelaxed(0);
     st->poolSplits[i].splitPreparingMask.storeRelaxed(0);
   }
+  st->dump.lock.storeRelaxed(0);
+  st->dump.filterEnabled.storeRelaxed(0);
+  st->dump.resultValid.storeRelaxed(0);
+  st->dump.truncated.storeRelaxed(0);
+  st->dump.filterLen = 0;
+  st->dump.resultNameLen = 0;
+  st->dump.irSize = 0;
+  st->dump.asmSize = 0;
+  st->dump.keyHi = 0;
+  st->dump.keyLo = 0;
+  st->dump.reserved0 = 0;
+  st->dump.reserved1 = 0;
+  for (uint32_t i = 0; i < kEJitSharedDumpNameBytes; ++i) {
+    st->dump.filterName[i] = 0;
+    st->dump.resultName[i] = 0;
+  }
+  for (uint32_t i = 0; i < kEJitSharedDumpTextBytes; ++i) {
+    st->dump.ir[i] = 0;
+    st->dump.asmText[i] = 0;
+  }
   for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b) {
     st->buckets[b].writeFlag.storeRelaxed(0);
     st->buckets[b].readers.storeRelaxed(0);
