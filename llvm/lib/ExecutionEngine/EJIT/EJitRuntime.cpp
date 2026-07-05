@@ -431,7 +431,6 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     return EJIT_ERR_NOT_ACTIVE;
   }
 
-  EJitDimPair localDims[4];
   if (numDims > 4) {
     EJIT_DIAG("taskpool_compile_or_get reject func=%u: numDims=%u > 4",
               funcIndex, numDims);
@@ -443,8 +442,6 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     return EJIT_ERR_INVALID_PARAM;
   }
   for (uint32_t i = 0; i < numDims; ++i) {
-    // dimType is an explicit lifecycle index in [0, MAX_DIM_TYPES); instanceId
-    // is in [0, MAX_INSTANCES). Both are range-checked (spec §5.1).
     if (dims[i].dimType >= EJitSwitchController::MAX_DIM_TYPES) {
       EJIT_DIAG("taskpool_compile_or_get reject func=%u: dim[%u] dimType=%u OOR",
                 funcIndex, i, dims[i].dimType);
@@ -455,11 +452,12 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
                 funcIndex, i, dims[i].instanceId);
       return EJIT_ERR_INVALID_PARAM;
     }
-    localDims[i].dimType = dims[i].dimType;
-    localDims[i].instanceId = dims[i].instanceId;
   }
 
-  auto r = tp->compileOrGet(funcIndex, numDims ? localDims : nullptr, numDims,
+  // ejit_dim_pair_t and EJitDimPair share the same layout; pass through
+  // to avoid a stack copy of up to 4 dim pairs.
+  auto r = tp->compileOrGet(funcIndex,
+                            reinterpret_cast<const EJitDimPair *>(dims), numDims,
                             /*fallback=*/nullptr);
   if (outFn)
     *outFn = r.fnPtr;

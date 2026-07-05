@@ -509,7 +509,9 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       Builder.CreateStore(InstanceId, InstancePtr);
     }
 
-    Value *DimsPtr = Builder.CreatePointerCast(DimsAlloca, PtrTy);
+    Value *DimsPtr =
+        DimCount > 0 ? Builder.CreatePointerCast(DimsAlloca, PtrTy)
+                     : ConstantPointerNull::get(PtrTy);
     Value *Status = Builder.CreateCall(
         M.getFunction(FN_TASKPOOL_COMPILE_OR_GET),
         {FuncIdx, DimsPtr, ConstantInt::get(I32Ty, DimCount),

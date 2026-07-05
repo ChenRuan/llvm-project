@@ -321,15 +321,9 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   EJIT_DIAG_VERBOSE("taskpool request func=%u dims=%u fallback=%p", funcIndex, numDims,
             fallback);
 
-  // 1. Parameter check.
-  if ((numDims > 0 && !dims) || numDims > 4) {
-    EJIT_DIAG("taskpool reject func=%u: invalid dims ptr=%p count=%u",
-              funcIndex, static_cast<const void *>(dims), numDims);
-    R.status = EJitCompileOrGetStatus::InvalidParam;
-    return R;
-  }
+  // Parameter check already done by the C API layer (ejit_taskpool_compile_or_get).
 
-  // 2. Instance-enabled check (§5.2 step 0) — a disabled instance falls back
+  // 1. Instance-enabled check (§5.2 step 0) — a disabled instance falls back
   //    and never reaches the cache, so it is never served a stale cached JIT.
   for (uint32_t i = 0; i < numDims; ++i) {
     if (!switch_.isInstanceEnabled(dims[i].dimType, dims[i].instanceId)) {

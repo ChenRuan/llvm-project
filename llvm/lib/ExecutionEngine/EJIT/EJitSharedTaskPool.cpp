@@ -898,12 +898,8 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     R.status = EJitCompileOrGetStatus::OffMode; // not Ready → clean fallback.
     return R;
   }
-  if ((numDims > 0 && !dims) || numDims > 4) {
-    EJIT_DIAG("shared taskpool reject func=%u: invalid dims ptr=%p count=%u",
-              funcIndex, static_cast<const void *>(dims), numDims);
-    R.status = EJitCompileOrGetStatus::InvalidParam;
-    return R;
-  }
+  // Parameter check already done by the C API layer.
+
   // Instance-enabled check (§5.2 step 0).
   for (uint32_t i = 0; i < numDims; ++i)
     if (!isInstanceEnabled(dims[i].dimType, dims[i].instanceId)) {
