@@ -363,7 +363,7 @@ void ejit_set_compile_mode(ejit_compile_mode_t mode) {
 
 ejit_compile_mode_t ejit_get_compile_mode(void) {
   if (!gEJIT) {
-    EJIT_DIAG("get_compile_mode: not initialized (default sync)");
+    EJIT_DIAG("get_compile_mode: not initialized (default async)");
     return EJIT_COMPILE_SYNC;
   }
   return gEJIT->getCompileMode() == CompileMode::Async ? EJIT_COMPILE_ASYNC

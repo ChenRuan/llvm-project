@@ -546,7 +546,6 @@ bool EJit::registerStaticVar(const std::string &varName, void *varAddr) {
 }
 
 bool EJit::setCompileMode(CompileMode mode) {
-#ifdef EJIT_SRE_TASKPOOL
   EJitTaskPool *tp = taskPool();
   if (!tp)
     return false;
@@ -571,8 +570,11 @@ bool EJit::setCompileMode(CompileMode mode) {
 #endif
     tp->switchController().setMode(EJitCompileMode::Async);
     EJIT_DIAG("compile mode switched to async");
-  } else {
+  } else if (mode == CompileMode::Off) {
     tp->switchController().setMode(EJitCompileMode::Off);
+    EJIT_DIAG("compile mode switched to off (no JIT)");
+  } else {
+    tp->switchController().setMode(EJitCompileMode::Sync);
 #ifndef EJIT_SRE_SHARED_TASKPOOL
     // Private taskpool: stop this instance's local worker. In a shared build
     // the single worker is owner-controlled and shared across cores, so a mode
@@ -589,9 +591,9 @@ bool EJit::setCompileMode(CompileMode mode) {
   // mode; engine/worker ownership stays owner-controlled (a mode flip never
   // starts/stops the shared worker or re-runs owner election).
   if (EJitSharedTaskPool *sp = sharedTaskPool())
-    sp->setSharedMode(mode == CompileMode::Async ? EJitCompileMode::Async
-                                                 : EJitCompileMode::Off);
-#endif
+    sp->setSharedMode(mode == CompileMode::Async   ? EJitCompileMode::Async
+                     : mode == CompileMode::Sync   ? EJitCompileMode::Sync
+                                                   : EJitCompileMode::Off);
 #endif
   config_.compileMode = mode;
   return true;
@@ -604,8 +606,10 @@ CompileMode EJit::getCompileMode() const {
   // rather than this instance's stale local config_.
   if (compileDriver_) {
     EJitSharedTaskPool *sp = compileDriver_->sharedTaskPool();
-    return sp->getSharedMode() == EJitCompileMode::Async ? CompileMode::Async
-                                                         : CompileMode::Sync;
+    EJitCompileMode m = sp->getSharedMode();
+    return m == EJitCompileMode::Async ? CompileMode::Async
+         : m == EJitCompileMode::Sync ? CompileMode::Sync
+                                      : CompileMode::Off;
   }
 #endif
   return config_.compileMode;

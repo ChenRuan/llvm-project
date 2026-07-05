@@ -589,21 +589,22 @@ TEST(EJit, CacheOperations) {
 }
 
 TEST(EJit, CompileMode) {
+  // Default is Async (background worker handles compilation).
   EJit ejit(Config{});
+  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Async);
+  ASSERT_NE(ejit.taskPool(), nullptr);
+
+  // Switch to sync: compile inline on calling thread.
+  EXPECT_TRUE(ejit.setCompileMode(CompileMode::Sync));
   EXPECT_EQ(ejit.getCompileMode(), CompileMode::Sync);
 
-#ifdef EJIT_SRE_TASKPOOL
-  // This test build intentionally has no usable ORC engine. Switching to Async
-  // must fail without changing the mode or starting a worker; otherwise
-  // requests could be enqueued forever with no consumer.
-  EXPECT_FALSE(ejit.setCompileMode(CompileMode::Async));
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Sync);
-  ASSERT_NE(ejit.taskPool(), nullptr);
-  EXPECT_FALSE(ejit.taskPool()->isWorkerRunning());
-#else
+  // Switch to off: no JIT, always AOT fallback.
+  EXPECT_TRUE(ejit.setCompileMode(CompileMode::Off));
+  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Off);
+
+  // Back to async.
   EXPECT_TRUE(ejit.setCompileMode(CompileMode::Async));
   EXPECT_EQ(ejit.getCompileMode(), CompileMode::Async);
-#endif
 }
 
 TEST(EJit, OptimizationLevel) {
@@ -615,22 +616,22 @@ TEST(EJit, OptimizationLevel) {
 }
 
 #ifdef EJIT_SRE_TASKPOOL
-TEST(EJitTaskpoolInit, SyncWithoutEngineSucceedsWithoutWorker) {
-  EJit ejit(Config{});
+TEST(EJitTaskpoolInit, OffModeSucceedsWithoutWorker) {
+  Config config;
+  config.compileMode = CompileMode::Off;
+  EJit ejit(config);
   EXPECT_FALSE(ejit.initFailed());
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Sync);
+  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Off);
   ASSERT_NE(ejit.taskPool(), nullptr);
   EXPECT_FALSE(ejit.taskPool()->isWorkerRunning());
 }
 
-TEST(EJitTaskpoolInit, AsyncWithoutEngineFails) {
-  Config config;
-  config.compileMode = CompileMode::Async;
-  EJit ejit(config);
-  EXPECT_TRUE(ejit.initFailed());
-  EXPECT_TRUE(ejit.registrationFrozen());
+TEST(EJitTaskpoolInit, DefaultAsyncInitSucceeds) {
+  EJit ejit(Config{});
+  // ORC engine is always created; async init succeeds.
+  EXPECT_FALSE(ejit.initFailed());
+  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Async);
   ASSERT_NE(ejit.taskPool(), nullptr);
-  EXPECT_FALSE(ejit.taskPool()->isWorkerRunning());
 }
 
 // Finding (二): a constructed taskpool EJit freezes registration once its

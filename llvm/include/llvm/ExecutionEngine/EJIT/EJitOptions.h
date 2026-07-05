@@ -25,7 +25,7 @@ enum class CompileMode { Off, Sync, Async };
 enum class OptimizationLevel { L1 = 1, L2 = 2, L3 = 3 };
 
 struct Config {
-  CompileMode compileMode = CompileMode::Off;
+  CompileMode compileMode = CompileMode::Async;
   OptimizationLevel optLevel = OptimizationLevel::L2;
   size_t maxCodeMemory = 2 * 1024 * 1024;
   size_t maxDataMemory = 128 * 1024;

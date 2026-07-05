@@ -124,8 +124,9 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
                                              /*autoStartWorker=*/false);
   taskPool_->setCompiler(&taskpoolCompileThunk, this);
   taskPool_->switchController().setMode(
-      config_.compileMode == CompileMode::Async ? EJitCompileMode::Async
-                                                : EJitCompileMode::Off);
+      config_.compileMode == CompileMode::Async   ? EJitCompileMode::Async
+      : config_.compileMode == CompileMode::Sync ? EJitCompileMode::Sync
+                                                  : EJitCompileMode::Off);
 #endif
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   // Bind the cross-core shared pool to the process-global shared state and wire
@@ -141,9 +142,9 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   // Ready or on an empty queue (spec §11): a high-priority worker that spun
   // could starve the owner core trying to publish Ready / a producer enqueuing.
   sharedPool_.setWorkerIdleHook(&EJitCompileDriver::sharedWorkerIdle, this);
-  sharedPool_.setMode(config_.compileMode == CompileMode::Async
-                          ? EJitCompileMode::Async
-                          : EJitCompileMode::Off);
+  sharedPool_.setMode(config_.compileMode == CompileMode::Async   ? EJitCompileMode::Async
+                          : config_.compileMode == CompileMode::Sync ? EJitCompileMode::Sync
+                                                                     : EJitCompileMode::Off);
   // Cross-core fnPtr sharing is gated by the build capability flag
   // EJIT_SRE_SHARED_CODE_POINTERS (default OFF -> clean fallback for non-owner
   // cores). Only the platform may assert same-VA + sealed + I/D-cache-coherent
