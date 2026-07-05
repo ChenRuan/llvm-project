@@ -3,6 +3,14 @@
 **版本**: 1.1
 **日期**: 2026-04-29
 **关联**: SPEC4.md, PLAN4.md, PASS1–6 设计文档
+
+> **v2 更新 (2026-07)**: 本文档描述原始设计。v2 重构中的关键变化：
+> - `ejit_compile_or_get` → `ejit_taskpool_compile_or_get`（统一 Sync/Async）
+> - `EJitAsyncCompiler` → 由 `EJitTaskPool` / `EJitSharedTaskPool` worker 取代
+> - `EJitCache` (LRU) → 由 taskpool bucket cache + shared pool lock-free cache 取代
+> - `EJitSyncCompiler` → 由 `EJitCompileDriver::compileCold` 直接调用 ORC engine
+> - `syncEngine/asyncEngine` → 统一为 `jitEngine_`
+> - 文档中 EJitAsyncCompiler、EJitCache、EJitSyncCompiler 的详细设计为历史参考
 **类型**: 运行时库 (libejit.a)
 **核心框架**: LLVM OrcJIT + JITLink
 
@@ -24,7 +32,7 @@ EmbeddedJIT 运行时库基于 LLVM OrcJIT + JITLink 构建，支持同步 (Sync
 │  │   ejit_init/shutdown  │    │   EJit class          │                       │
 │  │   ejit_activate/      │    │   EJitCache           │                       │
 │  │     deactivate        │    │                       │                       │
-│  │   ejit_compile_or_get │    │                       │                       │
+│  │   ejit_taskpool_compile_or_get │    │                       │                       │
 │  └──────────┬───────────┘    └───────────┬───────────┘                       │
 │             │                            │                                    │
 │  ┌──────────┴────────────────────────────┴──────────────────────────────┐   │
@@ -415,7 +423,7 @@ LRU 淘汰时:
                          │ (用户代码)    │
                          └──────┬──────┘
                                 │
-                    ejit_compile_or_get()
+                    ejit_taskpool_compile_or_get()
                                 │
                     ┌───────────┴───────────┐
                     │  EJitCompileDriver    │
@@ -491,7 +499,8 @@ public:
 
 ```cpp
 // 异步编译器: 后台线程 + 请求队列 + 隔离引擎实例
-class EJitAsyncCompiler {
+// v2: 已移除，由 taskpool worker 取代
+// 以下为历史设计参考
 public:
     EJitAsyncCompiler(EJitConfig& config, EJitCache& cache,
                        EJitRuntimeState& runtimeState);
@@ -1123,7 +1132,7 @@ ejit_status_t ejit_init(const ejit_config_t* config) {
     // Step 7: 验证注册数据完整性
     if (storedData.periodArrays.empty() && storedData.staticVars.empty()) {
         // 警告: 无 EmbeddedJIT 数据 — 可能是无 ejit 代码的普通程序
-        // 不视为错误，后续 ejit_compile_or_get 全部走 fallback
+        // 不视为错误，后续 ejit_taskpool_compile_or_get 全部走 fallback
         logWarning("EJit: no registration data consumed from store");
     }
 
@@ -1366,7 +1375,7 @@ EJitOrcEngine::compileFunction → return Error
     ↓
 EJitCompileDriver::getOrCompile → return nullptr
     ↓
-ejit_compile_or_get → return NULL
+ejit_taskpool_compile_or_get → return NULL
     ↓
 Wrapper → 跳转到 jit_fallback → 执行 AOT 代码
 ```
@@ -1411,7 +1420,7 @@ public:
            │
            ├─ wrapper:
            │    ├─构建 dims
-           │    ├─ejit_compile_or_get()
+           │    ├─ejit_taskpool_compile_or_get()
            │    │   ├─查 Cache → MISS
            │    │   ├─验证时间窗状态
            │    │   ├─syncCompiler.compile()
@@ -1446,7 +1455,7 @@ adjust_param(idx)
 │
 ├─ wrapper:
 │    ├─构建 dims
-│    ├─ejit_compile_or_get()
+│    ├─ejit_taskpool_compile_or_get()
 │    │   ├─查 Cache → MISS
 │    │   ├─提交 CompileRequest
 │    │   └─return NULL ─────→    workerLoop():
@@ -1462,7 +1471,7 @@ adjust_param(idx)
 下次调用:                             │
 adjust_param(idx)                   │
 ├─ wrapper:                         │
-│    ├─ejit_compile_or_get()       │
+│    ├─ejit_taskpool_compile_or_get()       │
 │    ├─查 Cache → HIT! ☆          │
 │    ├─return pfn ────────────────  │
 │    └─调用 pfn → 特化函数

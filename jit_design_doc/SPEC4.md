@@ -155,20 +155,17 @@ ejit_entry void jit_entry(ejit_period_arr_ind(cell) uint8_t cellIndex)
 - 单个函数最多支持 4 个 `ejit_period_arr_ind` 参数
 - 每个维度最多关联 1024 个数组
 
-**Cache Key 格式** (v1.8: uint64_t):
+**Cache Key 格式** (v2: taskpool dim-pair hash):
 
-```
-┌──────────────────────┬──────────┬──────────┬──────────┬──────────┐
-│    funcIdx (32b)     │  d[3]    │  d[2]    │  d[1]    │  d[0]    │
-│                      │  (8b)    │  (8b)    │  (8b)    │  (8b)    │
-└──────────────────────┴──────────┴──────────┴──────────┴──────────┘
- bit 63-32              31-24      23-16      15-8       7-0
-```
-
-- **funcIdx**：FNV-1a 32-bit hash of 函数名，AOT 编译期计算，运行时一致
-- **d[0..3]**：每个维度 index 占 8-bit（完整 uint8_t，与 wrapper 中 d[i] 参数一致），按 `ejit_period_arr_ind` 参数顺序排列
-- 无维度时低 32 位为 0
-- 相比旧方案（字符串拼接 `"fnName|cell=3,trp=1"`），uint64_t 直接比较/哈希，无内存分配
+> v1.8 使用 packed uint64_t cacheKey（上图为历史设计）。v2 改用 `ejit_dim_pair_t[]` + golden-ratio hash：
+> ```c
+> ejit_dim_pair_t dims[] = {{dimType, instanceId}, ...};
+> uint64_t key = funcIndex;
+> for (d in dims) key ^= (d.dimType << 32) | d.instanceId;
+> key *= 0x9e3779b97f4a7c15ULL;  // FNV prime
+> ```
+> dimType 由 AOT wrapper 从 per-lifecycle global 加载，保证跨模块一致。
+> 旧格式（下图）已不再使用。
 
 #### 2.3.3 ejit_period_lc(name) — 时间窗生命周期管理函数
 
@@ -217,7 +214,8 @@ typedef enum {
     EJIT_OPT_L3 = 3       /* 激进：+ 循环展开 */
 } ejit_opt_level_t;
 
-/* 维度编码在 cacheKey 中 —— 不再需要 ejit_dim_t 结构 */```
+// v2: cacheKey 编码方式已替换为 ejit_dim_pair_t[] 数组，dimType 由 AOT global 传递
+// 详见 §3.5 编译接口
 
 ### 3.2 初始化与配置
 
@@ -279,25 +277,42 @@ void ejit_register_symbol(const char *name, void *addr);
 
 ### 3.5 编译接口
 
+统一编译入口 `ejit_taskpool_compile_or_get`，Sync 和 Async 行为由运行时模式控制（`ejit_set_compile_mode`）。
+
 ```c
-void* ejit_compile_or_get(uint64_t cacheKey,
-                          int count, void** out_pfn);
+typedef struct {
+  uint32_t dimType;     // 生命周期槽位（由 EJitLifecycleRegistry 分配）
+  uint32_t instanceId;  // 实例下标
+} ejit_dim_pair_t;
+
+ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
+                                           const ejit_dim_pair_t *dims,
+                                           uint32_t numDims,
+                                           void **outFn,
+                                           uint32_t *outBucket);
+void ejit_taskpool_release_read(uint32_t bucketIndex);
 ```
 
 | 参数 | 说明 |
 |------|------|
-| `funcIdx` | FNV-1a 32-bit hash of 函数名（AOT 编译期计算） |
-| `cacheKey` | 预计算的 uint64_t key = funcIdx(32b) \| dims(4x8b) |
-| `count` | 维度数量（无维度时为 0，dims 为 NULL） |
-| `out_pfn` | 保留扩展参数，当前传 NULL |
+| `funcIndex` | dense funcIndex，由 `EJitFuncRegistry` 在注册时按名称分配 |
+| `dims` | dimType + instanceId 对数组，由 AOT wrapper 从 per-lifecycle globals 加载 |
+| `numDims` | 维度数量（无维度时为 0） |
+| `outFn` | 输出：特化函数指针（命中时有效） |
+| `outBucket` | 输出：read-token bucket index，用完后须调用 `ejit_taskpool_release_read` |
 
-**返回值**:
-- 非 NULL：特化函数指针，调用方可直接调用
-- NULL：编译失败或异步模式尚未完成，调用方应 fallback 到原函数
+**返回值** (`ejit_status_t`):
+- `EJIT_OK` (0)：Cache 命中，`outFn` 有效
+- `EJIT_PENDING` (1)：异步模式，编译已提交，`outFn` 为 NULL
+- `EJIT_ERR_*` (<0)：编译失败/实例未激活/队列满等
 
 **行为说明**:
-- 同步模式：首次调用阻塞等待编译完成，返回特化函数指针
-- 异步模式：首次调用触发后台编译，立即返回 NULL，下次调用命中 Cache
+- 统一 AOT wrapper：始终生成 `ejit_taskpool_compile_or_get` + `release_read` 调用
+- Sync 模式：Cache miss → 调用线程内联编译 → 返回 fnPtr
+- Async 模式：Cache miss → 入队 + 后台 worker 编译 → 返回 PENDING（下次命中）
+- 调用方**必须**在 `outFn` 使用完毕后调用 `ejit_taskpool_release_read(bucketIndex)`
+
+> **v2 变更**：旧接口 `ejit_compile_or_get(uint64_t cacheKey, void **out_pfn)` 已移除。PASS3 不再生成 packed cacheKey，改为生成 dimType/instanceId 对 + taskpool API 调用。
 
 ---
 
@@ -307,7 +322,7 @@ void* ejit_compile_or_get(uint64_t cacheKey,
 
 编译器在 AOT 阶段需完成以下工作：
 
-1. **插桩**: 为 `ejit_entry` 函数生成 wrapper 逻辑，在函数入口插入对 `ejit_compile_or_get` 的调用
+1. **插桩**: 为 `ejit_entry` 函数生成 wrapper 逻辑，在函数入口插入对 `ejit_taskpool_compile_or_get` 的调用，并使用 `ejit_taskpool_release_read` 释放读令牌
 2. **Bitcode 收集**: 为 `ejit_entry` 函数生成包含必要符号的 IR，嵌入二进制文件
 3. **元数据生成**: 记录 JIT 优化所需的元数据（函数依赖的时间窗、变量、常量成员等）
 4. **结构体布局注册**: 生成结构体字段布局信息的注册代码，供运行时字段偏移计算使用
@@ -458,7 +473,7 @@ void change_trp_cfg(ejit_period_arr_ind(trp) uint8_t trpIndex);
 | 版本管理 | 不需要，编译时固定结构体定义 |
 | 长期运行 | 可接受重启，无需特殊内存管理 |
 | 单函数代码量 | 需限制单个特化函数最大代码量，防止循环展开导致膨胀 |
-| Code Cache | 需要淘汰策略 (如 LRU) + 大小限制 |
+| Code Cache | taskpool bucket cache + shared pool lock-free cache，支持 read-token 并发安全 |
 | 数组大小 | 时间窗数组长度 <100，全局最多 1024 个数组 |
 | 特化维度 | 单函数最多 4 个 `ejit_period_arr_ind` 参数 |
 | 函数递归 | `ejit_entry` 函数不支持递归 |
@@ -549,7 +564,7 @@ ejit_entry void jit_entry(ejit_period_arr_ind(trp) uint8_t trpIndex) {
 |--------|------|------|
 | 内存模式 | 按需加载 Bitcode | 减少启动时内存占用 |
 | 优化等级 | 可配置 (1/2/3 级) | 适应不同场景需求 |
-| 缓存策略 | LRU 淘汰 + 大小限制 | 防止内存耗尽 |
+| 缓存策略 | taskpool 固定 bucket + read-token 并发安全 | 防止内存耗尽 |
 | 错误策略 | 记录日志后 fallback | 保证系统稳定性 |
 | 编译模式 | 同步/异步可选 | 适应不同实时性需求 |
 | 插桩方案 | 单函数混合方案 | 无需单独 fallback 函数 |
