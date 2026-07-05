@@ -941,7 +941,69 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     R.status = EJitCompileOrGetStatus::OffMode;
     return R;
   }
-  // Dedup + enqueue (§5.2 step 3).
+  // Sync mode: compile inline on the calling thread (no queue, no worker). Only
+  // the owner core has the compile callback; non-owner cores fall back cleanly.
+  if (state_->mode.loadAcquire() ==
+      static_cast<uint32_t>(EJitCompileMode::Sync)) {
+    if (!isOwner_ || !compileFn_) {
+      EJIT_DIAG_VERBOSE("shared taskpool sync fallback func=%u: not owner (owner=%u fn=%p)",
+                        funcIndex, static_cast<unsigned>(isOwner_),
+                        reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(compileFn_)));
+      R.status = EJitCompileOrGetStatus::OffMode;
+      return R;
+    }
+    // Build request with current instance versions, then compile inline.
+    EJitCompileRequest ReqLocal{};
+    ReqLocal.funcIndex = funcIndex;
+    ReqLocal.numDims = numDims;
+    for (uint32_t i = 0; i < numDims; ++i) {
+      ReqLocal.dims[i] = dims[i];
+      ReqLocal.versions[i] =
+          instanceVersion(dims[i].dimType, dims[i].instanceId);
+    }
+    void *fn = nullptr;
+    bool ok = compileFn_(compileCtx_, ReqLocal, &fn);
+    if (!ok || !fn) {
+      state_->counters.compileFailed.fetchAdd(1);
+      EJIT_DIAG("shared taskpool sync compile failed func=%u ok=%u", funcIndex,
+                static_cast<unsigned>(ok));
+      R.status = EJitCompileOrGetStatus::CompileFailed;
+      return R;
+    }
+    if (!versionsCurrent(ReqLocal)) {
+      if (releaseFn_) releaseFn_(releaseCtx_, fn);
+      state_->counters.compileFailed.fetchAdd(1);
+      EJIT_DIAG("shared taskpool sync compile drop func=%u: version changed",
+                funcIndex);
+      R.status = EJitCompileOrGetStatus::CompileFailed;
+      return R;
+    }
+    EJitCompiledCodeInfo info;
+    if (codeRangeFn_) codeRangeFn_(codeRangeCtx_, fn, &info);
+    EJitPublishStatus PS =
+        cachePublish(ReqLocal, fn, info.codeSize ? &info : nullptr);
+    if (PS == EJitPublishStatus::Published) {
+      state_->counters.asyncCompiles.fetchAdd(1);
+      SharedLookup Hit2 = cacheLookup(funcIndex, dims, numDims);
+      if (Hit2.hasReadToken && Hit2.fnPtr) {
+        R.status = EJitCompileOrGetStatus::CacheHit;
+        R.fnPtr = Hit2.fnPtr;
+        R.bucketIndex = Hit2.bucketIndex;
+        R.hasReadToken = true;
+        EJIT_DIAG_VERBOSE("shared taskpool sync compiled func=%u fn=%p", funcIndex,
+                          Hit2.fnPtr);
+        return R;
+      }
+    } else {
+      if (releaseFn_) releaseFn_(releaseCtx_, fn);
+    }
+    state_->counters.compileFailed.fetchAdd(1);
+    EJIT_DIAG("shared taskpool sync compile failed func=%u publish=%u", funcIndex,
+              static_cast<unsigned>(PS));
+    R.status = EJitCompileOrGetStatus::CompileFailed;
+    return R;
+  }
+  // Dedup + enqueue (§5.2 step 3) — Async path.
   uint32_t gen = state_->generation.loadAcquire();
   EJitCompileRequest Req{};
   Req.funcIndex = funcIndex;

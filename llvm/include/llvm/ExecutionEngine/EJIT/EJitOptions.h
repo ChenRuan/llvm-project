@@ -16,11 +16,16 @@
 namespace llvm {
 namespace ejit {
 
-enum class CompileMode { Sync, Async };
+/// Off  — no JIT compilation; the wrapper falls through to AOT on every call.
+/// Sync — compile inline on the calling thread (blocking, for deterministic
+///         environments or when background threads are not available).
+/// Async — enqueue to a background worker; the first call falls through to
+///         AOT and subsequent calls hit the cache.
+enum class CompileMode { Off, Sync, Async };
 enum class OptimizationLevel { L1 = 1, L2 = 2, L3 = 3 };
 
 struct Config {
-  CompileMode compileMode = CompileMode::Sync;
+  CompileMode compileMode = CompileMode::Off;
   OptimizationLevel optLevel = OptimizationLevel::L2;
   size_t maxCodeMemory = 2 * 1024 * 1024;
   size_t maxDataMemory = 128 * 1024;

@@ -1,4 +1,4 @@
-; RUN: opt -ejit-wrapper-async -passes=ejit-wrapper-gen -S %s | FileCheck %s
+; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s
 
 ; Test: Edge cases for wrapper generation:
 ;   1. 0-dim entry (static period only, no dims)

@@ -106,8 +106,6 @@ EJit::EJit(const Config &config) : config_(config) {
   // Create all runtime components
   runtimeState_ = std::make_unique<EJitRuntimeState>();
   moduleLoader_ = std::make_unique<EJitModuleLoader>();
-  cache_ = std::make_unique<EJitCache>(
-      config.maxCacheEntries, config.maxCacheSize, config.maxSingleFuncSize);
 
 #ifndef EJIT_FREESTANDING
   if (config.enableLogger)
@@ -120,7 +118,7 @@ EJit::EJit(const Config &config) : config_(config) {
   EJitLogger *logger = nullptr;
 #endif
   compileDriver_ = std::make_unique<EJitCompileDriver>(
-      config_, *cache_, *runtimeState_, *moduleLoader_, logger);
+      config_, *runtimeState_, *moduleLoader_, logger);
 
   // Consume registration data from the staging store (constructor path).
   StoredData data = EJitRegistrationStore::instance().consume();
@@ -242,7 +240,7 @@ EJit::EJit(const Config &config) : config_(config) {
     // Forward auto-registered user symbols to the engine.
     for (auto &sym : data.userSymbols)
       (*engine)->addUserSymbol(sym.name, sym.addr);
-    compileDriver_->setSyncEngine(std::move(*engine));
+    compileDriver_->setJitEngine(std::move(*engine));
     engineReady = true;
     EJIT_DIAG("OrcJIT engine created successfully");
   } else {
@@ -304,7 +302,6 @@ EJit::~EJit() {
   // Destroy in reverse order (compile driver holds references to other
   // components)
   compileDriver_.reset();
-  cache_.reset();
   moduleLoader_.reset();
 #ifndef EJIT_FREESTANDING
   logger_.reset();
@@ -475,26 +472,14 @@ bool EJit::isActive(const std::string &periodName, uint8_t cellIdx) const {
   return runtimeState_->isActive(periodName, cellIdx);
 }
 
-void *EJit::getOrCompile(uint64_t cacheKey) {
-  return compileDriver_->getOrCompile(cacheKey);
-}
-
-void EJit::clearCache() { cache_->clear(); }
+void EJit::clearCache() { /* Legacy LRU cache retired */ }
 
 void EJit::invalidateByPeriod(const std::string &periodName, uint8_t cellIdx) {
-  cache_->invalidateByPeriod(periodName, cellIdx);
+  (void)periodName; (void)cellIdx;
 }
 
 void EJit::invalidateAllByPeriod(const std::string &periodName) {
-  // Invalidate all known cellIdx entries for this period.
-  // Iterate over registered arrays and invalidate each cell index.
-  const auto *arrs = getRegistry().getArrays(periodName);
-  if (!arrs)
-    return;
-  for (const auto &info : *arrs) {
-    for (size_t i = 0; i < info.arraySize; i++)
-      cache_->invalidateByPeriod(periodName, static_cast<uint8_t>(i));
-  }
+  (void)periodName;
 }
 
 void EJit::registerSymbol(const std::string &name, void *addr) {
@@ -570,7 +555,7 @@ bool EJit::setCompileMode(CompileMode mode) {
     // Do not expose Async until both the compiler engine and consumer exist.
     // Failure preserves the old mode, so callers cannot enqueue permanent
     // pending work into a worker-less taskpool.
-    if (!compileDriver_->hasSyncEngine()) {
+    if (!compileDriver_->hasJitEngine()) {
       EJIT_DIAG("compile mode switch rejected: async without engine");
       return false;
     }
@@ -633,8 +618,6 @@ void EJit::setOptimizationLevel(OptimizationLevel level) {
 OptimizationLevel EJit::getOptimizationLevel() const {
   return config_.optLevel;
 }
-
-EJitCache::Stats EJit::getStats() const { return cache_->getStats(); }
 
 const EJitError *EJit::getLastError() const {
 #ifdef EJIT_FREESTANDING

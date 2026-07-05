@@ -19,12 +19,11 @@ entry:
 !0 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
 !1 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}}
 
-; Exactly one wrapper entry block and one dispatch call survive two passes.
-; Labels are matched with their trailing colon so they don't collide with the
-; "preds = %jit_entry" comments.
+; IDEMPOTENCY: after one or two PASS3 runs the function must contain EXACTLY ONE
+; wrapper prologue. The unified wrapper uses the taskpool API.
 ; CHECK-LABEL: define i32 @entry_twice(i8 %cell)
 ; CHECK: jit_entry:
-; CHECK: call ptr @ejit_compile_or_get
+; CHECK: call i32 @ejit_taskpool_compile_or_get
 ; CHECK: jit_fallback:
 ; CHECK: load i32, ptr @data
 ; CHECK: jit_dispatch:

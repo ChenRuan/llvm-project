@@ -313,18 +313,9 @@ bool ejit_is_active(const char *periodName, uint8_t cellIdx) {
 }
 
 void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn) {
-  if (!gEJIT) {
-    EJIT_DIAG("compile_or_get(key=0x%016lx) failed: not initialized", cacheKey);
-    return nullptr;
-  }
-
-  void *result = gEJIT->getOrCompile(cacheKey);
-  if (out_pfn)
-    *out_pfn = result;
-
-  EJIT_DIAG_VERBOSE("compile_or_get(key=0x%016lx) → %s", cacheKey,
-                    result ? "JIT" : "NULL");
-  return result;
+  if (out_pfn) *out_pfn = nullptr;
+  EJIT_DIAG("compile_or_get(key=0x%016lx): retired, use taskpool API", cacheKey);
+  return nullptr;
 }
 
 void ejit_clear_cache(void) {
@@ -340,22 +331,9 @@ void ejit_invalidate(const char *periodName, uint8_t cellIdx) {
 }
 
 ejit_status_t ejit_get_stats(ejit_stats_t *stats) {
-  if (!gEJIT) {
-    EJIT_DIAG("get_stats failed: not initialized");
-    return EJIT_ERR_NOT_ACTIVE;
-  }
-  if (!stats) {
-    EJIT_DIAG("get_stats failed: null stats pointer");
-    return EJIT_ERR_INVALID_PARAM;
-  }
-
-  auto s = gEJIT->getStats();
-  stats->entryCount = s.entryCount;
-  stats->totalCodeSize = s.totalCodeSize;
-  stats->maxSize = s.maxSize;
-  stats->hits = s.hits;
-  stats->misses = s.misses;
-  stats->evictions = s.evictions;
+  if (!gEJIT) return EJIT_ERR_NOT_ACTIVE;
+  if (!stats) return EJIT_ERR_INVALID_PARAM;
+  memset(stats, 0, sizeof(*stats));
   return EJIT_OK;
 }
 
@@ -392,7 +370,6 @@ ejit_compile_mode_t ejit_get_compile_mode(void) {
                                                        : EJIT_COMPILE_SYNC;
 }
 
-#ifdef EJIT_SRE_TASKPOOL
 //===-- SRE taskpool black-box API ----------------------------------------===//
 
 static ejit_status_t taskpoolStatus(EJitCompileOrGetStatus s) {
@@ -742,7 +719,6 @@ uint32_t ejit_taskpool_get_worker_core() {
   return kEJitInvalidOwnerCore;
 #endif
 }
-#endif // EJIT_SRE_TASKPOOL
 
 //===----------------------------------------------------------------------===//
 // General diagnostics (available in every build, not only taskpool).

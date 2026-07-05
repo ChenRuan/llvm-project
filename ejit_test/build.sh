@@ -125,16 +125,16 @@ _set_min_libs() {
 }
 
 # Detect EJIT taskpool build flags from CMakeCache and propagate them to test
-# compilation.  When EJIT_SRE_SHARED_TASKPOOL is active the async AOT wrapper
-# is also enabled (-mllvm -ejit-wrapper-async=true) so that the compiled tests
-# exercise the real taskpool code path rather than the legacy LRU ABI.
+# compilation.  The wrapper now always uses the unified taskpool ABI
+# (ejit_taskpool_compile_or_get) — the former -ejit-wrapper-async option has
+# been retired.  Sync vs Async is runtime-configurable and needs no AOT flag.
 EJIT_SRE_CFLAGS=""
 if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
   if grep -q "^EJIT_SRE_TASKPOOL:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
     EJIT_SRE_CFLAGS="${EJIT_SRE_CFLAGS} -DEJIT_SRE_TASKPOOL"
   fi
   if grep -q "^EJIT_SRE_SHARED_TASKPOOL:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
-    EJIT_SRE_CFLAGS="${EJIT_SRE_CFLAGS} -DEJIT_SRE_SHARED_TASKPOOL -mllvm -ejit-wrapper-async=true"
+    EJIT_SRE_CFLAGS="${EJIT_SRE_CFLAGS} -DEJIT_SRE_SHARED_TASKPOOL"
   fi
 fi
 [[ -n "${EJIT_SRE_CFLAGS}" ]] && echo "Taskpool flags: ${EJIT_SRE_CFLAGS}"
@@ -184,6 +184,7 @@ ALL_TESTS=(
   ejit_manual_register_test
   ejit_multi_tu_test
   ejit_baremetal_link_test
+  ejit_sync_mode_test
   ejit_perf_bench
   ejit_ptr_period_test
   ejit_trace_test
@@ -239,6 +240,7 @@ TEST_ARGS[ejit_dump_test]="0 3"
 TEST_ARGS[ejit_ptr_period_test]="0 1 3"
 TEST_ARGS[ejit_multi_tu_test]="0 3"
 TEST_ARGS[ejit_baremetal_link_test]="0 3"
+TEST_ARGS[ejit_sync_mode_test]="0"
 
 if [[ ${#SELECTED[@]} -eq 0 ]]; then
   SELECTED=("${ALL_TESTS[@]}")

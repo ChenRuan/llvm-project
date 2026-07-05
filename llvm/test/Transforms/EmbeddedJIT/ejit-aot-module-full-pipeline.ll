@@ -1,4 +1,4 @@
-; RUN: opt -ejit-wrapper-async -passes=ejit-aot-module -S %s | FileCheck %s
+; RUN: opt -passes=ejit-aot-module -S %s | FileCheck %s
 
 ; Test: Full AOT pipeline on a comprehensive module.
 

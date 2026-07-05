@@ -43,13 +43,10 @@ static cl::opt<bool> EJitNoInlineEntry(
     cl::desc("Add noinline attribute to ejit_entry functions to prevent the "
              "CGSCC inliner from duplicating the JIT wrapper into callers"));
 
-// Temporary migration switch while the taskpool path is being stabilized.
-// The default preserves the mature synchronous ABI. Remove this option and
-// make the asynchronous path unconditional once taskpool rollout is complete.
-static cl::opt<bool> EJitAsyncWrapper(
-    "ejit-wrapper-async", cl::init(false), cl::Hidden,
-    cl::desc("Generate taskpool-based asynchronous EJIT wrappers instead of "
-             "the synchronous ejit_compile_or_get wrapper"));
+// Wrapper generation now unconditionally uses the unified taskpool API
+// (ejit_taskpool_compile_or_get + ejit_taskpool_release_read). Both Sync
+// and Async modes are runtime-configurable — the AOT wrapper code is
+// identical for both. The -ejit-wrapper-async flag has been retired.
 
 namespace {
 
@@ -286,22 +283,19 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   }
 
   auto *I32Ty = Type::getInt32Ty(Ctx);
-  auto *I64Ty = Type::getInt64Ty(Ctx);
-  if (EJitAsyncWrapper) {
-    // ejit_taskpool_compile_or_get(i32 funcIndex, ptr dims, i32 numDims,
-    //                              ptr outFn, ptr outBucket)
-    // ejit_taskpool_release_read(i32 bucketIndex)
-    M.getOrInsertFunction(
-        FN_TASKPOOL_COMPILE_OR_GET,
-        FunctionType::get(I32Ty, {I32Ty, PtrTy, I32Ty, PtrTy, PtrTy}, false));
-    M.getOrInsertFunction(
-        FN_TASKPOOL_RELEASE_READ,
-        FunctionType::get(Type::getVoidTy(Ctx), {I32Ty}, false));
-  } else {
-    // Mature synchronous path used during taskpool rollout.
-    M.getOrInsertFunction(FN_COMPILE_OR_GET,
-                          FunctionType::get(PtrTy, {I64Ty, PtrTy}, false));
-  }
+  // Unified taskpool API: always declare ejit_taskpool_compile_or_get +
+  // ejit_taskpool_release_read. Both Sync and Async modes share the same
+  // AOT wrapper — the runtime compile mode controls whether the taskpool
+  // does inline compilation or background worker dispatch.
+  //   ejit_taskpool_compile_or_get(i32 funcIndex, ptr dims, i32 numDims,
+  //                                ptr outFn, ptr outBucket)
+  //   ejit_taskpool_release_read(i32 bucketIndex)
+  M.getOrInsertFunction(
+      FN_TASKPOOL_COMPILE_OR_GET,
+      FunctionType::get(I32Ty, {I32Ty, PtrTy, I32Ty, PtrTy, PtrTy}, false));
+  M.getOrInsertFunction(
+      FN_TASKPOOL_RELEASE_READ,
+      FunctionType::get(Type::getVoidTy(Ctx), {I32Ty}, false));
 
   auto isAlreadyWrapped = [](Function &F) -> bool {
     if (!F.getEntryBlock().getName().starts_with("jit_entry"))
@@ -337,18 +331,16 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     for (auto &PI : getPeriodArrIndInfo(*F))
       if (!PI.PeriodName.empty())
         DimTypeGlobals.emplace(PI.PeriodName, nullptr);
-  if (EJitAsyncWrapper && DimTypeGlobals.size() > kEJitMaxDimTypes) {
+  if (DimTypeGlobals.size() > kEJitMaxDimTypes) {
     Ctx.emitError("ejit-wrapper-gen: module references " +
                   Twine(DimTypeGlobals.size()) +
                   " distinct lifecycle dimensions but at most " +
                   Twine(kEJitMaxDimTypes) + " are supported (spec §5.1)");
     return PreservedAnalyses::all();
   }
-  if (EJitAsyncWrapper) {
-    for (auto &KV : DimTypeGlobals)
-      KV.second = getOrCreateDimTypeGlobal(M, KV.first);
-    emitLifecycleRegistration(M, DimTypeGlobals);
-  }
+  for (auto &KV : DimTypeGlobals)
+    KV.second = getOrCreateDimTypeGlobal(M, KV.first);
+  emitLifecycleRegistration(M, DimTypeGlobals);
 
   // Explicit, registration-time dense funcIndex: give each entry function a
   // per-function i32 global seeded with kEJitInvalidFuncIndex. The dense index
@@ -479,80 +471,58 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     // compile path.
     IRBuilder<> Builder(JitEntry);
     auto *DimPairTy = StructType::get(I32Ty, I32Ty);
-    Value *DimsAlloca = nullptr;
-    Value *OutFnAlloca = nullptr;
-    Value *OutBucketAlloca = nullptr;
-    if (EJitAsyncWrapper) {
-      DimsAlloca = Builder.CreateAlloca(ArrayType::get(DimPairTy, 4), nullptr,
-                                        "ejit_dims");
-      OutFnAlloca = Builder.CreateAlloca(PtrTy, nullptr, "ejit_out_fn");
-      OutBucketAlloca = Builder.CreateAlloca(I32Ty, nullptr, "ejit_out_bucket");
-    }
+    Value *DimsAlloca =
+        Builder.CreateAlloca(ArrayType::get(DimPairTy, 4), nullptr, "ejit_dims");
+    Value *OutFnAlloca =
+        Builder.CreateAlloca(PtrTy, nullptr, "ejit_out_fn");
+    Value *OutBucketAlloca =
+        Builder.CreateAlloca(I32Ty, nullptr, "ejit_out_bucket");
     Value *FuncIdx = Builder.CreateLoad(
         I32Ty, FuncIndexGlobals[F->getName().str()], "ejit_funcidx");
     Value *IdxValid = Builder.CreateICmpNE(
         FuncIdx, ConstantInt::get(I32Ty, kEJitInvalidFuncIndex), "ejit_idx_ok");
     Builder.CreateCondBr(IdxValid, JitCall, JitFallback);
 
-    // jit_call: issue either the temporary synchronous ABI or the taskpool ABI.
+    // jit_call: unified taskpool API (ejit_taskpool_compile_or_get). Both
+    // Sync and Async modes share the same AOT wrapper — the runtime compile
+    // mode controls whether compilation is inline or via a background worker.
     Builder.SetInsertPoint(JitCall);
-    Value *OutFn = nullptr;
-    if (EJitAsyncWrapper) {
-      for (unsigned I = 0; I < DimCount; ++I) {
-        Value *Idxs[] = {ConstantInt::get(I32Ty, 0),
-                         ConstantInt::get(I32Ty, I)};
-        Value *PairPtr = Builder.CreateInBoundsGEP(ArrayType::get(DimPairTy, 4),
-                                                   DimsAlloca, Idxs);
-        Value *DimTypePtr =
-            Builder.CreateStructGEP(DimPairTy, PairPtr, 0, "dim_type_ptr");
-        Value *InstancePtr =
-            Builder.CreateStructGEP(DimPairTy, PairPtr, 1, "instance_ptr");
-        Value *DimTypeVal = Builder.CreateLoad(
-            I32Ty, DimTypeGlobals[PeriodInds[I].PeriodName], "ejit_dimtype");
-        Builder.CreateStore(DimTypeVal, DimTypePtr);
+    for (unsigned I = 0; I < DimCount; ++I) {
+      Value *Idxs[] = {ConstantInt::get(I32Ty, 0), ConstantInt::get(I32Ty, I)};
+      Value *PairPtr = Builder.CreateInBoundsGEP(ArrayType::get(DimPairTy, 4),
+                                                 DimsAlloca, Idxs);
+      Value *DimTypePtr =
+          Builder.CreateStructGEP(DimPairTy, PairPtr, 0, "dim_type_ptr");
+      Value *InstancePtr =
+          Builder.CreateStructGEP(DimPairTy, PairPtr, 1, "instance_ptr");
+      Value *DimTypeVal = Builder.CreateLoad(
+          I32Ty, DimTypeGlobals[PeriodInds[I].PeriodName], "ejit_dimtype");
+      Builder.CreateStore(DimTypeVal, DimTypePtr);
 
-        Value *ArgVal = F->getArg(PeriodInds[I].ArgIndex);
-        unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
-        Value *InstanceId = ArgVal;
-        if (BW > 32)
-          InstanceId = Builder.CreateTrunc(ArgVal, I32Ty);
-        else if (BW < 32)
-          InstanceId = Builder.CreateZExt(ArgVal, I32Ty);
-        Builder.CreateStore(InstanceId, InstancePtr);
-      }
-
-      Value *DimsPtr = Builder.CreatePointerCast(DimsAlloca, PtrTy);
-      Value *Status = Builder.CreateCall(
-          M.getFunction(FN_TASKPOOL_COMPILE_OR_GET),
-          {FuncIdx, DimsPtr, ConstantInt::get(I32Ty, DimCount),
-           Builder.CreatePointerCast(OutFnAlloca, PtrTy),
-           Builder.CreatePointerCast(OutBucketAlloca, PtrTy)});
-      OutFn = Builder.CreateLoad(PtrTy, OutFnAlloca, "ejit_fn");
-      Value *HitStatus =
-          Builder.CreateICmpEQ(Status, ConstantInt::get(I32Ty, 0));
-      Builder.CreateCondBr(
-          Builder.CreateAnd(HitStatus, Builder.CreateIsNotNull(OutFn)),
-          JitDispatch, JitFallback);
-    } else {
-      // Keep the established 64-bit synchronous cache-key layout, replacing
-      // only the old name hash with the runtime-assigned dense funcIndex.
-      Value *Key = Builder.CreateShl(Builder.CreateZExt(FuncIdx, I64Ty), 32);
-      for (unsigned I = 0; I < DimCount; ++I) {
-        Value *ArgVal = F->getArg(PeriodInds[I].ArgIndex);
-        Value *Dim = Builder.CreateZExt(
-            Builder.CreateTrunc(ArgVal, Type::getInt8Ty(Ctx)), I64Ty);
-        if (I > 0)
-          Dim = Builder.CreateShl(Dim, I * 8);
-        Key = Builder.CreateOr(Key, Dim);
-      }
-      OutFn =
-          Builder.CreateCall(M.getFunction(FN_COMPILE_OR_GET),
-                             {Key, ConstantPointerNull::get(PtrTy)}, "ejit_fn");
-      Builder.CreateCondBr(Builder.CreateIsNotNull(OutFn), JitDispatch,
-                           JitFallback);
+      Value *ArgVal = F->getArg(PeriodInds[I].ArgIndex);
+      unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
+      Value *InstanceId = ArgVal;
+      if (BW > 32)
+        InstanceId = Builder.CreateTrunc(ArgVal, I32Ty);
+      else if (BW < 32)
+        InstanceId = Builder.CreateZExt(ArgVal, I32Ty);
+      Builder.CreateStore(InstanceId, InstancePtr);
     }
 
-    // jit_dispatch: cast function pointer and call
+    Value *DimsPtr = Builder.CreatePointerCast(DimsAlloca, PtrTy);
+    Value *Status = Builder.CreateCall(
+        M.getFunction(FN_TASKPOOL_COMPILE_OR_GET),
+        {FuncIdx, DimsPtr, ConstantInt::get(I32Ty, DimCount),
+         Builder.CreatePointerCast(OutFnAlloca, PtrTy),
+         Builder.CreatePointerCast(OutBucketAlloca, PtrTy)});
+    Value *OutFn = Builder.CreateLoad(PtrTy, OutFnAlloca, "ejit_fn");
+    Value *HitStatus =
+        Builder.CreateICmpEQ(Status, ConstantInt::get(I32Ty, 0));
+    Builder.CreateCondBr(
+        Builder.CreateAnd(HitStatus, Builder.CreateIsNotNull(OutFn)),
+        JitDispatch, JitFallback);
+
+    // jit_dispatch: cast function pointer, call, and release the read token.
     Builder.SetInsertPoint(JitDispatch);
 
     // Build argument list for indirect call
@@ -562,17 +532,15 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
     if (F->getReturnType()->isVoidTy()) {
       Builder.CreateCall(F->getFunctionType(), OutFn, Args);
-      if (EJitAsyncWrapper) {
-        Value *Bucket = Builder.CreateLoad(I32Ty, OutBucketAlloca);
-        Builder.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ), {Bucket});
-      }
+      // Always release the taskpool read token after the JIT call finishes.
+      Value *Bucket = Builder.CreateLoad(I32Ty, OutBucketAlloca);
+      Builder.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ), {Bucket});
       Builder.CreateRetVoid();
     } else {
       Value *RetVal = Builder.CreateCall(F->getFunctionType(), OutFn, Args);
-      if (EJitAsyncWrapper) {
-        Value *Bucket = Builder.CreateLoad(I32Ty, OutBucketAlloca);
-        Builder.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ), {Bucket});
-      }
+      // Always release the taskpool read token after the JIT call finishes.
+      Value *Bucket = Builder.CreateLoad(I32Ty, OutBucketAlloca);
+      Builder.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ), {Bucket});
       Builder.CreateRet(RetVal);
     }
 

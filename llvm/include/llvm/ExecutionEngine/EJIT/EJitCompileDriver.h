@@ -9,7 +9,6 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITCOMPILEDRIVER_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITCOMPILEDRIVER_H
 
-#include "llvm/ExecutionEngine/EJIT/EJitCache.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
@@ -39,7 +38,7 @@ public:
     size_t codeSize = 0;
   };
 
-  EJitCompileDriver(const Config &config, EJitCache &cache,
+  EJitCompileDriver(const Config &config,
                     EJitRuntimeState &runtimeState, EJitModuleLoader &loader,
                     EJitLogger *logger = nullptr);
 
@@ -49,7 +48,6 @@ public:
   /// Cold path: decode cacheKey → load bitcode → JIT compile.
   /// Returns nullptr on miss that cannot be compiled (time window not
   /// active, no bitcode, or compile failure).
-  void *getOrCompile(uint64_t cacheKey);
 
 #ifdef EJIT_SRE_TASKPOOL
   /// Cold compile path WITHOUT storing into the LRU EJitCache. Used as the
@@ -70,7 +68,7 @@ public:
     return taskPool_ && taskPool_->isWorkerRunning();
   }
 
-  bool hasSyncEngine() const { return syncEngine_ != nullptr; }
+  bool hasJitEngine() const { return jitEngine_ != nullptr; }
 
   void stopTaskPoolWorker() {
     if (taskPool_)
@@ -94,30 +92,28 @@ public:
   void stopSharedTaskPool() { sharedPool_.ownerShutdown(); }
 #endif
 
-  EJitCache &getCache() { return cache_; }
   EJitRuntimeState &getRuntimeState() { return runtimeState_; }
   EJitModuleLoader &getLoader() { return loader_; }
   const Config &getConfig() { return config_; }
-  EJitOrcEngine *getSyncEngine() { return syncEngine_.get(); }
+  EJitOrcEngine *getJitEngine() { return jitEngine_.get(); }
 #ifndef EJIT_FREESTANDING
   EJitLogger *getLogger() { return logger_; }
 #else
   EJitLogger *getLogger() { return nullptr; }
 #endif
 
-  void setSyncEngine(std::unique_ptr<EJitOrcEngine> engine);
+  void setJitEngine(std::unique_ptr<EJitOrcEngine> engine);
   void registerSymbol(const std::string &name, void *addr);
 
 private:
   const Config &config_;
-  EJitCache &cache_;
   EJitRuntimeState &runtimeState_;
   EJitModuleLoader &loader_;
 #ifndef EJIT_FREESTANDING
   EJitLogger *logger_;
 #endif
 
-  std::unique_ptr<EJitOrcEngine> syncEngine_;
+  std::unique_ptr<EJitOrcEngine> jitEngine_;
 #ifdef EJIT_SRE_TASKPOOL
   std::unique_ptr<EJitTaskPool> taskPool_;
 #endif
