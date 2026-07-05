@@ -21,6 +21,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+#include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#endif
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
 #ifdef EJIT_SRE_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
@@ -893,23 +896,41 @@ TEST(EJitTaskpoolArray, NameLevelSyncsSwitchController) {
   ASSERT_NE(tp, nullptr);
   uint32_t dt = EJitLifecycleRegistry::instance().lookup("cell");
   ASSERT_NE(dt, kEJitInvalidDimType);
-  EJitSwitchController &sw = tp->switchController();
 
-  uint32_t v0 = sw.getInstanceVersion(dt, 5);
-  EXPECT_TRUE(sw.isInstanceEnabled(dt, 5)); // default enabled
-  // deactivate: RuntimeState inactive + SwitchController disabled + v+1.
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  // Shared build: deactivate/activate writes the shared pool's switch
+  // controller, which is separate from the per-instance EJitTaskPool switch.
+  // Check enabled state via the shared pool (instanceVersion is private).
+  // initSharedStorage defaults all instances to disabled — enable explicitly.
+  EJitSharedTaskPool *sp = ejit.sharedTaskPool();
+  ASSERT_NE(sp, nullptr);
+  EXPECT_TRUE(sp->setInstanceEnabled(dt, 5, true));
+  auto instanceEnabled = [&]() { return sp->isInstanceActive(dt, 5); };
+#else
+  EJitSwitchController &sw = tp->switchController();
+  auto instanceEnabled = [&]() { return sw.isInstanceEnabled(dt, 5); };
+  auto instanceVer = [&]() { return sw.getInstanceVersion(dt, 5); };
+  uint32_t v0 = instanceVer();
+#endif
+
+  EXPECT_TRUE(instanceEnabled()); // defaults enabled
+  // deactivate.
   EXPECT_TRUE(ejit.deactivate("cell", 5));
   EXPECT_FALSE(ejit.isActive("cell", 5));
-  EXPECT_FALSE(sw.isInstanceEnabled(dt, 5));
-  EXPECT_EQ(sw.getInstanceVersion(dt, 5), v0 + 1);
-  // activate: RuntimeState active + SwitchController enabled + v+1.
+  EXPECT_FALSE(instanceEnabled());
+#ifndef EJIT_SRE_SHARED_TASKPOOL
+  EXPECT_EQ(instanceVer(), v0 + 1);
+#endif
+  // activate.
   EXPECT_TRUE(ejit.activate("cell", 5));
   EXPECT_TRUE(ejit.isActive("cell", 5));
-  EXPECT_TRUE(sw.isInstanceEnabled(dt, 5));
-  EXPECT_EQ(sw.getInstanceVersion(dt, 5), v0 + 2);
-  // Redundant activate: no flip, no version bump.
+  EXPECT_TRUE(instanceEnabled());
+#ifndef EJIT_SRE_SHARED_TASKPOOL
+  EXPECT_EQ(instanceVer(), v0 + 2);
+  // Redundant activate: no flip.
   EXPECT_TRUE(ejit.activate("cell", 5));
-  EXPECT_EQ(sw.getInstanceVersion(dt, 5), v0 + 2);
+  EXPECT_EQ(instanceVer(), v0 + 2);
+#endif
   resetTaskpoolRegState();
 }
 
