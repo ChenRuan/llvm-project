@@ -91,12 +91,25 @@ int main(int argc, char **argv) {
 #endif
 
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  // In shared-taskpool builds, setCompileMode requires the shared pool to be
-  // running; the per-instance path returns early before reaching the shared
-  // pool. The mode begins as ASYNC; just verify it stays ASYNC here.
+  // Verify the initial mode is ASYNC (the shared pool was started with it).
   m = ejit_get_compile_mode();
   T(m == EJIT_COMPILE_ASYNC,
-    "get_compile_mode = %d (ASYNC in shared-taskpool build)", m);
+    "get_compile_mode = %d (initial ASYNC)", m);
+
+  // Switch to SYNC and verify JIT still works via the unified inline path.
+  ejit_set_compile_mode(EJIT_COMPILE_SYNC);
+  m = ejit_get_compile_mode();
+  T(m == EJIT_COMPILE_SYNC, "get_compile_mode = %d (SYNC after set)", m);
+
+  // The sync inline path is verified below in §5a (full round-trip after
+  // the async worker has processed at least one compile to exercise the
+  // shared code path).
+
+  // Switch back to ASYNC for the rest of the test.
+  ejit_set_compile_mode(EJIT_COMPILE_ASYNC);
+  m = ejit_get_compile_mode();
+  T(m == EJIT_COMPILE_ASYNC,
+    "get_compile_mode = %d (ASYNC after restore)", m);
 #else
   // Only sync mode is supported. Async is excluded in bare-metal builds.
   ejit_set_compile_mode(EJIT_COMPILE_SYNC);

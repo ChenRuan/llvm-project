@@ -27,13 +27,16 @@ def:
 
 ; CHECK-LABEL: define i32 @switch_entry(i32 %sel)
 ; CHECK: jit_entry:
-; CHECK: call ptr @ejit_compile_or_get(i64 {{.*}}, ptr null)
 ; Every PHI incoming edge that referenced the erased entry block — in the
 ; direct switch successors AND in the shared merge block — must now name
-; jit_fallback. (The spliced switch lands in jit_fallback, which the pass
-; emits after these PHI-bearing blocks.)
+; jit_fallback. (The original switch lands in jit_fallback.)
 ; CHECK: %pa = phi i32 [ 10, %jit_fallback ]
 ; CHECK: %pb = phi i32 [ 20, %jit_fallback ]
 ; CHECK: %r = phi i32 [ 0, %jit_fallback ], [ %pa, %a ], [ %pb, %b ]
+; CHECK: jit_call:
+; CHECK: call i32 @ejit_taskpool_compile_or_get(i32 {{.*}}, ptr {{.*}}, i32 0, ptr {{.*}}, ptr {{.*}})
 ; CHECK: jit_fallback:
 ; CHECK: switch i32 %sel
+; CHECK: jit_dispatch:
+; CHECK: call i32 {{.*}}(i32 %sel)
+; CHECK: call void @ejit_taskpool_release_read

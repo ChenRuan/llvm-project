@@ -106,8 +106,6 @@ EJit::EJit(const Config &config) : config_(config) {
   // Create all runtime components
   runtimeState_ = std::make_unique<EJitRuntimeState>();
   moduleLoader_ = std::make_unique<EJitModuleLoader>();
-  cache_ = std::make_unique<EJitCache>(
-      config.maxCacheEntries, config.maxCacheSize, config.maxSingleFuncSize);
 
 #ifndef EJIT_FREESTANDING
   if (config.enableLogger)
@@ -120,7 +118,7 @@ EJit::EJit(const Config &config) : config_(config) {
   EJitLogger *logger = nullptr;
 #endif
   compileDriver_ = std::make_unique<EJitCompileDriver>(
-      config_, *cache_, *runtimeState_, *moduleLoader_, logger);
+      config_, *runtimeState_, *moduleLoader_, logger);
 
   // Consume registration data from the staging store (constructor path).
   StoredData data = EJitRegistrationStore::instance().consume();
@@ -242,7 +240,7 @@ EJit::EJit(const Config &config) : config_(config) {
     // Forward auto-registered user symbols to the engine.
     for (auto &sym : data.userSymbols)
       (*engine)->addUserSymbol(sym.name, sym.addr);
-    compileDriver_->setSyncEngine(std::move(*engine));
+    compileDriver_->setJitEngine(std::move(*engine));
     engineReady = true;
     EJIT_DIAG("OrcJIT engine created successfully");
   } else {
@@ -304,7 +302,6 @@ EJit::~EJit() {
   // Destroy in reverse order (compile driver holds references to other
   // components)
   compileDriver_.reset();
-  cache_.reset();
   moduleLoader_.reset();
 #ifndef EJIT_FREESTANDING
   logger_.reset();
@@ -475,26 +472,14 @@ bool EJit::isActive(const std::string &periodName, uint8_t cellIdx) const {
   return runtimeState_->isActive(periodName, cellIdx);
 }
 
-void *EJit::getOrCompile(uint64_t cacheKey) {
-  return compileDriver_->getOrCompile(cacheKey);
-}
-
-void EJit::clearCache() { cache_->clear(); }
+void EJit::clearCache() { /* Legacy LRU cache retired */ }
 
 void EJit::invalidateByPeriod(const std::string &periodName, uint8_t cellIdx) {
-  cache_->invalidateByPeriod(periodName, cellIdx);
+  (void)periodName; (void)cellIdx;
 }
 
 void EJit::invalidateAllByPeriod(const std::string &periodName) {
-  // Invalidate all known cellIdx entries for this period.
-  // Iterate over registered arrays and invalidate each cell index.
-  const auto *arrs = getRegistry().getArrays(periodName);
-  if (!arrs)
-    return;
-  for (const auto &info : *arrs) {
-    for (size_t i = 0; i < info.arraySize; i++)
-      cache_->invalidateByPeriod(periodName, static_cast<uint8_t>(i));
-  }
+  (void)periodName;
 }
 
 void EJit::registerSymbol(const std::string &name, void *addr) {
@@ -561,7 +546,6 @@ bool EJit::registerStaticVar(const std::string &varName, void *varAddr) {
 }
 
 bool EJit::setCompileMode(CompileMode mode) {
-#ifdef EJIT_SRE_TASKPOOL
   EJitTaskPool *tp = taskPool();
   if (!tp)
     return false;
@@ -570,7 +554,7 @@ bool EJit::setCompileMode(CompileMode mode) {
     // Do not expose Async until both the compiler engine and consumer exist.
     // Failure preserves the old mode, so callers cannot enqueue permanent
     // pending work into a worker-less taskpool.
-    if (!compileDriver_->hasSyncEngine()) {
+    if (!compileDriver_->hasJitEngine()) {
       EJIT_DIAG("compile mode switch rejected: async without engine");
       return false;
     }
@@ -586,8 +570,11 @@ bool EJit::setCompileMode(CompileMode mode) {
 #endif
     tp->switchController().setMode(EJitCompileMode::Async);
     EJIT_DIAG("compile mode switched to async");
-  } else {
+  } else if (mode == CompileMode::Off) {
     tp->switchController().setMode(EJitCompileMode::Off);
+    EJIT_DIAG("compile mode switched to off (no JIT)");
+  } else {
+    tp->switchController().setMode(EJitCompileMode::Sync);
 #ifndef EJIT_SRE_SHARED_TASKPOOL
     // Private taskpool: stop this instance's local worker. In a shared build
     // the single worker is owner-controlled and shared across cores, so a mode
@@ -604,9 +591,9 @@ bool EJit::setCompileMode(CompileMode mode) {
   // mode; engine/worker ownership stays owner-controlled (a mode flip never
   // starts/stops the shared worker or re-runs owner election).
   if (EJitSharedTaskPool *sp = sharedTaskPool())
-    sp->setSharedMode(mode == CompileMode::Async ? EJitCompileMode::Async
-                                                 : EJitCompileMode::Off);
-#endif
+    sp->setSharedMode(mode == CompileMode::Async   ? EJitCompileMode::Async
+                     : mode == CompileMode::Sync   ? EJitCompileMode::Sync
+                                                   : EJitCompileMode::Off);
 #endif
   config_.compileMode = mode;
   return true;
@@ -619,8 +606,10 @@ CompileMode EJit::getCompileMode() const {
   // rather than this instance's stale local config_.
   if (compileDriver_) {
     EJitSharedTaskPool *sp = compileDriver_->sharedTaskPool();
-    return sp->getSharedMode() == EJitCompileMode::Async ? CompileMode::Async
-                                                         : CompileMode::Sync;
+    EJitCompileMode m = sp->getSharedMode();
+    return m == EJitCompileMode::Async ? CompileMode::Async
+         : m == EJitCompileMode::Sync ? CompileMode::Sync
+                                      : CompileMode::Off;
   }
 #endif
   return config_.compileMode;
@@ -633,8 +622,6 @@ void EJit::setOptimizationLevel(OptimizationLevel level) {
 OptimizationLevel EJit::getOptimizationLevel() const {
   return config_.optLevel;
 }
-
-EJitCache::Stats EJit::getStats() const { return cache_->getStats(); }
 
 const EJitError *EJit::getLastError() const {
 #ifdef EJIT_FREESTANDING

@@ -32,11 +32,11 @@ llvm/
 │   └── ExecutionEngine/
 │       └── EJIT/                   // 运行时库 (含 JIT Pipeline Pass)
 │           ├── EJit.cpp           // 主实现
-│           ├── EJitCache.cpp      // Code Cache 管理 (增强版 LRU)
+│           ├── EJitTaskPool.cpp   // taskpool 编译调度器 (含 cache/queue/dedup)
 │           ├── EJitRuntime.cpp    // 运行时状态管理 (新增 activate/deactivate)
 │           ├── EJitCompiler.cpp   // 编译协调器
 │           ├── EJitStructFieldPass.cpp  // 结构体字段特化 (JIT Pipeline, 新增)
-│           ├── EJitAsyncCompiler.cpp    // 异步编译器 (工作线程 + 请求队列)
+│           ├── EJitSrePlatform.cpp      // SRE 平台抽象层
 │           ├── EJitModuleLoader.cpp // Bitcode 加载器 (参考 easyJIT)
 │           ├── EJitOptimizer.cpp    // 优化 pipeline
 │           ├── EJitLogger.cpp      // 日志系统
@@ -135,7 +135,7 @@ clang/lib/CodeGen/CodeGenModule.cpp
 │  ┌──────────────────────────────────────────────────────────────────┐   │
 │  │ 用户调用 ejit_entry 函数                                          │   │
 │  │ - 实际执行 Wrapper 插桩代码                                        │   │
-│  │ - 查询 Code Cache (封装在 ejit_compile_or_get 内部)               │   │
+│  │ - 查询 taskpool Cache (封装在 ejit_taskpool_compile_or_get 内部)   │   │
 │  │ - 命中 → 直接调用特化函数                                          │   │
 │  │ - 未命中 → JIT 编译 → Cache → 调用                                 │   │
 │  └──────────────────────────────────────────────────────────────────┘   │
@@ -167,7 +167,7 @@ clang/lib/CodeGen/CodeGenModule.cpp
 用户调用:                          运行时:
 process_task_multi(idx, iter);  →  Wrapper 构建 dims
                                        ↓
-                                 ejit_compile_or_get()
+                                 ejit_taskpool_compile_or_get()
                                        ↓
                                  [内部: 查Cache → 命中 → 返回]
                                  [内部: 未命中 → JIT编译 → 存Cache → 返回]
@@ -178,7 +178,7 @@ process_task_multi(idx, iter);  →  Wrapper 构建 dims
 
 **关键点**：
 
-- Cache 查询封装在 `ejit_compile_or_get` 内部，调用者不感知缓存逻辑
+- Cache 查询封装在 `ejit_taskpool_compile_or_get` 内部，调用者不感知缓存逻辑
 - 根据 **funcIdx（FNV-1a hash）** + **ejit_period_arr_ind 参数值** 构建 Cache key
 - **常量读取时机**：JIT 编译时按需读取 `ejit_may_const` 字段值，从进程内存直接读取
 - 用户调用原函数名，实际执行 Wrapper 插桩代码
@@ -316,7 +316,9 @@ JIT 编译时读取常量:
 // funcIdx 由 FNV-1a hash 确定（AOT 编译期计算，运行时一致）。
 // 无维度时低 32 位为 0。
 
-// 缓存条目 — LRU list iterator 嵌入 Entry，getOrNull 一次 hash 完成 LRU bump
+// v2: LRU 缓存已移除。编译结果由 taskpool 的 lock-free bucket cache 管理。
+// 以下为历史设计参考。
+#if 0 // legacy design
 struct Entry {
     void* funcPtr;
     size_t codeSize;
@@ -324,10 +326,11 @@ struct Entry {
     SmallVector<std::string, 4> periodDeps;
 };
 
-// Code Cache 管理器 — 线程安全，iterator-embedded LRU
+#if 0 // legacy LRU — 已由 taskpool cache 取代
 class EJitCache {
     std::unordered_map<uint64_t, Entry> cache_;
     std::list<uint64_t> lruList_;         // key, LRU 顺序
+#endif // legacy LRU
     // 不再需要 lruIter_ 反向映射 — iterator 嵌在 Entry 里
 
     std::unordered_map<std::string, std::set<uint64_t>> periodIndex_;
@@ -337,8 +340,8 @@ class EJitCache {
     size_t maxSingleFuncSize_ = 512 KB;    // 单函数上限
 
 public:
-    void* getOrNull(uint64_t cacheKey);    // unique_lock (splice 是写操作)
-    bool put(uint64_t cacheKey, void* fn, size_t codeSize,
+    EJitCacheLookupResult lookup(uint32_t funcIndex, ...);  // taskpool bucket cache
+    EJitPublishStatus publish(uint32_t funcIndex, ...);  // taskpool commit gate
              ArrayRef<std::string> periodDeps = {});
     void invalidateByPeriod(const std::string& periodName, uint8_t cellIdx);
     void clear();
@@ -373,9 +376,9 @@ uint64_t buildCacheKey(uint32_t funcIdx,
 **Wrapper 生成方式**：
 
 - `EJitWrapperGenPass` 在 AOT 编译时为每个 `ejit_entry` 函数生成独立的 Wrapper
-- Wrapper 包含 Cache 查询和 `ejit_compile_or_get()` 调用逻辑
+- Wrapper 包含 Cache 查询和 `ejit_taskpool_compile_or_get()` 调用逻辑
 - 用户直接调用原函数名，实际执行的是 Wrapper 代码
-- `PFN_xxx` 是 Pass 生成的函数指针 typedef，签名与原函数一致，用于类型安全地转换 `ejit_compile_or_get` 返回的 `void*`
+- `PFN_xxx` 是 Pass 生成的函数指针 typedef，签名与原函数一致，用于类型安全地转换 `ejit_taskpool_compile_or_get` 通过 `outFn` 返回的 `void*`
 
 **单维度 Wrapper 示例 (单函数混合方案)**：
 
@@ -388,7 +391,7 @@ void process_task_multi(uint8_t cellIdx, int iterations) {
     // === Wrapper 逻辑 (JIT 入口) ===
     // 维度编码在 cacheKey 中
     uint64_t key = (funcIdx << 32) | cellIdx;
-    PFN_process_task_multi pfn = (PFN_process_task_multi)ejit_compile_or_get(key, NULL);
+    PFN_process_task_multi pfn = (PFN_process_task_multi)ejit_taskpool_compile_or_get(funcIdx, dims, numDims, &fn, &bucket);
 
     if (pfn) {
         return pfn(cellIdx, iterations);  // JIT 成功，调用 specialized 版本
@@ -411,7 +414,7 @@ void process_task_multi(uint8_t cellIdx, uint8_t trpIdx, int iterations) {
         {"cell", cellIdx},   // cell 维度: g_cellCfg[cellIdx]
         {"trp", trpIdx}      // trp 维度: g_trpCfg[trpIdx]
     };
-    PFN_process_task_multi pfn = (PFN_process_task_multi)ejit_compile_or_get(key, NULL);
+    PFN_process_task_multi pfn = (PFN_process_task_multi)ejit_taskpool_compile_or_get(funcIdx, dims, numDims, &fn, &bucket);
 
     if (pfn) {
         return pfn(cellIdx, trpIdx, iterations);  // JIT 成功，调用 specialized 版本
@@ -431,7 +434,8 @@ void process_static_data(void) { ... }
 void process_static_data(void) {
     // === Wrapper 逻辑 (JIT 入口) ===
     // 无维度参数，dims 为 NULL，count 为 0
-    PFN_process_static_data pfn = (PFN_process_static_data)ejit_compile_or_get(funcIdx << 32, NULL);
+    ejit_taskpool_compile_or_get(funcIdx, nullptr, 0, &fn, &bucket);
+    PFN_process_static_data pfn = (PFN_process_static_data)(fn ? fn : fallback);
 
     if (pfn) {
         return pfn();  // JIT 成功，调用 specialized 版本
@@ -447,7 +451,7 @@ void process_static_data(void) {
 | ---------- | ----------------------------------------- |
 | Wrapper 生成 | AOT 编译时由 `EJitWrapperGenPass` 生成，单函数混合方案  |
 | Wrapper 数量 | 每个 `ejit_entry` 函数只有一个函数                  |
-| 参数传递       | Wrapper 在寄存器中计算 cacheKey（funcIdx<<32|dims），零栈分配    |
+| 参数传递       | Wrapper 从 per-lifecycle globals 加载 dimType，构造 [{dimType,instanceId}] 对，mem2reg 优化为零栈分配 |
 | 用户调用       | 直接调用原函数名，实际执行 wrapper + 原函数逻辑             |
 | Fallback   | 单函数混合方案：JIT 失败时继续执行原函数逻辑，无需单独 fallback 函数 |
 | out_pfn    | 保留作为 future 扩展，用于跨平台适配或状态查询               |
@@ -574,7 +578,7 @@ AOT Pipeline:
 非LTO: PASS2-4 在 O2/O3 之前运行
 LTO:   PASS2-4 在 O2/O3 之后运行
 
-JIT Pipeline (ejit_compile_or_get 内部执行):
+JIT Pipeline (ejit_taskpool_compile_or_get 内部执行):
 ┌───────────────────────────────────────────────┐
 │  1. 参数预处理: 替换 ejit_period_arr_ind 参数   │
 │  2. InstCombine: 折叠常量链                    │
@@ -614,7 +618,7 @@ JIT Pipeline (ejit_compile_or_get 内部执行):
 
 > **为什么 InstCombine 在 PASS6 之前**: 参数替换 (`replaceAllUsesWith(ConstantInt)`) 后，`zext i8 3 to i64` 等指令仍是变量形式。InstCombine 将它们折叠为常量，使 `accumulateConstantOffset` 计算可靠。
 
-**JIT 编译流程** (ejit_compile_or_get 内部):
+**JIT 编译流程** (ejit_taskpool_compile_or_get 内部):
 
 ```cpp
 CompiledFunction EJitCompiler::compile(Module& M, Function* targetFunc,
@@ -670,11 +674,11 @@ public:
 
 ```
 同步模式 (EJIT_COMPILE_SYNC):
-  ejit_compile_or_get() → 查Cache → 未命中 → 阻塞JIT编译 → 存Cache → 返回pfn
+  ejit_taskpool_compile_or_get() → 查Cache → 未命中 → 阻塞JIT编译 → 存Cache → 返回pfn
   首次调用有延迟，后续调用命中Cache
 
 异步模式 (EJIT_COMPILE_ASYNC):
-  ejit_compile_or_get() → 查Cache → 未命中 → 提交编译请求 → 立即返回NULL
+  ejit_taskpool_compile_or_get() → 查Cache → 未命中 → 提交编译请求 → 立即返回NULL
   后台线程完成编译 → 存入Cache
   下次调用命中Cache → 返回pfn
 ```
@@ -686,11 +690,11 @@ public:
 struct CompileRequest {
     std::string funcName;
     std::vector<std::pair<std::string, int>> dims; // (periodName, cellIdx)
-    std::string cacheKey;
+    // v2: cacheKey replaced by funcIndex + dim pairs
 };
 
 // 异步编译器
-class EJitAsyncCompiler {
+// EJitAsyncCompiler 已被 taskpool worker 取代，不再存在于源码中
     std::thread workerThread_;
     std::queue<CompileRequest> requestQueue_;
     std::mutex queueMutex_;
@@ -707,7 +711,7 @@ private:
 };
 ```
 
-**ejit_compile_or_get 行为差异**:
+**ejit_taskpool_compile_or_get 行为差异**:
 
 | 步骤 | 同步模式 | 异步模式 |
 |------|---------|---------|
@@ -885,7 +889,7 @@ void ejit_deactivate_all(const char* periodName);
 
 bool ejit_is_active(const char* periodName, int cellIdx);
 
-// 维度信息结构 (用于 ejit_compile_or_get)
+// 维度信息结构 (用于 ejit_taskpool_compile_or_get)
 // 包含维度名称和索引值，用于 JIT 特化
 typedef struct {
     const char* name;    /* 维度名称，如 "cell", "trp" */
@@ -893,10 +897,11 @@ typedef struct {
 
 // 内部使用: Wrapper 入口和编译函数
 // 返回特化函数指针，NULL 表示编译失败继续执行原函数逻辑
-// cacheKey = (funcIdx << 32) | dims
+// dims = [{dimType, instanceId}] pairs, dimType from per-lifecycle global
 // out_pfn 保留作为 future 扩展，用于跨平台适配或状态查询
-void* ejit_compile_or_get(uint64_t cacheKey,
-                          int count, void** out_pfn);
+ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
+    const ejit_dim_pair_t *dims, uint32_t numDims, void **outFn, uint32_t *outBucket);
+void ejit_taskpool_release_read(uint32_t bucketIndex);  // 使用完 fnPtr 后释放 read-token
 
 // 缓存管理
 void ejit_clear_cache(void);
@@ -988,7 +993,7 @@ public:
 // ===== JIT Pipeline Passes =====
 
 // EJitStructFieldPass - 替换 load(!ejit.may_const) 为运行时常量
-// 运行在 ejit_compile_or_get 内部，Inline 之后
+// 运行在 ejit_taskpool_compile_or_get 内部，Inline 之后
 // v1.2: may_const 识别通过 load 上的 !ejit.may_const metadata
 // v1.3: 支持直接 GlobalVariable load（无 GEP），内联后的函数也可处理
 class EJitStructFieldPass : public PassInfoMixin<EJitStructFieldPass> {

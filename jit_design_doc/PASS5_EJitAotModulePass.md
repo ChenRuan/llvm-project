@@ -298,7 +298,7 @@ static void addEmbeddedJITPasses(const PassBuilder &PB,
 ; 验证 AOT Pipeline 输出:
 ; CHECK: define internal void @ejit_auto_register
 ; CHECK: call void @ejit_register_period_array
-; CHECK: call ptr @ejit_compile_or_get
+; CHECK: call i32 @ejit_taskpool_compile_or_get
 ; CHECK: call void @ejit_deactivate
 ; CHECK: call void @ejit_activate
 ; 注意: @__ejit_bitcode 和 ejit_register_bitcode 调用由早期 EJitRegisterBitcodePass 生成

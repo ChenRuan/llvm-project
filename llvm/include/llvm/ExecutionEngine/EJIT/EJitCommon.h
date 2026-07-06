@@ -57,7 +57,6 @@ constexpr const char *FN_REGISTER_PERIOD_ARRAY = "ejit_register_period_array";
 constexpr const char *FN_REGISTER_STATIC_VAR = "ejit_register_static_var";
 constexpr const char *FN_REGISTER_LIFECYCLE = "ejit_register_lifecycle";
 constexpr const char *FN_REGISTER_FUNCINDEX = "ejit_register_funcindex";
-constexpr const char *FN_COMPILE_OR_GET = "ejit_compile_or_get";
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET =
     "ejit_taskpool_compile_or_get";
 constexpr const char *FN_TASKPOOL_RELEASE_READ = "ejit_taskpool_release_read";

@@ -691,7 +691,7 @@ EJitStructFieldPass 本身不受优化等级影响 — 常量替换是基础操�
 | 指针操作数为 PHI/Select | 跳过 — Inline+InstCombine 已消除绝大多数，残余 fallback 到 AOT | v1.3 |
 | 间接访问的指针值为 null | 跳过，记录 warning | v1.5 |
 | 运行时地址读取失败 | 跳过该 load，记录 warning 日志 |
-| cellIdx 越界 | 跳过该 load（运行时检查在 ejit_compile_or_get 之前完成） |
+| cellIdx 越界 | 跳过该 load（运行时检查在 ejit_taskpool_compile_or_get 之前完成） |
 | GEP accumulateConstantOffset 失败 | 跳过该 load |
 | 类型不匹配 | 跳过该 load，记录 warning |
 | `!ejit.may_const` metadata 被 AOT 优化丢弃 | 不再发生 — bitcode 在标准优化前提取 | v1.3 |

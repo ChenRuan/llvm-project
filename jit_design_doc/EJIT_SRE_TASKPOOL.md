@@ -10,7 +10,7 @@
 
 ### 1.1 为什么需要 taskpool
 
-`ejit_compile_or_get` 的原实现是一条直通路径：查 LRU cache → 未命中则同步编译 → 写入 LRU cache。
+`ejit_taskpool_compile_or_get` 的原实现是一条直通路径：查 LRU cache → 未命中则同步编译 → 写入 LRU cache。
 这在以下场景中有局限：
 
 - **无去重**：多个调用方同时请求同一个 (funcIndex, cacheKey)，各自独立编译，浪费 CPU
@@ -135,13 +135,13 @@ compile_or_get(funcIndex, dims, numDims)
            pollOne() → taskQueue.tryDequeue() → runCompile → publish (该桶 write spin 等 readers→0)
 ```
 
-### 2.3 Before vs After：`ejit_compile_or_get` 流程变化
+### 2.3 Before vs After：`ejit_taskpool_compile_or_get` 流程变化
 
 ```
                         BEFORE                                    AFTER
                   (ejit_dev_spec4)                        (ejit_taskpool)
 
-ejit_compile_or_get                                   ejit_compile_or_get
+ejit_taskpool_compile_or_get                                   ejit_taskpool_compile_or_get
   └─ EJit::getOrCompile                                 └─ EJit::getOrCompile
        └─ EJitCompileDriver::getOrCompile                    └─ EJitCompileDriver::getOrCompile
             │                                                     │
@@ -204,7 +204,7 @@ pool.startWorker();          // 内部: EJitWorker → EJitSreTask::create
 
 ```
 核 0 (业务)                               核 N (JIT worker, 由 SreTask 决定)
-ejit_compile_or_get()                     EJitWorker::run() 循环中
+ejit_taskpool_compile_or_get()                     EJitWorker::run() 循环中
   → miss → taskQueue_.tryEnqueue()          → pool.pollOne()
   → 立即返回 fallback                       → taskQueue_.tryDequeue()
                                             → runCompile()
@@ -1166,8 +1166,8 @@ typedef struct {
 
 | Clang 参数 | 生成的 wrapper | 默认 |
 |-----------|---------------|------|
-| 无 | 同步调用 `ejit_compile_or_get` | 是 |
-| `-mllvm -ejit-wrapper-async` | 异步调用 `ejit_taskpool_compile_or_get` | 否 |
+| 无 | 同步调用 `ejit_taskpool_compile_or_get` | 是 |
+| `-mllvm -ejit-wrapper-async` | （已移除，wrapper 始终使用 taskpool API） | — |
 
 两种 wrapper 都使用注册阶段分配的 dense `funcIndex`，不会退回旧的函数名
 hash。异步路径稳定后应删除此临时开关并固定生成 taskpool wrapper。

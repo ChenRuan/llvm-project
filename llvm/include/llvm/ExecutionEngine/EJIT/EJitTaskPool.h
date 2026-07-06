@@ -36,6 +36,7 @@ namespace ejit {
 enum class EJitCompileMode : uint32_t {
   Off = 0,
   Async = 1,
+  Sync = 2, ///< Compile inline on the calling thread (no worker).
 };
 
 enum class EJitCompileOrGetStatus : uint32_t {
