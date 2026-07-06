@@ -586,9 +586,10 @@ endif()
 # (CodeGenTargetMachineImpl::createMCStreamer) to save image size; this option
 # overrides that so ejit_print_dumped can produce ASM on target. Cost: the
 # textual-asm backend (MCInstPrinter/MCAsmStreamer/MCAsmBackend and deps) is
-# retained by the lipo, ~a few hundred KB. When ON, the SRE/lipo image must
-# also link ejit_test/stubs/ejit_sre_format_stubs.cpp (the InstPrinter's
-# snprintf/vsnprintf). Default OFF to keep the trimmed image small.
+# retained by the lipo, ~a few hundred KB. The ASM emit's InstPrinter needs
+# snprintf/vsnprintf: link a libc that provides them, OR (if the SRE libc
+# lacks them) link ejit_test/stubs/ejit_sre_format_stubs.cpp instead — not
+# both (strong-symbol conflict). Default OFF to keep the trimmed image small.
 option(EJIT_DUMP_ASM "Re-enable textual assembly emission for the EJIT IR/ASM diagnostic dump under EJIT_TRIM_LLVM_BACKEND" OFF)
 if(EJIT_DUMP_ASM)
   add_definitions(-DEJIT_DUMP_ASM)

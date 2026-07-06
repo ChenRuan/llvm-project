@@ -640,10 +640,12 @@ EJitOrcEngine::Create(const Config &config,
               // unmapped on bare-metal/SRE and crashes. So under trim we skip
               // ASM (IR is still captured — M.print to a string stream is
               // SRE-safe). To get ASM on target, build with EJIT_DUMP_ASM=ON
-              // (re-enables the textual asm backend under trim; also link
-              // ejit_test/stubs/ejit_sre_format_stubs.cpp for the InstPrinter's
-              // snprintf). The success path of the emit does not call errs(),
-              // so once the path is compiled in it is SRE-safe.
+              // (re-enables the textual asm backend under trim). The ASM emit's
+              // InstPrinter needs snprintf/vsnprintf: link a libc that provides
+              // them, OR ejit_test/stubs/ejit_sre_format_stubs.cpp if the SRE
+              // libc lacks them (not both — strong-symbol conflict). The success
+              // path of the emit does not call errs(), so once the path is
+              // compiled in it is SRE-safe.
 #if !defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM)
               if (engine->P->dumpTM) {
                 EJIT_DIAG_DEBUG("dump asm begin fn=%s", ctx->fnName.c_str());
