@@ -580,6 +580,20 @@ if(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
   add_definitions(-DEJIT_TRIM_LLVM_BACKEND)
 endif()
 
+# Re-enable textual assembly (.s) emission for the JIT IR/ASM diagnostic dump
+# (ejit_dump_func / ejit_dump_all) even in an EJIT_TRIM_LLVM_BACKEND build.
+# The trim normally #ifdef's out the AssemblyFile codegen path
+# (CodeGenTargetMachineImpl::createMCStreamer) to save image size; this option
+# overrides that so ejit_print_dumped can produce ASM on target. Cost: the
+# textual-asm backend (MCInstPrinter/MCAsmStreamer/MCAsmBackend and deps) is
+# retained by the lipo, ~a few hundred KB. When ON, the SRE/lipo image must
+# also link ejit_test/stubs/ejit_sre_format_stubs.cpp (the InstPrinter's
+# snprintf/vsnprintf). Default OFF to keep the trimmed image small.
+option(EJIT_DUMP_ASM "Re-enable textual assembly emission for the EJIT IR/ASM diagnostic dump under EJIT_TRIM_LLVM_BACKEND" OFF)
+if(EJIT_DUMP_ASM)
+  add_definitions(-DEJIT_DUMP_ASM)
+endif()
+
 option(EJIT_FREESTANDING "Build EJIT runtime for freestanding: no OS threads, no file I/O, no-op logging" OFF)
 if(EJIT_FREESTANDING)
   add_definitions(-DEJIT_FREESTANDING)

@@ -631,12 +631,20 @@ EJitOrcEngine::Create(const Config &config,
               IOS.flush();
 
               std::string Asm;
-              // ASM dump drives the LLVM assembly emitter, whose InstPrinter
-              // formats fields into AsmBuf via C-library snprintf/vsnprintf.
-              // On SRE those must be functional or the emit crashes in
-              // raw_ostream::operator<<(format_object_base). Link
-              // ejit_test/stubs/ejit_sre_format_stubs.cpp into the SRE/lipo
-              // image, or provide an equivalent platform vsnprintf.
+              // Textual ASM emit goes through addPassesToEmitFile ->
+              // addAsmPrinter -> createMCStreamer(AssemblyFile). Under
+              // EJIT_TRIM_LLVM_BACKEND that path is compile-time removed and
+              // createMCStreamer returns "textual assembly output unavailable";
+              // addAsmPrinter reports it via MCContext::reportError ->
+              // llvm::errs() (raw_fd_ostream fd 2), whose constructor is
+              // unmapped on bare-metal/SRE and crashes. So under trim we skip
+              // ASM (IR is still captured — M.print to a string stream is
+              // SRE-safe). To get ASM on target, build with EJIT_DUMP_ASM=ON
+              // (re-enables the textual asm backend under trim; also link
+              // ejit_test/stubs/ejit_sre_format_stubs.cpp for the InstPrinter's
+              // snprintf). The success path of the emit does not call errs(),
+              // so once the path is compiled in it is SRE-safe.
+#if !defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM)
               if (engine->P->dumpTM) {
                 EJIT_DIAG_DEBUG("dump asm begin fn=%s", ctx->fnName.c_str());
                 SmallVector<char, 0> AsmBuf;
@@ -662,6 +670,11 @@ EJitOrcEngine::Create(const Config &config,
                             ctx->fnName.c_str());
                 }
               }
+#else
+              EJIT_DIAG_DEBUG("dump asm skipped (EJIT_TRIM_LLVM_BACKEND, "
+                              "EJIT_DUMP_ASM off) fn=%s; IR captured",
+                              ctx->fnName.c_str());
+#endif
               captureDump(ctx->fnName, ctx->cacheKey, std::move(IR),
                           std::move(Asm));
             }
