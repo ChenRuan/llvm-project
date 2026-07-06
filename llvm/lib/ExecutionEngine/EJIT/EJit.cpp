@@ -747,3 +747,73 @@ void EJit::printFuncMeta(const std::string &funcName) {
     EJIT_DIAG("  %s %s", tag.str().c_str(), rest.c_str());
   }
 }
+
+bool EJit::getCodePoolStats(ejit_code_pool_stats_t *out) const {
+  if (!out)
+    return false;
+#ifdef EJIT_SRE_CODE_POOL
+  if (!compileDriver_)
+    return false;
+  EJitOrcEngine *engine = compileDriver_->getJitEngine();
+  if (!engine)
+    return false;
+  EJitCodePoolManager::Stats s = engine->getCodePoolStats();
+  out->poolCount = s.poolCount;
+  out->sealedCount = s.sealedCount;
+  out->activeCount = s.activeCount;
+  out->usedBytes = s.usedBytes;
+  out->reservedBytes = s.reservedBytes;
+  out->wastedBytes = s.wastedBytes;
+  out->sealInvocations = s.sealInvocations;
+  out->splitInvocations = s.splitInvocations;
+  out->finalizedRangeCount = s.finalizedRangeCount;
+  return true;
+#else
+  return false;
+#endif
+}
+
+void EJit::printCodePoolStats() const {
+#ifdef EJIT_SRE_CODE_POOL
+  ejit_code_pool_stats_t s{};
+  if (!getCodePoolStats(&s)) {
+    EJIT_DIAG("code pool: not available (no engine)");
+    return;
+  }
+  EJIT_DIAG("code pool: pools=%llu sealed=%llu active=%llu",
+            (unsigned long long)s.poolCount, (unsigned long long)s.sealedCount,
+            (unsigned long long)s.activeCount);
+  EJIT_DIAG("  bytes used=%llu reserved=%llu wasted=%llu",
+            (unsigned long long)s.usedBytes,
+            (unsigned long long)s.reservedBytes,
+            (unsigned long long)s.wastedBytes);
+  EJIT_DIAG("  sealInvocations=%llu splitInvocations=%llu finalizedRanges=%llu",
+            (unsigned long long)s.sealInvocations,
+            (unsigned long long)s.splitInvocations,
+            (unsigned long long)s.finalizedRangeCount);
+#else
+  EJIT_DIAG("code pool: EJIT_SRE_CODE_POOL not enabled");
+#endif
+}
+
+void EJit::printActive() const {
+  const PeriodArrayRegistry &reg = runtimeState_->getRegistry();
+  EJIT_DIAG("active periods:");
+  // Query the same isActive() path the JIT gate uses (shared SwitchController
+  // in shared-taskpool builds, per-instance arrayStates_ otherwise), so the
+  // printed view matches the compile decision.
+  for (const auto &kv : reg.arraysByPeriod()) {
+    const std::string &period = kv.first;
+    uint32_t activeCells = 0;
+    for (uint32_t cell = 0; cell < kEJitMaxInstances; ++cell) {
+      if (isActive(period, static_cast<uint8_t>(cell))) {
+        EJIT_DIAG("  period=%s cell=%u", period.c_str(), cell);
+        ++activeCells;
+      }
+    }
+    if (activeCells == 0)
+      EJIT_DIAG("  period=%s (no active cells)", period.c_str());
+  }
+  // The built-in "static" time window is always active.
+  EJIT_DIAG("active static vars: %zu (always active)", reg.getStaticVars().size());
+}

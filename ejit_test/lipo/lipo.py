@@ -363,6 +363,8 @@ def doit_gc_merge(args):
         "ejit_set_log_level", "ejit_get_log_level",
         "ejit_print_registry", "ejit_print_func_meta",
         "ejit_dump_all",
+        "ejit_get_code_pool_stats", "ejit_print_code_pool_stats",
+        "ejit_print_active",
     ]
     optional_api = [
         "ejit_register_lifecycle", "ejit_register_funcindex",

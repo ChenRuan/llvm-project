@@ -757,4 +757,36 @@ void ejit_print_func_meta(const char *funcName) {
   gEJIT->printFuncMeta(funcName);
 }
 
+ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out) {
+  if (!out) {
+    EJIT_DIAG("get_code_pool_stats: null out pointer");
+    return EJIT_ERR_INVALID_PARAM;
+  }
+  if (!gEJIT) {
+    EJIT_DIAG("get_code_pool_stats: not initialized");
+    return EJIT_ERR_NOT_ACTIVE;
+  }
+  if (!gEJIT->getCodePoolStats(out)) {
+    EJIT_DIAG("get_code_pool_stats: no code pool (EJIT_SRE_CODE_POOL off or no engine)");
+    return EJIT_ERR_DISABLED;
+  }
+  return EJIT_OK;
+}
+
+void ejit_print_code_pool_stats(void) {
+  if (!gEJIT) {
+    EJIT_DIAG("print_code_pool_stats: not initialized");
+    return;
+  }
+  gEJIT->printCodePoolStats();
+}
+
+void ejit_print_active(void) {
+  if (!gEJIT) {
+    EJIT_DIAG("print_active: not initialized");
+    return;
+  }
+  gEJIT->printActive();
+}
+
 } // extern "C"
