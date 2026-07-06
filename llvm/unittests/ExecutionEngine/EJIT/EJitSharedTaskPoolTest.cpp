@@ -2059,4 +2059,87 @@ TEST_F(SharedTaskPoolTest, FixedDimReadyButNotShareableCleanFallback) {
   EXPECT_EQ(fast.fnPtr, nullptr);
 }
 
+// The specialized cacheLookupNd behind each fixed entry must agree with the
+// generic tryCacheHit()/cacheLookup() for the same identity: same fnPtr, same
+// bucket, same CacheHit status across 0D..4D.
+TEST_F(SharedTaskPoolTest, FixedDimCacheLookupMatchesGenericAllDims) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(0, 1, true);
+  owner.setInstanceEnabled(1, 2, true);
+  owner.setInstanceEnabled(2, 3, true);
+  owner.setInstanceEnabled(3, 4, true);
+  EJitDimPair d1[1] = {dim(0, 1)};
+  EJitDimPair d2[2] = {dim(0, 1), dim(1, 2)};
+  EJitDimPair d3[3] = {dim(0, 1), dim(1, 2), dim(2, 3)};
+  EJitDimPair d4[4] = {dim(0, 1), dim(1, 2), dim(2, 3), dim(3, 4)};
+  auto publishDims = [&](uint32_t fi, const EJitDimPair *d, uint32_t n) {
+    ASSERT_EQ(owner.compileOrGet(fi, d, n, codeFor(fi)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(owner.pollOne());
+  };
+  publish(owner, 60);
+  publishDims(61, d1, 1);
+  publishDims(62, d2, 2);
+  publishDims(63, d3, 3);
+  publishDims(64, d4, 4);
+
+  auto cmp = [&](EJitSharedTaskPool::CompileOrGetResult fixed, uint32_t fi,
+                 const EJitDimPair *d, uint32_t n) {
+    auto gen = owner.tryCacheHit(fi, d, n);
+    EXPECT_EQ(fixed.status, EJitCompileOrGetStatus::CacheHit);
+    EXPECT_EQ(fixed.status, gen.status);
+    EXPECT_EQ(fixed.fnPtr, gen.fnPtr);
+    EXPECT_EQ(fixed.bucketIndex, gen.bucketIndex);
+    owner.releaseRead(fixed.bucketIndex);
+    owner.releaseRead(gen.bucketIndex);
+  };
+  cmp(owner.tryCacheHit0D(60), 60, nullptr, 0);
+  cmp(owner.tryCacheHit1D(61, 0, 1), 61, d1, 1);
+  cmp(owner.tryCacheHit2D(62, 0, 1, 1, 2), 62, d2, 2);
+  cmp(owner.tryCacheHit3D(63, 0, 1, 1, 2, 2, 3), 63, d3, 3);
+  cmp(owner.tryCacheHit4D(64, 0, 1, 1, 2, 2, 3, 3, 4), 64, d4, 4);
+}
+
+// Version mismatch: a stale instance version (bumped by a deactivate/activate
+// cycle after publish) must miss on the fixed path exactly as on the generic
+// path — never returning the stale cached pointer.
+TEST_F(SharedTaskPoolTest, FixedDimVersionMismatchMisses) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(0, 1, true);
+  owner.setInstanceEnabled(1, 2, true);
+
+  // 1D
+  EJitDimPair d1[1] = {dim(0, 1)};
+  ASSERT_EQ(owner.compileOrGet(70, d1, 1, codeFor(70)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  // Bump the version while leaving the instance ENABLED (disable then enable).
+  owner.setInstanceEnabled(0, 1, false);
+  owner.setInstanceEnabled(0, 1, true);
+  auto genMiss = owner.tryCacheHit(70, d1, 1);
+  auto fixedMiss = owner.tryCacheHit1D(70, 0, 1);
+  EXPECT_FALSE(genMiss.fastPathTerminal);   // stale version → miss
+  EXPECT_FALSE(fixedMiss.fastPathTerminal); // same on the fixed path
+  EXPECT_NE(fixedMiss.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_FALSE(fixedMiss.hasReadToken);
+
+  // 2D: bump only the second dim's version.
+  EJitDimPair d2[2] = {dim(0, 1), dim(1, 2)};
+  ASSERT_EQ(owner.compileOrGet(71, d2, 2, codeFor(71)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  auto hit2 = owner.tryCacheHit2D(71, 0, 1, 1, 2); // sanity: hits before bump
+  ASSERT_EQ(hit2.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(hit2.bucketIndex);
+  owner.setInstanceEnabled(1, 2, false);
+  owner.setInstanceEnabled(1, 2, true);
+  auto fixedMiss2 = owner.tryCacheHit2D(71, 0, 1, 1, 2);
+  EXPECT_FALSE(fixedMiss2.fastPathTerminal);
+  EXPECT_FALSE(fixedMiss2.hasReadToken);
+}
+
 } // namespace
