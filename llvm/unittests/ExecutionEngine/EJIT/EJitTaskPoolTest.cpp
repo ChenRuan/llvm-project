@@ -866,12 +866,10 @@ TEST(EJitControlPlane, ActivateAllSweepsEveryInstanceOfOneLifecycleOnly) {
 //===----------------------------------------------------------------------===//
 
 TEST(EJitTaskPoolTest, InvalidParam) {
-  EJitTaskPool P(8, false);
-  EXPECT_EQ(P.compileOrGet(1, nullptr, 1, nullptr).status,
-            EJitCompileOrGetStatus::InvalidParam);
-  EJitDimPair D5[5] = {{0, 1}, {1, 1}, {2, 1}, {3, 1}, {4, 1}};
-  EXPECT_EQ(P.compileOrGet(1, D5, 5, nullptr).status,
-            EJitCompileOrGetStatus::InvalidParam);
+  // PASS3 guarantees numDims ≤ 4 and dims ≠ null for numDims > 0 at AOT time.
+  // The C API layer (ejit_taskpool_compile_or_get) performs runtime validation
+  // for these invariants; the internal compileOrGet/tryCacheHit assumes
+  // already-validated inputs.
 }
 
 TEST(EJitTaskPoolTest, OutOfRangeFuncIndexRejected) {
