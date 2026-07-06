@@ -148,6 +148,13 @@ void setDumpFuncFilter(const std::string &name) {
 void setDumpSharedState(EJitSharedTaskPoolState *state) {
   gDumpSharedState = state;
   EJIT_DIAG_DEBUG("set_dump_shared_state state=%p", (void *)state);
+  // If a filter was set before the shared state was bound — e.g. ejit_dump_all
+  // or ejit_dump_func called during the init_array phase, before ejit_init —
+  // propagate it into the now-bound shared state. Otherwise the owner worker
+  // (possibly a different core) sees an empty shared filter and never captures,
+  // even though the producer thinks dump is armed.
+  if (gDumpSharedState && !gDumpFuncFilter.empty())
+    setDumpFuncFilter(gDumpFuncFilter);
 }
 
 static void sharedDumpLock(EJitSharedDumpState &D) {
