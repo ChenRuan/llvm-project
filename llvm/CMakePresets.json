@@ -84,7 +84,8 @@
         "EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE": "262144",
         "EJIT_SHARED_SECTION_ATTR": "__attribute__((section(\".mc_shared\")))",
         "EJIT_DIAG_ENABLE": "ON",
-        "EJIT_SRE_DIAG": "ON"
+        "EJIT_SRE_DIAG": "ON",
+        "EJIT_DUMP_ASM": "ON"
       }
     },
     {
