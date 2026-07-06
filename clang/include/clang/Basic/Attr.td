@@ -5224,14 +5224,16 @@ def OpenACCRoutineDecl :InheritableAttr {
 
 // Marks a struct member as potentially constant within a time window
 def EjitMayConst : InheritableAttr {
-  let Spellings = [Clang<"ejit_may_const">];
+  let Spellings = [Clang<"ejit_period_const">,
+                   Clang<"ejit_may_const">];
   let Subjects = SubjectList<[Field]>;
   let Documentation = [EjitMayConstDocs];
 }
 
 // Marks the time window a global variable belongs to
 def EjitPeriod : InheritableAttr {
-  let Spellings = [Clang<"ejit_period">];
+  let Spellings = [Clang<"ejit_in_period">,
+                   Clang<"ejit_period">];
   let Args = [StringArgument<"PeriodName">];
   let Subjects = SubjectList<[Var]>;
   let Documentation = [EjitPeriodDocs];
@@ -5239,7 +5241,8 @@ def EjitPeriod : InheritableAttr {
 
 // Marks the time window array a global array belongs to
 def EjitPeriodArr : InheritableAttr {
-  let Spellings = [Clang<"ejit_period_arr">];
+  let Spellings = [Clang<"ejit_in_period_array">,
+                   Clang<"ejit_period_arr">];
   let Args = [StringArgument<"PeriodName">];
   let Subjects = SubjectList<[Var]>;
   let Documentation = [EjitPeriodArrDocs];
@@ -5247,7 +5250,8 @@ def EjitPeriodArr : InheritableAttr {
 
 // Marks a function parameter as a specialization dimension index
 def EjitPeriodArrInd : InheritableParamAttr {
-  let Spellings = [Clang<"ejit_period_arr_ind">];
+  let Spellings = [Clang<"ejit_dim">,
+                   Clang<"ejit_period_arr_ind">];
   let Args = [StringArgument<"PeriodName">];
   let Subjects = SubjectList<[ParmVar]>;
   let Documentation = [EjitPeriodArrIndDocs];
@@ -5262,7 +5266,8 @@ def EjitEntry : InheritableAttr {
 
 // Marks a time window lifecycle management function
 def EjitPeriodLc : InheritableAttr {
-  let Spellings = [Clang<"ejit_period_lc">];
+  let Spellings = [Clang<"ejit_period_guard">,
+                   Clang<"ejit_period_lc">];
   let Args = [StringArgument<"PeriodName">];
   let Subjects = SubjectList<[Function]>;
   let Documentation = [EjitPeriodLcDocs];

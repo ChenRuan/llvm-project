@@ -184,6 +184,7 @@ ALL_TESTS=(
   ejit_manual_register_test
   ejit_multi_tu_test
   ejit_baremetal_link_test
+  ejit_new_attr_test
   ejit_sync_mode_test
   ejit_perf_bench
   ejit_ptr_period_test
@@ -241,6 +242,7 @@ TEST_ARGS[ejit_ptr_period_test]="0 1 3"
 TEST_ARGS[ejit_multi_tu_test]="0 3"
 TEST_ARGS[ejit_baremetal_link_test]="0 3"
 TEST_ARGS[ejit_sync_mode_test]="0"
+TEST_ARGS[ejit_new_attr_test]="0"
 
 if [[ ${#SELECTED[@]} -eq 0 ]]; then
   SELECTED=("${ALL_TESTS[@]}")

@@ -30,19 +30,33 @@
 //===----------------------------------------------------------------------===//
 
 #ifdef EJIT_DISABLE
+#define EJIT_PERIOD_CONST
 #define ejit_may_const
+#define EJIT_IN_PERIOD(x)
 #define ejit_period(x)
+#define EJIT_IN_PERIOD_ARRAY(x)
 #define ejit_period_arr(x)
+#define EJIT_DIM(x)
 #define ejit_period_arr_ind(x)
+#define EJIT_ENTRY
 #define ejit_entry
+#define EJIT_PERIOD_GUARD(x)
 #define ejit_period_lc(x)
 #else
-#define ejit_may_const          __attribute__((ejit_may_const))
-#define ejit_period(x)          __attribute__((ejit_period(#x)))
-#define ejit_period_arr(x)      __attribute__((ejit_period_arr(#x)))
-#define ejit_period_arr_ind(x)  __attribute__((ejit_period_arr_ind(#x)))
-#define ejit_entry              __attribute__((ejit_entry))
-#define ejit_period_lc(x)       __attribute__((ejit_period_lc(#x)))
+// New names (preferred)
+#define EJIT_PERIOD_CONST       __attribute__((ejit_period_const))
+#define EJIT_IN_PERIOD(x)       __attribute__((ejit_in_period(#x)))
+#define EJIT_IN_PERIOD_ARRAY(x) __attribute__((ejit_in_period_array(#x)))
+#define EJIT_DIM(x)             __attribute__((ejit_dim(#x)))
+#define EJIT_ENTRY              __attribute__((ejit_entry))
+#define EJIT_PERIOD_GUARD(x)    __attribute__((ejit_period_guard(#x)))
+// Old names (aliases — use new macros to avoid double expansion)
+#define ejit_may_const          EJIT_PERIOD_CONST
+#define ejit_period(x)          EJIT_IN_PERIOD(x)
+#define ejit_period_arr(x)      EJIT_IN_PERIOD_ARRAY(x)
+#define ejit_period_arr_ind(x)  EJIT_DIM(x)
+#define ejit_entry              EJIT_ENTRY
+#define ejit_period_lc(x)       EJIT_PERIOD_GUARD(x)
 #endif
 
 #ifdef __cplusplus
