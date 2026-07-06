@@ -481,10 +481,17 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     // invalid, branch straight to the AOT fallback without entering either
     // compile path.
     IRBuilder<> Builder(JitEntry);
-    // Emit the fixed-dimension fast-path C API for entries with <= 4 dims when
-    // the opt-in flag is set; otherwise keep the generic ejit_taskpool_compile_
-    // or_get with the dim array on the stack.
-    bool UseFixed = EJitWrapperFixedDimEntry && DimCount <= 4;
+    // Emit the fixed-dimension fast-path C API only for 0/1/2-dim entries when
+    // the opt-in flag is set. Rationale (measured on aarch64, -Os): 0D/1D/2D
+    // pass funcIndex + up to 4 dim scalars + 2 out pointers, which still fit in
+    // the 8 integer argument registers (no stack spill) and hit a specialized
+    // cacheLookupNd with the numDims/identity/version loops fully unrolled. A
+    // 3D call needs 9 and a 4D call 11 integer arguments, spilling to the stack
+    // at every call site, which cancels the lookup saving — so 3D/4D keep using
+    // the generic ejit_taskpool_compile_or_get (one dim-array pointer). The
+    // fixed 3D/4D C APIs still exist and are semantically correct for direct
+    // callers; the wrapper just does not select them.
+    bool UseFixed = EJitWrapperFixedDimEntry && DimCount <= 2;
     auto *DimPairTy = StructType::get(I32Ty, I32Ty);
     Value *DimsAlloca = UseFixed
                             ? nullptr

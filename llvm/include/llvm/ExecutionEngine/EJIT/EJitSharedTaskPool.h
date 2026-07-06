@@ -381,6 +381,39 @@ private:
                         uint32_t numDims) const;
   SharedLookup cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
                            uint32_t numDims);
+  /// Fixed-dimension specializations of cacheLookup() (0-4 dims). Identity
+  /// hashing, slot identity comparison, and version comparison are all unrolled
+  /// (no numDims loops, no dims[] indexing), so a cache hit reaches the shared
+  /// slot resolution with the least per-hit work. Behavior is identical to
+  /// cacheLookup() with the matching numDims. The cross-core fnPtr gate and the
+  /// cold non-owner preparation are shared via resolveMatchedSlot() /
+  /// peerPrepareSlot(), so these stay small on the hot path.
+  SharedLookup cacheLookup0D(uint32_t funcIndex);
+  SharedLookup cacheLookup1D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0);
+  SharedLookup cacheLookup2D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
+                             uint32_t dim1, uint32_t inst1);
+  SharedLookup cacheLookup3D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
+                             uint32_t dim1, uint32_t inst1, uint32_t dim2,
+                             uint32_t inst2);
+  SharedLookup cacheLookup4D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
+                             uint32_t dim1, uint32_t inst1, uint32_t dim2,
+                             uint32_t inst2, uint32_t dim3, uint32_t inst3);
+  /// Resolve a cache slot whose identity + versions already matched, with the
+  /// bucket read lock HELD on entry. Applies the cross-core fnPtr gate and
+  /// returns the hit (with the read token held) for the owner core or a core
+  /// that has already memoized execute permission; a core that may not read the
+  /// pointer gets a clean readyButNotShareable fallback (lock released). The
+  /// rare non-owner first-touch case is delegated to peerPrepareSlot(). Shared
+  /// by cacheLookup() and all fixed-dimension specializations.
+  SharedLookup resolveMatchedSlot(EJitSharedCacheBucket &bucket,
+                                  uint32_t bucketIndex, uint32_t slotIndex);
+  /// Cold non-owner first-touch execute-permission preparation for a matched
+  /// slot, with the bucket read lock HELD on entry (this function releases it).
+  /// Snapshots the slot, drops the lock for the per-core platform seal, then
+  /// re-validates before handing back the prepared pointer. Kept out-of-line
+  /// (noinline) so it never bloats the hit path in cacheLookup()/cacheLookupNd.
+  SharedLookup peerPrepareSlot(EJitSharedCacheBucket &bucket,
+                               uint32_t bucketIndex, uint32_t slotIndex);
   /// Convert a shared cache lookup outcome into a CompileOrGetResult with the
   /// fast-path terminal classification (CacheHit / readyButNotShareable /
   /// miss). Shared by tryCacheHit() and the fixed-dimension entries so the
