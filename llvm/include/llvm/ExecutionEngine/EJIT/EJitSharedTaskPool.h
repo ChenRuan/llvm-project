@@ -62,6 +62,7 @@ struct EJitSharedDiagnostics {
   uint64_t compileFailed;
   uint64_t publishFailed;
   uint64_t instanceDisabled;
+  uint64_t instanceDisabledPreActivate; ///< instanceDisabled before first activate.
   uint64_t executePrepareFailed;
 };
 
