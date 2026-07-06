@@ -321,15 +321,9 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   EJIT_DIAG_VERBOSE("taskpool request func=%u dims=%u fallback=%p", funcIndex, numDims,
             fallback);
 
-  // 1. Parameter check.
-  if ((numDims > 0 && !dims) || numDims > 4) {
-    EJIT_DIAG("taskpool reject func=%u: invalid dims ptr=%p count=%u",
-              funcIndex, static_cast<const void *>(dims), numDims);
-    R.status = EJitCompileOrGetStatus::InvalidParam;
-    return R;
-  }
+  // Parameter check already done by the C API layer (ejit_taskpool_compile_or_get).
 
-  // 2. Instance-enabled check (§5.2 step 0) — a disabled instance falls back
+  // 1. Instance-enabled check (§5.2 step 0) — a disabled instance falls back
   //    and never reaches the cache, so it is never served a stale cached JIT.
   for (uint32_t i = 0; i < numDims; ++i) {
     if (!switch_.isInstanceEnabled(dims[i].dimType, dims[i].instanceId)) {
@@ -364,7 +358,67 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     return R;
   }
 
-  // 5. Dedup + enqueue (§5.2 step 3).
+  // 4b. Sync mode: compile inline on the calling thread (no queue, no worker).
+  //     All JIT failures → fallback; async worker is not involved.
+  if (switch_.getMode() == EJitCompileMode::Sync) {
+    if (!compileFn_) {
+      EJIT_DIAG("taskpool sync reject func=%u: no compile callback", funcIndex);
+      R.status = EJitCompileOrGetStatus::CompileFailed;
+      return R;
+    }
+    EJitCompileRequest Req{};
+    Req.funcIndex = funcIndex;
+    Req.numDims = numDims;
+    Req.fallbackPtr = reinterpret_cast<uintptr_t>(fallback);
+    for (uint32_t i = 0; i < numDims; ++i) {
+      Req.dims[i] = dims[i];
+      Req.versions[i] =
+          switch_.getInstanceVersion(dims[i].dimType, dims[i].instanceId);
+    }
+    // Inline compile: checkpoint 1 + compile + checkpoint 2 + commit gate,
+    // same logic as runCompile(), executed on the calling thread.
+    void *fn = nullptr;
+    bool ok = compileFn_(compileCtx_, Req, &fn);
+    if (!ok || !fn) {
+      counters_.compileFailed.fetchAdd(1);
+      EJIT_DIAG("taskpool sync compile failed func=%u ok=%u", funcIndex,
+                static_cast<unsigned>(ok));
+      R.status = EJitCompileOrGetStatus::CompileFailed;
+      return R;
+    }
+    if (!versionsMatch(Req)) {
+      cache_.retireCode(fn);
+      counters_.compileFailed.fetchAdd(1);
+      EJIT_DIAG("taskpool sync compile drop func=%u: version changed", funcIndex);
+      R.status = EJitCompileOrGetStatus::CompileFailed;
+      return R;
+    }
+    EJitPublishStatus PS =
+        cache_.publish(Req.funcIndex, Req.dims, Req.numDims, Req.versions, fn);
+    if (PS == EJitPublishStatus::Published) {
+      counters_.asyncCompiles.fetchAdd(1); // "synchronous asyncCompiles"
+      // Re-lookup to obtain the read-token from the cache.
+      EJitCacheLookupResult Hit2 = cache_.lookup(funcIndex, dims, numDims);
+      if (Hit2.hasReadToken && Hit2.fnPtr) {
+        R.status = EJitCompileOrGetStatus::CacheHit;
+        R.fnPtr = Hit2.fnPtr;
+        R.bucketIndex = Hit2.bucketIndex;
+        R.hasReadToken = true;
+        EJIT_DIAG_VERBOSE("taskpool sync compiled func=%u fn=%p", funcIndex,
+                          Hit2.fnPtr);
+        return R;
+      }
+    } else {
+      cache_.retireCode(fn);
+    }
+    counters_.compileFailed.fetchAdd(1);
+    EJIT_DIAG("taskpool sync compile failed func=%u publish=%u", funcIndex,
+              static_cast<unsigned>(PS));
+    R.status = EJitCompileOrGetStatus::CompileFailed;
+    return R;
+  }
+
+  // 5. Dedup + enqueue (§5.2 step 3) — Async path.
   EJitCompileRequest Req{};
   Req.funcIndex = funcIndex;
   Req.numDims = numDims;

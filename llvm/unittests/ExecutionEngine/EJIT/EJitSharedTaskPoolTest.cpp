@@ -470,6 +470,7 @@ TEST_F(SharedTaskPoolTest, MultiProducerSharedQueue) {
 TEST_F(SharedTaskPoolTest, CrossCoreSameKeyDedup) {
   EJitSharedTaskPool owner;
   bringUpOwner(owner);
+  owner.setInstanceEnabled(0, 3, true);
   EJitDimPair d0[1] = {dim(0, 3)};
 
   EJitCoreId::setCurrentForTest(1);
@@ -554,6 +555,7 @@ TEST_F(SharedTaskPoolTest, DeactivateDuringCompileBlocksPublish) {
   ToggleCtx tctx{&owner, 0, 7};
   owner.setCompiler(&mockCompileThenToggle, &tctx);
   ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  owner.setInstanceEnabled(0, 7, true);
 
   EJitDimPair d0[1] = {dim(0, 7)};
   ASSERT_EQ(owner.compileOrGet(9, d0, 1, codeFor(9)).status,
@@ -572,6 +574,7 @@ TEST_F(SharedTaskPoolTest, PublishLookupAndReadTokenRelease) {
   EJitSharedTaskPool owner;
   bringUpOwner(owner, /*codeSharing=*/true);
   EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(1, 4, true);
   EJitDimPair d0[1] = {dim(1, 4)};
   ASSERT_EQ(owner.compileOrGet(11, d0, 1, codeFor(11)).status,
             EJitCompileOrGetStatus::EnqueuedPending);
@@ -712,6 +715,7 @@ TEST_F(SharedTaskPoolTest, PublishOverwriteReleasesOldCode) {
   owner.setCodeSharingEnabled(true);
   owner.setMode(EJitCompileMode::Async);
   ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  owner.setInstanceEnabled(0, 1, true);
 
   EJitDimPair d0[1] = {dim(0, 1)};
   // First publish for (func=30, (0,1)).
@@ -739,6 +743,8 @@ TEST_F(SharedTaskPoolTest, PublishOverwriteReleasesOldCode) {
 TEST_F(SharedTaskPoolTest, BigEndianFieldSemantics) {
   EJitSharedTaskPool owner;
   bringUpOwner(owner, /*codeSharing=*/true);
+  owner.setInstanceEnabled(0x03u, 0x0005u, true);
+  owner.setInstanceEnabled(0x07u, 0x00FFu, true);
   EJitCoreId::setCurrentForTest(0);
   const uint32_t func = 0x0ABCu; // distinct bytes, still < max func index
   EJitDimPair d0[2] = {dim(0x03u, 0x0005u), dim(0x07u, 0x00FFu)};
@@ -800,6 +806,7 @@ TEST_F(SharedTaskPoolTest, DisabledInstanceFallsBackNoEnqueue) {
   bringUpOwner(owner);
   EJitCoreId::setCurrentForTest(0);
   EJitDimPair d0[1] = {dim(2, 5)};
+  EXPECT_TRUE(owner.setInstanceEnabled(2, 5, true));
   EXPECT_TRUE(owner.setInstanceEnabled(2, 5, false));
   auto r = owner.compileOrGet(50, d0, 1, codeFor(50));
   EXPECT_EQ(r.status, EJitCompileOrGetStatus::InstanceDisabled);

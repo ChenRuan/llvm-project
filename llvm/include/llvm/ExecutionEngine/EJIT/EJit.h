@@ -9,7 +9,6 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJIT_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJIT_H
 
-#include "llvm/ExecutionEngine/EJIT/EJitCache.h"
 #include "llvm/ExecutionEngine/EJIT/EJitError.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
@@ -44,7 +43,6 @@ public:
   // Compilation
   /// Pre-computed cacheKey = funcIdx(32b) | dims(4x8b). The AOT wrapper
   /// computes this in registers; no dims array construction.
-  void *getOrCompile(uint64_t cacheKey);
 
   // Cache management
   void clearCache();
@@ -84,7 +82,6 @@ public:
   }
 
   // Statistics
-  EJitCache::Stats getStats() const;
 
   // Error
   const EJitError *getLastError() const;
@@ -134,7 +131,6 @@ private:
   Config config_;
   std::unique_ptr<EJitRuntimeState> runtimeState_;
   std::unique_ptr<EJitModuleLoader> moduleLoader_;
-  std::unique_ptr<EJitCache> cache_;
 #ifndef EJIT_FREESTANDING
   std::unique_ptr<EJitLogger> logger_;
 #endif

@@ -37,7 +37,7 @@ EJitRegisterBitcodePass 负责从编译单元中提取所有 `ejit_entry` 标记
 
 PASS1 必须在 O2/O3 标准优化之前运行，原因：
 
-1. **Wapper 必须在 bitcode 提取前**：PASS3 (WrapperGen) 插入 `ejit_compile_or_get` 调用和 wrapper 块。如果 PASS1 提取含 wrapper 的 bitcode，JIT 会编译 wrapper 自身导致无限递归。
+1. **Wapper 必须在 bitcode 提取前**：PASS3 (WrapperGen) 插入 `ejit_taskpool_compile_or_get` 调用和 wrapper 块。如果 PASS1 提取含 wrapper 的 bitcode，JIT 会编译 wrapper 自身导致无限递归。
 2. **提取闭包**：PASS1 需要在优化前识别完整的函数闭包（内联前），以保证所有被调用的辅助函数都包含在 bitcode 中。
 
 `!ejit.may_const` metadata 的保留通过两个机制保证：

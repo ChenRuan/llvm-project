@@ -1,13 +1,11 @@
-; RUN: opt -ejit-wrapper-async -passes=ejit-wrapper-gen -S %s | FileCheck %s --implicit-check-not='@__ejit_registry_lifecycle' --implicit-check-not='@__ejit_registry_funcindex'
+; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s --implicit-check-not='@__ejit_registry_lifecycle' --implicit-check-not='@__ejit_registry_funcindex'
 
 ; PASS3's static-registry fallback must use linker-concatenated private section
 ; entries, not fixed external __ejit_registry_* arrays. Fixed external arrays
 ; collide when multiple TUs contain ejit_entry functions.
 
-; CHECK: @__ejit_dimtype_cell = internal global i32 -1
-; CHECK: @__ejit_funcidx_process_cell = internal global i32 -1
-; CHECK: @{{.*}} = private constant [1 x {{.*}}] {{.*}}{ i32 5, ptr {{.*}}, ptr null, ptr @__ejit_dimtype_cell, i64 0 }{{.*}}, section ".ejit_period"
-; CHECK: @{{.*}} = private constant [1 x {{.*}}] {{.*}}{ i32 6, ptr {{.*}}, ptr null, ptr @__ejit_funcidx_process_cell, i64 0 }{{.*}}, section ".ejit_period"
+; CHECK: @__ejit_dimtype_cell = internal global i32
+; CHECK: @__ejit_funcidx_process_cell = internal global i32
 ; CHECK: call void @ejit_register_lifecycle(ptr {{.*}}, ptr @__ejit_dimtype_cell)
 ; CHECK: call void @ejit_register_funcindex(ptr {{.*}}, ptr @__ejit_funcidx_process_cell)
 

@@ -61,7 +61,6 @@ set(EJIT_SOURCES
   EJitOrcEngine.cpp
   EJitLibcallStubs.cpp
   EJitCompileDriver.cpp
-  EJitCache.cpp
   EJitRuntimeState.cpp
   EJitModuleLoader.cpp
   EJitRegistrationStore.cpp
@@ -78,35 +77,32 @@ list(APPEND EJIT_SOURCES
   EJitLogger.cpp
 )
 
-# SRE taskpool compile scheduler — only compiled into the library when enabled.
-# It uses no C++ threading facilities, so it is compatible with EJIT_FREESTANDING.
-if(EJIT_SRE_TASKPOOL)
+# SRE taskpool compile scheduler — always compiled (PASS3 unconditionally
+# generates ejit_taskpool_compile_or_get calls). It uses no C++ threading
+# facilities, so it is compatible with EJIT_FREESTANDING.
+list(APPEND EJIT_SOURCES
+  EJitTaskPool.cpp
+  EJitSreQueue.cpp
+  EJitWorker.cpp
+)
+if(EJIT_FREESTANDING)
+  list(APPEND EJIT_SOURCES EJitSreTask_sre.cpp)
+else()
+  list(APPEND EJIT_SOURCES EJitSreTask_host.cpp)
+endif()
+# Cross-core shared taskpool (single shared worker owner) — optional.
+# POD shared state + injectable core-id seam; no C++ threading facilities, so
+# it is compatible with EJIT_FREESTANDING.
+if(EJIT_SRE_SHARED_TASKPOOL)
   list(APPEND EJIT_SOURCES
-    EJitTaskPool.cpp
-    EJitSreQueue.cpp
-    EJitWorker.cpp
+    EJitSharedTaskPool.cpp
+    EJitSharedPlatform.cpp
   )
-  if(EJIT_FREESTANDING)
-    list(APPEND EJIT_SOURCES EJitSreTask_sre.cpp)
-  else()
-    list(APPEND EJIT_SOURCES EJitSreTask_host.cpp)
-  endif()
-  # Cross-core shared taskpool (single shared worker owner) — only when enabled.
-  # POD shared state + injectable core-id seam; no C++ threading facilities, so
-  # it is compatible with EJIT_FREESTANDING.
-  if(EJIT_SRE_SHARED_TASKPOOL)
-    list(APPEND EJIT_SOURCES
-      EJitSharedTaskPool.cpp
-      EJitSharedPlatform.cpp
-    )
-  endif()
 endif()
 
 # Async/sync compiler — excluded in freestanding mode (single-threaded, no std::thread)
 if(NOT EJIT_FREESTANDING)
   list(APPEND EJIT_SOURCES
-    EJitSyncCompiler.cpp
-    EJitAsyncCompiler.cpp
   )
 endif()
 

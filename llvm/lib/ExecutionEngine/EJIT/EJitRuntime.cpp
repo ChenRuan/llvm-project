@@ -313,18 +313,9 @@ bool ejit_is_active(const char *periodName, uint8_t cellIdx) {
 }
 
 void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn) {
-  if (!gEJIT) {
-    EJIT_DIAG("compile_or_get(key=0x%016lx) failed: not initialized", cacheKey);
-    return nullptr;
-  }
-
-  void *result = gEJIT->getOrCompile(cacheKey);
-  if (out_pfn)
-    *out_pfn = result;
-
-  EJIT_DIAG_VERBOSE("compile_or_get(key=0x%016lx) → %s", cacheKey,
-                    result ? "JIT" : "NULL");
-  return result;
+  if (out_pfn) *out_pfn = nullptr;
+  EJIT_DIAG("compile_or_get(key=0x%016lx): retired, use taskpool API", cacheKey);
+  return nullptr;
 }
 
 void ejit_clear_cache(void) {
@@ -340,22 +331,9 @@ void ejit_invalidate(const char *periodName, uint8_t cellIdx) {
 }
 
 ejit_status_t ejit_get_stats(ejit_stats_t *stats) {
-  if (!gEJIT) {
-    EJIT_DIAG("get_stats failed: not initialized");
-    return EJIT_ERR_NOT_ACTIVE;
-  }
-  if (!stats) {
-    EJIT_DIAG("get_stats failed: null stats pointer");
-    return EJIT_ERR_INVALID_PARAM;
-  }
-
-  auto s = gEJIT->getStats();
-  stats->entryCount = s.entryCount;
-  stats->totalCodeSize = s.totalCodeSize;
-  stats->maxSize = s.maxSize;
-  stats->hits = s.hits;
-  stats->misses = s.misses;
-  stats->evictions = s.evictions;
+  if (!gEJIT) return EJIT_ERR_NOT_ACTIVE;
+  if (!stats) return EJIT_ERR_INVALID_PARAM;
+  memset(stats, 0, sizeof(*stats));
   return EJIT_OK;
 }
 
@@ -385,14 +363,13 @@ void ejit_set_compile_mode(ejit_compile_mode_t mode) {
 
 ejit_compile_mode_t ejit_get_compile_mode(void) {
   if (!gEJIT) {
-    EJIT_DIAG("get_compile_mode: not initialized (default sync)");
+    EJIT_DIAG("get_compile_mode: not initialized (default async)");
     return EJIT_COMPILE_SYNC;
   }
   return gEJIT->getCompileMode() == CompileMode::Async ? EJIT_COMPILE_ASYNC
                                                        : EJIT_COMPILE_SYNC;
 }
 
-#ifdef EJIT_SRE_TASKPOOL
 //===-- SRE taskpool black-box API ----------------------------------------===//
 
 static ejit_status_t taskpoolStatus(EJitCompileOrGetStatus s) {
@@ -455,7 +432,6 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     return EJIT_ERR_NOT_ACTIVE;
   }
 
-  EJitDimPair localDims[4];
   if (numDims > 4) {
     EJIT_DIAG("taskpool_compile_or_get reject func=%u: numDims=%u > 4",
               funcIndex, numDims);
@@ -467,8 +443,6 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     return EJIT_ERR_INVALID_PARAM;
   }
   for (uint32_t i = 0; i < numDims; ++i) {
-    // dimType is an explicit lifecycle index in [0, MAX_DIM_TYPES); instanceId
-    // is in [0, MAX_INSTANCES). Both are range-checked (spec §5.1).
     if (dims[i].dimType >= EJitSwitchController::MAX_DIM_TYPES) {
       EJIT_DIAG("taskpool_compile_or_get reject func=%u: dim[%u] dimType=%u OOR",
                 funcIndex, i, dims[i].dimType);
@@ -479,11 +453,12 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
                 funcIndex, i, dims[i].instanceId);
       return EJIT_ERR_INVALID_PARAM;
     }
-    localDims[i].dimType = dims[i].dimType;
-    localDims[i].instanceId = dims[i].instanceId;
   }
 
-  auto r = tp->compileOrGet(funcIndex, numDims ? localDims : nullptr, numDims,
+  // ejit_dim_pair_t and EJitDimPair share the same layout; pass through
+  // to avoid a stack copy of up to 4 dim pairs.
+  auto r = tp->compileOrGet(funcIndex,
+                            reinterpret_cast<const EJitDimPair *>(dims), numDims,
                             /*fallback=*/nullptr);
   if (outFn)
     *outFn = r.fnPtr;
@@ -734,7 +709,6 @@ uint32_t ejit_taskpool_get_worker_core() {
   return kEJitInvalidOwnerCore;
 #endif
 }
-#endif // EJIT_SRE_TASKPOOL
 
 //===----------------------------------------------------------------------===//
 // General diagnostics (available in every build, not only taskpool).

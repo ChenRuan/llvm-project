@@ -12,7 +12,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
-#include "llvm/ExecutionEngine/EJIT/EJitCache.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
@@ -22,6 +21,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+#include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#endif
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
 #ifdef EJIT_SRE_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
@@ -278,139 +280,8 @@ TEST(EJitModuleLoader, SameNameDifferentPayloadRejectedKeepsOriginal) {
 // EJitCache tests (T3-10)
 //===----------------------------------------------------------------------===//
 
-TEST(EJitCache, BasicPutAndGet) {
-  EJitCache cache(10, 1024 * 1024);
-  int dummy = 0;
-  cache.put(1, &dummy, 64);
-  EXPECT_EQ(cache.getOrNull(1), &dummy);
-  EXPECT_EQ(cache.getOrNull(999), nullptr);
-}
-
-TEST(EJitCache, StatsTracking) {
-  EJitCache cache(10, 1024 * 1024);
-  int dummy;
-  cache.put(100, &dummy, 64);
-  cache.getOrNull(100); // hit
-  cache.getOrNull(100); // hit
-  cache.getOrNull(200); // miss
-
-  auto stats = cache.getStats();
-  EXPECT_EQ(stats.entryCount, 1u);
-  EXPECT_EQ(stats.hits, 2ull);
-  EXPECT_EQ(stats.misses, 1ull);
-}
-
-TEST(EJitCache, LRUEvictionByEntryCount) {
-  EJitCache cache(2, 1024 * 1024);
-  int a, b, c;
-
-  EXPECT_TRUE(cache.put(10, &a, 1));
-  EXPECT_TRUE(cache.put(20, &b, 1));
-  EXPECT_TRUE(cache.put(30, &c, 1)); // should evict 'a'
-
-  EXPECT_EQ(cache.getOrNull(10), nullptr);
-  EXPECT_EQ(cache.getOrNull(20), &b);
-  EXPECT_EQ(cache.getOrNull(30), &c);
-
-  auto stats = cache.getStats();
-  EXPECT_EQ(stats.evictions, 1ull);
-}
-
-TEST(EJitCache, LRUEvictionByTotalSize) {
-  EJitCache cache(100, 200);
-  int dummy;
-
-  cache.put(10, &dummy, 120); // ok
-  cache.put(20, &dummy, 90);  // should evict 'a'
-
-  EXPECT_EQ(cache.getOrNull(10), nullptr);
-  EXPECT_EQ(cache.getOrNull(20), &dummy);
-}
-
-TEST(EJitCache, SingleFuncSizeLimit) {
-  EJitCache cache(10, 1024 * 1024, 100);
-  int dummy;
-  EXPECT_FALSE(cache.put(9999, &dummy, 200));
-  EXPECT_TRUE(cache.put(500, &dummy, 50));
-
-  auto stats = cache.getStats();
-  EXPECT_EQ(stats.entryCount, 1u);
-}
-
-TEST(EJitCache, PeriodicInvalidation) {
-  EJitCache cache(10, 1024 * 1024);
-  int dummy;
-
-  std::vector<std::string> depsA = {"cell=0"};
-  std::vector<std::string> depsB = {"cell=1"};
-  std::vector<std::string> depsC = {"trp=0"};
-
-  cache.put(10, &dummy, 1, depsA);
-  cache.put(20, &dummy, 1, depsB);
-  cache.put(30, &dummy, 1, depsC);
-
-  EXPECT_EQ(cache.getOrNull(10), &dummy);
-  EXPECT_EQ(cache.getOrNull(20), &dummy);
-  EXPECT_EQ(cache.getOrNull(30), &dummy);
-
-  cache.invalidateByPeriod("cell", 0);
-  EXPECT_EQ(cache.getOrNull(10), nullptr); // invalidated
-  EXPECT_EQ(cache.getOrNull(20), &dummy);  // still valid (cell=1)
-  EXPECT_EQ(cache.getOrNull(30), &dummy);  // still valid (trp=0)
-}
-
-TEST(EJitCache, BuildCacheKey) {
-  // uint64_t key = funcIdx(32b) | dim[0](8b) | dim[1](8b) | dim[2](8b) |
-  // dim[3](8b) No dimensions → key = funcIdx << 32
-  uint64_t key0 = EJitCache::buildCacheKey(7, nullptr, 0);
-  EXPECT_EQ(key0, 0x0000000700000000ULL);
-
-  // Single dimension: funcIdx=1, cell=3 → (1 << 32) | 3
-  std::pair<std::string, uint8_t> dims1[] = {{"cell", 3}};
-  uint64_t key1 = EJitCache::buildCacheKey(1, dims1, 1);
-  EXPECT_EQ(key1, 0x0000000100000003ULL);
-
-  // Multiple dimensions: funcIdx=2, d0=1, d1=5 → (2 << 32) | 1 | (5 << 8)
-  std::pair<std::string, uint8_t> dims2[] = {{"trp", 1}, {"cell", 5}};
-  uint64_t key2 = EJitCache::buildCacheKey(2, dims2, 2);
-  EXPECT_EQ(key2, 0x0000000200000501ULL);
-}
-
-TEST(EJitCache, Clear) {
-  EJitCache cache(10, 1024 * 1024);
-  int dummy;
-  cache.put(10, &dummy, 64);
-  cache.put(20, &dummy, 64);
-  cache.clear();
-
-  EXPECT_EQ(cache.getOrNull(10), nullptr);
-  EXPECT_EQ(cache.getOrNull(20), nullptr);
-
-  auto stats = cache.getStats();
-  EXPECT_EQ(stats.entryCount, 0u);
-}
-
 #ifndef EJIT_FREESTANDING
-TEST(EJitCache, ThreadSafety) {
-  EJitCache cache(1000, 1024 * 1024 * 100);
-  int dummy[100]{};
 
-  std::thread writer([&]() {
-    for (int i = 0; i < 100; ++i)
-      cache.put(static_cast<uint32_t>(i), &dummy[i], 1);
-  });
-
-  std::thread reader([&]() {
-    for (int i = 0; i < 1000; ++i)
-      cache.getOrNull(static_cast<uint32_t>(i % 100));
-  });
-
-  writer.join();
-  reader.join();
-
-  auto stats = cache.getStats();
-  EXPECT_EQ(stats.entryCount, 100u);
-}
 #endif // EJIT_FREESTANDING
 
 //===----------------------------------------------------------------------===//
@@ -687,9 +558,7 @@ TEST(EJit, ConstructionAndBasicOps) {
   ejit.deactivate("test_period", 0);
   EXPECT_FALSE(ejit.isActive("test_period", 0));
 
-  // Cache should be empty initially
-  auto stats = ejit.getStats();
-  EXPECT_EQ(stats.entryCount, 0u);
+  // Legacy LRU cache retired; taskpool stats via ejit_taskpool_get_stats.
 }
 
 TEST(EJit, ActivateAllAndDeactivateAll) {
@@ -723,21 +592,22 @@ TEST(EJit, CacheOperations) {
 }
 
 TEST(EJit, CompileMode) {
+  // Default is Async (background worker handles compilation).
   EJit ejit(Config{});
+  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Async);
+  ASSERT_NE(ejit.taskPool(), nullptr);
+
+  // Switch to sync: compile inline on calling thread.
+  EXPECT_TRUE(ejit.setCompileMode(CompileMode::Sync));
   EXPECT_EQ(ejit.getCompileMode(), CompileMode::Sync);
 
-#ifdef EJIT_SRE_TASKPOOL
-  // This test build intentionally has no usable ORC engine. Switching to Async
-  // must fail without changing the mode or starting a worker; otherwise
-  // requests could be enqueued forever with no consumer.
-  EXPECT_FALSE(ejit.setCompileMode(CompileMode::Async));
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Sync);
-  ASSERT_NE(ejit.taskPool(), nullptr);
-  EXPECT_FALSE(ejit.taskPool()->isWorkerRunning());
-#else
+  // Switch to off: no JIT, always AOT fallback.
+  EXPECT_TRUE(ejit.setCompileMode(CompileMode::Off));
+  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Off);
+
+  // Back to async.
   EXPECT_TRUE(ejit.setCompileMode(CompileMode::Async));
   EXPECT_EQ(ejit.getCompileMode(), CompileMode::Async);
-#endif
 }
 
 TEST(EJit, OptimizationLevel) {
@@ -749,22 +619,22 @@ TEST(EJit, OptimizationLevel) {
 }
 
 #ifdef EJIT_SRE_TASKPOOL
-TEST(EJitTaskpoolInit, SyncWithoutEngineSucceedsWithoutWorker) {
-  EJit ejit(Config{});
+TEST(EJitTaskpoolInit, OffModeSucceedsWithoutWorker) {
+  Config config;
+  config.compileMode = CompileMode::Off;
+  EJit ejit(config);
   EXPECT_FALSE(ejit.initFailed());
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Sync);
+  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Off);
   ASSERT_NE(ejit.taskPool(), nullptr);
   EXPECT_FALSE(ejit.taskPool()->isWorkerRunning());
 }
 
-TEST(EJitTaskpoolInit, AsyncWithoutEngineFails) {
-  Config config;
-  config.compileMode = CompileMode::Async;
-  EJit ejit(config);
-  EXPECT_TRUE(ejit.initFailed());
-  EXPECT_TRUE(ejit.registrationFrozen());
+TEST(EJitTaskpoolInit, DefaultAsyncInitSucceeds) {
+  EJit ejit(Config{});
+  // ORC engine is always created; async init succeeds.
+  EXPECT_FALSE(ejit.initFailed());
+  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Async);
   ASSERT_NE(ejit.taskPool(), nullptr);
-  EXPECT_FALSE(ejit.taskPool()->isWorkerRunning());
 }
 
 // Finding (二): a constructed taskpool EJit freezes registration once its
@@ -1026,23 +896,41 @@ TEST(EJitTaskpoolArray, NameLevelSyncsSwitchController) {
   ASSERT_NE(tp, nullptr);
   uint32_t dt = EJitLifecycleRegistry::instance().lookup("cell");
   ASSERT_NE(dt, kEJitInvalidDimType);
-  EJitSwitchController &sw = tp->switchController();
 
-  uint32_t v0 = sw.getInstanceVersion(dt, 5);
-  EXPECT_TRUE(sw.isInstanceEnabled(dt, 5)); // default enabled
-  // deactivate: RuntimeState inactive + SwitchController disabled + v+1.
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  // Shared build: deactivate/activate writes the shared pool's switch
+  // controller, which is separate from the per-instance EJitTaskPool switch.
+  // Check enabled state via the shared pool (instanceVersion is private).
+  // initSharedStorage defaults all instances to disabled — enable explicitly.
+  EJitSharedTaskPool *sp = ejit.sharedTaskPool();
+  ASSERT_NE(sp, nullptr);
+  EXPECT_TRUE(sp->setInstanceEnabled(dt, 5, true));
+  auto instanceEnabled = [&]() { return sp->isInstanceActive(dt, 5); };
+#else
+  EJitSwitchController &sw = tp->switchController();
+  auto instanceEnabled = [&]() { return sw.isInstanceEnabled(dt, 5); };
+  auto instanceVer = [&]() { return sw.getInstanceVersion(dt, 5); };
+  uint32_t v0 = instanceVer();
+#endif
+
+  EXPECT_TRUE(instanceEnabled()); // defaults enabled
+  // deactivate.
   EXPECT_TRUE(ejit.deactivate("cell", 5));
   EXPECT_FALSE(ejit.isActive("cell", 5));
-  EXPECT_FALSE(sw.isInstanceEnabled(dt, 5));
-  EXPECT_EQ(sw.getInstanceVersion(dt, 5), v0 + 1);
-  // activate: RuntimeState active + SwitchController enabled + v+1.
+  EXPECT_FALSE(instanceEnabled());
+#ifndef EJIT_SRE_SHARED_TASKPOOL
+  EXPECT_EQ(instanceVer(), v0 + 1);
+#endif
+  // activate.
   EXPECT_TRUE(ejit.activate("cell", 5));
   EXPECT_TRUE(ejit.isActive("cell", 5));
-  EXPECT_TRUE(sw.isInstanceEnabled(dt, 5));
-  EXPECT_EQ(sw.getInstanceVersion(dt, 5), v0 + 2);
-  // Redundant activate: no flip, no version bump.
+  EXPECT_TRUE(instanceEnabled());
+#ifndef EJIT_SRE_SHARED_TASKPOOL
+  EXPECT_EQ(instanceVer(), v0 + 2);
+  // Redundant activate: no flip.
   EXPECT_TRUE(ejit.activate("cell", 5));
-  EXPECT_EQ(sw.getInstanceVersion(dt, 5), v0 + 2);
+  EXPECT_EQ(instanceVer(), v0 + 2);
+#endif
   resetTaskpoolRegState();
 }
 
@@ -2501,34 +2389,7 @@ TEST(EJitEndToEnd, MultiPeriodSpecialization) {
 // EJit end-to-end cache invalidation test
 //===----------------------------------------------------------------------===//
 
-TEST(EJitEndToEnd, CacheInvalidation) {
-  EJitCache cache(100, 1024 * 1024);
-  int dummy = 42;
 
-  // Put entries with different period dependencies
-  std::vector<std::string> depsA = {"cell=1", "trp=2"};
-  std::vector<std::string> depsB = {"cell=3", "slice=0"};
-  std::vector<std::string> depsC = {"cell=1", "carrier=5"};
-
-  cache.put(1001, &dummy, 64, depsA);
-  cache.put(1002, &dummy, 64, depsB);
-  cache.put(1003, &dummy, 64, depsC);
-
-  EXPECT_NE(cache.getOrNull(1001), nullptr);
-  EXPECT_NE(cache.getOrNull(1002), nullptr);
-  EXPECT_NE(cache.getOrNull(1003), nullptr);
-
-  // Invalidate cell=1: should remove key_a (cell=1,trp=2) and key_c
-  // (cell=1,carrier=5) but NOT key_b (cell=3,slice=0)
-  cache.invalidateByPeriod("cell", 1);
-
-  EXPECT_EQ(cache.getOrNull(1001), nullptr);
-  EXPECT_NE(cache.getOrNull(1002), nullptr);
-  EXPECT_EQ(cache.getOrNull(1003), nullptr);
-
-  auto stats = cache.getStats();
-  EXPECT_EQ(stats.entryCount, 1u); // only key_b remains
-}
 
 //===----------------------------------------------------------------------===//
 // JIT pipeline IR verification tests
@@ -2842,56 +2703,6 @@ TEST(EJitPipelineIR, PeriodIndexReplacementAndFold) {
 //===----------------------------------------------------------------------===//
 // JIT cache lifecycle tests
 //===----------------------------------------------------------------------===//
-
-TEST(EJitCacheLifecycle, HitAfterPut) {
-  EJitCache cache(100, 1024 * 1024);
-  int dummy = 42;
-  EXPECT_EQ(cache.getOrNull(777), nullptr);
-  cache.put(777, &dummy, 64);
-  EXPECT_EQ(cache.getOrNull(777), &dummy);
-}
-
-TEST(EJitCacheLifecycle, MissAfterInvalidate) {
-  EJitCache cache(100, 1024 * 1024);
-  int dummy = 42;
-  std::vector<std::string> deps = {"cell=5"};
-  cache.put(777, &dummy, 64, deps);
-  EXPECT_NE(cache.getOrNull(777), nullptr);
-  cache.invalidateByPeriod("cell", 5);
-  EXPECT_EQ(cache.getOrNull(777), nullptr);
-}
-
-TEST(EJitCacheLifecycle, MissAfterEviction) {
-  EJitCache cache(2, 1024 * 1024);
-  int a, b, c;
-  cache.put(10, &a, 1);
-  cache.put(20, &b, 1);
-  cache.put(30, &c, 1); // should evict 'a'
-  EXPECT_EQ(cache.getOrNull(10), nullptr);
-  EXPECT_NE(cache.getOrNull(30), nullptr);
-}
-
-TEST(EJitCacheLifecycle, MissAfterClear) {
-  EJitCache cache(10, 1024 * 1024);
-  int dummy;
-  cache.put(10, &dummy, 64);
-  cache.put(20, &dummy, 64);
-  cache.clear();
-  EXPECT_EQ(cache.getOrNull(10), nullptr);
-  EXPECT_EQ(cache.getOrNull(20), nullptr);
-}
-
-TEST(EJitCacheLifecycle, ReputAfterInvalidate) {
-  EJitCache cache(100, 1024 * 1024);
-  int dummy = 42;
-  std::vector<std::string> deps = {"cell=3"};
-  cache.put(777, &dummy, 64, deps);
-  cache.invalidateByPeriod("cell", 3);
-  // Reput with new value
-  int newVal = 99;
-  cache.put(777, &newVal, 64, deps);
-  EXPECT_EQ(cache.getOrNull(777), &newVal);
-}
 
 //===----------------------------------------------------------------------===//
 // Log level + diagnostics C-API (ejit_set_log_level, ejit_dump_all,

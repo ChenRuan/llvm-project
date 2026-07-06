@@ -56,7 +56,7 @@ bool taskpoolCompileThunk(void *ctx, const EJitCompileRequest &req,
                                            EJitCompiledCodeInfo *outInfo) {
 #ifdef EJIT_SRE_CODE_POOL
   auto *drv = static_cast<EJitCompileDriver *>(ctx);
-  EJitOrcEngine *eng = drv->getSyncEngine();
+  EJitOrcEngine *eng = drv->getJitEngine();
   if (eng && outInfo)
     return eng->findCodeRange(fnPtr, *outInfo);
   return false;
@@ -104,11 +104,11 @@ EJIT_SHARED_SECTION EJitSharedTaskPoolState gEJitSharedTaskPoolState;
 } // namespace
 #endif
 
-EJitCompileDriver::EJitCompileDriver(const Config &config, EJitCache &cache,
+EJitCompileDriver::EJitCompileDriver(const Config &config,
                                      EJitRuntimeState &runtimeState,
                                      EJitModuleLoader &loader,
                                      EJitLogger *logger)
-    : config_(config), cache_(cache), runtimeState_(runtimeState),
+    : config_(config), runtimeState_(runtimeState),
       loader_(loader)
 #ifndef EJIT_FREESTANDING
       ,
@@ -124,8 +124,9 @@ EJitCompileDriver::EJitCompileDriver(const Config &config, EJitCache &cache,
                                              /*autoStartWorker=*/false);
   taskPool_->setCompiler(&taskpoolCompileThunk, this);
   taskPool_->switchController().setMode(
-      config_.compileMode == CompileMode::Async ? EJitCompileMode::Async
-                                                : EJitCompileMode::Off);
+      config_.compileMode == CompileMode::Async   ? EJitCompileMode::Async
+      : config_.compileMode == CompileMode::Sync ? EJitCompileMode::Sync
+                                                  : EJitCompileMode::Off);
 #endif
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   // Bind the cross-core shared pool to the process-global shared state and wire
@@ -141,9 +142,9 @@ EJitCompileDriver::EJitCompileDriver(const Config &config, EJitCache &cache,
   // Ready or on an empty queue (spec §11): a high-priority worker that spun
   // could starve the owner core trying to publish Ready / a producer enqueuing.
   sharedPool_.setWorkerIdleHook(&EJitCompileDriver::sharedWorkerIdle, this);
-  sharedPool_.setMode(config_.compileMode == CompileMode::Async
-                          ? EJitCompileMode::Async
-                          : EJitCompileMode::Off);
+  sharedPool_.setMode(config_.compileMode == CompileMode::Async   ? EJitCompileMode::Async
+                          : config_.compileMode == CompileMode::Sync ? EJitCompileMode::Sync
+                                                                     : EJitCompileMode::Off);
   // Cross-core fnPtr sharing is gated by the build capability flag
   // EJIT_SRE_SHARED_CODE_POINTERS (default OFF -> clean fallback for non-owner
   // cores). Only the platform may assert same-VA + sealed + I/D-cache-coherent
@@ -246,31 +247,13 @@ bool EJitCompileDriver::startSharedTaskPool() {
 }
 #endif
 
-void EJitCompileDriver::setSyncEngine(std::unique_ptr<EJitOrcEngine> engine) {
-  syncEngine_ = std::move(engine);
+void EJitCompileDriver::setJitEngine(std::unique_ptr<EJitOrcEngine> engine) {
+  jitEngine_ = std::move(engine);
 }
 
 void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
-  if (syncEngine_)
-    syncEngine_->addUserSymbol(name, addr);
-}
-
-void *EJitCompileDriver::getOrCompile(uint64_t cacheKey) {
-  // Legacy ABI (ejit_compile_or_get): this entry point has no bucket/release
-  // capability, so it must NOT enter the taskpool's read-token cache — doing so
-  // would hand out a JIT pointer whose read token is released before the caller
-  // ever executes it (use-after-free window). The legacy ABI therefore always
-  // uses the LRU EJitCache path below. Only the new AOT wrapper ABI
-  // (ejit_taskpool_compile_or_get) drives the taskpool, where the caller owns
-  // the bucket and calls ejit_taskpool_release_read after using fnPtr.
-
-  // ── Hot path: single hash find ───────────────────────────────────────────
-  if (void *cached = cache_.getOrNull(cacheKey)) {
-    EJIT_DIAG_VERBOSE("cache HIT key=0x%016lx", cacheKey);
-    return cached;
-  }
-
-  return compileCold(cacheKey, /*storeLru=*/true);
+  if (jitEngine_)
+    jitEngine_->addUserSymbol(name, addr);
 }
 
 void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
@@ -353,7 +336,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
   for (unsigned i = 0; i < dimCount; ++i)
     ctx.dimensions.push_back({periodNames[i], dims[i]});
 
-  if (!syncEngine_) {
+  if (!jitEngine_) {
     EJIT_DIAG("compile FAIL key=0x%016lx func=%s: no sync engine", cacheKey,
               funcName.c_str());
 #ifndef EJIT_FREESTANDING
@@ -364,10 +347,10 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
     return nullptr;
   }
 
-  syncEngine_->setActiveContext(&ctx);
+  jitEngine_->setActiveContext(&ctx);
 
-  if (auto Err = syncEngine_->loadBitcodeModule(bitcode, cacheKey, funcName)) {
-    syncEngine_->setActiveContext(nullptr);
+  if (auto Err = jitEngine_->loadBitcodeModule(bitcode, cacheKey, funcName)) {
+    jitEngine_->setActiveContext(nullptr);
     EJIT_DIAG("compile FAIL key=0x%016lx func=%s: load bitcode module failed",
               cacheKey, funcName.c_str());
 #ifndef EJIT_FREESTANDING
@@ -380,8 +363,8 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
     return nullptr;
   }
 
-  auto addrOrErr = syncEngine_->lookup(cacheKey, funcName);
-  syncEngine_->setActiveContext(nullptr);
+  auto addrOrErr = jitEngine_->lookup(cacheKey, funcName);
+  jitEngine_->setActiveContext(nullptr);
 
   if (!addrOrErr) {
     EJIT_DIAG("compile FAIL key=0x%016lx func=%s: lookup after compile failed",
@@ -398,16 +381,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
   }
 
   void *funcPtr = *addrOrErr;
-
-  // storeLru is false on the taskpool path: the taskpool publishes to its own
-  // fixed cache and the LRU EJitCache is bypassed in that configuration.
-  if (storeLru) {
-    SmallVector<std::string, 4> periodDeps;
-    for (unsigned i = 0; i < dimCount; ++i)
-      periodDeps.push_back(periodNames[i] + "=" + std::to_string(dims[i]));
-
-    cache_.put(cacheKey, funcPtr, bitcode.size(), periodDeps);
-  }
 
   EJIT_DIAG("compile OK key=0x%016lx func=%s → pfn=%p", cacheKey,
             funcName.c_str(), funcPtr);

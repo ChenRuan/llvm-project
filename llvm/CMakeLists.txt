@@ -639,7 +639,7 @@ endif()
 # worker", never an EJIT-owned thread (the target aarch64_be SRE platform has
 # no C++ thread library). Default OFF: upstream default behavior is unchanged.
 option(EJIT_SRE_TASKPOOL
-  "Enable the EmbeddedJIT SRE taskpool compile scheduler for ejit_compile_or_get" OFF)
+  "Enable the EmbeddedJIT SRE taskpool compile scheduler" ON)
 if(EJIT_SRE_TASKPOOL)
   add_definitions(-DEJIT_SRE_TASKPOOL)
 endif()
@@ -680,7 +680,7 @@ endif()
 # default and the plain EJIT_SRE_TASKPOOL builds are byte-for-byte unchanged. It
 # requires EJIT_SRE_TASKPOOL (it reuses the request/identity model and macros).
 option(EJIT_SRE_SHARED_TASKPOOL
-  "Enable the EmbeddedJIT cross-core shared taskpool (single shared worker owner)" OFF)
+  "Enable the EmbeddedJIT cross-core shared taskpool (single shared worker owner)" ON)
 # Fixed cache slots per bucket in the shared POD cache (no std::unordered_map can
 # live in shared memory, so each bucket is a fixed slot array).
 set(EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS "16" CACHE STRING

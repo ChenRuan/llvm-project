@@ -7,7 +7,7 @@
 ; --- wrapped: static-only entry ---
 ; CHECK-LABEL: define void @entry_a()
 ; CHECK: jit_entry:
-; CHECK: call ptr @ejit_compile_or_get
+; CHECK: call i32 @ejit_taskpool_compile_or_get
 define void @entry_a() !ejit.metadata !0 {
 entry:
   ret void
@@ -16,7 +16,7 @@ entry:
 ; --- wrapped: single-dim entry ---
 ; CHECK-LABEL: define void @entry_b(i8 %cell)
 ; CHECK: jit_entry:
-; CHECK: call ptr @ejit_compile_or_get
+; CHECK: call i32 @ejit_taskpool_compile_or_get
 define void @entry_b(i8 %cell) !ejit.metadata !1 {
 entry:
   ret void

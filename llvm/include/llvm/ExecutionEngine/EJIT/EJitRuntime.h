@@ -135,10 +135,8 @@ ejit_status_t ejit_deactivate_all(const char *periodName);
 bool ejit_is_active(const char *periodName, uint8_t cellIdx);
 
 // Compilation
-/// Pre-computed cacheKey = funcIdx(32b) | dim[3](8b) | ... | dim[0](8b).
-/// The AOT wrapper computes this in registers (zero alloca/store overhead).
-/// Hot path: single hash lookup; cold path: bitcode parse + JIT compile.
-void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn);
+// ejit_taskpool_compile_or_get is the single compilation entry point for both
+// Sync and Async modes (runtime-configurable via ejit_set_compile_mode).
 
 typedef struct {
   uint32_t dimType;
