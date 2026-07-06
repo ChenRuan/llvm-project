@@ -283,6 +283,13 @@ public:
     void *fnPtr = nullptr;
     uint32_t bucketIndex = 0;
     bool hasReadToken = false;
+    /// Set by tryCacheHit() when the request was fully resolved on the fast
+    /// cache-hit path (a cache hit or a disabled instance). When true the
+    /// caller returns this result directly and MUST NOT enter the
+    /// compileOrGet() slow path; when false the request is a true miss that
+    /// still needs compileOrGet(). Internal control signal only — it does not
+    /// affect status mapping or the C ABI.
+    bool fastPathTerminal = false;
   };
 
   explicit EJitTaskPool(
@@ -306,6 +313,20 @@ public:
 
   CompileOrGetResult compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
                                   uint32_t numDims, void *fallback);
+
+  /// Flattened fast cache-hit path (spec §5.2 steps 0-1). Performs ONLY the
+  /// terminal front half of compileOrGet(): the instance-enabled check and the
+  /// cache lookup, then classifies the outcome:
+  ///   * CacheHit         — returns fnPtr + bucketIndex + a held read token
+  ///                        (caller releases via releaseRead), cacheHits++.
+  ///   * InstanceDisabled — a disabled dim, instanceDisabled++.
+  /// Both set fastPathTerminal = true; the caller returns the result directly
+  /// and never enters the slow path. A true miss (enabled, no cached code)
+  /// returns fastPathTerminal = false and the caller must fall through to
+  /// compileOrGet(). compileOrGet() itself calls this so the
+  /// ordering/counters/semantics stay identical.
+  CompileOrGetResult tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
+                                 uint32_t numDims);
 
   bool pollOne();
   unsigned pollBudget(unsigned maxItems);
