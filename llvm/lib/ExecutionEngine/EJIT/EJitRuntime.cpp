@@ -443,11 +443,12 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     *outBucket = 0;
   EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u dims=%u", funcIndex,
                     numDims);
-  if (!gEJIT) {
-    EJIT_DIAG("taskpool_compile_or_get reject func=%u: not initialized",
-              funcIndex);
+  // Silently return EJIT_ERR_NOT_ACTIVE when the runtime is not initialized.
+  // The AOT wrapper calls this on every ejit_entry invocation, so a per-call
+  // "not initialized" log would noise the trace; the caller already handles
+  // the status code.
+  if (!gEJIT)
     return EJIT_ERR_NOT_ACTIVE;
-  }
   auto *tp = activeTaskPool();
   if (!tp) {
     EJIT_DIAG("taskpool_compile_or_get reject func=%u: no taskpool", funcIndex);
