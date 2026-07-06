@@ -272,6 +272,43 @@ struct EJitSharedCounters {
 };
 
 //===----------------------------------------------------------------------===//
+// EJitSharedCodePoolStats: owner-published mirror of the owner-core
+// EJitCodePoolManager stats. The code pool itself is owner-private (only the
+// worker core allocates/seals), so a non-owner core reading its own per-core
+// manager sees pools=0. The owner publishes a fresh snapshot here after every
+// successful compile (runCompile / sync publish), and every core reads this for
+// ejit_print_code_pool_stats / ejit_get_code_pool_stats — so the diagnostic is
+// consistent cross-core. Relaxed loads/stores: diagnostic only, monotone-ish.
+//===----------------------------------------------------------------------===//
+struct EJitSharedCodePoolStats {
+  EJitAtomicU64 poolCount;
+  EJitAtomicU64 sealedCount;
+  EJitAtomicU64 activeCount;
+  EJitAtomicU64 usedBytes;
+  EJitAtomicU64 reservedBytes;
+  EJitAtomicU64 wastedBytes;
+  EJitAtomicU64 sealInvocations;
+  EJitAtomicU64 splitInvocations;
+  EJitAtomicU64 finalizedRangeCount;
+};
+
+/// Plain (non-atomic) snapshot of code-pool stats, used as the callback
+/// out-struct for the owner-private provider and as the reader return shape.
+/// Mirrors EJitCodePoolManager::Stats field-for-field but stays decoupled from
+/// the code-pool header so the shared-taskpool ABI does not depend on it.
+struct EJitCodePoolStatsOut {
+  uint64_t poolCount = 0;
+  uint64_t sealedCount = 0;
+  uint64_t activeCount = 0;
+  uint64_t usedBytes = 0;
+  uint64_t reservedBytes = 0;
+  uint64_t wastedBytes = 0;
+  uint64_t sealInvocations = 0;
+  uint64_t splitInvocations = 0;
+  uint64_t finalizedRangeCount = 0;
+};
+
+//===----------------------------------------------------------------------===//
 // EJitSharedTaskPoolState: the whole shared blob. One instance per shared
 // memory region. Cache-line aligned, fields grouped to keep hot producer state
 // (queue head/tail) off the same line as cold state.
@@ -318,6 +355,11 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
 
   //--- counters (own cache line)
   alignas(kEJitSharedCacheLine) EJitSharedCounters counters;
+
+  //--- owner-published code-pool stats mirror (own cache line). Read by every
+  //    core for ejit_print_code_pool_stats so the view is consistent cross-core
+  //    (the real pools live owner-side only).
+  alignas(kEJitSharedCacheLine) EJitSharedCodePoolStats codePoolStats;
 
   //--- per-core 4K split readiness, one entry per tracked 2MiB pool (own cache
   //    line). Open-addressed by pool base; see EJitSharedPoolSplit.

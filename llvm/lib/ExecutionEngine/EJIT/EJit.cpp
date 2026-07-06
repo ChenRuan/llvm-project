@@ -751,6 +751,27 @@ void EJit::printFuncMeta(const std::string &funcName) {
 bool EJit::getCodePoolStats(ejit_code_pool_stats_t *out) const {
   if (!out)
     return false;
+#if defined(EJIT_SRE_SHARED_TASKPOOL) && defined(EJIT_SRE_CODE_POOL)
+  // Shared build: read the owner-published mirror so every core (owner and
+  // non-owner) sees the SAME code-pool stats. The real pools are owner-private,
+  // so a non-owner's per-core manager is empty (pools=0) — the mirror is the
+  // only cross-core-consistent source.
+  if (const EJitSharedTaskPool *sp = sharedTaskPool()) {
+    EJitCodePoolStatsOut s{};
+    if (sp->readCodePoolStats(&s)) {
+      out->poolCount = s.poolCount;
+      out->sealedCount = s.sealedCount;
+      out->activeCount = s.activeCount;
+      out->usedBytes = s.usedBytes;
+      out->reservedBytes = s.reservedBytes;
+      out->wastedBytes = s.wastedBytes;
+      out->sealInvocations = s.sealInvocations;
+      out->splitInvocations = s.splitInvocations;
+      out->finalizedRangeCount = s.finalizedRangeCount;
+      return true;
+    }
+  }
+#endif
 #ifdef EJIT_SRE_CODE_POOL
   if (!compileDriver_)
     return false;
