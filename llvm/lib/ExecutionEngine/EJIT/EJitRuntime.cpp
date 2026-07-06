@@ -456,8 +456,28 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
 
   // ejit_dim_pair_t and EJitDimPair share the same layout; pass through
   // to avoid a stack copy of up to 4 dim pairs.
-  auto r = tp->compileOrGet(funcIndex,
-                            reinterpret_cast<const EJitDimPair *>(dims), numDims,
+  const EJitDimPair *dimsCast = reinterpret_cast<const EJitDimPair *>(dims);
+
+  // Flattened fast cache-hit path: resolve the common terminal outcomes (cache
+  // hit, disabled instance, not-Ready / ready-but-not-shareable fallback)
+  // without entering the full compileOrGet slow path. tryCacheHit preserves the
+  // exact compileOrGet hot-path semantics (ordering, counters, read tokens),
+  // so a hit still hands back outBucket for ejit_taskpool_release_read and a
+  // disabled instance never returns stale code. A true miss falls through to
+  // compileOrGet unchanged (enqueue/dedup/compile).
+  auto fast = tp->tryCacheHit(funcIndex, dimsCast, numDims);
+  if (fast.fastPathTerminal) {
+    if (outFn)
+      *outFn = fast.fnPtr;
+    if (outBucket)
+      *outBucket = fast.bucketIndex;
+    EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u fast status=%u fn=%p",
+                      funcIndex, static_cast<unsigned>(fast.status),
+                      fast.fnPtr);
+    return taskpoolStatus(fast.status);
+  }
+
+  auto r = tp->compileOrGet(funcIndex, dimsCast, numDims,
                             /*fallback=*/nullptr);
   if (outFn)
     *outFn = r.fnPtr;

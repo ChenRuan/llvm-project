@@ -955,6 +955,72 @@ TEST(EJitTaskPoolTest, DisabledInstanceWithExistingCacheFallsBack) {
   EXPECT_EQ(r.fnPtr, fb);
 }
 
+//===----------------------------------------------------------------------===//
+// tryCacheHit(): the flattened fast cache-hit path the C API drives before the
+// compileOrGet slow path. On the private pool it performs the instance-enabled
+// check + cache lookup only; it must match compileOrGet's front-half semantics
+// and never enqueue.
+//===----------------------------------------------------------------------===//
+
+// A cache hit is served on the fast path with a held read token and NO enqueue.
+TEST(EJitTaskPoolTest, TryCacheHitServesHitWithoutEnqueue) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  P.setCompiler(&MockCompiler::compile, &C);
+  EJitDimPair D[1] = {{0, 1}};
+  P.compileOrGet(40, D, 1, nullptr);
+  EXPECT_TRUE(P.pollOne()); // populate cache
+  ASSERT_EQ(P.pendingCount(), 0u);
+
+  auto fast = P.tryCacheHit(40, D, 1);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_TRUE(fast.hasReadToken);
+  EXPECT_NE(fast.fnPtr, nullptr);
+  EXPECT_EQ(P.pendingCount(), 0u); // no enqueue/dedup on the fast path
+  P.releaseRead(fast.bucketIndex);
+}
+
+// A true miss is NOT terminal on the fast path; the slow path still enqueues.
+TEST(EJitTaskPoolTest, TryCacheHitMissFallsThroughToCompileOrGet) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  P.setCompiler(&MockCompiler::compile, &C);
+  EJitDimPair D[1] = {{0, 1}};
+
+  auto fast = P.tryCacheHit(41, D, 1);
+  EXPECT_FALSE(fast.fastPathTerminal);
+  EXPECT_NE(fast.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_FALSE(fast.hasReadToken);
+  EXPECT_EQ(P.pendingCount(), 0u); // fast path never enqueues
+
+  auto slow = P.compileOrGet(41, D, 1, nullptr);
+  EXPECT_EQ(slow.status, EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(P.pendingCount(), 1u);
+}
+
+// A disabled instance returns InstanceDisabled on the fast path and never
+// serves cached code.
+TEST(EJitTaskPoolTest, TryCacheHitDisabledInstanceReturnsDisabled) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  P.setCompiler(&MockCompiler::compile, &C);
+  EJitDimPair D[1] = {{0, 1}};
+  P.compileOrGet(42, D, 1, nullptr);
+  EXPECT_TRUE(P.pollOne()); // cache now holds func 42
+  P.switchController().setEnabled(0, 1, false);
+
+  auto fast = P.tryCacheHit(42, D, 1);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::InstanceDisabled);
+  EXPECT_EQ(fast.fnPtr, nullptr); // no stale cached code
+  EXPECT_FALSE(fast.hasReadToken);
+  EXPECT_EQ(P.pendingCount(), 0u);
+}
+
 TEST(EJitTaskPoolTest, SameFuncDifferentDimsAlreadyPending) {
   EJitTaskPool P(16, false);
   P.switchController().setMode(EJitCompileMode::Async);
