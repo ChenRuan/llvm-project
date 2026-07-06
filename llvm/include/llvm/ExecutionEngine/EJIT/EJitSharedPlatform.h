@@ -66,7 +66,11 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// (codeStart/codeSize/poolBase/poolSize/poolId) and the shared state gains a
 /// per-core, per-pool 4K split-readiness table, so a non-owner core in 4K-seal
 /// mode can split its pool once and seal exactly the pages the code covers.
-constexpr uint32_t kEJitSharedAbiVersion = 5u;
+/// v6: the shared state gains a direct-mapped HotHint table (recent successful
+/// (funcIndex,dims)->(bucket,slot) locations) plus a hotHintHits counter, to
+/// skip the bucket scan on repeated cache hits. Hints are advisory only: every
+/// hit is still re-validated under the bucket read token.
+constexpr uint32_t kEJitSharedAbiVersion = 6u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

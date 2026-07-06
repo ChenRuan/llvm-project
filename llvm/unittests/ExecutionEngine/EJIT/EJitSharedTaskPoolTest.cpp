@@ -1575,7 +1575,7 @@ TEST_F(SharedTaskPoolTest, FourKGenerationChangeDuringPrepareNotReturned) {
 // naturally-aligned scalars (read back by value — endian-safe), and the
 // pool-split table is POD.
 TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
-  EXPECT_EQ(kEJitSharedAbiVersion, 5u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 6u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -2140,6 +2140,232 @@ TEST_F(SharedTaskPoolTest, FixedDimVersionMismatchMisses) {
   auto fixedMiss2 = owner.tryCacheHit2D(71, 0, 1, 1, 2);
   EXPECT_FALSE(fixedMiss2.fastPathTerminal);
   EXPECT_FALSE(fixedMiss2.hasReadToken);
+}
+
+//===----------------------------------------------------------------------===//
+// HotHint fast path (ABI v6). The hint skips the bucket scan on a repeat hit
+// but is advisory: every hit is re-validated under the bucket read token, so it
+// can never return a stale fnPtr. These tests pin the invalidation semantics.
+//===----------------------------------------------------------------------===//
+
+// A first hit takes the full lookup and populates the hint; a second identical
+// query is served by the hint fast path (hotHintHits increments) with the same
+// fnPtr/bucket + a real read token.
+TEST_F(SharedTaskPoolTest, HotHintMissThenHitRefreshes) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(0, 1, true);
+  EJitDimPair d1[1] = {dim(0, 1)};
+  ASSERT_EQ(owner.compileOrGet(5, d1, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  EJitSharedDiagnostics d0;
+  owner.getDiagnostics(d0);
+  auto r1 = owner.tryCacheHit1D(5, 0, 1); // full lookup, populates hint
+  ASSERT_EQ(r1.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(r1.fnPtr, codeFor(5));
+  owner.releaseRead(r1.bucketIndex);
+  EJitSharedDiagnostics d1s;
+  owner.getDiagnostics(d1s);
+  EXPECT_EQ(d1s.hotHintHits, d0.hotHintHits); // first call was not a hint hit
+
+  auto r2 = owner.tryCacheHit1D(5, 0, 1); // served by the hint
+  ASSERT_EQ(r2.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(r2.fnPtr, codeFor(5));
+  EXPECT_EQ(r2.bucketIndex, r1.bucketIndex);
+  EXPECT_TRUE(r2.hasReadToken);
+  EXPECT_GT(state_->buckets[r2.bucketIndex].readers.loadAcquire(), 0u);
+  owner.releaseRead(r2.bucketIndex);
+  EJitSharedDiagnostics d2;
+  owner.getDiagnostics(d2);
+  EXPECT_EQ(d2.hotHintHits, d1s.hotHintHits + 1);
+}
+
+// A deactivated instance returns InstanceDisabled and never a hinted fnPtr —
+// the enabled gate precedes the hint, and the under-token version check is a
+// second backstop.
+TEST_F(SharedTaskPoolTest, HotHintDeactivateNoStale) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(0, 1, true);
+  EJitDimPair d1[1] = {dim(0, 1)};
+  ASSERT_EQ(owner.compileOrGet(6, d1, 1, codeFor(6)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  auto warm = owner.tryCacheHit1D(6, 0, 1); // populate the hint
+  ASSERT_EQ(warm.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(warm.bucketIndex);
+
+  owner.setInstanceEnabled(0, 1, false); // deactivate
+  auto r = owner.tryCacheHit1D(6, 0, 1);
+  EXPECT_EQ(r.status, EJitCompileOrGetStatus::InstanceDisabled);
+  EXPECT_EQ(r.fnPtr, nullptr);
+  EXPECT_FALSE(r.hasReadToken);
+}
+
+// A version bump (deactivate+reactivate) while the instance stays enabled makes
+// the old hint stale: the under-token version check fails and the fast path
+// falls back to a miss, never returning the old fnPtr.
+TEST_F(SharedTaskPoolTest, HotHintVersionBumpInvalidates) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(0, 1, true);
+  EJitDimPair d1[1] = {dim(0, 1)};
+  ASSERT_EQ(owner.compileOrGet(7, d1, 1, codeFor(7)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  auto warm = owner.tryCacheHit1D(7, 0, 1);
+  ASSERT_EQ(warm.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(warm.bucketIndex);
+
+  // Bump the version but leave the instance enabled.
+  owner.setInstanceEnabled(0, 1, false);
+  owner.setInstanceEnabled(0, 1, true);
+  EJitSharedDiagnostics before;
+  owner.getDiagnostics(before);
+  auto r = owner.tryCacheHit1D(7, 0, 1);
+  EXPECT_NE(r.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_FALSE(r.hasReadToken);
+  EXPECT_FALSE(r.fastPathTerminal); // stale version -> miss -> slow path
+  EJitSharedDiagnostics after;
+  owner.getDiagnostics(after);
+  EXPECT_EQ(after.hotHintHits, before.hotHintHits); // no stale hint hit
+}
+
+// An owner re-init bumps the generation and clears the cache; the old hint's
+// generation no longer matches, so the fast path never returns the pre-reinit
+// pointer.
+TEST_F(SharedTaskPoolTest, HotHintGenerationReinitInvalidates) {
+  EJitSharedTaskPool owner;
+  owner.setWorkerHooks(&mockWorkerStart, &mockWorkerStop, new WorkerHooks());
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  publish(owner, 8); // 0D entry
+  auto warm = owner.tryCacheHit0D(8);
+  ASSERT_EQ(warm.status, EJitCompileOrGetStatus::CacheHit);
+  void *fnOld = warm.fnPtr;
+  owner.releaseRead(warm.bucketIndex);
+
+  EJitCoreId::setCurrentForTest(0);
+  owner.ownerShutdown();
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  // Cache is empty at the new generation; the stale hint must not resurrect the
+  // old pointer.
+  auto r = owner.tryCacheHit0D(8);
+  EXPECT_NE(r.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_NE(r.fnPtr, fnOld);
+  EXPECT_FALSE(r.hasReadToken);
+
+  // A fresh publish at the new generation hits normally and re-populates.
+  publish(owner, 8);
+  auto r2 = owner.tryCacheHit0D(8);
+  ASSERT_EQ(r2.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(r2.fnPtr, codeFor(8));
+  owner.releaseRead(r2.bucketIndex);
+}
+
+// After an in-place recompile (new code address) the hint transparently returns
+// the NEW pointer read from the live slot, never the cached-at-hint old one.
+TEST_F(SharedTaskPoolTest, HotHintOverwriteReturnsNewPointer) {
+  EJitSharedTaskPool owner;
+  SeqCompiler seq;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompileSeq, &seq);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setCodeSharingEnabled(true);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  owner.setInstanceEnabled(3, 7, true);
+  EJitDimPair d1[1] = {dim(3, 7)};
+  void *fb = reinterpret_cast<void *>(0xDEAD0000ull);
+
+  ASSERT_EQ(owner.compileOrGet(9, d1, 1, fb).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  auto h1 = owner.tryCacheHit1D(9, 3, 7);
+  ASSERT_EQ(h1.status, EJitCompileOrGetStatus::CacheHit);
+  void *fn1 = h1.fnPtr;
+  owner.releaseRead(h1.bucketIndex);
+
+  // Bump version -> stale window: the old hint must not return fn1.
+  owner.setInstanceEnabled(3, 7, false);
+  owner.setInstanceEnabled(3, 7, true);
+  auto hStale = owner.tryCacheHit1D(9, 3, 7);
+  EXPECT_NE(hStale.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_FALSE(hStale.hasReadToken);
+
+  // Recompile at the new version -> new address in the same slot.
+  ASSERT_EQ(owner.compileOrGet(9, d1, 1, fb).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  auto h2 = owner.tryCacheHit1D(9, 3, 7);
+  ASSERT_EQ(h2.status, EJitCompileOrGetStatus::CacheHit);
+  void *fn2 = h2.fnPtr;
+  owner.releaseRead(h2.bucketIndex);
+  EXPECT_NE(fn2, fn1); // new code address
+
+  // The hint now tracks the new slot/pointer; a repeat is a hint hit for fn2.
+  EJitSharedDiagnostics before;
+  owner.getDiagnostics(before);
+  auto h3 = owner.tryCacheHit1D(9, 3, 7);
+  ASSERT_EQ(h3.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(h3.fnPtr, fn2);
+  owner.releaseRead(h3.bucketIndex);
+  EJitSharedDiagnostics after;
+  owner.getDiagnostics(after);
+  EXPECT_EQ(after.hotHintHits, before.hotHintHits + 1);
+}
+
+// A peer core that may not read the cross-core pointer (codeSharing OFF) never
+// gets a hinted fnPtr: the hint verifies but resolveMatchedSlot cleanly rejects
+// (readyButNotShareable), and hotHintHits does NOT count it.
+TEST_F(SharedTaskPoolTest, HotHintPeerNotShareableNoStale) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/false);
+  EJitCoreId::setCurrentForTest(0);
+  publish(owner, 10);
+  auto warm = owner.tryCacheHit0D(10); // owner populates the shared hint
+  ASSERT_EQ(warm.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(warm.bucketIndex);
+
+  EJitSharedTaskPool peer;
+  peer.bind(state_.get());
+  EJitCoreId::setCurrentForTest(9);
+  EJitSharedDiagnostics before;
+  peer.getDiagnostics(before);
+  auto r = peer.tryCacheHit0D(10);
+  EXPECT_TRUE(r.readyButNotShareable);
+  EXPECT_FALSE(r.hasReadToken);
+  EXPECT_EQ(r.fnPtr, nullptr);
+  EXPECT_EQ(state_->buckets[warm.bucketIndex].readers.loadAcquire(), 0u);
+  EJitSharedDiagnostics after;
+  peer.getDiagnostics(after);
+  EXPECT_EQ(after.hotHintHits, before.hotHintHits); // reject is not a hint hit
+}
+
+// A pure miss (never-published funcIndex) leaves the hint empty and still falls
+// through to enqueue — the hint must not disturb queue/dedup behavior.
+TEST_F(SharedTaskPoolTest, HotHintMissDoesNotDisturbQueue) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(0, 1, true);
+  auto fast = owner.tryCacheHit1D(12, 0, 1);
+  EXPECT_FALSE(fast.fastPathTerminal); // miss falls through
+  EJitSharedDiagnostics d;
+  owner.getDiagnostics(d);
+  EXPECT_EQ(d.hotHintHits, 0u);
+  EXPECT_EQ(d.queueDepth, 0u);
+  EJitDimPair d1[1] = {dim(0, 1)};
+  EXPECT_EQ(owner.compileOrGet(12, d1, 1, codeFor(12)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  owner.getDiagnostics(d);
+  EXPECT_EQ(d.queueDepth, 1u);
 }
 
 } // namespace

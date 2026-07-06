@@ -63,6 +63,7 @@ struct EJitSharedDiagnostics {
   uint64_t publishFailed;
   uint64_t instanceDisabled;
   uint64_t executePrepareFailed;
+  uint64_t hotHintHits; ///< cache hits served via the HotHint fast path
 };
 
 //===----------------------------------------------------------------------===//
@@ -372,6 +373,7 @@ private:
   struct SharedLookup {
     void *fnPtr = nullptr;
     uint32_t bucketIndex = 0;
+    uint32_t slotIndex = 0; ///< slot within bucketIndex on a hit (for HotHint)
     bool hasReadToken = false;
     bool readyButNotShareable = false;
   };
@@ -423,6 +425,31 @@ private:
   CompileOrGetResult classifyHit(const SharedLookup &Hit);
   EJitPublishStatus cachePublish(const EJitCompileRequest &req, void *fnPtr,
                                  const EJitCompiledCodeInfo *info);
+
+  //--- HotHint fast path (ABI v6). "Memory for time": a direct-mapped table of
+  //    recent successful (funcIndex, 0/1/2 dims) -> (bucket, slot) locations
+  //    that lets a repeat hit skip the bucket scan. ADVISORY only — the fast
+  //    path re-acquires the bucket read token and re-validates
+  //    state/generation/identity/version and re-gates execute permission
+  //    against the LIVE slot; the fnPtr is always read from the live slot.
+  //    Stale/torn hints are safe (range-checked + fully re-verified) and simply
+  //    fall back to the full cacheLookupNd path.
+  /// Try the HotHint fast path. Returns true and fills \p out with the
+  /// definitive result (a re-validated CacheHit, or a clean
+  /// readyButNotShareable fallback) when the hinted slot still holds this exact
+  /// identity/version at the current generation. Returns false (nothing
+  /// consumed, no token held) when the caller must fall back to the full
+  /// cacheLookupNd path — no hint, stale generation, identity/version mismatch,
+  /// or a busy bucket.
+  bool hotHintTryResolve(uint32_t funcIndex, uint32_t numDims, uint32_t dim0,
+                         uint32_t inst0, uint32_t dim1, uint32_t inst1,
+                         SharedLookup &out);
+  /// Record the winning (bucket, slot) for \p funcIndex after a full lookup
+  /// hit, so the next identical query can take the fast path. Best-effort
+  /// (try-lock seqlock; skipped on contention) and a no-op for numDims > 2.
+  void refreshHotHint(uint32_t funcIndex, uint32_t numDims, uint32_t dim0,
+                      uint32_t inst0, uint32_t dim1, uint32_t inst1,
+                      uint32_t bucket, uint32_t slot, void *fnPtr);
 
   /// Snapshot of one Ready cache slot taken under the bucket read lock, so the
   /// expensive per-core execute-permission preparation (split + enable_ex)

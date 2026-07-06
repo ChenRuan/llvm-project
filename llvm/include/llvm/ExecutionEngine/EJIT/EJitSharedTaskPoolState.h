@@ -70,6 +70,14 @@
 #ifndef EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS
 #define EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS 16u
 #endif
+// Direct-mapped HotHint table size (power of two). Each recently-hit funcIndex
+// caches its winning (bucket, slot) location so a repeat hit skips the bucket
+// scan. Indexed by funcIndex & (N-1); a colliding funcIndex overwrites (the
+// stored funcIndex is re-checked on read, so a collision is just a miss ->
+// fallback). Advisory only: never a substitute for the under-lock re-validate.
+#ifndef EJIT_SRE_SHARED_TASKPOOL_HOT_HINT_SLOTS
+#define EJIT_SRE_SHARED_TASKPOOL_HOT_HINT_SLOTS 1024u
+#endif
 #ifndef EJIT_SRE_SHARED_DUMP_NAME_BYTES
 #define EJIT_SRE_SHARED_DUMP_NAME_BYTES 128u
 #endif
@@ -90,6 +98,8 @@ constexpr uint32_t kEJitSharedCacheBuckets = EJIT_SRE_TASKPOOL_BUCKETS;
 constexpr uint32_t kEJitSharedCacheSlots = EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS;
 constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
 constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
+constexpr uint32_t kEJitSharedHotHintSlots =
+    EJIT_SRE_SHARED_TASKPOOL_HOT_HINT_SLOTS;
 constexpr uint32_t kEJitSharedDumpNameBytes =
     EJIT_SRE_SHARED_DUMP_NAME_BYTES;
 constexpr uint32_t kEJitSharedDumpTextBytes =
@@ -106,6 +116,9 @@ constexpr uint32_t kEJitSharedMaxMemoCores = 64u;
 static_assert((kEJitSharedQueueSlots & (kEJitSharedQueueSlots - 1)) == 0 &&
                   kEJitSharedQueueSlots >= 2,
               "shared queue slot count must be a power of two >= 2");
+static_assert((kEJitSharedHotHintSlots & (kEJitSharedHotHintSlots - 1)) == 0 &&
+                  kEJitSharedHotHintSlots >= 1,
+              "shared hot hint slot count must be a power of two >= 1");
 
 //===----------------------------------------------------------------------===//
 // Init / owner-election state machine (spec §11). A single EJitAtomicU32 holds
@@ -246,6 +259,41 @@ struct EJitSharedCounters {
   EJitAtomicU64 publishFailed;
   EJitAtomicU64 instanceDisabled;
   EJitAtomicU64 executePrepareFailed;
+  EJitAtomicU64 hotHintHits; ///< cache hits served via the HotHint fast path
+};
+
+//===----------------------------------------------------------------------===//
+// EJitSharedHotHint: one direct-mapped "memory for time" location cache entry.
+//
+// Records the (bucket, slot) a recent successful cache hit for a funcIndex (and
+// its 0/1/2 dims) landed on, so a repeat hit can jump straight to that slot
+// instead of scanning the bucket. It is ADVISORY ONLY and never a substitute
+// for correctness: the fast path re-acquires the bucket read token and
+// re-validates state/generation/identity/version (and re-gates cross-core
+// execute permission) against the LIVE slot before returning; the fnPtr is
+// always read from the live slot, never from the hint. A torn / stale / garbage
+// hint therefore can only cause a wasted verify + fallback, never a stale
+// pointer: bucket/slot are range-checked and everything is re-verified.
+//
+// Consistency: `seq` is a try-lock seqlock stamp (even = stable, odd = a writer
+// is mid-update). Writers CAS even->odd (skip if lost), publish fields, then
+// storeRelease even+2. Readers snapshot between two equal even `seq` loads.
+// Every payload field is an EJitAtomic accessed relaxed, so a concurrent
+// reader/writer is race-free (well-defined) even though the seqlock is
+// try-lock; the seqlock only decides whether the snapshot is self-consistent.
+// numDims is limited to 0..2 (the wrapper-selected fast paths); higher arities
+// never populate or read a hint. All fixed-width scalars, no STL, POD.
+//===----------------------------------------------------------------------===//
+struct EJitSharedHotHint {
+  EJitAtomicU32 seq;         ///< seqlock stamp (even stable / odd writing)
+  EJitAtomicU32 funcIndex;   ///< identity: exact funcIndex (collision check)
+  EJitAtomicU32 generation;  ///< owner generation when the hint was cached
+  EJitAtomicU32 bucket;      ///< cached cache-bucket index
+  EJitAtomicU32 slot;        ///< cached slot index within the bucket
+  EJitAtomicU32 numDims;     ///< 0..2 (arities served by the fast path)
+  EJitAtomicU64 packedDims0; ///< dim0 (dimType<<32)|instanceId (query gate)
+  EJitAtomicU64 packedDims1; ///< dim1 (dimType<<32)|instanceId (query gate)
+  EJitAtomicUPtr fnPtr;      ///< last fnPtr (diagnostic cross-check only)
 };
 
 //===----------------------------------------------------------------------===//
@@ -304,6 +352,12 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   //--- bounded cross-core IR/ASM dump diagnostics (own cache line)
   alignas(kEJitSharedCacheLine) EJitSharedDumpState dump;
 
+  //--- direct-mapped HotHint location cache (own cache line). Advisory: skips
+  //    the bucket scan on repeat hits; every hit is still re-validated under
+  //    the bucket read token (see EJitSharedHotHint).
+  alignas(kEJitSharedCacheLine)
+      EJitSharedHotHint hotHints[kEJitSharedHotHintSlots];
+
   //--- result cache (own cache line; each bucket is itself cache-line aligned)
   alignas(kEJitSharedCacheLine)
       EJitSharedCacheBucket buckets[kEJitSharedCacheBuckets];
@@ -356,6 +410,11 @@ static_assert(
         std::is_trivially_destructible<EJitSharedDumpState>::value &&
         std::is_trivially_default_constructible<EJitSharedDumpState>::value,
     "EJitSharedDumpState must be POD-style");
+static_assert(
+    std::is_standard_layout<EJitSharedHotHint>::value &&
+        std::is_trivially_destructible<EJitSharedHotHint>::value &&
+        std::is_trivially_default_constructible<EJitSharedHotHint>::value,
+    "EJitSharedHotHint must be POD-style");
 static_assert(alignof(EJitSharedTaskPoolState) == kEJitSharedCacheLine,
               "EJitSharedTaskPoolState must be cache-line aligned");
 static_assert(

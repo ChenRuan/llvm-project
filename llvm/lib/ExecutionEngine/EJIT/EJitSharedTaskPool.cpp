@@ -323,6 +323,7 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
   if (self == owner) {
     R.fnPtr = fn;
     R.bucketIndex = bucket;
+    R.slotIndex = slotIndex;
     R.hasReadToken = true;
     return R;
   }
@@ -335,6 +336,7 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
   if (CanMemoize && (Slot.executableCoreMask.loadAcquire() & CoreBit) != 0) {
     R.fnPtr = fn;
     R.bucketIndex = bucket;
+    R.slotIndex = slotIndex;
     R.hasReadToken = true;
     return R;
   }
@@ -419,6 +421,7 @@ EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
     S2.executableCoreMask.fetchOr(CoreBit);
   R.fnPtr = Snap.fn;
   R.bucketIndex = Snap.bucket;
+  R.slotIndex = Snap.slotIndex;
   R.hasReadToken = true;
   return R; // token held (re-acquired); caller releases after using fnPtr.
 }
@@ -942,6 +945,7 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
   st->counters.publishFailed.storeRelaxed(0);
   st->counters.instanceDisabled.storeRelaxed(0);
   st->counters.executePrepareFailed.storeRelaxed(0);
+  st->counters.hotHintHits.storeRelaxed(0);
   // Per-core, per-pool 4K split readiness (ABI v5). MUST be cleared on every
   // (re)initialization: a stale splitDone bit from an earlier generation would
   // otherwise make a peer skip split_2m_to_4k for a pool the new generation
@@ -951,6 +955,24 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
     st->poolSplits[i].poolBase.storeRelaxed(0);
     st->poolSplits[i].splitDoneMask.storeRelaxed(0);
     st->poolSplits[i].splitPreparingMask.storeRelaxed(0);
+  }
+  // HotHint location cache (ABI v6). Cleared on every (re)initialization so a
+  // stale hint from an earlier generation can never point a fast-path reader at
+  // a slot the new generation rebuilt. (The generation gate would reject it
+  // anyway, but a clean zero keeps the invariant obvious.) seq=0 is even, so a
+  // reader treats a fresh entry as stable-but-non-matching (funcIndex 0 /
+  // generation 0 fail the gate for any real query at generation >= 1).
+  for (uint32_t i = 0; i < kEJitSharedHotHintSlots; ++i) {
+    EJitSharedHotHint &H = st->hotHints[i];
+    H.seq.storeRelaxed(0);
+    H.funcIndex.storeRelaxed(0);
+    H.generation.storeRelaxed(0);
+    H.bucket.storeRelaxed(0);
+    H.slot.storeRelaxed(0);
+    H.numDims.storeRelaxed(0);
+    H.packedDims0.storeRelaxed(0);
+    H.packedDims1.storeRelaxed(0);
+    H.fnPtr.storeRelaxed(0);
   }
   st->dump.lock.storeRelaxed(0);
   st->dump.filterEnabled.storeRelaxed(0);
@@ -1134,6 +1156,123 @@ void EJitSharedTaskPool::ownerShutdown() {
 }
 
 //===----------------------------------------------------------------------===//
+// HotHint fast path (ABI v6). "Memory for time": a direct-mapped location cache
+// that lets a repeat cache hit skip the bucket scan. SAFETY: advisory only. The
+// fnPtr is NEVER taken from the hint; a fast-path hit still re-acquires the
+// bucket read token and re-validates state/generation/identity/version (and
+// re-gates execute permission) against the LIVE slot via resolveMatchedSlot().
+// A stale/torn/garbage hint is safe — bucket/slot are range-checked and every
+// field is re-verified — it can only cost a wasted verify + fallback. Staleness
+// is handled without explicit clearing: generation bump (reinit) invalidates
+// all hints (generation gate), deactivate/version-bump and cache
+// publish/overwrite are caught by the live identity/version re-check, and
+// cross-core code-sharing permission is re-gated live by resolveMatchedSlot().
+//===----------------------------------------------------------------------===//
+bool EJitSharedTaskPool::hotHintTryResolve(uint32_t funcIndex, uint32_t numDims,
+                                           uint32_t dim0, uint32_t inst0,
+                                           uint32_t dim1, uint32_t inst1,
+                                           SharedLookup &out) {
+  const uint32_t idx = funcIndex & (kEJitSharedHotHintSlots - 1);
+  EJitSharedHotHint &H = state_->hotHints[idx];
+
+  // Seqlock snapshot. A torn read is harmless (everything below is re-verified
+  // under the bucket lock), so this only trims wasted work: skip while a writer
+  // holds it (odd), and require two matching even stamps around the field
+  // reads.
+  uint32_t s1 = H.seq.loadAcquire();
+  if (s1 & 1u)
+    return false;
+  uint32_t hFunc = H.funcIndex.loadRelaxed();
+  uint32_t hGen = H.generation.loadRelaxed();
+  uint32_t hBucket = H.bucket.loadRelaxed();
+  uint32_t hSlot = H.slot.loadRelaxed();
+  uint32_t hNumDims = H.numDims.loadRelaxed();
+  uint64_t hp0 = H.packedDims0.loadRelaxed();
+  uint64_t hp1 = H.packedDims1.loadRelaxed();
+  if (H.seq.loadAcquire() != s1)
+    return false; // concurrent update: bail (fall back to full lookup).
+
+  // Pre-lock gate against the live query + current generation. Nothing here is
+  // trusted for correctness; it only decides whether the hinted slot is worth
+  // verifying under the lock.
+  uint32_t curGen = state_->generation.loadAcquire();
+  if (hFunc != funcIndex || hGen != curGen || hNumDims != numDims)
+    return false;
+  if (numDims >= 1 && hp0 != ((static_cast<uint64_t>(dim0) << 32) | inst0))
+    return false;
+  if (numDims >= 2 && hp1 != ((static_cast<uint64_t>(dim1) << 32) | inst1))
+    return false;
+  if (hBucket >= kEJitSharedCacheBuckets || hSlot >= kEJitSharedCacheSlots)
+    return false;
+
+  // Verify the hinted slot under the bucket read token. Identical checks to one
+  // cacheLookupNd scan iteration, but at a KNOWN slot (no loop). Any mismatch
+  // -> release + fall back so a moved/evicted/stale entry is never returned.
+  EJitSharedCacheBucket &B = state_->buckets[hBucket];
+  if (!bucketTryRead(B))
+    return false;
+  EJitSharedCacheSlot &Slot = B.slots[hSlot];
+  if (Slot.state.loadAcquire() !=
+          static_cast<uint32_t>(EJitSharedSlotState::Ready) ||
+      Slot.generation != curGen || Slot.funcIndex != funcIndex ||
+      Slot.numDims != numDims) {
+    bucketReadRelease(B);
+    return false;
+  }
+  if (numDims >= 1 &&
+      (Slot.dims[0].dimType != dim0 || Slot.dims[0].instanceId != inst0 ||
+       Slot.versions[0] != instanceVersion(dim0, inst0))) {
+    bucketReadRelease(B);
+    return false;
+  }
+  if (numDims >= 2 &&
+      (Slot.dims[1].dimType != dim1 || Slot.dims[1].instanceId != inst1 ||
+       Slot.versions[1] != instanceVersion(dim1, inst1))) {
+    bucketReadRelease(B);
+    return false;
+  }
+
+  // Identity + generation + version all match at the hinted slot: resolve the
+  // cross-core fnPtr gate exactly as the full path would (owner/memoized fast
+  // return with the read token held, clean readyButNotShareable, or cold peer
+  // preparation). The fnPtr comes from the LIVE slot inside resolveMatchedSlot.
+  out = resolveMatchedSlot(B, hBucket, hSlot);
+  if (out.hasReadToken)
+    state_->counters.hotHintHits.fetchAdd(1);
+  return true;
+}
+
+void EJitSharedTaskPool::refreshHotHint(uint32_t funcIndex, uint32_t numDims,
+                                        uint32_t dim0, uint32_t inst0,
+                                        uint32_t dim1, uint32_t inst1,
+                                        uint32_t bucket, uint32_t slot,
+                                        void *fnPtr) {
+  if (numDims > 2)
+    return; // the HotHint table serves the 0/1/2-dim fast paths only.
+  const uint32_t idx = funcIndex & (kEJitSharedHotHintSlots - 1);
+  EJitSharedHotHint &H = state_->hotHints[idx];
+  // Try-lock seqlock: at most one writer updates a hint; a loser simply skips
+  // (the hint is best-effort). even -> odd claims the write.
+  uint32_t s = H.seq.loadAcquire();
+  if (s & 1u)
+    return;
+  uint32_t writing = s + 1;
+  if (!H.seq.compareExchange(s, writing))
+    return;
+  H.funcIndex.storeRelaxed(funcIndex);
+  H.generation.storeRelaxed(state_->generation.loadAcquire());
+  H.bucket.storeRelaxed(bucket);
+  H.slot.storeRelaxed(slot);
+  H.numDims.storeRelaxed(numDims);
+  H.packedDims0.storeRelaxed(
+      numDims >= 1 ? ((static_cast<uint64_t>(dim0) << 32) | inst0) : 0);
+  H.packedDims1.storeRelaxed(
+      numDims >= 2 ? ((static_cast<uint64_t>(dim1) << 32) | inst1) : 0);
+  H.fnPtr.storeRelaxed(reinterpret_cast<uintptr_t>(fnPtr));
+  H.seq.storeRelease(writing + 1); // odd -> even: hint published/stable.
+}
+
+//===----------------------------------------------------------------------===//
 // Producer path (§5.2).
 //===----------------------------------------------------------------------===//
 __attribute__((always_inline)) EJitSharedTaskPool::CompileOrGetResult
@@ -1210,7 +1349,16 @@ EJitSharedTaskPool::tryCacheHit0D(uint32_t funcIndex) {
     R.fastPathTerminal = true;
     return R;
   }
-  return classifyHit(cacheLookup0D(funcIndex));
+  // HotHint fast path: jump straight to the last winning slot (re-validated).
+  SharedLookup H;
+  if (hotHintTryResolve(funcIndex, 0, 0, 0, 0, 0, H))
+    return classifyHit(H);
+  // Miss / stale hint: full scan, then remember the winning location.
+  SharedLookup L = cacheLookup0D(funcIndex);
+  if (L.hasReadToken)
+    refreshHotHint(funcIndex, 0, 0, 0, 0, 0, L.bucketIndex, L.slotIndex,
+                   L.fnPtr);
+  return classifyHit(L);
 }
 
 EJitSharedTaskPool::CompileOrGetResult
@@ -1228,7 +1376,14 @@ EJitSharedTaskPool::tryCacheHit1D(uint32_t funcIndex, uint32_t dim0,
     R.fastPathTerminal = true;
     return R;
   }
-  return classifyHit(cacheLookup1D(funcIndex, dim0, inst0));
+  SharedLookup H;
+  if (hotHintTryResolve(funcIndex, 1, dim0, inst0, 0, 0, H))
+    return classifyHit(H);
+  SharedLookup L = cacheLookup1D(funcIndex, dim0, inst0);
+  if (L.hasReadToken)
+    refreshHotHint(funcIndex, 1, dim0, inst0, 0, 0, L.bucketIndex, L.slotIndex,
+                   L.fnPtr);
+  return classifyHit(L);
 }
 
 EJitSharedTaskPool::CompileOrGetResult
@@ -1247,7 +1402,14 @@ EJitSharedTaskPool::tryCacheHit2D(uint32_t funcIndex, uint32_t dim0,
     R.fastPathTerminal = true;
     return R;
   }
-  return classifyHit(cacheLookup2D(funcIndex, dim0, inst0, dim1, inst1));
+  SharedLookup H;
+  if (hotHintTryResolve(funcIndex, 2, dim0, inst0, dim1, inst1, H))
+    return classifyHit(H);
+  SharedLookup L = cacheLookup2D(funcIndex, dim0, inst0, dim1, inst1);
+  if (L.hasReadToken)
+    refreshHotHint(funcIndex, 2, dim0, inst0, dim1, inst1, L.bucketIndex,
+                   L.slotIndex, L.fnPtr);
+  return classifyHit(L);
 }
 
 EJitSharedTaskPool::CompileOrGetResult
@@ -1624,4 +1786,5 @@ void EJitSharedTaskPool::getDiagnostics(EJitSharedDiagnostics &out) const {
   out.instanceDisabled = state_->counters.instanceDisabled.loadRelaxed();
   out.executePrepareFailed =
       state_->counters.executePrepareFailed.loadRelaxed();
+  out.hotHintHits = state_->counters.hotHintHits.loadRelaxed();
 }
