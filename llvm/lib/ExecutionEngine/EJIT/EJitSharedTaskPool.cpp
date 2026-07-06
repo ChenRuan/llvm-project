@@ -887,6 +887,32 @@ void EJitSharedTaskPool::ownerShutdown() {
 // Producer path (§5.2).
 //===----------------------------------------------------------------------===//
 EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::classifyHit(const SharedLookup &Hit) {
+  CompileOrGetResult R;
+  if (Hit.hasReadToken && Hit.fnPtr) {
+    state_->counters.cacheHits.fetchAdd(1);
+    R.status = EJitCompileOrGetStatus::CacheHit;
+    R.fnPtr = Hit.fnPtr;
+    R.bucketIndex = Hit.bucketIndex;
+    R.hasReadToken = true;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  if (Hit.readyButNotShareable) {
+    // The work is already done but this core may not read the cross-core
+    // pointer; fall back cleanly WITHOUT re-enqueuing (avoids recompile churn).
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.readyButNotShareable = true;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  // True miss (Ready, enabled, no shareable cached code): the caller must fall
+  // through to the compileOrGet() slow path (Off / Sync / Async).
+  R.fastPathTerminal = false;
+  return R;
+}
+
+EJitSharedTaskPool::CompileOrGetResult
 EJitSharedTaskPool::tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
                                 uint32_t numDims) {
   CompileOrGetResult R;
@@ -915,34 +941,109 @@ EJitSharedTaskPool::tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
 
   // Cache lookup (§5.2 step 1) — runs BEFORE the Off check, so an already
   // compiled entry is still served even when the pool is globally Off.
-  EJitSharedTaskPool::SharedLookup Hit = cacheLookup(funcIndex, dims, numDims);
-  if (Hit.hasReadToken && Hit.fnPtr) {
-    state_->counters.cacheHits.fetchAdd(1);
-    R.status = EJitCompileOrGetStatus::CacheHit;
-    R.fnPtr = Hit.fnPtr;
-    R.bucketIndex = Hit.bucketIndex;
-    R.hasReadToken = true;
-    R.fastPathTerminal = true;
-    EJIT_DIAG_VERBOSE("shared taskpool hit func=%u bucket=%u fn=%p", funcIndex,
-                      Hit.bucketIndex, Hit.fnPtr);
-    return R;
-  }
-  if (Hit.readyButNotShareable) {
-    // The work is already done but this core may not read the cross-core
-    // pointer; fall back cleanly WITHOUT re-enqueuing (avoids recompile churn).
-    EJIT_DIAG_VERBOSE("shared taskpool fallback func=%u: ready but not "
-                      "shareable on this core",
-                      funcIndex);
-    R.status = EJitCompileOrGetStatus::OffMode;
-    R.readyButNotShareable = true;
-    R.fastPathTerminal = true;
-    return R;
-  }
+  return classifyHit(cacheLookup(funcIndex, dims, numDims));
+}
 
-  // True miss (Ready, enabled, no shareable cached code): the caller must fall
-  // through to the compileOrGet() slow path (Off / Sync / Async).
-  R.fastPathTerminal = false;
-  return R;
+//===----------------------------------------------------------------------===//
+// Fixed-dimension fast cache-hit entries (§5.2 steps 0-1, unrolled). Each
+// shares the Ready gate + classifyHit() with tryCacheHit() but the
+// instance-enabled check is unrolled and the dim identity is built directly on
+// the stack, so the C ABI fixed-dimension entries reach the shared
+// cacheLookup() without a numDims loop or variable-length array setup.
+// Semantics are identical to tryCacheHit() with the matching numDims.
+//===----------------------------------------------------------------------===//
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::tryCacheHit0D(uint32_t funcIndex) {
+  CompileOrGetResult R;
+  if (!state_ || state_->initState.loadAcquire() != kReady) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  return classifyHit(cacheLookup(funcIndex, nullptr, 0));
+}
+
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::tryCacheHit1D(uint32_t funcIndex, uint32_t dim0,
+                                  uint32_t inst0) {
+  CompileOrGetResult R;
+  if (!state_ || state_->initState.loadAcquire() != kReady) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  if (!isInstanceEnabled(dim0, inst0)) {
+    state_->counters.instanceDisabled.fetchAdd(1);
+    R.status = EJitCompileOrGetStatus::InstanceDisabled;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  const EJitDimPair dims[1] = {{dim0, inst0}};
+  return classifyHit(cacheLookup(funcIndex, dims, 1));
+}
+
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::tryCacheHit2D(uint32_t funcIndex, uint32_t dim0,
+                                  uint32_t inst0, uint32_t dim1,
+                                  uint32_t inst1) {
+  CompileOrGetResult R;
+  if (!state_ || state_->initState.loadAcquire() != kReady) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  if (!isInstanceEnabled(dim0, inst0) || !isInstanceEnabled(dim1, inst1)) {
+    state_->counters.instanceDisabled.fetchAdd(1);
+    R.status = EJitCompileOrGetStatus::InstanceDisabled;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  const EJitDimPair dims[2] = {{dim0, inst0}, {dim1, inst1}};
+  return classifyHit(cacheLookup(funcIndex, dims, 2));
+}
+
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::tryCacheHit3D(uint32_t funcIndex, uint32_t dim0,
+                                  uint32_t inst0, uint32_t dim1, uint32_t inst1,
+                                  uint32_t dim2, uint32_t inst2) {
+  CompileOrGetResult R;
+  if (!state_ || state_->initState.loadAcquire() != kReady) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  if (!isInstanceEnabled(dim0, inst0) || !isInstanceEnabled(dim1, inst1) ||
+      !isInstanceEnabled(dim2, inst2)) {
+    state_->counters.instanceDisabled.fetchAdd(1);
+    R.status = EJitCompileOrGetStatus::InstanceDisabled;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  const EJitDimPair dims[3] = {{dim0, inst0}, {dim1, inst1}, {dim2, inst2}};
+  return classifyHit(cacheLookup(funcIndex, dims, 3));
+}
+
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::tryCacheHit4D(uint32_t funcIndex, uint32_t dim0,
+                                  uint32_t inst0, uint32_t dim1, uint32_t inst1,
+                                  uint32_t dim2, uint32_t inst2, uint32_t dim3,
+                                  uint32_t inst3) {
+  CompileOrGetResult R;
+  if (!state_ || state_->initState.loadAcquire() != kReady) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  if (!isInstanceEnabled(dim0, inst0) || !isInstanceEnabled(dim1, inst1) ||
+      !isInstanceEnabled(dim2, inst2) || !isInstanceEnabled(dim3, inst3)) {
+    state_->counters.instanceDisabled.fetchAdd(1);
+    R.status = EJitCompileOrGetStatus::InstanceDisabled;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  const EJitDimPair dims[4] = {
+      {dim0, inst0}, {dim1, inst1}, {dim2, inst2}, {dim3, inst3}};
+  return classifyHit(cacheLookup(funcIndex, dims, 4));
 }
 
 EJitSharedTaskPool::CompileOrGetResult
