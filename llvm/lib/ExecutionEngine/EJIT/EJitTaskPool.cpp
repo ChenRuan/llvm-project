@@ -314,12 +314,9 @@ EJitTaskPool::~EJitTaskPool() {
 }
 
 EJitTaskPool::CompileOrGetResult
-EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
-                           uint32_t numDims, void *fallback) {
+EJitTaskPool::tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
+                          uint32_t numDims) {
   CompileOrGetResult R;
-  R.fnPtr = fallback;
-  EJIT_DIAG_VERBOSE("taskpool request func=%u dims=%u fallback=%p", funcIndex, numDims,
-            fallback);
 
   // Parameter check already done by the C API layer (ejit_taskpool_compile_or_get).
 
@@ -331,14 +328,15 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
       EJIT_DIAG_VERBOSE("taskpool disabled func=%u dim[%u]=(%u,%u)", funcIndex, i,
                 dims[i].dimType, dims[i].instanceId);
       R.status = EJitCompileOrGetStatus::InstanceDisabled;
+      R.fastPathTerminal = true;
       return R;
     }
   }
 
-  // 3. Cache lookup (§5.2 step 1) — runs BEFORE the Off check, so an already
+  // 2. Cache lookup (§5.2 step 1) — runs BEFORE the Off check, so an already
   //    compiled entry is still served while the pool is globally Off (the spec
   //    orders cache lookup ahead of the Off check). A disabled instance was
-  //    already rejected in step 2 and never reaches here.
+  //    already rejected above and never reaches here.
   EJitCacheLookupResult Hit = cache_.lookup(funcIndex, dims, numDims);
   if (Hit.hasReadToken && Hit.fnPtr) {
     counters_.cacheHits.fetchAdd(1);
@@ -346,12 +344,41 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     R.fnPtr = Hit.fnPtr;
     R.bucketIndex = Hit.bucketIndex;
     R.hasReadToken = true;
+    R.fastPathTerminal = true;
     EJIT_DIAG_VERBOSE("taskpool hit func=%u bucket=%u fn=%p", funcIndex,
               Hit.bucketIndex, Hit.fnPtr);
     return R;
   }
 
-  // 4. Off mode (§5.2 step 2) — fall back, never enqueue/compile.
+  // True miss (enabled, no cached code): the caller must fall through to the
+  // compileOrGet() slow path (Off / Sync / Async).
+  R.fastPathTerminal = false;
+  return R;
+}
+
+EJitTaskPool::CompileOrGetResult
+EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
+                           uint32_t numDims, void *fallback) {
+  EJIT_DIAG_VERBOSE("taskpool request func=%u dims=%u fallback=%p", funcIndex,
+                    numDims, fallback);
+
+  // Parameter check already done by the C API layer
+  // (ejit_taskpool_compile_or_get).
+
+  // Fast cache-hit path (§5.2 steps 0-1). On a terminal outcome (hit or a
+  // disabled instance) return directly.
+  CompileOrGetResult R = tryCacheHit(funcIndex, dims, numDims);
+  if (R.fastPathTerminal) {
+    // Non-hit terminals surface the caller's fallback pointer (a hit already
+    // carries the cached fnPtr + read token).
+    if (R.status != EJitCompileOrGetStatus::CacheHit)
+      R.fnPtr = fallback;
+    return R;
+  }
+  // True miss: continue the slow path with the caller's fallback.
+  R.fnPtr = fallback;
+
+  // 3. Off mode (§5.2 step 2) — fall back, never enqueue/compile.
   if (switch_.getMode() == EJitCompileMode::Off) {
     EJIT_DIAG_VERBOSE("taskpool fallback func=%u: mode off", funcIndex);
     R.status = EJitCompileOrGetStatus::OffMode;

@@ -887,29 +887,34 @@ void EJitSharedTaskPool::ownerShutdown() {
 // Producer path (§5.2).
 //===----------------------------------------------------------------------===//
 EJitSharedTaskPool::CompileOrGetResult
-EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
-                                 uint32_t numDims, void *fallback) {
+EJitSharedTaskPool::tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
+                                uint32_t numDims) {
   CompileOrGetResult R;
-  R.fnPtr = fallback;
-  EJIT_DIAG_VERBOSE("shared taskpool request func=%u dims=%u fallback=%p", funcIndex,
-            numDims, fallback);
+  // Parameter check already done by the C API layer.
+
+  // Ready check (§5.2 step 0): a not-yet-Ready pool is a clean fallback and
+  // never reads the queue/cache.
   if (!state_ || state_->initState.loadAcquire() != kReady) {
     EJIT_DIAG_VERBOSE("shared taskpool fallback func=%u: not Ready", funcIndex);
     R.status = EJitCompileOrGetStatus::OffMode; // not Ready → clean fallback.
+    R.fastPathTerminal = true;
     return R;
   }
-  // Parameter check already done by the C API layer.
 
-  // Instance-enabled check (§5.2 step 0).
+  // Instance-enabled check (§5.2 step 0): a disabled dim falls back and never
+  // reaches the cache, so a deactivated instance is never served stale code.
   for (uint32_t i = 0; i < numDims; ++i)
     if (!isInstanceEnabled(dims[i].dimType, dims[i].instanceId)) {
       state_->counters.instanceDisabled.fetchAdd(1);
-      EJIT_DIAG_VERBOSE("shared taskpool disabled func=%u dim[%u]=(%u,%u)", funcIndex,
-                i, dims[i].dimType, dims[i].instanceId);
+      EJIT_DIAG_VERBOSE("shared taskpool disabled func=%u dim[%u]=(%u,%u)",
+                        funcIndex, i, dims[i].dimType, dims[i].instanceId);
       R.status = EJitCompileOrGetStatus::InstanceDisabled;
+      R.fastPathTerminal = true;
       return R;
     }
-  // Cache lookup (§5.2 step 1).
+
+  // Cache lookup (§5.2 step 1) — runs BEFORE the Off check, so an already
+  // compiled entry is still served even when the pool is globally Off.
   EJitSharedTaskPool::SharedLookup Hit = cacheLookup(funcIndex, dims, numDims);
   if (Hit.hasReadToken && Hit.fnPtr) {
     state_->counters.cacheHits.fetchAdd(1);
@@ -917,19 +922,48 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     R.fnPtr = Hit.fnPtr;
     R.bucketIndex = Hit.bucketIndex;
     R.hasReadToken = true;
+    R.fastPathTerminal = true;
     EJIT_DIAG_VERBOSE("shared taskpool hit func=%u bucket=%u fn=%p", funcIndex,
-              Hit.bucketIndex, Hit.fnPtr);
+                      Hit.bucketIndex, Hit.fnPtr);
     return R;
   }
   if (Hit.readyButNotShareable) {
     // The work is already done but this core may not read the cross-core
     // pointer; fall back cleanly WITHOUT re-enqueuing (avoids recompile churn).
-    EJIT_DIAG_VERBOSE("shared taskpool fallback func=%u: ready but not shareable on this core",
-              funcIndex);
+    EJIT_DIAG_VERBOSE("shared taskpool fallback func=%u: ready but not "
+                      "shareable on this core",
+                      funcIndex);
     R.status = EJitCompileOrGetStatus::OffMode;
     R.readyButNotShareable = true;
+    R.fastPathTerminal = true;
     return R;
   }
+
+  // True miss (Ready, enabled, no shareable cached code): the caller must fall
+  // through to the compileOrGet() slow path (Off / Sync / Async).
+  R.fastPathTerminal = false;
+  return R;
+}
+
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
+                                 uint32_t numDims, void *fallback) {
+  EJIT_DIAG_VERBOSE("shared taskpool request func=%u dims=%u fallback=%p",
+                    funcIndex, numDims, fallback);
+  // Parameter check already done by the C API layer.
+
+  // Fast cache-hit path (§5.2 steps 0-1). On any terminal outcome (hit,
+  // disabled instance, not-Ready, or ready-but-not-shareable) return directly.
+  CompileOrGetResult R = tryCacheHit(funcIndex, dims, numDims);
+  if (R.fastPathTerminal) {
+    // Non-hit terminals surface the caller's fallback pointer (a hit already
+    // carries the cached fnPtr + read token).
+    if (R.status != EJitCompileOrGetStatus::CacheHit)
+      R.fnPtr = fallback;
+    return R;
+  }
+  // True miss: continue the slow path with the caller's fallback.
+  R.fnPtr = fallback;
   // Off mode (§5.2 step 2).
   if (state_->mode.loadAcquire() ==
       static_cast<uint32_t>(EJitCompileMode::Off)) {

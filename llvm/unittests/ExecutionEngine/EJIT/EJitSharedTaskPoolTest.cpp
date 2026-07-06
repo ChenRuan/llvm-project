@@ -1726,4 +1726,156 @@ TEST_F(SharedTaskPoolTest, FourKReinitForcesPeerToReSplit) {
   EXPECT_EQ(fourK.splits[1].second, 3u);
 }
 
+//===----------------------------------------------------------------------===//
+// tryCacheHit(): the flattened fast cache-hit path the C API drives before the
+// compileOrGet slow path. It must preserve every compileOrGet hot-path
+// semantic (ordering, counters, read tokens) while NEVER enqueuing/deduping.
+//===----------------------------------------------------------------------===//
+
+// 1/ A cache hit is served entirely on the fast path: fnPtr + bucket + a held
+//    read token, fastPathTerminal set, and NO enqueue/dedup side effects.
+TEST_F(SharedTaskPoolTest, TryCacheHitServesHitWithoutEnqueue) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(0);
+  EJitSharedDiagnostics before;
+  owner.getDiagnostics(before);
+
+  auto fast = owner.tryCacheHit(1, nullptr, 0);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(fast.fnPtr, codeFor(1));
+  EXPECT_TRUE(fast.hasReadToken);
+  EXPECT_FALSE(fast.readyButNotShareable);
+  // A held read token keeps readers > 0 (same ownership contract as
+  // compileOrGet — the caller must release through releaseRead).
+  EXPECT_GT(state_->buckets[fast.bucketIndex].readers.loadAcquire(), 0u);
+
+  EJitSharedDiagnostics after;
+  owner.getDiagnostics(after);
+  EXPECT_EQ(after.cacheHits, before.cacheHits + 1);     // counted exactly once
+  EXPECT_EQ(after.asyncEnqueues, before.asyncEnqueues); // no enqueue
+  EXPECT_EQ(after.queueDepth, 0u);                      // no dedup slot
+  EXPECT_EQ(after.pendingCount, 0u);
+
+  owner.releaseRead(fast.bucketIndex);
+  EXPECT_EQ(state_->buckets[fast.bucketIndex].readers.loadAcquire(), 0u);
+}
+
+// 2/ A true miss is NOT terminal on the fast path (no enqueue), and the slow
+//    path (compileOrGet) still enqueues/compiles exactly as before.
+TEST_F(SharedTaskPoolTest, TryCacheHitMissFallsThroughToCompileOrGet) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  EJitCoreId::setCurrentForTest(0);
+
+  auto fast = owner.tryCacheHit(5, nullptr, 0);
+  EXPECT_FALSE(fast.fastPathTerminal); // must fall through
+  EXPECT_NE(fast.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_FALSE(fast.hasReadToken);
+
+  EJitSharedDiagnostics d;
+  owner.getDiagnostics(d);
+  EXPECT_EQ(d.asyncEnqueues, 0u); // fast path never enqueues
+  EXPECT_EQ(d.queueDepth, 0u);
+  EXPECT_EQ(d.pendingCount, 0u);
+
+  // The slow path still enqueues the async request unchanged.
+  auto slow = owner.compileOrGet(5, nullptr, 0, codeFor(5));
+  EXPECT_EQ(slow.status, EJitCompileOrGetStatus::EnqueuedPending);
+  owner.getDiagnostics(d);
+  EXPECT_EQ(d.asyncEnqueues, 1u);
+  EXPECT_EQ(d.queueDepth, 1u);
+  EXPECT_EQ(d.pendingCount, 1u);
+}
+
+// 3/ A disabled instance returns InstanceDisabled on the fast path and NEVER
+//    hands back cached code, even though a Ready entry exists (deactivate must
+//    not serve stale code). No enqueue.
+TEST_F(SharedTaskPoolTest, TryCacheHitDisabledInstanceReturnsDisabled) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  owner.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.compileOrGet(11, d0, 1, codeFor(11)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  // Sanity: while enabled the entry is a real hit.
+  auto sane = owner.tryCacheHit(11, d0, 1);
+  ASSERT_EQ(sane.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(sane.bucketIndex);
+
+  // Deactivate the instance, then the fast path must reject before the cache.
+  owner.setInstanceEnabled(1, 4, false);
+  EJitSharedDiagnostics before;
+  owner.getDiagnostics(before);
+
+  auto fast = owner.tryCacheHit(11, d0, 1);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::InstanceDisabled);
+  EXPECT_EQ(fast.fnPtr, nullptr); // no stale cached code
+  EXPECT_FALSE(fast.hasReadToken);
+
+  EJitSharedDiagnostics after;
+  owner.getDiagnostics(after);
+  EXPECT_EQ(after.instanceDisabled, before.instanceDisabled + 1);
+  EXPECT_EQ(after.queueDepth, before.queueDepth); // no enqueue
+  EXPECT_EQ(after.asyncEnqueues, before.asyncEnqueues);
+}
+
+// 4/ readyButNotShareable: a peer core that may not read the cross-core pointer
+//    gets a clean OffMode fallback with readyButNotShareable set, no read
+//    token, and NO enqueue/dedup.
+TEST_F(SharedTaskPoolTest, TryCacheHitReadyButNotShareableCleanFallback) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/false);
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.compileOrGet(20, nullptr, 0, codeFor(20)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  EJitSharedTaskPool peer;
+  peer.bind(state_.get());
+  EJitCoreId::setCurrentForTest(9);
+  EJitSharedDiagnostics before;
+  peer.getDiagnostics(before);
+
+  auto fast = peer.tryCacheHit(20, nullptr, 0);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::OffMode);
+  EXPECT_TRUE(fast.readyButNotShareable);
+  EXPECT_FALSE(fast.hasReadToken);
+  EXPECT_EQ(fast.fnPtr, nullptr);
+
+  EJitSharedDiagnostics after;
+  peer.getDiagnostics(after);
+  EXPECT_EQ(after.queueDepth, before.queueDepth); // no enqueue/dedup
+  EXPECT_EQ(after.asyncEnqueues, before.asyncEnqueues);
+  EXPECT_EQ(after.pendingCount, before.pendingCount);
+}
+
+// 5/ Mode Off still returns an existing cache hit on the fast path — the cache
+//    lookup is ordered ahead of the Off check, matching compileOrGet.
+TEST_F(SharedTaskPoolTest, TryCacheHitServesHitEvenWhenModeOff) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true); // comes up Async
+  publish(owner, 30);
+
+  // Flip the cross-core mode to Off after the entry is Ready.
+  owner.setSharedMode(EJitCompileMode::Off);
+  EXPECT_EQ(owner.getSharedMode(), EJitCompileMode::Off);
+
+  EJitCoreId::setCurrentForTest(0);
+  auto fast = owner.tryCacheHit(30, nullptr, 0);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(fast.fnPtr, codeFor(30));
+  EXPECT_TRUE(fast.hasReadToken);
+  owner.releaseRead(fast.bucketIndex);
+}
+
 } // namespace

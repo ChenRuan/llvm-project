@@ -150,6 +150,14 @@ public:
     /// cross-core pointer (code sharing not platform-validated): a clean
     /// fallback that did NOT re-enqueue.
     bool readyButNotShareable = false;
+    /// Set by tryCacheHit() when the request was fully resolved on the fast
+    /// cache-hit path (a cache hit, a disabled instance, a not-yet-Ready pool,
+    /// or a ready-but-not-shareable fallback). When true the caller returns
+    /// this result directly and MUST NOT enter the compileOrGet() slow path.
+    /// When false the request is a true miss that still needs compileOrGet().
+    /// This flag is an internal control signal; it does not affect status
+    /// mapping or the C ABI.
+    bool fastPathTerminal = false;
   };
 
   EJitSharedTaskPool() = default;
@@ -274,6 +282,22 @@ public:
   //--- producer path ----------------------------------------------------------
   CompileOrGetResult compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
                                   uint32_t numDims, void *fallback);
+  /// Flattened fast cache-hit path (spec §5.2 steps 0-1). Performs ONLY the
+  /// terminal front half of compileOrGet(): the Ready check, the
+  /// instance-enabled check, and the cache lookup, then classifies the outcome:
+  ///   * CacheHit           — returns fnPtr + bucketIndex + a held read token
+  ///                          (caller releases via releaseRead), cacheHits++.
+  ///   * InstanceDisabled   — a disabled dim, instanceDisabled++.
+  ///   * OffMode            — the pool is not Ready (clean fallback).
+  ///   * OffMode + readyButNotShareable — Ready code this core may not read;
+  ///                          NO enqueue / dedup.
+  /// Each of the above sets fastPathTerminal = true; the caller returns the
+  /// result directly and never enters the slow path. A true miss (Ready,
+  /// enabled, no shareable cached code) returns fastPathTerminal = false and
+  /// the caller must fall through to compileOrGet(). compileOrGet() itself
+  /// calls this so the ordering/counters/semantics stay identical.
+  CompileOrGetResult tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
+                                 uint32_t numDims);
   void releaseRead(uint32_t bucketIndex);
   bool setInstanceEnabled(uint32_t dimType, uint32_t instanceId, bool enabled);
   /// Query the shared activation bit for a lifecycle instance — the read
