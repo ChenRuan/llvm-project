@@ -1205,12 +1205,11 @@ EJitSharedTaskPool::tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
   for (uint32_t i = 0; i < numDims; ++i)
     if (!isInstanceEnabled(dims[i].dimType, dims[i].instanceId)) {
       state_->counters.instanceDisabled.fetchAdd(1);
-      // If no instance has been activated yet, this hit is in the init→activate
-      // window — tally it separately to localize the pre-activate fallback storm.
+      // Track init→activate window hits separately.
       if (state_->anyInstanceActivated.loadAcquire() == 0)
         state_->counters.instanceDisabledPreActivate.fetchAdd(1);
-      EJIT_DIAG_VERBOSE("shared taskpool disabled func=%u dim[%u]=(%u,%u)", funcIndex,
-                i, dims[i].dimType, dims[i].instanceId);
+      EJIT_DIAG_VERBOSE("shared taskpool disabled func=%u dim[%u]=(%u,%u)",
+                        funcIndex, i, dims[i].dimType, dims[i].instanceId);
       R.status = EJitCompileOrGetStatus::InstanceDisabled;
       R.fastPathTerminal = true;
       return R;
@@ -1251,6 +1250,8 @@ EJitSharedTaskPool::tryCacheHit1D(uint32_t funcIndex, uint32_t dim0,
   }
   if (!isInstanceEnabled(dim0, inst0)) {
     state_->counters.instanceDisabled.fetchAdd(1);
+    if (state_->anyInstanceActivated.loadAcquire() == 0)
+      state_->counters.instanceDisabledPreActivate.fetchAdd(1);
     R.status = EJitCompileOrGetStatus::InstanceDisabled;
     R.fastPathTerminal = true;
     return R;
@@ -1270,6 +1271,8 @@ EJitSharedTaskPool::tryCacheHit2D(uint32_t funcIndex, uint32_t dim0,
   }
   if (!isInstanceEnabled(dim0, inst0) || !isInstanceEnabled(dim1, inst1)) {
     state_->counters.instanceDisabled.fetchAdd(1);
+    if (state_->anyInstanceActivated.loadAcquire() == 0)
+      state_->counters.instanceDisabledPreActivate.fetchAdd(1);
     R.status = EJitCompileOrGetStatus::InstanceDisabled;
     R.fastPathTerminal = true;
     return R;
@@ -1290,6 +1293,8 @@ EJitSharedTaskPool::tryCacheHit3D(uint32_t funcIndex, uint32_t dim0,
   if (!isInstanceEnabled(dim0, inst0) || !isInstanceEnabled(dim1, inst1) ||
       !isInstanceEnabled(dim2, inst2)) {
     state_->counters.instanceDisabled.fetchAdd(1);
+    if (state_->anyInstanceActivated.loadAcquire() == 0)
+      state_->counters.instanceDisabledPreActivate.fetchAdd(1);
     R.status = EJitCompileOrGetStatus::InstanceDisabled;
     R.fastPathTerminal = true;
     return R;
@@ -1312,6 +1317,8 @@ EJitSharedTaskPool::tryCacheHit4D(uint32_t funcIndex, uint32_t dim0,
   if (!isInstanceEnabled(dim0, inst0) || !isInstanceEnabled(dim1, inst1) ||
       !isInstanceEnabled(dim2, inst2) || !isInstanceEnabled(dim3, inst3)) {
     state_->counters.instanceDisabled.fetchAdd(1);
+    if (state_->anyInstanceActivated.loadAcquire() == 0)
+      state_->counters.instanceDisabledPreActivate.fetchAdd(1);
     R.status = EJitCompileOrGetStatus::InstanceDisabled;
     R.fastPathTerminal = true;
     return R;

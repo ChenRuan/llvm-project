@@ -186,6 +186,7 @@ ALL_TESTS=(
   ejit_baremetal_link_test
   ejit_new_attr_test
   ejit_sync_mode_test
+  ejit_fixed_dim_test
   ejit_perf_bench
   ejit_ptr_period_test
   ejit_trace_test
@@ -197,6 +198,7 @@ COMPILE_FLAGS[ejit_manual_register_test]="-mllvm -enable-ejit-global-ctors=false
 # Bare-metal link test: no global ctors -> registration must use the static
 # registry tables walked via linker-script-provided __start_/__stop_ symbols.
 COMPILE_FLAGS[ejit_baremetal_link_test]="-mllvm -enable-ejit-global-ctors=false"
+COMPILE_FLAGS[ejit_fixed_dim_test]="-mllvm -ejit-wrapper-fixed-dim-entry"
 
 # Override the primary source file for a test (default: <name>.c). Lets a test
 # reuse existing sources under a different build/link recipe without copying.
@@ -243,6 +245,7 @@ TEST_ARGS[ejit_multi_tu_test]="0 3"
 TEST_ARGS[ejit_baremetal_link_test]="0 3"
 TEST_ARGS[ejit_sync_mode_test]="0"
 TEST_ARGS[ejit_new_attr_test]="0"
+TEST_ARGS[ejit_fixed_dim_test]="0 1"
 
 if [[ ${#SELECTED[@]} -eq 0 ]]; then
   SELECTED=("${ALL_TESTS[@]}")
