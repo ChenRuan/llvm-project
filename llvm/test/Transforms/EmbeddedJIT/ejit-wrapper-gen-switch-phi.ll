@@ -34,7 +34,7 @@ def:
 ; CHECK: %pb = phi i32 [ 20, %jit_fallback ]
 ; CHECK: %r = phi i32 [ 0, %jit_fallback ], [ %pa, %a ], [ %pb, %b ]
 ; CHECK: jit_call:
-; CHECK: call i32 @ejit_taskpool_compile_or_get(i32 {{.*}}, ptr {{.*}}, i32 0, ptr {{.*}}, ptr {{.*}})
+; CHECK: call i32 @ejit_taskpool_compile_or_get_0d(i32 {{.*}}, ptr {{.*}}, ptr {{.*}})
 ; CHECK: jit_fallback:
 ; CHECK: switch i32 %sel
 ; CHECK: jit_dispatch:

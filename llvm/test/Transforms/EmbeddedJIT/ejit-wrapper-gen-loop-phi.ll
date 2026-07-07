@@ -32,7 +32,7 @@ done:
 
 ; Wrapper blocks follow.
 ; CHECK: jit_call:
-; CHECK: call i32 @ejit_taskpool_compile_or_get(i32 {{.*}}, ptr {{.*}}, i32 0, ptr {{.*}}, ptr {{.*}})
+; CHECK: call i32 @ejit_taskpool_compile_or_get_0d(i32 {{.*}}, ptr {{.*}}, ptr {{.*}})
 ; CHECK: jit_fallback:
 ; CHECK: br label %loop
 ; CHECK: jit_dispatch:

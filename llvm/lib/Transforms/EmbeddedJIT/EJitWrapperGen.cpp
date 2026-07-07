@@ -43,13 +43,12 @@ static cl::opt<bool> EJitNoInlineEntry(
     cl::desc("Add noinline attribute to ejit_entry functions to prevent the "
              "CGSCC inliner from duplicating the JIT wrapper into callers"));
 
-// Temporary opt-in: emit the fixed-dimension taskpool fast-path C ABI calls
-// (ejit_taskpool_compile_or_get_Nd, N = dim count) for entries with <= 4 dims
-// instead of the generic ejit_taskpool_compile_or_get. Default OFF so existing
-// wrapper output / lit tests are unaffected; entries with > 4 dims always use
-// the generic entry.
+// Emit fixed-dimension taskpool fast-path C ABI calls
+// (ejit_taskpool_compile_or_get_Nd, N = dim count) for entries with <= 2 dims
+// (0-2 dims fit in 8 integer arg registers, no stack spill). Entries with > 2
+// dims use the generic ejit_taskpool_compile_or_get.
 static cl::opt<bool> EJitWrapperFixedDimEntry(
-    "ejit-wrapper-fixed-dim-entry", cl::init(false), cl::Hidden,
+    "ejit-wrapper-fixed-dim-entry", cl::init(true), cl::Hidden,
     cl::desc("Emit fixed-dimension taskpool fast-path calls "
              "(ejit_taskpool_compile_or_get_Nd) for ejit_entry functions with "
              "<= 4 dims instead of the generic ejit_taskpool_compile_or_get"));

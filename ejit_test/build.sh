@@ -198,7 +198,7 @@ COMPILE_FLAGS[ejit_manual_register_test]="-mllvm -enable-ejit-global-ctors=false
 # Bare-metal link test: no global ctors -> registration must use the static
 # registry tables walked via linker-script-provided __start_/__stop_ symbols.
 COMPILE_FLAGS[ejit_baremetal_link_test]="-mllvm -enable-ejit-global-ctors=false"
-COMPILE_FLAGS[ejit_fixed_dim_test]="-mllvm -ejit-wrapper-fixed-dim-entry"
+COMPILE_FLAGS[ejit_fixed_dim_test]=""
 
 # Override the primary source file for a test (default: <name>.c). Lets a test
 # reuse existing sources under a different build/link recipe without copying.
