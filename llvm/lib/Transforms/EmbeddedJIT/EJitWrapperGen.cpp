@@ -100,13 +100,13 @@ static GlobalVariable *getOrCreateDimTypeGlobal(Module &M,
 
 // Emit registration that fills each per-lifecycle dimType global with the slot
 // the process-global EJitLifecycleRegistry assigns by name: ejit_register_
-// lifecycle() calls in ejit_auto_register (constructor path) plus a static
-// __ejit_registry_lifecycle[] table (bare-metal / test fallback). Mirrors the
-// period pass. Idempotent: skips if the static table already exists.
+// lifecycle() calls in ejit_auto_register (constructor path) plus private
+// .ejit_period section entries (bare-metal / test fallback). Mirrors the period
+// pass. Idempotent: skips if the static section payload already exists.
 static void
 emitLifecycleRegistration(Module &M,
                           const std::map<std::string, GlobalVariable *> &LCs) {
-  if (LCs.empty() || M.getGlobalVariable("__ejit_registry_lifecycle"))
+  if (LCs.empty() || M.getGlobalVariable(".ejit.registry.lifecycle"))
     return;
   LLVMContext &Ctx = M.getContext();
   auto *PtrTy = PointerType::getUnqual(Ctx);
@@ -143,7 +143,10 @@ emitLifecycleRegistration(Module &M,
   if (EnableEJitGlobalCtors && CreatedAutoReg)
     appendToGlobalCtors(M, AutoReg, EJIT_CTOR_PRIORITY);
 
-  // Static registry table for bare-metal / testing fallback.
+  // Static registry entries for bare-metal / testing fallback. They use the
+  // same linker-concatenated section model as PASS2: private arrays in
+  // ".ejit_period", no sentinel and no fixed external symbol, so multiple TUs
+  // can all contribute lifecycle fixups without duplicate-symbol errors.
   StructType *EntryTy = StructType::get(
       Ctx, {I32Ty, PtrTy, PtrTy, PtrTy, I64Ty}, /*isPacked=*/false);
   auto makeStrGV = [&](const std::string &S) -> Constant * {
@@ -161,15 +164,15 @@ emitLifecycleRegistration(Module &M,
                   ConstantExpr::getBitCast(KV.second, PtrTy),
                   ConstantInt::get(I64Ty, 0)}));
   }
-  Entries.push_back(ConstantStruct::get(
-      EntryTy,
-      {ConstantInt::get(I32Ty, 4), // EJIT_REG_NONE (sentinel)
-       ConstantPointerNull::get(PtrTy), ConstantPointerNull::get(PtrTy),
-       ConstantPointerNull::get(PtrTy), ConstantInt::get(I64Ty, 0)}));
+  if (Entries.empty())
+    return;
   ArrayType *ArrayTy = ArrayType::get(EntryTy, Entries.size());
-  (void)new GlobalVariable(
-      M, ArrayTy, /*isConstant=*/true, GlobalValue::ExternalLinkage,
-      ConstantArray::get(ArrayTy, Entries), "__ejit_registry_lifecycle");
+  auto *GV = new GlobalVariable(
+      M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
+      ConstantArray::get(ArrayTy, Entries), ".ejit.registry.lifecycle");
+  GV->setSection(".ejit_period");
+  GV->setAlignment(M.getDataLayout().getABITypeAlign(EntryTy));
+  appendToUsed(M, {GV});
 }
 
 // Per-function i32 global holding the dense funcIndex. Internal linkage so the
@@ -190,13 +193,14 @@ static GlobalVariable *getOrCreateFuncIndexGlobal(Module &M,
 
 // Emit registration that fills each per-function dense-funcIndex global with
 // the index the process-global EJitFuncRegistry assigns by name: ejit_register_
-// funcindex() calls in ejit_auto_register (constructor path) plus a static
-// __ejit_registry_funcindex[] table (bare-metal / test fallback). Mirrors the
-// lifecycle registration. Idempotent: skips if the static table already exists.
+// funcindex() calls in ejit_auto_register (constructor path) plus private
+// .ejit_period section entries (bare-metal / test fallback). Mirrors the
+// lifecycle registration. Idempotent: skips if the static section payload
+// already exists.
 static void
 emitFuncIndexRegistration(Module &M,
                           const std::map<std::string, GlobalVariable *> &Fns) {
-  if (Fns.empty() || M.getGlobalVariable("__ejit_registry_funcindex"))
+  if (Fns.empty() || M.getGlobalVariable(".ejit.registry.funcindex"))
     return;
   LLVMContext &Ctx = M.getContext();
   auto *PtrTy = PointerType::getUnqual(Ctx);
@@ -231,7 +235,10 @@ emitFuncIndexRegistration(Module &M,
   if (EnableEJitGlobalCtors && CreatedAutoReg)
     appendToGlobalCtors(M, AutoReg, EJIT_CTOR_PRIORITY);
 
-  // Static registry table for bare-metal / testing fallback.
+  // Static registry entries for bare-metal / testing fallback. They use the
+  // same linker-concatenated section model as PASS2: private arrays in
+  // ".ejit_period", no sentinel and no fixed external symbol, so multiple TUs
+  // can all contribute funcIndex fixups without duplicate-symbol errors.
   StructType *EntryTy = StructType::get(
       Ctx, {I32Ty, PtrTy, PtrTy, PtrTy, I64Ty}, /*isPacked=*/false);
   auto makeStrGV = [&](const std::string &S) -> Constant * {
@@ -249,15 +256,15 @@ emitFuncIndexRegistration(Module &M,
                   ConstantExpr::getBitCast(KV.second, PtrTy),
                   ConstantInt::get(I64Ty, 0)}));
   }
-  Entries.push_back(ConstantStruct::get(
-      EntryTy,
-      {ConstantInt::get(I32Ty, 4), // EJIT_REG_NONE (sentinel)
-       ConstantPointerNull::get(PtrTy), ConstantPointerNull::get(PtrTy),
-       ConstantPointerNull::get(PtrTy), ConstantInt::get(I64Ty, 0)}));
+  if (Entries.empty())
+    return;
   ArrayType *ArrayTy = ArrayType::get(EntryTy, Entries.size());
-  (void)new GlobalVariable(
-      M, ArrayTy, /*isConstant=*/true, GlobalValue::ExternalLinkage,
-      ConstantArray::get(ArrayTy, Entries), "__ejit_registry_funcindex");
+  auto *GV = new GlobalVariable(
+      M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
+      ConstantArray::get(ArrayTy, Entries), ".ejit.registry.funcindex");
+  GV->setSection(".ejit_period");
+  GV->setAlignment(M.getDataLayout().getABITypeAlign(EntryTy));
+  appendToUsed(M, {GV});
 }
 
 } // anonymous namespace
@@ -440,14 +447,28 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     auto *JitFallback = BasicBlock::Create(Ctx, "jit_fallback", F);
     auto *JitDispatch = BasicBlock::Create(Ctx, "jit_dispatch", F);
 
+    // Update PHI incoming blocks in successors that reference OrigEntry.
+    //
+    // NOTE: replaceAllUsesWith does NOT update PHI incoming blocks — a
+    // PHINode's incoming block is stored inside the PHINode and is NOT part
+    // of the BasicBlock's use list (OrigEntry can be a PHI incoming block
+    // while getNumUses() == 0). Without this explicit rewrite, erasing
+    // OrigEntry leaves dangling PHI incoming block pointers, crashing later
+    // passes. This triggers whenever the ejit_entry function's entry block
+    // is an incoming predecessor of a PHI — e.g. short-circuit && / || inside
+    // __builtin_expect(!!(a && b), 1) produces a PHI in the merge block whose
+    // incoming block is the entry block; lower-expect's handlePhiDef then
+    // dereferences the dangling pointer.
+    //
+    // Must run before splice(): replaceSuccessorsPhiUsesWith walks OrigEntry's
+    // successors via its terminator, which the splice below moves away.
+    OrigEntry.replaceSuccessorsPhiUsesWith(JitFallback);
+
     // Splice all instructions from OrigEntry to jit_fallback
     JitFallback->splice(JitFallback->end(), &OrigEntry, OrigEntry.begin(),
                         OrigEntry.end());
 
-    // Fix PHI nodes in successor blocks that reference the original entry
-    // block. Optimization passes may have created PHI nodes pointing at the
-    // entry block, and after we replace it with jit_fallback those PHI entries
-    // must be updated.
+    // Handle any remaining non-PHI uses of OrigEntry (e.g. blockaddress).
     OrigEntry.replaceAllUsesWith(JitFallback);
 
     // Delete the now-empty original entry block

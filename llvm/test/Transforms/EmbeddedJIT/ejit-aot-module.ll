@@ -4,15 +4,16 @@
 ; CHECK: @llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] [{ i32, ptr, ptr } { i32 65535, ptr @ejit_auto_register, ptr null }]
 
 ; PASS3 output: per-lifecycle dimType global (filled at registration) and the
-; lifecycle registry table. The wrapper LOADS the slot from this global instead
-; of baking a per-module constant, so the slot is cross-module stable.
+; lifecycle static-registry section entry. The wrapper LOADS the slot from this
+; global instead of baking a per-module constant, so the slot is cross-module
+; stable.
 ; CHECK: @__ejit_dimtype_cell = internal global i32 -1
-; CHECK: @__ejit_registry_lifecycle = constant {{.*}}{ i32 5, ptr {{.*}}, ptr null, ptr @__ejit_dimtype_cell, i64 0 }
+; CHECK: @{{.*}} = private constant {{.*}}{ i32 5, ptr {{.*}}, ptr null, ptr @__ejit_dimtype_cell, i64 0 }{{.*}}, section ".ejit_period"
 
 ; PASS3 output: per-function dense funcIndex global (filled at registration) and
-; the funcIndex registry table (EJIT_REG_FUNCINDEX == 6).
+; the funcIndex static-registry section entry (EJIT_REG_FUNCINDEX == 6).
 ; CHECK: @__ejit_funcidx_process_cell = internal global i32 -1
-; CHECK: @__ejit_registry_funcindex = constant {{.*}}{ i32 6, ptr {{.*}}, ptr null, ptr @__ejit_funcidx_process_cell, i64 0 }
+; CHECK: @{{.*}} = private constant {{.*}}{ i32 6, ptr {{.*}}, ptr null, ptr @__ejit_funcidx_process_cell, i64 0 }{{.*}}, section ".ejit_period"
 
 ; PASS3 output: wrapper generation in process_cell. jit_entry LOADS the funcIndex
 ; and falls back WITHOUT entering the taskpool while it is still invalid (-1).
