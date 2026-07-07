@@ -113,6 +113,21 @@ typedef struct {
   uint64_t evictions;
 } ejit_stats_t;
 
+/// Code pool usage statistics (EJIT_SRE_CODE_POOL builds). All fixed-width so
+/// the layout is stable across the aarch64_be target and a host reader.
+/// Mirrors EJitCodePoolManager::Stats.
+typedef struct ejit_code_pool_stats_t {
+  uint64_t poolCount;          ///< total 2MiB pools created
+  uint64_t sealedCount;        ///< pools currently sealed (RX)
+  uint64_t activeCount;        ///< pools still RW
+  uint64_t usedBytes;          ///< sum of bump offsets across all pools
+  uint64_t reservedBytes;      ///< sum of pool sizes across all pools
+  uint64_t wastedBytes;        ///< unused tail bytes inside sealed pools
+  uint64_t sealInvocations;    ///< successful enable_ex calls (per 4K page in 4K mode)
+  uint64_t splitInvocations;   ///< successful split_2m_to_4k calls (4K mode)
+  uint64_t finalizedRangeCount; ///< distinct executable ranges recorded
+} ejit_code_pool_stats_t;
+
 typedef struct {
   int code;
   char message[256];
@@ -184,6 +199,9 @@ typedef struct {
   uint64_t compileFailed;   ///< Compiles that failed, were cancelled or dropped.
   uint64_t publishFailed;   ///< Results that could not enter the cache.
   uint64_t instanceDisabled; ///< Per-instance disable fast-path hits.
+  uint64_t instanceDisabledPreActivate; ///< Subset of instanceDisabled that hit
+                                        ///< before the first activate (init→
+                                        ///< activate window). 0 in non-shared.
   uint32_t readyEntries;     ///< Live ready cache entries.
   uint32_t pendingEntries;   ///< Live in-flight dedup slots.
   uint32_t queueApproxSize;  ///< Approximate async queue depth.
@@ -258,6 +276,26 @@ void ejit_print_registry(void);
 /// period arrays, and may_const field offsets. For diagnosing specialization
 /// parameter binding and constant-substitution eligibility.
 void ejit_print_func_meta(const char *funcName);
+
+/// Fill \p out with code pool usage statistics (pools, sealed/active, used/
+/// reserved/wasted bytes, seal/split invocations, finalized ranges). Returns
+/// EJIT_OK on success, EJIT_ERR_NOT_ACTIVE if the runtime is not initialized,
+/// EJIT_ERR_INVALID_PARAM on a null out pointer, EJIT_ERR_DISABLED if the
+/// runtime was built without EJIT_SRE_CODE_POOL (no pool). For monitoring
+/// embedded code-memory exhaustion. Mirrors EJitCodePoolManager::Stats.
+ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out);
+
+/// Print code pool usage statistics through the platform log. Paired with
+/// ejit_get_code_pool_stats() (human-readable form).
+void ejit_print_code_pool_stats(void);
+
+/// Print the currently-active time-window instances through the platform log:
+/// for each registered period, every active (period, cell) is listed. Works
+/// across builds (queries the same isActive() path the JIT gate uses: the
+/// shared SwitchController in shared-taskpool builds, the per-instance
+/// arrayStates_ otherwise). Static vars are always active. For diagnosing
+/// "why did/didn't this period instance compile".
+void ejit_print_active(void);
 
 // Cache
 void ejit_clear_cache(void);

@@ -420,11 +420,12 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     *outBucket = 0;
   EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u dims=%u", funcIndex,
                     numDims);
-  if (!gEJIT) {
-    EJIT_DIAG("taskpool_compile_or_get reject func=%u: not initialized",
-              funcIndex);
+  // Silently return EJIT_ERR_NOT_ACTIVE when the runtime is not initialized.
+  // The AOT wrapper calls this on every ejit_entry invocation, so a per-call
+  // "not initialized" log would noise the trace; the caller already handles
+  // the status code.
+  if (!gEJIT)
     return EJIT_ERR_NOT_ACTIVE;
-  }
   auto *tp = activeTaskPool();
   if (!tp) {
     EJIT_DIAG("taskpool_compile_or_get reject func=%u: no taskpool", funcIndex);
@@ -573,6 +574,7 @@ ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out) {
   out->compileFailed = d.compileFailed;
   out->publishFailed = d.publishFailed;
   out->instanceDisabled = d.instanceDisabled;
+  out->instanceDisabledPreActivate = d.instanceDisabledPreActivate;
   out->readyEntries = d.cacheReadyCount;
   out->pendingEntries = d.pendingCount;
   out->queueApproxSize = d.queueDepth;
@@ -595,6 +597,7 @@ ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out) {
   out->compileFailed = s.compileFailed;
   out->publishFailed = s.publishFailed;
   out->instanceDisabled = s.instanceDisabled;
+  out->instanceDisabledPreActivate = 0;
   out->readyEntries = s.readyEntries;
   out->pendingEntries = s.pendingEntries;
   out->queueApproxSize = s.queueApproxSize;
@@ -623,6 +626,13 @@ void ejit_taskpool_print_stats() {
             static_cast<unsigned long long>(s.publishFailed));
   EJIT_DIAG("  instanceDisabled = %llu",
             static_cast<unsigned long long>(s.instanceDisabled));
+  EJIT_DIAG("  instanceDisabledPreActivate  = %llu   (init->activate window)",
+            static_cast<unsigned long long>(s.instanceDisabledPreActivate));
+  EJIT_DIAG("  instanceDisabledPostActivate = %llu   (after first activate)",
+            static_cast<unsigned long long>(
+                s.instanceDisabled > s.instanceDisabledPreActivate
+                    ? s.instanceDisabled - s.instanceDisabledPreActivate
+                    : 0));
   EJIT_DIAG("  readyEntries     = %u", s.readyEntries);
   EJIT_DIAG("  pendingEntries   = %u", s.pendingEntries);
   EJIT_DIAG("  queueApproxSize  = %u", s.queueApproxSize);
@@ -674,24 +684,15 @@ void ejit_taskpool_print_compiled() {
 }
 
 void ejit_dump_func(const char *name) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (gEJIT) {
-    if (EJitSharedTaskPool *sp = gEJIT->sharedTaskPool())
-      setDumpSharedState(sp->state());
-  }
-#endif
+  // gDumpSharedState is bound once in ejit_init (and cleared in ejit_shutdown);
+  // no per-call rebind needed here.
   std::string filter = (name && name[0]) ? std::string(name) : std::string();
   EJIT_DIAG("dump_func filter=%s", filter.empty() ? "(off)" : filter.c_str());
   setDumpFuncFilter(filter);
 }
 
 void ejit_print_dumped(const char *name) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (gEJIT) {
-    if (EJitSharedTaskPool *sp = gEJIT->sharedTaskPool())
-      setDumpSharedState(sp->state());
-  }
-#endif
+  // gDumpSharedState is bound once in ejit_init; no per-call rebind needed.
   EJIT_DIAG("print_dumped name=%s", (name && name[0]) ? name : "(all)");
   printDumped(name);
 }
@@ -723,12 +724,7 @@ uint32_t ejit_taskpool_get_worker_core() {
 //===----------------------------------------------------------------------===//
 
 void ejit_dump_all(bool enable) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (gEJIT) {
-    if (EJitSharedTaskPool *sp = gEJIT->sharedTaskPool())
-      setDumpSharedState(sp->state());
-  }
-#endif
+  // gDumpSharedState is bound once in ejit_init; no per-call rebind needed.
   // The "*" filter is a wildcard matched by every specialization in the IR
   // transform layer (see getActiveDumpFilter / the capture condition). Capture
   // is bounded by distinct function names; print with ejit_print_dumped(NULL).
@@ -768,6 +764,38 @@ void ejit_print_func_meta(const char *funcName) {
     return;
   }
   gEJIT->printFuncMeta(funcName);
+}
+
+ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out) {
+  if (!out) {
+    EJIT_DIAG("get_code_pool_stats: null out pointer");
+    return EJIT_ERR_INVALID_PARAM;
+  }
+  if (!gEJIT) {
+    EJIT_DIAG("get_code_pool_stats: not initialized");
+    return EJIT_ERR_NOT_ACTIVE;
+  }
+  if (!gEJIT->getCodePoolStats(out)) {
+    EJIT_DIAG("get_code_pool_stats: no code pool (EJIT_SRE_CODE_POOL off or no engine)");
+    return EJIT_ERR_DISABLED;
+  }
+  return EJIT_OK;
+}
+
+void ejit_print_code_pool_stats(void) {
+  if (!gEJIT) {
+    EJIT_DIAG("print_code_pool_stats: not initialized");
+    return;
+  }
+  gEJIT->printCodePoolStats();
+}
+
+void ejit_print_active(void) {
+  if (!gEJIT) {
+    EJIT_DIAG("print_active: not initialized");
+    return;
+  }
+  gEJIT->printActive();
 }
 
 } // extern "C"

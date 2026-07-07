@@ -62,6 +62,7 @@ struct EJitSharedDiagnostics {
   uint64_t compileFailed;
   uint64_t publishFailed;
   uint64_t instanceDisabled;
+  uint64_t instanceDisabledPreActivate; ///< instanceDisabled before first activate.
   uint64_t executePrepareFailed;
 };
 
@@ -101,6 +102,13 @@ public:
   /// when unset, slots carry no range and 4K peer preparation cleanly fails.
   using CodeRangeCallback = bool (*)(void *ctx, const void *fnPtr,
                                      EJitCompiledCodeInfo *outInfo);
+  /// Owner-private provider that snapshots the owner-core code-pool manager
+  /// stats. The owner publishes this into the shared mirror after every
+  /// successful compile so every core's ejit_print_code_pool_stats is
+  /// consistent (the real pools are owner-private). Returns false when no code
+  /// pool exists (clean fallback). Optional: when unset, the shared mirror stays
+  /// zero and readers fall back to their per-core (empty) view.
+  using CodePoolStatsCallback = bool (*)(void *ctx, EJitCodePoolStatsOut *out);
   /// Per-core platform primitive: split a 2MiB-aligned [poolBase, poolBase +
   /// poolSize) window into 4KiB mappings in the CALLING core's translation
   /// context (split_2m_to_4k). Returns true on success. Used only in 4K
@@ -192,6 +200,15 @@ public:
     codeRangeFn_ = fn;
     codeRangeCtx_ = ctx;
   }
+  /// Owner: provide the code-pool stats snapshotter (see CodePoolStatsCallback).
+  void setCodePoolStatsProvider(CodePoolStatsCallback fn, void *ctx) {
+    codePoolStatsFn_ = fn;
+    codePoolStatsCtx_ = ctx;
+  }
+  /// Read the shared code-pool stats mirror (last owner-published snapshot).
+  /// Returns false if the shared state is not bound. Every core sees the same
+  /// values. Use this for ejit_get/print_code_pool_stats in shared builds.
+  bool readCodePoolStats(EJitCodePoolStatsOut *out) const;
   /// Select the execute-permission seal granularity for non-owner preparation:
   /// true = 4KiB page seal (split the pool once per core, then enable_ex every
   /// page the code covers), false = legacy whole-2MiB-pool seal. Must match the
@@ -386,6 +403,12 @@ private:
 
   void runCompile(const EJitCompileRequest &req);
 
+  /// Owner-only: snapshot the owner-core code-pool stats via the registered
+  /// provider and storeRelaxed them into the shared mirror. Called after every
+  /// successful compile (sync + async publish) so the mirror stays fresh for
+  /// cross-core readers. No-op when no provider is registered.
+  void publishCodePoolStats();
+
   EJitSharedTaskPoolState *state_ = nullptr;
   CompileCallback compileFn_ = nullptr;
   void *compileCtx_ = nullptr;
@@ -395,6 +418,8 @@ private:
   void *prepareCodeCtx_ = nullptr;
   CodeRangeCallback codeRangeFn_ = nullptr;
   void *codeRangeCtx_ = nullptr;
+  CodePoolStatsCallback codePoolStatsFn_ = nullptr;
+  void *codePoolStatsCtx_ = nullptr;
   SplitPoolCallback splitPoolFn_ = nullptr;
   void *splitPoolCtx_ = nullptr;
   SealPageCallback sealPageFn_ = nullptr;

@@ -679,6 +679,12 @@ extern int ejit_get_log_level(void);
 extern void ejit_dump_all(bool enable);
 extern void ejit_print_registry(void);
 extern void ejit_print_func_meta(const char *funcName);
+// P0 diagnostics: code pool stats + active period map. Declared returning int
+// (the real ejit_status_t) with literal status values (0=OK, -1=INVALID_PARAM,
+// -2=NOT_ACTIVE, -9=DISABLED) so the test need not include the C API header.
+extern int ejit_get_code_pool_stats(void *out);
+extern void ejit_print_code_pool_stats(void);
+extern void ejit_print_active(void);
 }
 
 // The "runtime-dynamic cellIdx" C-API tests below exercise the LEGACY model:
@@ -2749,4 +2755,28 @@ TEST(EJitDiagnostics, PrintFuncMetaMissingName) {
   ejit_print_func_meta(nullptr); // null
   ejit_print_func_meta("");      // empty
   ejit_print_func_meta("does_not_exist");
+}
+
+// Code pool stats: a null out pointer is rejected before the gEJIT check, so
+// it deterministically returns INVALID_PARAM (-1) regardless of init state.
+TEST(EJitDiagnostics, CodePoolStatsNullOutRejected) {
+  EXPECT_EQ(ejit_get_code_pool_stats(nullptr), -1);
+}
+
+// With a valid out pointer the call either succeeds (0) or reports a clean
+// non-fatal status (NOT_ACTIVE=-2 if not initialized, DISABLED=-9 if built
+// without EJIT_SRE_CODE_POOL). It must not crash and must not return a
+// positive value.
+TEST(EJitDiagnostics, CodePoolStatsNoCrash) {
+  int dummy = -1;
+  int rv = ejit_get_code_pool_stats(&dummy);
+  EXPECT_TRUE(rv == 0 || rv == -2 || rv == -9);
+}
+
+TEST(EJitDiagnostics, PrintCodePoolStatsNoCrash) {
+  ejit_print_code_pool_stats(); // uninitialized or no pool: prints a notice
+}
+
+TEST(EJitDiagnostics, PrintActiveNoCrash) {
+  ejit_print_active(); // uninitialized: prints a notice
 }

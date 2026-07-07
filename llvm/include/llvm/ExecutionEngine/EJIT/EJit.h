@@ -16,6 +16,13 @@
 #include <memory>
 #include <string>
 
+// Forward declaration of the C ABI stats struct (defined in EJitRuntime.h),
+// so getCodePoolStats() can take it without pulling the C API header into the
+// C++ core. C language linkage to match the definition in EJitRuntime.h.
+extern "C" {
+struct ejit_code_pool_stats_t;
+}
+
 namespace llvm {
 namespace ejit {
 
@@ -126,6 +133,17 @@ public:
   /// (ejit_entry marker, period_arr_ind slots, period arrays, may_const field
   /// offsets). For ejit_print_func_meta(). Non-const: caches func metadata.
   void printFuncMeta(const std::string &funcName);
+
+  /// Fill \p out with code pool usage stats. Returns false if not initialized
+  /// or built without EJIT_SRE_CODE_POOL. For ejit_get_code_pool_stats().
+  bool getCodePoolStats(ejit_code_pool_stats_t *out) const;
+
+  /// Print code pool usage stats through EJIT_DIAG. For
+  /// ejit_print_code_pool_stats().
+  void printCodePoolStats() const;
+
+  /// Print every active (period, cell) through EJIT_DIAG. For ejit_print_active().
+  void printActive() const;
 
 private:
   Config config_;
