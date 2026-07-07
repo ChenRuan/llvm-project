@@ -73,8 +73,19 @@
 #ifndef EJIT_SRE_SHARED_DUMP_NAME_BYTES
 #define EJIT_SRE_SHARED_DUMP_NAME_BYTES 128u
 #endif
-#ifndef EJIT_SRE_SHARED_DUMP_TEXT_BYTES
-#define EJIT_SRE_SHARED_DUMP_TEXT_BYTES 65536u
+// Per-slot IR/ASM text capacity in the cross-core dump table (each slot holds
+// one captured function's name + IR + ASM, truncated to this size per text).
+#ifndef EJIT_SRE_SHARED_DUMP_SLOT_TEXT_BYTES
+#define EJIT_SRE_SHARED_DUMP_SLOT_TEXT_BYTES 8192u
+#endif
+// Number of per-name result slots in the cross-core dump table. Each captured
+// specialization occupies one slot keyed by entry name; when full, the oldest
+// slot is round-robin evicted. Covers this many distinct functions for
+// cross-core ejit_print_dumped(name) retrieval. NOTE: the table lives in the
+// fixed shared section, so sizeof(EJitSharedTaskPoolState) scales with
+// SLOT_COUNT * (2 * SLOT_TEXT_BYTES); resize the linker section accordingly.
+#ifndef EJIT_SRE_SHARED_DUMP_SLOT_COUNT
+#define EJIT_SRE_SHARED_DUMP_SLOT_COUNT 50u
 #endif
 
 namespace llvm {
@@ -92,8 +103,10 @@ constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
 constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
 constexpr uint32_t kEJitSharedDumpNameBytes =
     EJIT_SRE_SHARED_DUMP_NAME_BYTES;
-constexpr uint32_t kEJitSharedDumpTextBytes =
-    EJIT_SRE_SHARED_DUMP_TEXT_BYTES;
+constexpr uint32_t kEJitSharedDumpSlotTextBytes =
+    EJIT_SRE_SHARED_DUMP_SLOT_TEXT_BYTES;
+constexpr uint32_t kEJitSharedDumpSlotCount =
+    EJIT_SRE_SHARED_DUMP_SLOT_COUNT;
 constexpr uint32_t kEJitSharedCacheLine = 64u;
 /// Execute-permission seal granularity (the platform's per-page enable_ex unit)
 /// and the large-page / split granularity. Fixed platform constants.
@@ -210,27 +223,37 @@ struct EJitSharedPoolSplit {
 //
 // The owner worker captures IR/ASM in its private ORC path, but shell/debug
 // requests can arrive on a different core. std::map/std::string cannot live in
-// shared memory, so the shared path uses one bounded filter + one bounded
-// captured result. It is diagnostic-only: long IR/ASM is truncated instead of
-// blocking normal JIT progress.
+// shared memory, so the shared path uses one bounded filter plus a bounded
+// per-name result TABLE: each captured specialization occupies one slot keyed
+// by entry name; when the table is full the oldest slot is round-robin
+// evicted. This lets a non-owner core retrieve any recently-captured function
+// by name (not just the latest). It is diagnostic-only: long IR/ASM is
+// truncated (per-slot) instead of blocking normal JIT progress; the full,
+// untruncated IR/ASM remains available on the owner core via the per-core
+// gDumpStore + ejit_print_dumped(NULL).
 //===----------------------------------------------------------------------===//
-struct alignas(kEJitSharedCacheLine) EJitSharedDumpState {
-  EJitAtomicU32 lock;          ///< 0 free, 1 locked by filter/capture/print
-  EJitAtomicU32 filterEnabled; ///< 1 => filterName is active
-  EJitAtomicU32 resultValid;   ///< 1 => resultName/ir/asm contain a capture
-  EJitAtomicU32 truncated;     ///< bit0 IR truncated, bit1 ASM truncated
-  uint32_t filterLen;
-  uint32_t resultNameLen;
+struct alignas(kEJitSharedCacheLine) EJitSharedDumpSlot {
+  EJitAtomicU32 valid;       ///< 1 => name/ir/asm hold a capture
+  EJitAtomicU32 truncated;   ///< bit0 IR, bit1 ASM, bit2 name truncated
+  uint32_t nameLen;
   uint32_t irSize;
   uint32_t asmSize;
   uint32_t keyHi;
   uint32_t keyLo;
   uint32_t reserved0;
-  uint32_t reserved1;
+  char name[kEJitSharedDumpNameBytes];
+  char ir[kEJitSharedDumpSlotTextBytes];
+  char asmText[kEJitSharedDumpSlotTextBytes];
+};
+
+struct alignas(kEJitSharedCacheLine) EJitSharedDumpState {
+  EJitAtomicU32 lock;          ///< 0 free, 1 locked by filter/capture/print
+  EJitAtomicU32 filterEnabled; ///< 1 => filterName is active
+  uint32_t filterLen;
+  uint32_t nextSlot;           ///< round-robin eviction cursor (under lock)
+  uint32_t reserved0;
   char filterName[kEJitSharedDumpNameBytes];
-  char resultName[kEJitSharedDumpNameBytes];
-  char ir[kEJitSharedDumpTextBytes];
-  char asmText[kEJitSharedDumpTextBytes];
+  EJitSharedDumpSlot slots[kEJitSharedDumpSlotCount];
 };
 
 //===----------------------------------------------------------------------===//
@@ -245,7 +268,48 @@ struct EJitSharedCounters {
   EJitAtomicU64 compileFailed;
   EJitAtomicU64 publishFailed;
   EJitAtomicU64 instanceDisabled;
+  EJitAtomicU64 instanceDisabledPreActivate; ///< Subset of instanceDisabled that
+                                             ///< occurred before the first
+                                             ///< setInstanceEnabled(true) — i.e.
+                                             ///< the init→activate window.
   EJitAtomicU64 executePrepareFailed;
+};
+
+//===----------------------------------------------------------------------===//
+// EJitSharedCodePoolStats: owner-published mirror of the owner-core
+// EJitCodePoolManager stats. The code pool itself is owner-private (only the
+// worker core allocates/seals), so a non-owner core reading its own per-core
+// manager sees pools=0. The owner publishes a fresh snapshot here after every
+// successful compile (runCompile / sync publish), and every core reads this for
+// ejit_print_code_pool_stats / ejit_get_code_pool_stats — so the diagnostic is
+// consistent cross-core. Relaxed loads/stores: diagnostic only, monotone-ish.
+//===----------------------------------------------------------------------===//
+struct EJitSharedCodePoolStats {
+  EJitAtomicU64 poolCount;
+  EJitAtomicU64 sealedCount;
+  EJitAtomicU64 activeCount;
+  EJitAtomicU64 usedBytes;
+  EJitAtomicU64 reservedBytes;
+  EJitAtomicU64 wastedBytes;
+  EJitAtomicU64 sealInvocations;
+  EJitAtomicU64 splitInvocations;
+  EJitAtomicU64 finalizedRangeCount;
+};
+
+/// Plain (non-atomic) snapshot of code-pool stats, used as the callback
+/// out-struct for the owner-private provider and as the reader return shape.
+/// Mirrors EJitCodePoolManager::Stats field-for-field but stays decoupled from
+/// the code-pool header so the shared-taskpool ABI does not depend on it.
+struct EJitCodePoolStatsOut {
+  uint64_t poolCount = 0;
+  uint64_t sealedCount = 0;
+  uint64_t activeCount = 0;
+  uint64_t usedBytes = 0;
+  uint64_t reservedBytes = 0;
+  uint64_t wastedBytes = 0;
+  uint64_t sealInvocations = 0;
+  uint64_t splitInvocations = 0;
+  uint64_t finalizedRangeCount = 0;
 };
 
 //===----------------------------------------------------------------------===//
@@ -279,6 +343,10 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
       EJitAtomicU8 enabled[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 version[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 mode; ///< EJitCompileMode (Off=0, Async=1)
+  EJitAtomicU32 anyInstanceActivated; ///< 1 once any instance first
+                                      ///< setInstanceEnabled(true); gates the
+                                      ///< instanceDisabledPreActivate counter.
+                                      ///< Reset on each (re)initialization.
 
   //--- flat dedup slots (own cache line). Each slot stores the OWNER GENERATION
   //    that claimed it (0 = free), not a 1-bit flag: a dedupMark CASes 0->gen
@@ -295,6 +363,11 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
 
   //--- counters (own cache line)
   alignas(kEJitSharedCacheLine) EJitSharedCounters counters;
+
+  //--- owner-published code-pool stats mirror (own cache line). Read by every
+  //    core for ejit_print_code_pool_stats so the view is consistent cross-core
+  //    (the real pools live owner-side only).
+  alignas(kEJitSharedCacheLine) EJitSharedCodePoolStats codePoolStats;
 
   //--- per-core 4K split readiness, one entry per tracked 2MiB pool (own cache
   //    line). Open-addressed by pool base; see EJitSharedPoolSplit.

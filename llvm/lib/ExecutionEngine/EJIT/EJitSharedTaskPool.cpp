@@ -130,6 +130,12 @@ bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,
   uint8_t desired = enabled ? 1 : 0;
   if (state_->enabled[dimType][instanceId].compareExchange(expected, desired)) {
     state_->version[dimType][instanceId].fetchAdd(1);
+    // Latch on the first successful enable of ANY instance: this brackets the
+    // init→activate window during which instanceDisabled hits are tallied
+    // separately (instanceDisabledPreActivate) for diagnosing the pre-activate
+    // fallback storm. Once latched it stays 1 until the next (re)initialization.
+    if (enabled)
+      state_->anyInstanceActivated.storeRelease(1);
     return true;
   }
   return false;
@@ -926,6 +932,7 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
       st->version[d][i].storeRelaxed(0);
     }
   st->mode.storeRelaxed(mode);
+  st->anyInstanceActivated.storeRelaxed(0);
   for (uint32_t i = 0; i < kEJitSharedMaxFuncIndex; ++i)
     st->inFlight[i].storeRelaxed(0);
   for (uint32_t i = 0; i < kEJitSharedQueueSlots; ++i) {
@@ -941,7 +948,19 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
   st->counters.compileFailed.storeRelaxed(0);
   st->counters.publishFailed.storeRelaxed(0);
   st->counters.instanceDisabled.storeRelaxed(0);
+  st->counters.instanceDisabledPreActivate.storeRelaxed(0);
   st->counters.executePrepareFailed.storeRelaxed(0);
+  // Code-pool stats mirror: zero until the owner publishes the first snapshot
+  // after a successful compile (the pools are owner-private and empty at init).
+  st->codePoolStats.poolCount.storeRelaxed(0);
+  st->codePoolStats.sealedCount.storeRelaxed(0);
+  st->codePoolStats.activeCount.storeRelaxed(0);
+  st->codePoolStats.usedBytes.storeRelaxed(0);
+  st->codePoolStats.reservedBytes.storeRelaxed(0);
+  st->codePoolStats.wastedBytes.storeRelaxed(0);
+  st->codePoolStats.sealInvocations.storeRelaxed(0);
+  st->codePoolStats.splitInvocations.storeRelaxed(0);
+  st->codePoolStats.finalizedRangeCount.storeRelaxed(0);
   // Per-core, per-pool 4K split readiness (ABI v5). MUST be cleared on every
   // (re)initialization: a stale splitDone bit from an earlier generation would
   // otherwise make a peer skip split_2m_to_4k for a pool the new generation
@@ -954,23 +973,27 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
   }
   st->dump.lock.storeRelaxed(0);
   st->dump.filterEnabled.storeRelaxed(0);
-  st->dump.resultValid.storeRelaxed(0);
-  st->dump.truncated.storeRelaxed(0);
   st->dump.filterLen = 0;
-  st->dump.resultNameLen = 0;
-  st->dump.irSize = 0;
-  st->dump.asmSize = 0;
-  st->dump.keyHi = 0;
-  st->dump.keyLo = 0;
+  st->dump.nextSlot = 0;
   st->dump.reserved0 = 0;
-  st->dump.reserved1 = 0;
-  for (uint32_t i = 0; i < kEJitSharedDumpNameBytes; ++i) {
+  for (uint32_t i = 0; i < kEJitSharedDumpNameBytes; ++i)
     st->dump.filterName[i] = 0;
-    st->dump.resultName[i] = 0;
-  }
-  for (uint32_t i = 0; i < kEJitSharedDumpTextBytes; ++i) {
-    st->dump.ir[i] = 0;
-    st->dump.asmText[i] = 0;
+  for (uint32_t s = 0; s < kEJitSharedDumpSlotCount; ++s) {
+    EJitSharedDumpSlot &Slot = st->dump.slots[s];
+    Slot.valid.storeRelaxed(0);
+    Slot.truncated.storeRelaxed(0);
+    Slot.nameLen = 0;
+    Slot.irSize = 0;
+    Slot.asmSize = 0;
+    Slot.keyHi = 0;
+    Slot.keyLo = 0;
+    Slot.reserved0 = 0;
+    for (uint32_t i = 0; i < kEJitSharedDumpNameBytes; ++i)
+      Slot.name[i] = 0;
+    for (uint32_t i = 0; i < kEJitSharedDumpSlotTextBytes; ++i) {
+      Slot.ir[i] = 0;
+      Slot.asmText[i] = 0;
+    }
   }
   for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b) {
     st->buckets[b].writeFlag.storeRelaxed(0);
@@ -1182,8 +1205,12 @@ EJitSharedTaskPool::tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
   for (uint32_t i = 0; i < numDims; ++i)
     if (!isInstanceEnabled(dims[i].dimType, dims[i].instanceId)) {
       state_->counters.instanceDisabled.fetchAdd(1);
-      EJIT_DIAG_VERBOSE("shared taskpool disabled func=%u dim[%u]=(%u,%u)",
-                        funcIndex, i, dims[i].dimType, dims[i].instanceId);
+      // If no instance has been activated yet, this hit is in the init→activate
+      // window — tally it separately to localize the pre-activate fallback storm.
+      if (state_->anyInstanceActivated.loadAcquire() == 0)
+        state_->counters.instanceDisabledPreActivate.fetchAdd(1);
+      EJIT_DIAG_VERBOSE("shared taskpool disabled func=%u dim[%u]=(%u,%u)", funcIndex,
+                i, dims[i].dimType, dims[i].instanceId);
       R.status = EJitCompileOrGetStatus::InstanceDisabled;
       R.fastPathTerminal = true;
       return R;
@@ -1362,6 +1389,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
         cachePublish(ReqLocal, fn, info.codeSize ? &info : nullptr);
     if (PS == EJitPublishStatus::Published) {
       state_->counters.asyncCompiles.fetchAdd(1);
+      publishCodePoolStats();
       SharedLookup Hit2 = cacheLookup(funcIndex, dims, numDims);
       if (Hit2.hasReadToken && Hit2.fnPtr) {
         R.status = EJitCompileOrGetStatus::CacheHit;
@@ -1421,6 +1449,39 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
 //===----------------------------------------------------------------------===//
 // Consumer path (§5.3) — runs on the single owner worker (or a test driver).
 //===----------------------------------------------------------------------===//
+void EJitSharedTaskPool::publishCodePoolStats() {
+  if (!state_ || !codePoolStatsFn_)
+    return;
+  EJitCodePoolStatsOut s{};
+  if (!codePoolStatsFn_(codePoolStatsCtx_, &s))
+    return;
+  state_->codePoolStats.poolCount.storeRelaxed(s.poolCount);
+  state_->codePoolStats.sealedCount.storeRelaxed(s.sealedCount);
+  state_->codePoolStats.activeCount.storeRelaxed(s.activeCount);
+  state_->codePoolStats.usedBytes.storeRelaxed(s.usedBytes);
+  state_->codePoolStats.reservedBytes.storeRelaxed(s.reservedBytes);
+  state_->codePoolStats.wastedBytes.storeRelaxed(s.wastedBytes);
+  state_->codePoolStats.sealInvocations.storeRelaxed(s.sealInvocations);
+  state_->codePoolStats.splitInvocations.storeRelaxed(s.splitInvocations);
+  state_->codePoolStats.finalizedRangeCount.storeRelaxed(s.finalizedRangeCount);
+}
+
+bool EJitSharedTaskPool::readCodePoolStats(EJitCodePoolStatsOut *out) const {
+  if (!state_ || !out)
+    return false;
+  out->poolCount = state_->codePoolStats.poolCount.loadRelaxed();
+  out->sealedCount = state_->codePoolStats.sealedCount.loadRelaxed();
+  out->activeCount = state_->codePoolStats.activeCount.loadRelaxed();
+  out->usedBytes = state_->codePoolStats.usedBytes.loadRelaxed();
+  out->reservedBytes = state_->codePoolStats.reservedBytes.loadRelaxed();
+  out->wastedBytes = state_->codePoolStats.wastedBytes.loadRelaxed();
+  out->sealInvocations = state_->codePoolStats.sealInvocations.loadRelaxed();
+  out->splitInvocations = state_->codePoolStats.splitInvocations.loadRelaxed();
+  out->finalizedRangeCount =
+      state_->codePoolStats.finalizedRangeCount.loadRelaxed();
+  return true;
+}
+
 void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   EJIT_DIAG_VERBOSE("shared worker compile begin func=%u dims=%u gen=%u", req.funcIndex,
             req.numDims, req.generation);
@@ -1475,6 +1536,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   switch (PS) {
   case EJitPublishStatus::Published:
     state_->counters.asyncCompiles.fetchAdd(1);
+    publishCodePoolStats();
     dedupClear(req.funcIndex, req.generation);
     EJIT_DIAG_VERBOSE("shared worker publish ok func=%u fn=%p", req.funcIndex, fn);
     return;
@@ -1622,6 +1684,8 @@ void EJitSharedTaskPool::getDiagnostics(EJitSharedDiagnostics &out) const {
   out.compileFailed = state_->counters.compileFailed.loadRelaxed();
   out.publishFailed = state_->counters.publishFailed.loadRelaxed();
   out.instanceDisabled = state_->counters.instanceDisabled.loadRelaxed();
+  out.instanceDisabledPreActivate =
+      state_->counters.instanceDisabledPreActivate.loadRelaxed();
   out.executePrepareFailed =
       state_->counters.executePrepareFailed.loadRelaxed();
 }

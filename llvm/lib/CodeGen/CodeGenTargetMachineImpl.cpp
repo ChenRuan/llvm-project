@@ -168,9 +168,10 @@ CodeGenTargetMachineImpl::createMCStreamer(raw_pwrite_stream &Out,
 
   switch (FileType) {
   case CodeGenFileType::AssemblyFile: {
-#ifdef EJIT_TRIM_LLVM_BACKEND
+#if defined(EJIT_TRIM_LLVM_BACKEND) && !defined(EJIT_DUMP_ASM)
     return make_error<StringError>(
-        "textual assembly output unavailable in EJIT_TRIM_LLVM_BACKEND build",
+        "textual assembly output unavailable in EJIT_TRIM_LLVM_BACKEND build "
+        "(enable EJIT_DUMP_ASM to re-enable it for the diagnostic dump)",
         inconvertibleErrorCode());
 #else
     std::unique_ptr<MCInstPrinter> InstPrinter(getTarget().createMCInstPrinter(

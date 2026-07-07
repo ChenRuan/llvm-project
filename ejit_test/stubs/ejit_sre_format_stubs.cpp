@@ -162,6 +162,21 @@ void emit_signed(OutBuf &ob, long long val, const Spec &s) {
 
 // Coarse fixed-point rendering of a double. Diagnostic-grade only.
 void emit_double(OutBuf &ob, double val, const Spec &s) {
+  // Guard the integer cast below: (unsigned long long)val is UB for NaN,
+  // Inf, or values >= 2^64. The ASM diagnostic path rarely formats doubles,
+  // but it is reachable, so fall back to a textual marker instead of UB.
+  if (val != val) { // NaN
+    for (const char *p = "nan"; *p; ++p)
+      ob.put(*p);
+    return;
+  }
+  if (val == val && (val > 1.8446744073709552e+19 || val < -1.8446744073709552e+19)) {
+    // |val| >= ~2^64 (ULLONG_MAX): print "inf"-style marker to avoid UB.
+    const char *p = val < 0 ? "-inf" : "inf";
+    for (; *p; ++p)
+      ob.put(*p);
+    return;
+  }
   const char *sign = "";
   if (val < 0) {
     sign = "-";

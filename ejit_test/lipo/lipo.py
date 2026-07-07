@@ -24,11 +24,14 @@ The resulting ejit.o (~30-40 MB) can replace all individual LLVM .a files
 when linking EJIT test binaries.
 
 When the EJIT ASM diagnostic dump (ejit_dump_func / ejit_print_dumped) is
-enabled on SRE, also add ejit_test/stubs/ejit_sre_format_stubs.o to the final
-SRE link/merge command alongside ejit.o. The assembly emitter formats text into
-an in-memory raw_svector_ostream and therefore needs working buffer formatting
-(snprintf/vsnprintf); that stub supplies it. It is intentionally NOT merged into
-ejit.o here so host builds keep using the platform libc.
+enabled on SRE (EJIT_DUMP_ASM=ON under EJIT_TRIM_LLVM_BACKEND), the assembly
+emitter formats text into an in-memory raw_svector_ostream and therefore
+needs working buffer formatting (snprintf/vsnprintf). Link a libc that
+provides them; OR, if the SRE libc lacks them, add
+ejit_test/stubs/ejit_sre_format_stubs.o to the final SRE link/merge command
+alongside ejit.o — not both (strong-symbol conflict on snprintf/vsnprintf).
+The stub is intentionally NOT merged into ejit.o here so host builds keep
+using the platform libc.
 """
 
 import subprocess as sp, os, sys, re, argparse, struct, glob, shutil
@@ -363,6 +366,8 @@ def doit_gc_merge(args):
         "ejit_set_log_level", "ejit_get_log_level",
         "ejit_print_registry", "ejit_print_func_meta",
         "ejit_dump_all",
+        "ejit_get_code_pool_stats", "ejit_print_code_pool_stats",
+        "ejit_print_active",
     ]
     optional_api = [
         "ejit_register_lifecycle", "ejit_register_funcindex",

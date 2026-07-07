@@ -68,6 +68,36 @@ bool taskpoolCompileThunk(void *ctx, const EJitCompileRequest &req,
 #endif
 }
 
+/// Owner-private provider: snapshot the owner-core code-pool manager stats for
+/// the shared taskpool to mirror cross-core (see CodePoolStatsCallback). The
+/// pools are owner-private, so without this a non-owner core's
+/// ejit_print_code_pool_stats reads its own empty per-core manager.
+[[maybe_unused]] bool sharedCodePoolStatsThunk(void *ctx,
+                                               EJitCodePoolStatsOut *out) {
+#ifdef EJIT_SRE_CODE_POOL
+  auto *drv = static_cast<EJitCompileDriver *>(ctx);
+  EJitOrcEngine *eng = drv->getJitEngine();
+  if (eng && out) {
+    EJitCodePoolManager::Stats s = eng->getCodePoolStats();
+    out->poolCount = s.poolCount;
+    out->sealedCount = s.sealedCount;
+    out->activeCount = s.activeCount;
+    out->usedBytes = s.usedBytes;
+    out->reservedBytes = s.reservedBytes;
+    out->wastedBytes = s.wastedBytes;
+    out->sealInvocations = s.sealInvocations;
+    out->splitInvocations = s.splitInvocations;
+    out->finalizedRangeCount = s.finalizedRangeCount;
+    return true;
+  }
+  return false;
+#else
+  (void)ctx;
+  (void)out;
+  return false;
+#endif
+}
+
 // Per-core platform primitives wrapped so the shared taskpool core never names
 // an SRE symbol directly (spec §7). Both are no-ops returning false when the
 // code pool / seal support is not built.
@@ -155,6 +185,9 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   // the extent a peer must seal. Harmless when sharing is off (no peer reads
   // it).
   sharedPool_.setCodeRangeProvider(&sharedCodeRangeThunk, this);
+  // Mirror the owner-core code-pool stats into the shared state so every core's
+  // ejit_print_code_pool_stats is consistent (the pools are owner-private).
+  sharedPool_.setCodePoolStatsProvider(&sharedCodePoolStatsThunk, this);
 #endif
 #ifdef EJIT_SRE_SHARED_CODE_POINTERS
   sharedPool_.setCodeSharingEnabled(true);
