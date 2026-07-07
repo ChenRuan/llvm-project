@@ -8,10 +8,13 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorSymbolDef.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Support/CodeGen.h"
@@ -43,6 +46,41 @@ using namespace llvm;
 using namespace llvm::ejit;
 
 #define DEBUG_TYPE "ejit-orc-engine"
+
+static const GlobalVariable *rootGlobal(Value *V) {
+  while (V) {
+    V = V->stripPointerCasts();
+    if (auto *GV = dyn_cast<GlobalVariable>(V))
+      return GV;
+    auto *GEP = dyn_cast<GEPOperator>(V);
+    if (!GEP)
+      return nullptr;
+    V = GEP->getPointerOperand();
+  }
+  return nullptr;
+}
+
+static void collectReferencedExternalDecls(
+    Module &M, SmallPtrSetImpl<const Function *> &Funcs,
+    SmallPtrSetImpl<const GlobalVariable *> &Globals) {
+  for (Function &F : M.functions()) {
+    if (F.isDeclaration())
+      continue;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        for (Use &U : I.operands()) {
+          Value *Op = U.get();
+          if (auto *Callee = dyn_cast<Function>(Op->stripPointerCasts()))
+            if (Callee->isDeclaration() && !Callee->isIntrinsic())
+              Funcs.insert(Callee);
+          if (auto *GV = rootGlobal(Op))
+            if (GV->isDeclaration() && !GV->getName().empty())
+              Globals.insert(GV);
+        }
+      }
+    }
+  }
+}
 
 struct EJitOrcEngine::Impl {
 #ifdef EJIT_SRE_CODE_POOL
@@ -774,6 +812,10 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
   size_t unresolvedGlobals = 0;
   SmallVector<std::string, 16> unresolvedNames;
   static constexpr size_t kMaxUnresolvedNames = 32;
+  SmallPtrSet<const Function *, 16> ReferencedExternalFuncs;
+  SmallPtrSet<const GlobalVariable *, 16> ReferencedExternalGlobals;
+  collectReferencedExternalDecls(**ModuleOrErr, ReferencedExternalFuncs,
+                                 ReferencedExternalGlobals);
   for (Function &F : (*ModuleOrErr)->functions()) {
     if (!F.isDeclaration() || F.getName().empty())
       continue;
@@ -782,7 +824,7 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
       continue;
     auto it = P->userSymbols.find(name);
     if (it == P->userSymbols.end()) {
-      if (!F.isIntrinsic()) {
+      if (!F.isIntrinsic() && ReferencedExternalFuncs.contains(&F)) {
         ++unresolvedFuncs;
         if (unresolvedNames.size() < kMaxUnresolvedNames)
           unresolvedNames.push_back("f:" + name);
@@ -801,9 +843,11 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
       continue;
     auto it = P->userSymbols.find(name);
     if (it == P->userSymbols.end()) {
-      ++unresolvedGlobals;
-      if (unresolvedNames.size() < kMaxUnresolvedNames)
-        unresolvedNames.push_back("g:" + name);
+      if (ReferencedExternalGlobals.contains(&GV)) {
+        ++unresolvedGlobals;
+        if (unresolvedNames.size() < kMaxUnresolvedNames)
+          unresolvedNames.push_back("g:" + name);
+      }
       continue;
     }
     globalSymbols[P->J->mangleAndIntern(name)] =
