@@ -66,7 +66,12 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// (codeStart/codeSize/poolBase/poolSize/poolId) and the shared state gains a
 /// per-core, per-pool 4K split-readiness table, so a non-owner core in 4K-seal
 /// mode can split its pool once and seal exactly the pages the code covers.
-constexpr uint32_t kEJitSharedAbiVersion = 5u;
+/// v6: EJitSharedDumpState no longer carries the large ir[]/asmText[] buffers.
+/// Full IR/ASM dump text stays worker-local (private std::map); the shared blob
+/// keeps only small dump metadata (hasDump, workerCore, cacheKey, resultName,
+/// irSize, asmSize, status). This shrinks the shared region and removes silent
+/// text truncation.
+constexpr uint32_t kEJitSharedAbiVersion = 6u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

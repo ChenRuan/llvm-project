@@ -170,15 +170,12 @@ void setDumpFuncFilter(const std::string &name) {
     }
     D.filterName[len] = 0;
     D.filterLen = len;
-    // A filter change invalidates all captured slots so stale results don't
-    // surface after re-arming.
-    for (uint32_t s = 0; s < kEJitSharedDumpSlotCount; ++s) {
-      D.slots[s].valid.storeRelease(0);
-      D.slots[s].nameLen = 0;
-      D.slots[s].irSize = 0;
-      D.slots[s].asmSize = 0;
-    }
-    D.nextSlot = 0;
+    D.hasDump.storeRelease(0);
+    D.resultNameLen = 0;
+    D.irSize = 0;
+    D.asmSize = 0;
+    D.workerCore = kEJitInvalidCoreId;
+    D.status.storeRelease(0);
     D.filterEnabled.storeRelease(len ? 1u : 0u);
     D.lock.storeRelease(0);
     EJIT_DIAG_DEBUG("set_dump_filter shared enabled=%u len=%u &shared=%p",
@@ -304,95 +301,83 @@ static uint32_t copyDumpBytes(char *dst, uint32_t cap, const char *src,
   return n;
 }
 
-static void captureSharedDump(const std::string &fnName, uint64_t cacheKey,
-                              const std::string &IR, const std::string &ASM) {
+static void captureSharedDumpMetadata(const std::string &fnName,
+                                      uint64_t cacheKey, size_t irSize,
+                                      size_t asmSize) {
   if (!gDumpSharedState)
     return;
   EJitSharedDumpState &D = gDumpSharedState->dump;
+  uint32_t core = EJitCoreId::current();
   sharedDumpLock(D);
-  // Find an existing slot for fnName (overwrite it in place). Distinct names
-  // accumulate; a repeat re-capture refreshes the same slot rather than
-  // consuming another.
-  uint32_t target = kEJitSharedDumpSlotCount;
-  for (uint32_t s = 0; s < kEJitSharedDumpSlotCount; ++s) {
-    if (D.slots[s].valid.loadRelaxed() != 0 &&
-        D.slots[s].nameLen == fnName.size() &&
-        std::memcmp(D.slots[s].name, fnName.data(), fnName.size()) == 0) {
-      target = s;
-      break;
-    }
-  }
-  if (target == kEJitSharedDumpSlotCount) {
-    // New name: prefer a free slot, else round-robin evict the oldest.
-    target = D.nextSlot;
-    for (uint32_t s = 0; s < kEJitSharedDumpSlotCount; ++s) {
-      uint32_t idx = (D.nextSlot + s) % kEJitSharedDumpSlotCount;
-      if (D.slots[idx].valid.loadRelaxed() == 0) {
-        target = idx;
-        break;
-      }
-    }
-    D.nextSlot = (target + 1) % kEJitSharedDumpSlotCount;
-  }
-  EJitSharedDumpSlot &Slot = D.slots[target];
-  bool nameTrunc = false, irTrunc = false, asmTrunc = false;
-  Slot.valid.storeRelease(0); // invalidate while writing (readers hold the lock)
-  Slot.nameLen = copyDumpBytes(Slot.name, kEJitSharedDumpNameBytes,
-                               fnName.data(), fnName.size(), nameTrunc);
-  Slot.irSize = copyDumpBytes(Slot.ir, kEJitSharedDumpSlotTextBytes, IR.data(),
-                              IR.size(), irTrunc);
-  Slot.asmSize = copyDumpBytes(Slot.asmText, kEJitSharedDumpSlotTextBytes,
-                               ASM.data(), ASM.size(), asmTrunc);
-  Slot.keyHi = (uint32_t)(cacheKey >> 32);
-  Slot.keyLo = (uint32_t)(cacheKey & 0xffffffffu);
-  Slot.truncated.storeRelease((nameTrunc ? 4u : 0u) | (irTrunc ? 1u : 0u) |
-                              (asmTrunc ? 2u : 0u));
-  Slot.valid.storeRelease(1);
+  bool nameTrunc = false;
+  D.hasDump.storeRelease(0);
+  D.resultNameLen = copyDumpBytes(D.resultName, kEJitSharedDumpNameBytes,
+                                  fnName.data(), fnName.size(), nameTrunc);
+  D.irSize = (irSize > 0xffffffffu) ? 0xffffffffu : (uint32_t)irSize;
+  D.asmSize = (asmSize > 0xffffffffu) ? 0xffffffffu : (uint32_t)asmSize;
+  D.keyHi = (uint32_t)(cacheKey >> 32);
+  D.keyLo = (uint32_t)(cacheKey & 0xffffffffu);
+  D.workerCore = core;
+  D.status.storeRelease(nameTrunc ? 4u : 0u);
+  D.hasDump.storeRelease(1);
   sharedDumpUnlock(D);
-  EJIT_DIAG_DEBUG("capture shared func=%s slot=%u ir=%u asm=%u trunc=0x%x &shared=%p",
-            fnName.c_str(), target, (unsigned)IR.size(), (unsigned)ASM.size(),
-            (nameTrunc ? 4u : 0u) | (irTrunc ? 1u : 0u) | (asmTrunc ? 2u : 0u),
+  EJIT_DIAG("capture shared metadata func=%s core=%u ir=%u asm=%u &shared=%p",
+            fnName.c_str(), core, (unsigned)irSize, (unsigned)asmSize,
             (void *)gDumpSharedState);
 }
 
-static bool printSharedDumped(const char *name) {
+/// A core that misses its private gDumpStore consults the shared metadata: if a
+/// worker core captured a matching dump, tell the user which core to re-run
+/// ejit_print_dumped() on. IR/ASM text is NEVER stored here, so it is never
+/// printed from the shared path — only the small metadata (worker core, sizes,
+/// cache key) is surfaced.
+static bool printSharedDumpHint(const char *name) {
   if (!gDumpSharedState)
     return false;
   EJitSharedDumpState &D = gDumpSharedState->dump;
-  bool hasName = name && name[0];
   sharedDumpLock(D);
-  bool any = false;
-  for (uint32_t s = 0; s < kEJitSharedDumpSlotCount; ++s) {
-    EJitSharedDumpSlot &Slot = D.slots[s];
-    if (Slot.valid.loadAcquire() == 0)
-      continue;
-    bool match = true;
-    if (hasName) {
-      uint32_t i = 0;
-      while (i < Slot.nameLen && name[i] && name[i] == Slot.name[i])
-        ++i;
-      match = (i == Slot.nameLen && name[i] == 0);
-    }
-    if (!match)
-      continue;
-    uint32_t trunc = Slot.truncated.loadAcquire();
-    EJIT_DIAG("print_dumped shared hit requested=%s stored=%s slot=%u "
-              "key_hi=0x%08x key_lo=0x%08x ir_size=%u asm_size=%u trunc=0x%x",
-              hasName ? name : "(all)", Slot.name, s, Slot.keyHi, Slot.keyLo,
-              Slot.irSize, Slot.asmSize, trunc);
-    if (Slot.irSize)
-      dumpBytesSafe("dump IR", Slot.ir, Slot.irSize);
-    if (Slot.asmSize)
-      dumpBytesSafe("dump ASM", Slot.asmText, Slot.asmSize);
-    any = true;
-    if (hasName)
-      break; // single-name query: done after the first match
+  bool has = D.hasDump.loadAcquire() != 0;
+  if (!has) {
+    sharedDumpUnlock(D);
+    return false;
   }
+  bool hasName = name && name[0];
+  bool match = true;
+  if (hasName) {
+    uint32_t i = 0;
+    while (i < D.resultNameLen && name[i] && name[i] == D.resultName[i])
+      ++i;
+    match = (i == D.resultNameLen && name[i] == 0);
+  }
+  if (!match) {
+    sharedDumpUnlock(D);
+    return false;
+  }
+  uint32_t workerCore = D.workerCore;
+  uint32_t irSize = D.irSize;
+  uint32_t asmSize = D.asmSize;
+  uint32_t keyHi = D.keyHi;
+  uint32_t keyLo = D.keyLo;
+  char stored[kEJitSharedDumpNameBytes];
+  uint32_t sn = D.resultNameLen;
+  if (sn >= kEJitSharedDumpNameBytes)
+    sn = kEJitSharedDumpNameBytes - 1;
+  for (uint32_t i = 0; i < sn; ++i)
+    stored[i] = D.resultName[i];
+  stored[sn] = 0;
   sharedDumpUnlock(D);
-  if (!any)
-    EJIT_DIAG_DEBUG("print_dumped shared miss name=%s &shared=%p",
-                    hasName ? name : "(all)", (void *)gDumpSharedState);
-  return any;
+  if (workerCore == kEJitInvalidCoreId) {
+    EJIT_DIAG("print_dumped: dump for \"%s\" is stored on the worker core "
+              "(core id unknown); please run ejit_print_dumped(\"%s\") on that "
+              "core. ir_size=%u asm_size=%u key_hi=0x%08x key_lo=0x%08x",
+              stored, stored, irSize, asmSize, keyHi, keyLo);
+  } else {
+    EJIT_DIAG("print_dumped: dump for \"%s\" is stored on worker core %u; "
+              "please run ejit_print_dumped(\"%s\") on that core. ir_size=%u "
+              "asm_size=%u key_hi=0x%08x key_lo=0x%08x",
+              stored, workerCore, stored, irSize, asmSize, keyHi, keyLo);
+  }
+  return true;
 }
 #endif
 
@@ -408,8 +393,10 @@ static void captureDump(const std::string &fnName, uint64_t cacheKey,
   gDumpStore[fnName] = DumpEntry{cacheKey, std::move(IR), std::move(ASM)};
   EJIT_DIAG_DEBUG("capture store_size after=%u", (unsigned)gDumpStore.size());
 #ifdef EJIT_SRE_SHARED_TASKPOOL
+  // Publish only small metadata to shared memory. The full IR/ASM text stays
+  // worker-local in gDumpStore above; it is never copied cross-core.
   const DumpEntry &E = gDumpStore[fnName];
-  captureSharedDump(fnName, cacheKey, E.IR, E.ASM);
+  captureSharedDumpMetadata(fnName, cacheKey, E.IR.size(), E.ASM.size());
 #endif
 }
 
@@ -458,18 +445,17 @@ void printDumped(const char *name) {
     }
   }
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  // Local miss / empty (e.g. a non-owner core, whose per-core gDumpStore is
-  // empty): serve from the cross-core shared per-name table. The table holds
-  // the last N captured functions (truncated to the slot text size); a specific
-  // name retrieves its slot, NULL lists all of them.
-  if (printSharedDumped(name))
+  // Local miss / empty (e.g. a non-owner core): point the user to the worker
+  // core that owns the full worker-local IR/ASM text.
+  if (printSharedDumpHint(name))
     return;
 #endif
-  if (hasName)
-    EJIT_DIAG_DEBUG("print_dumped miss name=%s store_size=%u", name,
-                    (unsigned)gDumpStore.size());
-  else
+  if (hasName) {
+    EJIT_DIAG("print_dumped miss name=%s store_size=%u", name,
+              (unsigned)gDumpStore.size());
+  } else {
     EJIT_DIAG("print_dumped: nothing saved");
+  }
 }
 
 } // namespace ejit

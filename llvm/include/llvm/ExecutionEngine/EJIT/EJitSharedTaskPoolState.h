@@ -73,20 +73,6 @@
 #ifndef EJIT_SRE_SHARED_DUMP_NAME_BYTES
 #define EJIT_SRE_SHARED_DUMP_NAME_BYTES 128u
 #endif
-// Per-slot IR/ASM text capacity in the cross-core dump table (each slot holds
-// one captured function's name + IR + ASM, truncated to this size per text).
-#ifndef EJIT_SRE_SHARED_DUMP_SLOT_TEXT_BYTES
-#define EJIT_SRE_SHARED_DUMP_SLOT_TEXT_BYTES 8192u
-#endif
-// Number of per-name result slots in the cross-core dump table. Each captured
-// specialization occupies one slot keyed by entry name; when full, the oldest
-// slot is round-robin evicted. Covers this many distinct functions for
-// cross-core ejit_print_dumped(name) retrieval. NOTE: the table lives in the
-// fixed shared section, so sizeof(EJitSharedTaskPoolState) scales with
-// SLOT_COUNT * (2 * SLOT_TEXT_BYTES); resize the linker section accordingly.
-#ifndef EJIT_SRE_SHARED_DUMP_SLOT_COUNT
-#define EJIT_SRE_SHARED_DUMP_SLOT_COUNT 50u
-#endif
 
 namespace llvm {
 namespace ejit {
@@ -103,10 +89,6 @@ constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
 constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
 constexpr uint32_t kEJitSharedDumpNameBytes =
     EJIT_SRE_SHARED_DUMP_NAME_BYTES;
-constexpr uint32_t kEJitSharedDumpSlotTextBytes =
-    EJIT_SRE_SHARED_DUMP_SLOT_TEXT_BYTES;
-constexpr uint32_t kEJitSharedDumpSlotCount =
-    EJIT_SRE_SHARED_DUMP_SLOT_COUNT;
 constexpr uint32_t kEJitSharedCacheLine = 64u;
 /// Execute-permission seal granularity (the platform's per-page enable_ex unit)
 /// and the large-page / split granularity. Fixed platform constants.
@@ -219,41 +201,33 @@ struct EJitSharedPoolSplit {
 };
 
 //===----------------------------------------------------------------------===//
-// EJitSharedDumpState: fixed-size cross-core diagnostic exchange.
+// EJitSharedDumpState: fixed-size cross-core diagnostic metadata.
 //
-// The owner worker captures IR/ASM in its private ORC path, but shell/debug
-// requests can arrive on a different core. std::map/std::string cannot live in
-// shared memory, so the shared path uses one bounded filter plus a bounded
-// per-name result TABLE: each captured specialization occupies one slot keyed
-// by entry name; when the table is full the oldest slot is round-robin
-// evicted. This lets a non-owner core retrieve any recently-captured function
-// by name (not just the latest). It is diagnostic-only: long IR/ASM is
-// truncated (per-slot) instead of blocking normal JIT progress; the full,
-// untruncated IR/ASM remains available on the owner core via the per-core
-// gDumpStore + ejit_print_dumped(NULL).
+// The owner worker captures full IR/ASM in its private ORC path (a
+// std::map<std::string, DumpEntry> that lives ONLY in that core's private
+// heap). std::map/std::string cannot live in shared memory, and copying large
+// IR/ASM text into a fixed shared buffer wastes cross-core memory and silently
+// truncates. So this shared struct holds ONLY small metadata: which core owns
+// the capture, its cache key, the requested filter, and the IR/ASM sizes. A
+// core that misses its private store uses this metadata to tell the user which
+// worker core to re-run ejit_print_dumped() on. The full text is NEVER copied
+// here.
 //===----------------------------------------------------------------------===//
-struct alignas(kEJitSharedCacheLine) EJitSharedDumpSlot {
-  EJitAtomicU32 valid;       ///< 1 => name/ir/asm hold a capture
-  EJitAtomicU32 truncated;   ///< bit0 IR, bit1 ASM, bit2 name truncated
-  uint32_t nameLen;
-  uint32_t irSize;
-  uint32_t asmSize;
-  uint32_t keyHi;
-  uint32_t keyLo;
-  uint32_t reserved0;
-  char name[kEJitSharedDumpNameBytes];
-  char ir[kEJitSharedDumpSlotTextBytes];
-  char asmText[kEJitSharedDumpSlotTextBytes];
-};
-
 struct alignas(kEJitSharedCacheLine) EJitSharedDumpState {
   EJitAtomicU32 lock;          ///< 0 free, 1 locked by filter/capture/print
   EJitAtomicU32 filterEnabled; ///< 1 => filterName is active
+  EJitAtomicU32 hasDump;       ///< 1 => metadata describes a worker-local dump
+  EJitAtomicU32 status;        ///< bit0 IR truncated, bit1 ASM truncated
   uint32_t filterLen;
-  uint32_t nextSlot;           ///< round-robin eviction cursor (under lock)
+  uint32_t resultNameLen;
+  uint32_t irSize;    ///< bytes of IR text kept worker-local (not stored here)
+  uint32_t asmSize;   ///< bytes of ASM text kept worker-local (not stored here)
+  uint32_t keyHi;
+  uint32_t keyLo;
+  uint32_t workerCore; ///< core that captured (kEJitInvalidCoreId if unknown)
   uint32_t reserved0;
   char filterName[kEJitSharedDumpNameBytes];
-  EJitSharedDumpSlot slots[kEJitSharedDumpSlotCount];
+  char resultName[kEJitSharedDumpNameBytes];
 };
 
 //===----------------------------------------------------------------------===//

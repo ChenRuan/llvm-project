@@ -252,6 +252,40 @@ TEST_F(SharedTaskPoolTest, SharedStateRequiresNoDynamicInitialization) {
 }
 
 //===----------------------------------------------------------------------===//
+// Dump metadata: the shared blob keeps ONLY small dump metadata. Full IR/ASM
+// text is worker-local (a private std::map in EJitOrcEngine.cpp) and must never
+// be copied into shared memory. Guard against a regression that re-adds a large
+// fixed ir[]/asmText[] buffer to EJitSharedDumpState.
+//===----------------------------------------------------------------------===//
+TEST_F(SharedTaskPoolTest, DumpStateHoldsOnlySmallMetadata) {
+  EXPECT_TRUE(std::is_standard_layout<EJitSharedDumpState>::value);
+  EXPECT_TRUE(std::is_trivially_destructible<EJitSharedDumpState>::value);
+  EXPECT_TRUE(
+      std::is_trivially_default_constructible<EJitSharedDumpState>::value);
+
+  // Two bounded name arrays plus a handful of scalars. If a large IR/ASM text
+  // buffer (previously kEJitSharedDumpTextBytes each) is ever re-introduced,
+  // this bound blows up immediately.
+  EXPECT_LE(sizeof(EJitSharedDumpState),
+            static_cast<size_t>(2 * kEJitSharedDumpNameBytes + 256))
+      << "EJitSharedDumpState must not carry large IR/ASM text buffers";
+}
+
+// After owner init, the dump metadata is cleared: no captured dump, worker core
+// unknown, and both text sizes zero.
+TEST_F(SharedTaskPoolTest, DumpMetadataClearedOnInit) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const EJitSharedDumpState &D = state_->dump;
+  EXPECT_EQ(D.hasDump.loadAcquire(), 0u);
+  EXPECT_EQ(D.filterEnabled.loadAcquire(), 0u);
+  EXPECT_EQ(D.workerCore, kEJitInvalidCoreId);
+  EXPECT_EQ(D.irSize, 0u);
+  EXPECT_EQ(D.asmSize, 0u);
+  EXPECT_EQ(D.resultNameLen, 0u);
+}
+
+//===----------------------------------------------------------------------===//
 // 1/ Owner election: exactly one owner across simulated cores.
 //===----------------------------------------------------------------------===//
 TEST_F(SharedTaskPoolTest, ExactlyOneOwnerAcrossCores) {
@@ -1575,7 +1609,7 @@ TEST_F(SharedTaskPoolTest, FourKGenerationChangeDuringPrepareNotReturned) {
 // naturally-aligned scalars (read back by value — endian-safe), and the
 // pool-split table is POD.
 TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
-  EXPECT_EQ(kEJitSharedAbiVersion, 5u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 6u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
