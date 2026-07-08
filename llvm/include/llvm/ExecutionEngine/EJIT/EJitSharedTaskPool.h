@@ -391,6 +391,15 @@ private:
     uint32_t bucketIndex = 0;
     bool hasReadToken = false;
     bool readyButNotShareable = false;
+    /// EJIT_SRE_TASKPOOL_NO_RECLAIM only: a validated seqlock hit that holds NO
+    /// read token. classifyHit() treats it as a CacheHit; bucketIndex is the
+    /// out-of-range sentinel (kEJitSharedCacheBuckets) so the wrapper's
+    /// releaseRead() is a silent no-op.
+    bool noTokenHit = false;
+    /// Set by peerPrepareSlot() when the pointer came from the out-of-line cold
+    /// first-touch path (which self-revalidates), so the seqlock caller must not
+    /// second-guess it with the bucket publishSeq check.
+    bool coldPrepared = false;
   };
 
   // shared cache helpers (POD table in the shared blob)
@@ -398,6 +407,13 @@ private:
                         uint32_t numDims) const;
   SharedLookup cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
                            uint32_t numDims);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  /// Load-only seqlock cache lookup (no per-hit read-token RMW). Returned hits
+  /// carry no read token (SharedLookup::noTokenHit). See the .cpp for the
+  /// never-free safety precondition.
+  SharedLookup cacheLookupSeq(uint32_t funcIndex, const EJitDimPair *dims,
+                              uint32_t numDims);
+#endif
   /// Fixed-dimension specializations of cacheLookup() (0-4 dims). Identity
   /// hashing, slot identity comparison, and version comparison are all unrolled
   /// (no numDims loops, no dims[] indexing), so a cache hit reaches the shared

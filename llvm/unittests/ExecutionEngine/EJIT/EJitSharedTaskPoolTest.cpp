@@ -1593,11 +1593,11 @@ TEST_F(SharedTaskPoolTest, FourKGenerationChangeDuringPrepareNotReturned) {
   EXPECT_TRUE(r.readyButNotShareable);
 }
 
-// 16/17 ABI v5 layout: the slot carries the executable range as fixed-width,
-// naturally-aligned scalars (read back by value — endian-safe), and the
-// pool-split table is POD.
+// 16/17 ABI v6 layout: the slot carries the executable range as fixed-width,
+// naturally-aligned scalars (read back by value — endian-safe), the pool-split
+// table is POD, and each bucket carries the NO_RECLAIM seqlock publishSeq word.
 TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
-  EXPECT_EQ(kEJitSharedAbiVersion, 5u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 6u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -2165,6 +2165,61 @@ TEST_F(SharedTaskPoolTest, FixedDimVersionMismatchMisses) {
 }
 
 //===----------------------------------------------------------------------===//
+// Read-token discipline + invalidation, valid in BOTH builds:
+//  * default (token) build: a hit holds a read token, keeps readers > 0, and
+//    hands back a real bucketIndex the caller releases.
+//  * EJIT_SRE_TASKPOOL_NO_RECLAIM (seqlock) build: a hit holds NO token, never
+//    touches readers, and returns the out-of-range sentinel bucketIndex so the
+//    wrapper's releaseRead() cleanly no-ops. The safety of skipping the token
+//    rests on published code never being freed in that build.
+// In EITHER build, activate/deactivate (a version bump) must still invalidate:
+// a hit for a re-disabled instance is never served stale code.
+//===----------------------------------------------------------------------===//
+TEST_F(SharedTaskPoolTest, HitTokenDisciplineAndVersionInvalidation) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitDimPair d0[1] = {dim(1u, 2u)};
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(1, 2, true); // enable the instance (bumps version)
+  ASSERT_EQ(owner.compileOrGet(9, d0, 1, codeFor(9)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  auto hit = owner.tryCacheHit1D(9, 1, 2);
+  ASSERT_TRUE(hit.fastPathTerminal);
+  EXPECT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(hit.fnPtr, codeFor(9)); // correct specialization pointer
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  EXPECT_FALSE(hit.hasReadToken);
+  EXPECT_EQ(hit.bucketIndex, kEJitSharedCacheBuckets); // sentinel
+  // No token was taken: readers stay 0 across the whole hit.
+  for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
+    EXPECT_EQ(state_->buckets[b].readers.loadAcquire(), 0u);
+  owner.releaseRead(hit.bucketIndex); // sentinel -> safe no-op
+#else
+  EXPECT_TRUE(hit.hasReadToken);
+  EXPECT_LT(hit.bucketIndex, kEJitSharedCacheBuckets);
+  EXPECT_GT(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
+  owner.releaseRead(hit.bucketIndex);
+  EXPECT_EQ(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
+#endif
+
+  // Deactivate → re-activate bumps the instance version: the stale-version slot
+  // must NOT be served; the fast path cleanly reports it (disabled or miss) so
+  // the caller recompiles. This holds identically in the seqlock build.
+  owner.setInstanceEnabled(1, 2, false);
+  auto disabled = owner.tryCacheHit1D(9, 1, 2);
+  EXPECT_NE(disabled.status, EJitCompileOrGetStatus::CacheHit);
+  owner.setInstanceEnabled(1, 2, true);
+  auto stale = owner.tryCacheHit1D(9, 1, 2);
+  // Re-enabled but version moved on: identity matches, version does not → not a
+  // hit (a fresh compile must republish under the new version).
+  EXPECT_NE(stale.status, EJitCompileOrGetStatus::CacheHit);
+  if (stale.hasReadToken)
+    owner.releaseRead(stale.bucketIndex);
+}
+
+//===----------------------------------------------------------------------===//
 // Phase-1 hot-hit micro-benchmark (DISABLED by default; run explicitly with
 //   --gtest_also_run_disabled_tests --gtest_filter='*HotHitMicroBench*'
 // on an aarch64 host). Measures the per-hit cost of the shared taskpool hit
@@ -2250,14 +2305,16 @@ TEST_F(SharedTaskPoolTest, DISABLED_HotHitMicroBench) {
   auto full = runBatches([&] {
     auto r = owner.tryCacheHit0D(42);
     sink = r.fnPtr;
-    owner.releaseRead(r.bucketIndex);
+    if (r.hasReadToken)
+      owner.releaseRead(r.bucketIndex);
   });
 
   // (B) Lookup only (read-token acquired but released untimed): isolates get_fn.
   auto lookup = runBatches([&] {
     auto r = owner.tryCacheHit0D(42);
     sink = r.fnPtr;
-    owner.releaseRead(r.bucketIndex); // released, but the timed body is above
+    if (r.hasReadToken)
+      owner.releaseRead(r.bucketIndex); // released, but the timed body is above
   });
   // Re-time (B) with release truly outside the measured region is not possible
   // per-iter; instead measure release in isolation as (C).
@@ -2265,7 +2322,8 @@ TEST_F(SharedTaskPoolTest, DISABLED_HotHitMicroBench) {
   // (C) releaseRead in isolation (lookup done untimed just before).
   auto release = runBatches([&] {
     auto r = owner.tryCacheHit0D(42); // untimed-ish, but included; see note
-    owner.releaseRead(r.bucketIndex);
+    if (r.hasReadToken)
+      owner.releaseRead(r.bucketIndex);
     sink = r.fnPtr;
   });
 

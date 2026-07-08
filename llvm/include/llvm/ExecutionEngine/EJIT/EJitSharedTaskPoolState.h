@@ -188,7 +188,16 @@ struct EJitSharedCacheSlot {
 //===----------------------------------------------------------------------===//
 struct alignas(kEJitSharedCacheLine) EJitSharedCacheBucket {
   EJitAtomicU32 writeFlag; ///< 0 = free, 1 = writer holds/pending
-  EJitAtomicU32 readers;   ///< active reader count
+  EJitAtomicU32 readers;   ///< active reader count (token model)
+  /// Monotonic publish sequence for the EJIT_SRE_TASKPOOL_NO_RECLAIM seqlock
+  /// reader: the publisher makes it ODD before writing a slot and EVEN after
+  /// (see bucketWrite/bucketWriteRelease). A load-only reader captures it before
+  /// its scan and re-checks it after loading fnPtr; an unequal/odd value means a
+  /// publish raced the read, so the reader discards and cleanly falls back. Zero
+  /// per-hit atomic RMW on this line (unlike the token's readers counter). Only
+  /// bumped in a NO_RECLAIM build; stays 0 otherwise, so the default token path
+  /// is byte-for-byte unchanged.
+  EJitAtomicU32 publishSeq;
   EJitSharedCacheSlot slots[kEJitSharedCacheSlots];
 };
 

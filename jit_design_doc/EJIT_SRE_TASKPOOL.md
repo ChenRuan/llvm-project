@@ -1245,11 +1245,19 @@ cmake --build build-ejit-sre-taskpool --target check-ejit-taskpool -j8
 
 ### 10.4 FreeCode 语义
 
-- `freeCode` 不参与失效路径，仅在以下两个场景触发：
-    - 模块 destroy：清理 cache 中所有 fnPtr
-    - cache publish 覆盖：同 cacheKey 写入新 fnPtr 时，旧 fnPtr 在该桶 `readers_=0` 后释放
-- 失效语义由 SwitchController 的 version bump + worker 检查点共同保证，不通过 `freeCode` 实现。
-- `freeCode` 与 publish 互斥由 cache 桶锁（`EJitRwLock.write`）保证：写者 spin 到 `readers_=0` 后才释放旧 fnPtr，确保无人持有该指针。
+- `freeCode` 不参与失效路径；失效语义由 SwitchController 的 version bump + worker
+  检查点共同保证，不通过 `freeCode` 实现。
+- 默认 read-token 路径保留对“未来可能物理释放旧 fnPtr”的保护：cache publish 覆盖
+  或整体清理时，写者需要等待该桶 `readers_=0` 后才能运行 release callback。
+- 当前 SRE code pool v1 的正式模型是 **logical eviction only**：cache entry 可以失效/
+  覆盖，但已发布的 JIT 代码内存不物理释放、不复用，生命周期覆盖 EJIT runtime/engine。
+  这与 `EJIT_SRE_CODE_POOL.md` 中的“FreeCode 不物理释放”保持一致。
+- `EJIT_SRE_TASKPOOL_NO_RECLAIM` 仅在上述不物理回收模型下成立：热路径不再获取
+  read token，而用 bucket `publishSeq` seqlock 检测并丢弃与 publish 竞态的读取。
+  若未来实现物理 LRU reclaim / code pool 小块复用，必须关闭该开关，或先引入
+  RCU/epoch 等延迟回收机制。
+- 在默认 read-token/releaser 路径下，`freeCode` 与 publish 互斥由 cache 桶锁
+  （`EJitRwLock.write`）保证：写者 spin 到 `readers_=0` 后才运行 release callback。
 
 ### 10.5 大端共享结构约束
 
