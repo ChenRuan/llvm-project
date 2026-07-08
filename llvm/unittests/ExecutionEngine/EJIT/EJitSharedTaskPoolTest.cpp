@@ -16,7 +16,10 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "gtest/gtest.h"
+#include <algorithm>
+#include <cstdio>
 #include <memory>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -2160,5 +2163,206 @@ TEST_F(SharedTaskPoolTest, FixedDimVersionMismatchMisses) {
   EXPECT_FALSE(fixedMiss2.fastPathTerminal);
   EXPECT_FALSE(fixedMiss2.hasReadToken);
 }
+
+//===----------------------------------------------------------------------===//
+// Phase-1 hot-hit micro-benchmark (DISABLED by default; run explicitly with
+//   --gtest_also_run_disabled_tests --gtest_filter='*HotHitMicroBench*'
+// on an aarch64 host). Measures the per-hit cost of the shared taskpool hit
+// path components to drive the read-token optimization. Not a correctness test.
+//===----------------------------------------------------------------------===//
+#if defined(__aarch64__)
+namespace {
+static inline uint64_t benchNow() {
+  uint64_t v;
+  asm volatile("isb; mrs %0, cntvct_el0" : "=r"(v)::"memory");
+  return v;
+}
+static inline uint64_t benchFreq() {
+  uint64_t v;
+  asm volatile("mrs %0, cntfrq_el0" : "=r"(v));
+  return v;
+}
+struct BatchStats {
+  double avgNs, p50, p90, p99, maxNs;
+  size_t samples;
+};
+static BatchStats summarize(std::vector<double> &perIterNs) {
+  std::sort(perIterNs.begin(), perIterNs.end());
+  BatchStats s;
+  s.samples = perIterNs.size();
+  double sum = 0;
+  for (double v : perIterNs)
+    sum += v;
+  s.avgNs = sum / perIterNs.size();
+  auto pct = [&](double p) {
+    size_t idx = static_cast<size_t>(p * (perIterNs.size() - 1));
+    return perIterNs[idx];
+  };
+  s.p50 = pct(0.50);
+  s.p90 = pct(0.90);
+  s.p99 = pct(0.99);
+  s.maxNs = perIterNs.back();
+  return s;
+}
+static void report(const char *name, const BatchStats &s) {
+  printf("  %-28s avg=%.1fns p50=%.1f p90=%.1f p99=%.1f max=%.1f (n=%zu batches)\n",
+         name, s.avgNs, s.p50, s.p90, s.p99, s.maxNs, s.samples);
+}
+} // namespace
+
+TEST_F(SharedTaskPoolTest, DISABLED_HotHitMicroBench) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  publish(owner, 42);
+  EJitCoreId::setCurrentForTest(0); // owner-core hit path
+  const uint64_t freq = benchFreq();
+  const double tickNs = 1e9 / static_cast<double>(freq);
+  const uint32_t kIters = 2000;    // per batch
+  const uint32_t kBatches = 2000;  // distribution samples
+  printf("HotHit micro-bench: cntfrq=%llu Hz (%.3f ns/tick), %u iters x %u batches\n",
+         (unsigned long long)freq, tickNs, kIters, kBatches);
+
+  // Warm up + correctness sanity.
+  {
+    auto r = owner.tryCacheHit0D(42);
+    ASSERT_TRUE(r.fastPathTerminal);
+    ASSERT_NE(r.fnPtr, nullptr);
+    if (r.hasReadToken)
+      owner.releaseRead(r.bucketIndex);
+  }
+
+  auto runBatches = [&](auto &&body) {
+    std::vector<double> perIterNs;
+    perIterNs.reserve(kBatches);
+    for (uint32_t b = 0; b < kBatches; ++b) {
+      uint64_t t0 = benchNow();
+      for (uint32_t i = 0; i < kIters; ++i)
+        body();
+      uint64_t t1 = benchNow();
+      perIterNs.push_back((double)(t1 - t0) * tickNs / kIters);
+    }
+    return summarize(perIterNs);
+  };
+
+  volatile void *sink = nullptr;
+
+  // (A) Full current hit path: lookup (read-token acquire) + releaseRead.
+  auto full = runBatches([&] {
+    auto r = owner.tryCacheHit0D(42);
+    sink = r.fnPtr;
+    owner.releaseRead(r.bucketIndex);
+  });
+
+  // (B) Lookup only (read-token acquired but released untimed): isolates get_fn.
+  auto lookup = runBatches([&] {
+    auto r = owner.tryCacheHit0D(42);
+    sink = r.fnPtr;
+    owner.releaseRead(r.bucketIndex); // released, but the timed body is above
+  });
+  // Re-time (B) with release truly outside the measured region is not possible
+  // per-iter; instead measure release in isolation as (C).
+
+  // (C) releaseRead in isolation (lookup done untimed just before).
+  auto release = runBatches([&] {
+    auto r = owner.tryCacheHit0D(42); // untimed-ish, but included; see note
+    owner.releaseRead(r.bucketIndex);
+    sink = r.fnPtr;
+  });
+
+  // (D) Load-only seqlock-style read of the SAME slot: no RMW atomics, no
+  // release. This is the target design's per-hit cost.
+  EJitSharedCacheSlot *slot = findReadySlot(42);
+  ASSERT_NE(slot, nullptr);
+  auto seqlike = runBatches([&] {
+    // state(acquire) -> identity loads -> fnPtr(acquire) -> re-check state.
+    uint32_t s0 = slot->state.loadAcquire();
+    uint32_t fi = slot->funcIndex;
+    uint64_t h = slot->identityHash;
+    void *fn = reinterpret_cast<void *>(slot->fnPtr.loadAcquire());
+    uint32_t s1 = slot->state.loadAcquire();
+    if (s0 == s1 && fi == 42 && h)
+      sink = fn;
+  });
+  (void)sink;
+
+  printf("Shared taskpool owner-core 0D hot hit component costs:\n");
+  report("A full (lookup+release)", full);
+  report("B lookup+release (dup)", lookup);
+  report("C lookup+release iso", release);
+  report("D seqlock load-only", seqlike);
+  printf("Delta A-D (RMW+release removed) approx avg = %.1f ns/hit\n",
+         full.avgNs - seqlike.avgNs);
+}
+
+// Multi-core contention model of the real board: N cores hammering the SAME hot
+// function share one bucket cache line. The read-token RMW (fetchAdd/fetchSub on
+// bucket.readers) then bounces that line between cores; a load-only seqlock read
+// does not. This is the scenario the 6us regression comes from.
+TEST_F(SharedTaskPoolTest, DISABLED_HotHitContendedBench) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  publish(owner, 42);
+  EJitSharedCacheSlot *slot = findReadySlot(42);
+  ASSERT_NE(slot, nullptr);
+  EJitSharedCacheBucket *bucket = nullptr;
+  for (uint32_t b = 0; b < kEJitSharedCacheBuckets && !bucket; ++b)
+    for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s)
+      if (&state_->buckets[b].slots[s] == slot) {
+        bucket = &state_->buckets[b];
+        break;
+      }
+  ASSERT_NE(bucket, nullptr);
+  const double tickNs = 1e9 / static_cast<double>(benchFreq());
+  const uint32_t kIters = 200000;
+
+  for (unsigned T : {1u, 2u, 4u, 8u}) {
+    std::vector<double> tokDur(T), seqDur(T);
+    auto tokenBody = [&](unsigned idx) {
+      uint64_t t0 = benchNow();
+      volatile uint64_t acc = 0;
+      for (uint32_t i = 0; i < kIters; ++i) {
+        bucket->readers.fetchAdd(1);
+        acc += slot->fnPtr.loadAcquire();
+        bucket->readers.fetchSub(1);
+      }
+      uint64_t t1 = benchNow();
+      (void)acc;
+      tokDur[idx] = (double)(t1 - t0) * tickNs / kIters;
+    };
+    auto seqBody = [&](unsigned idx) {
+      uint64_t t0 = benchNow();
+      volatile uint64_t acc = 0;
+      for (uint32_t i = 0; i < kIters; ++i) {
+        uint32_t s0 = slot->state.loadAcquire();
+        acc += slot->fnPtr.loadAcquire();
+        uint32_t s1 = slot->state.loadAcquire();
+        acc += (s0 == s1);
+      }
+      uint64_t t1 = benchNow();
+      (void)acc;
+      seqDur[idx] = (double)(t1 - t0) * tickNs / kIters;
+    };
+    auto runContended = [&](auto body, std::vector<double> &dur) {
+      std::vector<std::thread> ths;
+      for (unsigned t = 0; t < T; ++t)
+        ths.emplace_back([&, t] { body(t); });
+      for (auto &th : ths)
+        th.join();
+      double sum = 0, mx = 0;
+      for (double d : dur) {
+        sum += d;
+        mx = std::max(mx, d);
+      }
+      return std::pair<double, double>(sum / T, mx);
+    };
+    auto tok = runContended(tokenBody, tokDur);
+    auto seq = runContended(seqBody, seqDur);
+    printf("T=%u cores same bucket: token(RMW) avg=%.1fns max=%.1f | "
+           "seqlock(load) avg=%.1fns max=%.1f | token/seqlock=%.1fx\n",
+           T, tok.first, tok.second, seq.first, seq.second,
+           seq.first > 0 ? tok.first / seq.first : 0.0);
+  }
+}
+#endif // __aarch64__
 
 } // namespace
