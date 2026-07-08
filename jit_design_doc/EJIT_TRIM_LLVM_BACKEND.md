@@ -114,6 +114,40 @@ AArch64StorePairSuppress   AArch64Subtarget   AArch64TargetMachine
 AArch64TargetObjectFile    AArch64TargetTransformInfo
 ```
 
+### 2.4 Register Allocators
+
+Only the greedy register allocator (`RAGreedy`) is retained. EJIT codegens at a
+fixed optimization level and only ever selects greedy, so the alternatives and
+their advisory infrastructure are compiled out:
+
+| Removed | Notes |
+|---|---|
+| `RegAllocBasic` | basic allocator |
+| `RegAllocFast` | O0 / fast allocator |
+| `RegAllocPBQP` / `AArch64PBQPRegAlloc` | PBQP allocator (unused at `-Os`) |
+| `MLRegAllocEvictAdvisor`, `RegAllocPriorityAdvisor`, ML/priority eviction paths | the default heuristic eviction is kept |
+
+Guarded in `llvm/lib/CodeGen/RegAlloc*.cpp` and `TargetPassConfig::createRegAllocPass`.
+
+### 2.5 CodeGen and MC Trims
+
+The following are also removed under the flag:
+
+| Removed | Why |
+|---|---|
+| `MachineVerifier` | debug-only machine-IR correctness checker |
+| Textual assembly printer + per-instruction name tables | EJIT emits object code, not `.s` — opt back in with `EJIT_DUMP_ASM` (below) |
+| `MachinePipeliner` / software pipelining | not used by EJIT codegen |
+| Non-ELF object writers (MachO / COFF / Wasm / XCOFF) + x86 bitcode auto-upgrade path | EJIT targets ELF AArch64 only |
+| X86 backend dependencies | AArch64-only build |
+| Residual CodeView symbols, `.note.*`, and `.comment` sections | cleaned out of the final merged `ejit.o` during the lipo merge step |
+
+**`EJIT_DUMP_ASM` (opt-in).** Re-adds the textual assembly printer and its
+instruction-name tables so `ejit_dump_*()` can emit human-readable AArch64
+assembly under a trimmed build. Off by default because those tables have a size
+cost. The dump path takes `snprintf` from either libc or the SRE format stubs —
+never both.
+
 ---
 
 ## 3. Relationship with `EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL`
@@ -169,6 +203,10 @@ In practice, both flags converge to the same set of trimmed source files.  The s
 ## 4. Current Trimming Progress and Size Data
 
 All measurements are `build_release_aarch64` built with `clang`/`clang++`, `-Os -ffunction-sections -fdata-sections`, `LLVM_TARGETS_TO_BUILD=AArch64`.
+
+> The tables below reflect the SME/SVE/GISel scope only; they predate the
+> register-allocator (§2.4) and CodeGen/MC (§2.5) trims and the per-CPU
+> scheduling-model stripping (§5.3.1), and should be re-measured.
 
 ### 4.1 Lipo Pipeline Results (`EJIT_TRIM_LLVM_BACKEND=ON`, no `--exclude`)
 
@@ -275,6 +313,55 @@ ar t ejit_test/lipo/libejit_lipo_aarch64.a | wc -l    # total .o count
 ar t ejit_test/lipo/libejit_lipo_aarch64.a | grep GISel  # confirm GISel is absent
 ```
 
+### 5.3.1 Per-CPU Scheduling Model Stripping (`--keep` / `--keep-none`)
+
+`AArch64GenSubtargetInfo.inc` (a TableGen output) defines ~24 per-CPU scheduling
+models. Each carries a ~24 KB `MCSchedClassDesc` array plus a smaller
+`MCProcResourceDesc` array, and every model is kept alive by the CPU-name lookup
+table `AArch64SubTypeKV` — so `gc-sections` cannot remove them through normal
+linkage. `ejit_strip_sched_models.py` patches the `.inc`: it nulls the
+`ProcResourceTable` / `SchedClassTable` pointers and zeros the matching
+`NumProcResourceKinds` / `NumSchedClasses` in each `MCSchedModel` initializer
+that should be dropped. Those arrays then become unreferenced and the lipo
+`gc-merge` step eliminates them — roughly **24 KB per stripped model**.
+
+This is an **opt-in lipo-pipeline step, independent of the CMake trim flag**,
+driven through `run_aarch64_pipeline.sh`:
+
+```bash
+# Keep ONE CPU's scheduling model, strip the other ~23. Use this when the
+# deployment core is known and accurate machine scheduling matters. CPUNAME must
+# be an LLVM CPU name present in AArch64SubTypeKV (e.g. neoverse-n2, cortex-a57):
+~/ejit/llvm-project/ejit_test/lipo/run_aarch64_pipeline.sh --keep neoverse-n2
+
+# Strip ALL per-CPU models (smallest object). The target scheduler falls back to
+# the generic model — functional, but less precise instruction scheduling:
+~/ejit/llvm-project/ejit_test/lipo/run_aarch64_pipeline.sh --keep-none
+
+# Default (no flag): no stripping. If the .inc was previously patched, the script
+# regenerates it from TableGen and rebuilds the AArch64 libraries first.
+```
+
+Notes:
+
+- **One kept model can cover a whole CPU family** — e.g. `--keep cortex-a57`
+  keeps `CortexA57Model`, which also serves a72/a73/a75–a78c.
+- The script marks the patched `.inc` with a `// EJIT: stripped` sentinel and
+  rebuilds `LLVMAArch64CodeGen` + `LLVMAArch64Desc` before the lipo steps run.
+  Switching back to a no-strip build regenerates the `.inc` from `llvm-tblgen`
+  automatically (delete the `.inc` and run `ninja AArch64CommonTableGen`, which
+  `run_aarch64_pipeline.sh` does for you).
+- To run the patch by hand, outside the pipeline:
+
+  ```bash
+  python3 ejit_test/lipo/ejit_strip_sched_models.py BUILD_DIR [KEEP_CPU]
+  ninja -C BUILD_DIR LLVMAArch64CodeGen LLVMAArch64Desc
+  ```
+
+Choose `--keep <deployment-cpu>` when you know the exact target core and want
+good scheduling; choose `--keep-none` for the smallest object when scheduling
+precision is not critical.
+
 ### 5.4 Running the Test Suite
 
 ```bash
@@ -285,7 +372,10 @@ ar t ejit_test/lipo/libejit_lipo_aarch64.a | grep GISel  # confirm GISel is abse
 
 ## 6. Plans for Future Trimming
 
-The current pass removals (SME/SVE/GISel) reduce `ejit.o` by ~8 MB but there is still significant headroom.
+Backend trimming now covers SME/SVE/GISel (§2.1–2.3), the non-greedy register
+allocators (§2.4), and the machine verifier / textual ASM / non-ELF writers /
+X86 dependencies (§2.5), plus the opt-in per-CPU scheduling-model stripping
+(§5.3.1). There is still headroom below `ejit.o`.
 
 ### 6.1 Additional AArch64 Pass Exclusions
 
@@ -297,7 +387,6 @@ The following passes are still registered and pulled into `ejit.o`.  They are ca
 | `AArch64PointerAuthPass` | Small | Low — no PAC hardware on typical EJIT targets |
 | `AArch64SLSHardeningPass` | Negligible | Medium — security hardening |
 | `FalkorHWPFFix` / `FalkorMarkStridedAccesses` | Small | Low — Falkor CPU specific |
-| `AArch64PBQPRegAlloc` | Small | Low — not used at `-Os` |
 
 ### 6.2 TargetTransformInfo and TargetObjectFile
 
@@ -331,6 +420,10 @@ ninja -C build_release_aarch64 LLVMEJIT
 # Run full lipo pipeline → ejit_test/lipo/ejit.o
 ~/ejit/llvm-project/ejit_test/lipo/run_aarch64_pipeline.sh
 
+# ... optionally also strip per-CPU scheduling models (§5.3.1):
+~/ejit/llvm-project/ejit_test/lipo/run_aarch64_pipeline.sh --keep neoverse-n2  # keep one CPU
+~/ejit/llvm-project/ejit_test/lipo/run_aarch64_pipeline.sh --keep-none         # strip all
+
 # Run tests against the lipo-produced object
 ./ejit_test/build.sh --run --lipo=ejit_test/lipo/ejit.o
 
@@ -343,5 +436,6 @@ ar t ejit_test/lipo/libejit_lipo_aarch64.a | grep -E "GISel|SMEABI|SVEIntrinsic|
 
 ---
 
-*Document version: 1.0*
-*Created: 2026-06-10
+*Document version: 1.1*
+*Created: 2026-06-10*
+*Updated: 2026-07-07*
