@@ -180,15 +180,16 @@ static Constant *createConstantFromMemory(const void *addr, Type *Ty,
   unsigned byteSize = DL.getTypeStoreSize(Ty);
 
   if (Ty->isIntegerTy()) {
-    APInt val(byteSize * 8, 0);
-    if (byteSize <= 8) {
-      uint64_t raw = 0;
-      std::memcpy(&raw, addr, byteSize);
-      if (!DL.isLittleEndian())
-        raw >>= (8 - byteSize) * 8;
-      val = APInt(byteSize * 8, raw);
-    }
-    return ConstantInt::get(Ty, val);
+    // Only integers that fit in a single 64-bit word are materialized here.
+    // Wider integers (e.g. __int128, or _BitInt(N) with N > 64) are left
+    // un-substituted.
+    if (byteSize > 8)
+      return nullptr;
+    uint64_t raw = 0;
+    std::memcpy(&raw, addr, byteSize);
+    if (!DL.isLittleEndian())
+      raw >>= (8 - byteSize) * 8;
+    return ConstantInt::get(Ty, APInt(byteSize * 8, raw));
   }
   if (Ty->isFloatTy()) {
     float v;
