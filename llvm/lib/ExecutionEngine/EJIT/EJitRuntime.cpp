@@ -17,7 +17,7 @@
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #endif
-#if !defined(EJIT_FREESTANDING) && !defined(__aarch64__)
+#ifndef EJIT_FREESTANDING
 #include <chrono>
 #endif
 
@@ -25,6 +25,10 @@ using namespace llvm;
 using namespace llvm::ejit;
 
 static EJit *gEJIT = nullptr;
+
+#ifdef EJIT_FREESTANDING
+extern "C" uint64_t SRE_CycleCountGet64(void);
+#endif
 
 #ifndef EJIT_WRAPPER_TIMING_REPORT_EVERY
 #define EJIT_WRAPPER_TIMING_REPORT_EVERY 1024u
@@ -857,18 +861,14 @@ unsigned ejit_taskpool_pending_count(void) {
 }
 
 uint64_t ejit_taskpool_trace_now(void) {
-#if defined(__aarch64__)
-  uint64_t v = 0;
-  asm volatile("mrs %0, cntvct_el0" : "=r"(v));
-  return v;
-#elif !defined(EJIT_FREESTANDING)
+#ifdef EJIT_FREESTANDING
+  return SRE_CycleCountGet64();
+#else
   using clock = std::chrono::steady_clock;
   return static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           clock::now().time_since_epoch())
           .count());
-#else
-  return 0;
 #endif
 }
 

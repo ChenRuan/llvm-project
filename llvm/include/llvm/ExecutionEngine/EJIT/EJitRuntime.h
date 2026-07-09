@@ -215,8 +215,8 @@ unsigned ejit_taskpool_pending_count(void);
 // with -ejit-wrapper-timing. Runtime aggregates repeated calls and prints one
 // summary per EJIT_WRAPPER_TIMING_REPORT_EVERY samples (default 1024; set to 0
 // to suppress periodic output) to avoid flooding board logs. The timestamp unit
-// is platform-defined: aarch64 uses CNTVCT_EL0 cycles/ticks, host fallback uses
-// nanoseconds.
+// is platform-defined: SRE/freestanding builds use SRE_CycleCountGet64(), host
+// fallback uses steady_clock nanoseconds.
 uint64_t ejit_taskpool_trace_now(void);
 void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
                                  void *fnPtr, uint32_t bucketIndex,
