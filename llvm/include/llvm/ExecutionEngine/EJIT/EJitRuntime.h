@@ -211,6 +211,21 @@ void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
 void ejit_taskpool_release_read(uint32_t bucketIndex);
 unsigned ejit_taskpool_pending_count(void);
 
+// Diagnostic wrapper timing helpers. AOT wrappers only call these when built
+// with -ejit-wrapper-timing. Runtime aggregates repeated calls and prints one
+// summary per EJIT_WRAPPER_TIMING_REPORT_EVERY samples (default 1024; set to 0
+// to suppress periodic output) to avoid flooding board logs. The timestamp unit
+// is platform-defined: aarch64 uses CNTVCT_EL0 cycles/ticks, host fallback uses
+// nanoseconds.
+uint64_t ejit_taskpool_trace_now(void);
+void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
+                                 void *fnPtr, uint32_t bucketIndex,
+                                 uint64_t tBeforeLookup,
+                                 uint64_t tAfterLookup,
+                                 uint64_t tBeforeFn,
+                                 uint64_t tAfterFn,
+                                 uint64_t tAfterRelease);
+
 #ifdef EJIT_SRE_TASKPOOL_TESTING
 unsigned ejit_taskpool_poll_one(void);
 unsigned ejit_taskpool_poll_budget(unsigned maxItems);

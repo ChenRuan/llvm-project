@@ -72,6 +72,9 @@ constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_3D =
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_4D =
     "ejit_taskpool_compile_or_get_4d";
 constexpr const char *FN_TASKPOOL_RELEASE_READ = "ejit_taskpool_release_read";
+constexpr const char *FN_TASKPOOL_TRACE_NOW = "ejit_taskpool_trace_now";
+constexpr const char *FN_TASKPOOL_TRACE_WRAPPER =
+    "ejit_taskpool_trace_wrapper";
 // Lifecycle activation is keyed by period/lifecycle name + instance index only.
 // PASS4 emits these name-level calls at ejit_period_lc entry/exit; there is no
 // array-pointer dimension in the active-state hot path.

@@ -53,6 +53,11 @@ static cl::opt<bool> EJitWrapperFixedDimEntry(
              "(ejit_taskpool_compile_or_get_Nd) for ejit_entry functions with "
              "<= 4 dims instead of the generic ejit_taskpool_compile_or_get"));
 
+static cl::opt<bool> EJitWrapperTiming(
+    "ejit-wrapper-timing", cl::init(false), cl::Hidden,
+    cl::desc("Emit diagnostic timing probes around taskpool lookup, indirect "
+             "JIT call, and read-token release in ejit_entry wrappers"));
+
 // Wrapper generation now unconditionally uses the unified taskpool API
 // (ejit_taskpool_compile_or_get + ejit_taskpool_release_read). Both Sync
 // and Async modes are runtime-configurable — the AOT wrapper code is
@@ -492,6 +497,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     // callers; the wrapper just does not select them.
     bool UseFixed = EJitWrapperFixedDimEntry && DimCount <= 2;
     auto *DimPairTy = StructType::get(I32Ty, I32Ty);
+    auto *I64Ty = Type::getInt64Ty(Ctx);
     Value *DimsAlloca = UseFixed
                             ? nullptr
                             : Builder.CreateAlloca(ArrayType::get(DimPairTy, 4),
@@ -529,6 +535,21 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     Value *OutFnArg = Builder.CreatePointerCast(OutFnAlloca, PtrTy);
     Value *OutBucketArg = Builder.CreatePointerCast(OutBucketAlloca, PtrTy);
     Value *Status = nullptr;
+    FunctionCallee TraceNow{};
+    FunctionCallee TraceWrapper{};
+    Value *TBeforeLookup = nullptr;
+    Value *TAfterLookup = nullptr;
+    if (EJitWrapperTiming) {
+      TraceNow = M.getOrInsertFunction(FN_TASKPOOL_TRACE_NOW,
+                                       FunctionType::get(I64Ty, false));
+      SmallVector<Type *, 9> TraceTys = {I32Ty, I32Ty, PtrTy, I32Ty,
+                                         I64Ty, I64Ty, I64Ty, I64Ty, I64Ty};
+      TraceWrapper = M.getOrInsertFunction(
+          FN_TASKPOOL_TRACE_WRAPPER,
+          FunctionType::get(Type::getVoidTy(Ctx), TraceTys, false));
+      TBeforeLookup =
+          Builder.CreateCall(TraceNow, {}, "ejit_t_before_lookup");
+    }
     if (UseFixed) {
       // ejit_taskpool_compile_or_get_Nd(i32 funcIndex,
       //     [i32 dimType, i32 instanceId] * N, ptr outFn, ptr outBucket)
@@ -576,6 +597,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
                                    ConstantInt::get(I32Ty, DimCount), OutFnArg,
                                    OutBucketArg});
     }
+    if (EJitWrapperTiming)
+      TAfterLookup = Builder.CreateCall(TraceNow, {}, "ejit_t_after_lookup");
     Value *OutFn = Builder.CreateLoad(PtrTy, OutFnAlloca, "ejit_fn");
     Value *HitStatus =
         Builder.CreateICmpEQ(Status, ConstantInt::get(I32Ty, 0));
@@ -592,16 +615,42 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       Args.push_back(&Arg);
 
     if (F->getReturnType()->isVoidTy()) {
+      Value *TBeforeFn = nullptr;
+      if (EJitWrapperTiming)
+        TBeforeFn = Builder.CreateCall(TraceNow, {}, "ejit_t_before_fn");
       Builder.CreateCall(F->getFunctionType(), OutFn, Args);
+      Value *TAfterFn = nullptr;
+      if (EJitWrapperTiming)
+        TAfterFn = Builder.CreateCall(TraceNow, {}, "ejit_t_after_fn");
       // Always release the taskpool read token after the JIT call finishes.
       Value *Bucket = Builder.CreateLoad(I32Ty, OutBucketAlloca);
       Builder.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ), {Bucket});
+      if (EJitWrapperTiming) {
+        Value *TAfterRelease =
+            Builder.CreateCall(TraceNow, {}, "ejit_t_after_release");
+        Builder.CreateCall(TraceWrapper,
+                           {FuncIdx, Status, OutFn, Bucket, TBeforeLookup,
+                            TAfterLookup, TBeforeFn, TAfterFn, TAfterRelease});
+      }
       Builder.CreateRetVoid();
     } else {
+      Value *TBeforeFn = nullptr;
+      if (EJitWrapperTiming)
+        TBeforeFn = Builder.CreateCall(TraceNow, {}, "ejit_t_before_fn");
       Value *RetVal = Builder.CreateCall(F->getFunctionType(), OutFn, Args);
+      Value *TAfterFn = nullptr;
+      if (EJitWrapperTiming)
+        TAfterFn = Builder.CreateCall(TraceNow, {}, "ejit_t_after_fn");
       // Always release the taskpool read token after the JIT call finishes.
       Value *Bucket = Builder.CreateLoad(I32Ty, OutBucketAlloca);
       Builder.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ), {Bucket});
+      if (EJitWrapperTiming) {
+        Value *TAfterRelease =
+            Builder.CreateCall(TraceNow, {}, "ejit_t_after_release");
+        Builder.CreateCall(TraceWrapper,
+                           {FuncIdx, Status, OutFn, Bucket, TBeforeLookup,
+                            TAfterLookup, TBeforeFn, TAfterFn, TAfterRelease});
+      }
       Builder.CreateRet(RetVal);
     }
 

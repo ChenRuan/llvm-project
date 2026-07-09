@@ -88,10 +88,24 @@ target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
   EJIT_SRE_TASKPOOL
   EJIT_SRE_SHARED_TASKPOOL
   EJIT_SRE_TASKPOOL_TESTING
+  EJIT_STATS_ENABLE
   EJIT_SRE_TASKPOOL_BUCKETS=32
   EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
   EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=1048576
   )
+
+# Opt-in: build the shared taskpool tests with the load-only NO_RECLAIM seqlock
+# hit path (and cross-core code sharing, so the peer path is exercised too), to
+# validate the optimization. Configure a separate build dir with
+# -DEJIT_TEST_NO_RECLAIM=ON. Off by default so the normal build tests the token
+# path.
+option(EJIT_TEST_NO_RECLAIM
+  "Build EJITSharedTaskPoolTests with EJIT_SRE_TASKPOOL_NO_RECLAIM" OFF)
+if(EJIT_TEST_NO_RECLAIM)
+  target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
+    EJIT_SRE_TASKPOOL_NO_RECLAIM
+    EJIT_SRE_SHARED_CODE_POINTERS)
+endif()
 
 # Convenience target: build + run only the cross-core shared taskpool tests.
 add_custom_target(check-ejit-shared-taskpool

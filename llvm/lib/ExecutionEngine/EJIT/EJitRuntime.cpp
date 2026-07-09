@@ -3,6 +3,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
+#include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
@@ -16,11 +17,105 @@
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #endif
+#if !defined(EJIT_FREESTANDING) && !defined(__aarch64__)
+#include <chrono>
+#endif
 
 using namespace llvm;
 using namespace llvm::ejit;
 
 static EJit *gEJIT = nullptr;
+
+#ifndef EJIT_WRAPPER_TIMING_REPORT_EVERY
+#define EJIT_WRAPPER_TIMING_REPORT_EVERY 1024u
+#endif
+
+namespace {
+class TimingSpinLock {
+public:
+  void lock() {
+    uint32_t expected = 0;
+    while (!flag_.compareExchange(expected, 1u))
+      expected = 0;
+  }
+  void unlock() { flag_.storeRelease(0u); }
+
+private:
+  EJitAtomicU32 flag_;
+};
+
+struct WrapperTimingSlot {
+  bool Valid = false;
+  uint32_t FuncIndex = 0;
+  uint32_t Status = 0;
+  void *FnPtr = nullptr;
+  uint32_t BucketIndex = 0;
+  uint64_t Count = 0;
+  uint64_t GetFnSum = 0;
+  uint64_t GetFnMin = 0;
+  uint64_t GetFnMax = 0;
+  uint64_t FnCallSum = 0;
+  uint64_t FnCallMin = 0;
+  uint64_t FnCallMax = 0;
+  uint64_t ReleaseSum = 0;
+  uint64_t ReleaseMin = 0;
+  uint64_t ReleaseMax = 0;
+  uint64_t TotalSum = 0;
+  uint64_t TotalMin = 0;
+  uint64_t TotalMax = 0;
+};
+
+static TimingSpinLock gWrapperTimingLock;
+static WrapperTimingSlot gWrapperTimingSlots[32];
+
+static void updateTimingRange(uint64_t V, uint64_t &Sum, uint64_t &Min,
+                              uint64_t &Max, bool First) {
+  Sum += V;
+  if (First || V < Min)
+    Min = V;
+  if (First || V > Max)
+    Max = V;
+}
+
+static void resetTimingSlot(WrapperTimingSlot &S, uint32_t FuncIndex,
+                            uint32_t Status, void *FnPtr,
+                            uint32_t BucketIndex) {
+  S.Valid = true;
+  S.FuncIndex = FuncIndex;
+  S.Status = Status;
+  S.FnPtr = FnPtr;
+  S.BucketIndex = BucketIndex;
+  S.Count = 0;
+  S.GetFnSum = S.GetFnMin = S.GetFnMax = 0;
+  S.FnCallSum = S.FnCallMin = S.FnCallMax = 0;
+  S.ReleaseSum = S.ReleaseMin = S.ReleaseMax = 0;
+  S.TotalSum = S.TotalMin = S.TotalMax = 0;
+}
+
+static void reportTimingSlot(const WrapperTimingSlot &S) {
+  if (S.Count == 0)
+    return;
+  EJIT_DIAG("wrapper_timing_agg func=%u status=%u fn=%p bucket=%u count=%llu "
+            "get_fn_avg=%llu min=%llu max=%llu "
+            "fn_call_avg=%llu min=%llu max=%llu "
+            "release_avg=%llu min=%llu max=%llu "
+            "total_avg=%llu min=%llu max=%llu",
+            S.FuncIndex, S.Status, S.FnPtr, S.BucketIndex,
+            static_cast<unsigned long long>(S.Count),
+            static_cast<unsigned long long>(S.GetFnSum / S.Count),
+            static_cast<unsigned long long>(S.GetFnMin),
+            static_cast<unsigned long long>(S.GetFnMax),
+            static_cast<unsigned long long>(S.FnCallSum / S.Count),
+            static_cast<unsigned long long>(S.FnCallMin),
+            static_cast<unsigned long long>(S.FnCallMax),
+            static_cast<unsigned long long>(S.ReleaseSum / S.Count),
+            static_cast<unsigned long long>(S.ReleaseMin),
+            static_cast<unsigned long long>(S.ReleaseMax),
+            static_cast<unsigned long long>(S.TotalSum / S.Count),
+            static_cast<unsigned long long>(S.TotalMin),
+            static_cast<unsigned long long>(S.TotalMax));
+}
+} // namespace
 
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 static void bindDumpSharedStateFromRuntime() {
@@ -759,6 +854,64 @@ unsigned ejit_taskpool_pending_count(void) {
     return 0;
   }
   return tp->pendingCount();
+}
+
+uint64_t ejit_taskpool_trace_now(void) {
+#if defined(__aarch64__)
+  uint64_t v = 0;
+  asm volatile("mrs %0, cntvct_el0" : "=r"(v));
+  return v;
+#elif !defined(EJIT_FREESTANDING)
+  using clock = std::chrono::steady_clock;
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          clock::now().time_since_epoch())
+          .count());
+#else
+  return 0;
+#endif
+}
+
+void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
+                                 void *fnPtr, uint32_t bucketIndex,
+                                 uint64_t tBeforeLookup,
+                                 uint64_t tAfterLookup,
+                                 uint64_t tBeforeFn, uint64_t tAfterFn,
+                                 uint64_t tAfterRelease) {
+  uint64_t getFn = tAfterLookup - tBeforeLookup;
+  uint64_t fnCall = tAfterFn - tBeforeFn;
+  uint64_t release = tAfterRelease - tAfterFn;
+  uint64_t total = tAfterRelease - tBeforeLookup;
+  gWrapperTimingLock.lock();
+  unsigned SlotIdx = funcIndex % (sizeof(gWrapperTimingSlots) /
+                                  sizeof(gWrapperTimingSlots[0]));
+  WrapperTimingSlot &S = gWrapperTimingSlots[SlotIdx];
+  if (!S.Valid || S.FuncIndex != funcIndex || S.Status != status ||
+      S.FnPtr != fnPtr || S.BucketIndex != bucketIndex) {
+    reportTimingSlot(S);
+    resetTimingSlot(S, funcIndex, status, fnPtr, bucketIndex);
+  }
+
+  bool First = S.Count == 0;
+  ++S.Count;
+  updateTimingRange(getFn, S.GetFnSum, S.GetFnMin, S.GetFnMax, First);
+  updateTimingRange(fnCall, S.FnCallSum, S.FnCallMin, S.FnCallMax, First);
+  updateTimingRange(release, S.ReleaseSum, S.ReleaseMin, S.ReleaseMax, First);
+  updateTimingRange(total, S.TotalSum, S.TotalMin, S.TotalMax, First);
+
+#if EJIT_WRAPPER_TIMING_REPORT_EVERY > 0
+  if ((S.Count % EJIT_WRAPPER_TIMING_REPORT_EVERY) == 0) {
+    reportTimingSlot(S);
+    S.Count = 0;
+    S.GetFnSum = S.GetFnMin = S.GetFnMax = 0;
+    S.FnCallSum = S.FnCallMin = S.FnCallMax = 0;
+    S.ReleaseSum = S.ReleaseMin = S.ReleaseMax = 0;
+    S.TotalSum = S.TotalMin = S.TotalMax = 0;
+  }
+#else
+  (void)tAfterRelease;
+#endif
+  gWrapperTimingLock.unlock();
 }
 
 ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out) {
