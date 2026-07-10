@@ -141,15 +141,19 @@ isMayConstLoad(LoadInst *LI, const MayConstOffsetMap &mayConstFieldMap,
   if (LI->hasMetadata(MD_EJIT_MAY_CONST))
     return true;
 
-  // v1.7 fallback: check GV-level may_const field offsets
-  Value *Ptr = LI->getPointerOperand();
-  if (auto *RootGV = findRootGV(Ptr)) {
+  // v1.7 fallback: check GV-level may_const field offsets. Those offsets are
+  // relative to the array ELEMENT, so the load's field coordinate — not its
+  // total offset from the global — is what must match. Comparing the total
+  // offset silently restricted this fallback to element 0: `g_cfg[3].bandWidth`
+  // is at byte 100, which is in no field-offset list, so any load whose
+  // !ejit.may_const an earlier pass had dropped went unspecialized for every
+  // index but 0.
+  const GlobalVariable *RootGV = nullptr;
+  auto Off = ejitMayConstFieldOffset(LI->getPointerOperand(), DL, RootGV);
+  if (Off && RootGV) {
     auto It = mayConstFieldMap.find(RootGV);
-    if (It != mayConstFieldMap.end()) {
-      auto Off = accumulateFullOffset(DL, Ptr);
-      if (Off && is_contained(It->second, *Off))
-        return true;
-    }
+    if (It != mayConstFieldMap.end() && is_contained(It->second, *Off))
+      return true;
   }
   return false;
 }

@@ -164,14 +164,20 @@ static void reAnnotateMayConst(Module &M) {
         auto *LI = dyn_cast<LoadInst>(&I);
         if (!LI || LI->hasMetadata(MayConstKind))
           continue;
-        APInt Off;
-        const GlobalVariable *GV = findRootGV(LI->getPointerOperand(), Off, DL);
-        if (!GV)
+        // The recorded offsets are relative to the array ELEMENT, so compare
+        // against the field coordinate, not the total offset from the global.
+        // Using the total offset only ever matched element 0, and bailing on a
+        // variable array index meant `g_cfg[ci].field` was never re-annotated
+        // at all — so any load whose marker an earlier pass dropped stayed
+        // unspecialized for every index but 0.
+        const GlobalVariable *GV = nullptr;
+        auto Off = ejitMayConstFieldOffset(LI->getPointerOperand(), DL, GV);
+        if (!Off || !GV)
           continue;
         auto it = mayConstMap.find(GV);
         if (it == mayConstMap.end())
           continue;
-        if (is_contained(it->second, Off.getZExtValue())) {
+        if (is_contained(it->second, *Off)) {
           LI->setMetadata(MayConstKind, MDNode::get(Ctx, {}));
           count++;
         }

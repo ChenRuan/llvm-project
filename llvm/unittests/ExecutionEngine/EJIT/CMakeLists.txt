@@ -1,5 +1,6 @@
 set(LLVM_LINK_COMPONENTS
   Analysis
+  AsmParser
   Core
   EmbeddedJIT
   EJIT
@@ -12,6 +13,7 @@ set(LLVM_LINK_COMPONENTS
 
 add_llvm_unittest(EJITTests
   EJitRuntimeTest.cpp
+  EJitFieldOffsetTest.cpp
 
   PARTIAL_SOURCES_INTENDED
   )

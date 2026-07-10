@@ -14,12 +14,19 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITCOMMON_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITCOMMON_H
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 
 namespace llvm {
@@ -139,6 +146,118 @@ inline uint32_t getMDIntValue(const MDNode *Node, StringRef Tag) {
     }
   }
   return 0;
+}
+
+/// Byte offset of a field access *within its period-array element*, which is
+/// the coordinate the `ejit_may_const_field` entries on a period-array global
+/// are expressed in (they are relative to the element struct, NOT to the array
+/// base). Writes the root global to \p RootGV.
+///
+/// A load's pointer may take any of these shapes, all of which must reduce to
+/// the same field offset:
+///
+///   getelementptr [16 x %S], @g, 0, %ci, i32 4   AOT: dynamic element index
+///   getelementptr [16 x %S], @g, 0, 3,   i32 4   constant element index
+///   getelementptr %S,        @g, %ci             decayed array-to-pointer
+///   getelementptr i8,        @g, 100             post-InstCombine byte offset
+///
+/// Struct indices contribute their field offset. Constant sequential indices
+/// contribute their stride. Exactly ONE dynamic sequential index may be skipped:
+/// the one selecting an element of the root period array. Its contribution is a
+/// whole number of elements, which the closing `% ElemSize` erases, so skipping
+/// it is equivalent to including it. That is what lets `g_cfg[ci].field` resolve
+/// at AOT time, before the JIT replaces `ci` with a constant.
+///
+/// Every other dynamic sequential index is rejected. Typed pointer arithmetic
+/// can wear the same shape while walking *within* an element, e.g.
+///
+///   %e = getelementptr [16 x %S], @g, 0, %ci   ; element selector
+///   %p = getelementptr i32,       %e,  %j      ; ((int *)&g[ci])[j]
+///
+/// Skipping `%j` would resolve the access to offset 0 and wrongly attribute it
+/// to the field living there. The load would then be annotated may_const even
+/// though the frontend never marked it, and once `%j` specialized to a constant
+/// the JIT would fold a field that is free to change. Because the root global is
+/// only known after the whole chain is walked, the path is collected first and
+/// each dynamic index validated against the root array's stride afterwards.
+///
+/// Returns nullopt when the access cannot be attributed to a fixed field.
+inline std::optional<uint64_t>
+ejitMayConstFieldOffset(const Value *Ptr, const DataLayout &DL,
+                        const GlobalVariable *&RootGV) {
+  RootGV = nullptr;
+
+  // Phase 1: walk to the root global, remembering the path. No index can be
+  // judged before the root is known, because "is this the element selector?"
+  // is a question about the root array's element stride.
+  SmallVector<const GEPOperator *, 4> Path;
+  const Value *V = Ptr;
+  while (V) {
+    V = V->stripPointerCasts();
+    if (const auto *GV = dyn_cast<GlobalVariable>(V)) {
+      RootGV = GV;
+      break;
+    }
+    const auto *GEP = dyn_cast<GEPOperator>(V);
+    if (!GEP)
+      return std::nullopt;
+    Path.push_back(GEP);
+    V = GEP->getPointerOperand();
+  }
+  if (!RootGV)
+    return std::nullopt;
+
+  // Element stride of the period array. Zero when the global is not an array (a
+  // scalar `ejit_period` global), in which case no dynamic index is admissible.
+  uint64_t ElemSize = 0;
+  if (const auto *ATy = dyn_cast<ArrayType>(RootGV->getValueType())) {
+    TypeSize TS = DL.getTypeAllocSize(ATy->getElementType());
+    if (TS.isScalable())
+      return std::nullopt;
+    ElemSize = TS.getFixedValue();
+  }
+
+  // Only the GEP applied directly to the global can carry the element selector.
+  const GEPOperator *RootGEP = Path.empty() ? nullptr : Path.back();
+
+  // Phase 2: accumulate, validating each dynamic index against the root stride.
+  uint64_t Off = 0;
+  for (const GEPOperator *GEP : Path) {
+    for (auto GTI = gep_type_begin(GEP), GTE = gep_type_end(GEP); GTI != GTE;
+         ++GTI) {
+      if (StructType *STy = GTI.getStructTypeOrNull()) {
+        const auto *CI = dyn_cast<ConstantInt>(GTI.getOperand());
+        if (!CI)
+          return std::nullopt; // struct indices are constant in valid IR
+        Off += DL.getStructLayout(STy)->getElementOffset(CI->getZExtValue());
+        continue;
+      }
+
+      TypeSize TS = DL.getTypeAllocSize(GTI.getIndexedType());
+      if (TS.isScalable())
+        return std::nullopt;
+      const uint64_t Stride = TS.getFixedValue();
+
+      if (const auto *CI = dyn_cast<ConstantInt>(GTI.getOperand())) {
+        // GEP indices are signed; a negative one cannot be attributed to a
+        // field, and zero-extending it would wrap into a plausible offset.
+        const int64_t Idx = CI->getSExtValue();
+        if (Idx < 0)
+          return std::nullopt;
+        Off += static_cast<uint64_t>(Idx) * Stride;
+        continue;
+      }
+
+      // Dynamic index: admissible only as the root array's element selector.
+      if (GEP == RootGEP && ElemSize != 0 && Stride == ElemSize)
+        continue;
+      return std::nullopt;
+    }
+  }
+
+  if (ElemSize)
+    Off %= ElemSize; // drop whole elements: keep only the field coordinate
+  return Off;
 }
 
 //===----------------------------------------------------------------------===//
