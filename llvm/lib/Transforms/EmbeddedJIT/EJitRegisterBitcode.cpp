@@ -167,8 +167,8 @@ static void reAnnotateMayConst(Module &M) {
         // The recorded offsets are relative to the array ELEMENT, so compare
         // against the field coordinate, not the total offset from the global.
         // Using the total offset only ever matched element 0, and bailing on a
-        // variable array index meant `g_cfg[ci].field` was never re-annotated
-        // at all — so any load whose marker an earlier pass dropped stayed
+        // variable array index meant `g_cfg[ci].field` was never re-annotated at
+        // all — so any load whose marker an earlier pass dropped stayed
         // unspecialized for every index but 0.
         const GlobalVariable *GV = nullptr;
         auto Off = ejitMayConstFieldOffset(LI->getPointerOperand(), DL, GV);
@@ -177,10 +177,20 @@ static void reAnnotateMayConst(Module &M) {
         auto it = mayConstMap.find(GV);
         if (it == mayConstMap.end())
           continue;
-        if (is_contained(it->second, *Off)) {
-          LI->setMetadata(MayConstKind, MDNode::get(Ctx, {}));
-          count++;
-        }
+        if (!is_contained(it->second, *Off))
+          continue;
+        // An offset match only says the load *starts* at a may_const field. A
+        // widened load (e.g. an i64 formed from a memcpy spanning a may_const
+        // i32 and the mutable i32 beside it) would otherwise be annotated
+        // whole, letting PASS6 freeze the adjacent field as part of the same
+        // constant.
+        TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
+        if (AccessSize.isScalable() ||
+            !ejitAccessFitsMayConstField(GV, *Off, AccessSize.getFixedValue(),
+                                         DL))
+          continue;
+        LI->setMetadata(MayConstKind, MDNode::get(Ctx, {}));
+        count++;
       }
     }
   }

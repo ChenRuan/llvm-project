@@ -221,6 +221,11 @@ ejitMayConstFieldOffset(const Value *Ptr, const DataLayout &DL,
   const GEPOperator *RootGEP = Path.empty() ? nullptr : Path.back();
 
   // Phase 2: accumulate, validating each dynamic index against the root stride.
+  // At most ONE dynamic index may be skipped: an array has a single element
+  // selector. Two indices can both match the stride test (e.g. `[16 x [1 x i32]]`
+  // where the element and its own element are the same size), so the acceptance
+  // has to be recorded rather than re-derived per index.
+  bool SkippedDynamic = false;
   uint64_t Off = 0;
   for (const GEPOperator *GEP : Path) {
     for (auto GTI = gep_type_begin(GEP), GTE = gep_type_end(GEP); GTI != GTE;
@@ -248,9 +253,13 @@ ejitMayConstFieldOffset(const Value *Ptr, const DataLayout &DL,
         continue;
       }
 
-      // Dynamic index: admissible only as the root array's element selector.
-      if (GEP == RootGEP && ElemSize != 0 && Stride == ElemSize)
+      // Dynamic index: admissible only as the root array's element selector,
+      // and only once.
+      if (!SkippedDynamic && GEP == RootGEP && ElemSize != 0 &&
+          Stride == ElemSize) {
+        SkippedDynamic = true;
         continue;
+      }
       return std::nullopt;
     }
   }
@@ -258,6 +267,75 @@ ejitMayConstFieldOffset(const Value *Ptr, const DataLayout &DL,
   if (ElemSize)
     Off %= ElemSize; // drop whole elements: keep only the field coordinate
   return Off;
+}
+
+/// Size in bytes of the may_const field beginning at \p Off inside the period
+/// element of \p RootGV, or nullopt when \p Off is not the start of a field.
+///
+/// The `ejit_may_const_field` metadata records a field's *offset* and nothing
+/// else, so an offset match alone does not bound how many bytes of the element
+/// an access may legitimately read. Recovering the size from the aggregate
+/// layout supplies that bound.
+///
+/// A nested aggregate shares its offset with its own first field, so the descent
+/// continues to the innermost field starting at \p Off and reports that field's
+/// size. This is the conservative choice: it is the largest access guaranteed to
+/// stay inside a single may_const field. An access wider than the innermost field
+/// (say an i64 load formed from a memcpy over a may_const i32 and the mutable i32
+/// beside it) is therefore rejected, which is the point.
+inline std::optional<uint64_t>
+ejitMayConstFieldSize(const GlobalVariable *RootGV, uint64_t Off,
+                      const DataLayout &DL) {
+  if (!RootGV)
+    return std::nullopt;
+  Type *Ty = RootGV->getValueType();
+  if (const auto *ATy = dyn_cast<ArrayType>(Ty))
+    Ty = ATy->getElementType();
+
+  // Descend into whichever element contains Off, rebasing Off as we go. Only at
+  // the leaf does Off == 0 mean "this is where a field begins".
+  while (true) {
+    if (auto *STy = dyn_cast<StructType>(Ty)) {
+      if (STy->isOpaque())
+        return std::nullopt;
+      const StructLayout *SL = DL.getStructLayout(STy);
+      if (Off >= SL->getSizeInBytes())
+        return std::nullopt;
+      const unsigned Idx = SL->getElementContainingOffset(Off);
+      Off -= SL->getElementOffset(Idx);
+      Ty = STy->getElementType(Idx);
+      continue;
+    }
+    if (auto *ATy = dyn_cast<ArrayType>(Ty)) {
+      if (ATy->getNumElements() == 0)
+        return std::nullopt;
+      TypeSize ES = DL.getTypeAllocSize(ATy->getElementType());
+      if (ES.isScalable() || ES.getFixedValue() == 0)
+        return std::nullopt;
+      Off %= ES.getFixedValue();
+      Ty = ATy->getElementType();
+      continue;
+    }
+    break;
+  }
+
+  if (Off != 0)
+    return std::nullopt; // lands inside a field, not at its start
+
+  TypeSize TS = DL.getTypeStoreSize(Ty);
+  if (TS.isScalable())
+    return std::nullopt;
+  return TS.getFixedValue();
+}
+
+/// True when [\p Off, \p Off + \p AccessSize) lies entirely within the may_const
+/// field that begins at \p Off. Guards the offset-matching paths, which would
+/// otherwise let a widened load freeze the bytes of an adjacent mutable field.
+inline bool ejitAccessFitsMayConstField(const GlobalVariable *RootGV,
+                                        uint64_t Off, uint64_t AccessSize,
+                                        const DataLayout &DL) {
+  std::optional<uint64_t> FieldSize = ejitMayConstFieldSize(RootGV, Off, DL);
+  return FieldSize && AccessSize != 0 && AccessSize <= *FieldSize;
 }
 
 //===----------------------------------------------------------------------===//

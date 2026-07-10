@@ -152,8 +152,17 @@ isMayConstLoad(LoadInst *LI, const MayConstOffsetMap &mayConstFieldMap,
   auto Off = ejitMayConstFieldOffset(LI->getPointerOperand(), DL, RootGV);
   if (Off && RootGV) {
     auto It = mayConstFieldMap.find(RootGV);
-    if (It != mayConstFieldMap.end() && is_contained(It->second, *Off))
-      return true;
+    if (It != mayConstFieldMap.end() && is_contained(It->second, *Off)) {
+      // Matching the field's start offset does not bound the access width: the
+      // metadata records offsets only. A load wider than the field it begins at
+      // straddles the next one, and substituting it would freeze bytes that are
+      // free to change.
+      TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
+      if (!AccessSize.isScalable() &&
+          ejitAccessFitsMayConstField(RootGV, *Off, AccessSize.getFixedValue(),
+                                      DL))
+        return true;
+    }
   }
   return false;
 }

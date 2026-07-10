@@ -42,14 +42,23 @@ protected:
   LLVMContext Ctx;
   std::unique_ptr<Module> M;
 
-  /// Parse \p Body as the entire body of `@f(i64 %ci, i64 %j)` and return the
-  /// pointer operand of its single load.
-  const Value *ptrOfLoadIn(StringRef Body) {
+  /// Parse \p Body as the entire body of `@f(i64 %ci, i64 %j)`.
+  ///
+  ///   %S     7 x i32, 28 bytes -- the period element
+  ///   %N/%O  a nested record, whose first field shares offset 0 with it
+  ///   @g1    [16 x [1 x i32]]  -- element and its own element are both 4 bytes,
+  ///                               so two dynamic indices can both satisfy the
+  ///                               stride test
+  bool parse(StringRef Body) {
     std::string Src = R"(
       target datalayout = "e-m:e-i64:64-i128:128-n32:64-S128"
       %S = type { i32, i32, i32, i32, i32, i32, i32 }
+      %N = type { i32, i32 }
+      %O = type { %N, i32 }
       @g = external global [16 x %S]
       @scalar = external global %S
+      @outer = external global [4 x %O]
+      @g1 = external global [16 x [1 x i32]]
       define void @f(i64 %ci, i64 %j) {
       )" + Body.str() + R"(
         ret void
@@ -57,27 +66,50 @@ protected:
     )";
     SMDiagnostic Err;
     M = parseAssemblyString(Src, Err, Ctx);
-    if (!M) {
+    if (!M)
       Err.print("FieldOffsetTest", errs());
-      return nullptr;
-    }
+    return M != nullptr;
+  }
+
+  const LoadInst *firstLoad() {
     for (Instruction &I : instructions(M->getFunction("f")))
       if (auto *LI = dyn_cast<LoadInst>(&I))
-        return LI->getPointerOperand();
+        return LI;
     return nullptr;
   }
 
   std::optional<uint64_t> offsetOf(StringRef Body,
                                    const GlobalVariable **OutGV = nullptr) {
-    const Value *Ptr = ptrOfLoadIn(Body);
-    EXPECT_NE(Ptr, nullptr);
-    if (!Ptr)
+    if (!parse(Body))
+      return std::nullopt;
+    const LoadInst *LI = firstLoad();
+    EXPECT_NE(LI, nullptr);
+    if (!LI)
       return std::nullopt;
     const GlobalVariable *GV = nullptr;
-    auto Off = ejitMayConstFieldOffset(Ptr, M->getDataLayout(), GV);
+    auto Off =
+        ejitMayConstFieldOffset(LI->getPointerOperand(), M->getDataLayout(), GV);
     if (OutGV)
       *OutGV = GV;
     return Off;
+  }
+
+  /// A module with only the globals, for the layout-only helpers.
+  void parseGlobalsOnly() { ASSERT_TRUE(parse("%v = load i32, ptr @g")); }
+
+  std::optional<uint64_t> fieldSizeAt(StringRef GVName, uint64_t Off) {
+    parseGlobalsOnly();
+    const GlobalVariable *GV = M->getNamedGlobal(GVName);
+    EXPECT_NE(GV, nullptr);
+    return ejitMayConstFieldSize(GV, Off, M->getDataLayout());
+  }
+
+  bool accessFits(StringRef GVName, uint64_t Off, uint64_t AccessSize) {
+    parseGlobalsOnly();
+    const GlobalVariable *GV = M->getNamedGlobal(GVName);
+    EXPECT_NE(GV, nullptr);
+    return ejitAccessFitsMayConstField(GV, Off, AccessSize,
+                                       M->getDataLayout());
   }
 };
 
@@ -231,6 +263,56 @@ TEST_F(FieldOffsetTest, RejectsPointerNotRootedAtGlobal) {
     %v = load i32, ptr %p
   )");
   EXPECT_FALSE(Off.has_value());
+}
+
+TEST_F(FieldOffsetTest, RejectsTwoQualifyingDynamicIndices) {
+  // An array has exactly one element selector. @g1's element ([1 x i32]) and its
+  // own element (i32) are both 4 bytes, so BOTH dynamic indices pass the
+  // stride test on the root GEP. Only the first may be skipped.
+  auto Off = offsetOf(R"(
+    %p = getelementptr [1 x i32], ptr @g1, i64 %ci, i64 %j
+    %v = load i32, ptr %p
+  )");
+  EXPECT_FALSE(Off.has_value());
+}
+
+//===----------------------------------------------------------------------===//
+// Access-width containment. The metadata records a field's offset and nothing
+// else, so an offset match alone cannot bound how many bytes an access may read.
+//===----------------------------------------------------------------------===//
+
+TEST_F(FieldOffsetTest, FieldSizeIsRecoveredFromLayout) {
+  EXPECT_EQ(fieldSizeAt("g", 0), std::optional<uint64_t>(4));  // %S.0 : i32
+  EXPECT_EQ(fieldSizeAt("g", 16), std::optional<uint64_t>(4)); // %S.4 : i32
+  EXPECT_EQ(fieldSizeAt("scalar", 8), std::optional<uint64_t>(4));
+}
+
+TEST_F(FieldOffsetTest, FieldSizeDescendsIntoNestedRecord) {
+  // %O = { %N, i32 } and %N = { i32, i32 }: offset 0 names %N (8 bytes) *and*
+  // its first field (4 bytes). The innermost one bounds a may_const access, so
+  // an i64 load at offset 0 must not be treated as reading one field.
+  EXPECT_EQ(fieldSizeAt("outer", 0), std::optional<uint64_t>(4));
+  EXPECT_EQ(fieldSizeAt("outer", 4), std::optional<uint64_t>(4));
+  EXPECT_EQ(fieldSizeAt("outer", 8), std::optional<uint64_t>(4));
+}
+
+TEST_F(FieldOffsetTest, FieldSizeRejectsOffsetInsideAField) {
+  EXPECT_FALSE(fieldSizeAt("g", 2).has_value());  // mid-field
+  EXPECT_FALSE(fieldSizeAt("g", 28).has_value()); // past the element
+}
+
+TEST_F(FieldOffsetTest, AcceptsAccessNoWiderThanTheField) {
+  EXPECT_TRUE(accessFits("g", 16, 4)); // i32 load of the i32 field
+  EXPECT_TRUE(accessFits("g", 16, 1)); // narrower access stays inside
+}
+
+TEST_F(FieldOffsetTest, RejectsWideLoadOverlappingAdjacentField) {
+  // The case that matters: an 8-byte access starting at a 4-byte may_const field
+  // also covers the field beside it, which is free to change. Substituting it
+  // would freeze both.
+  EXPECT_FALSE(accessFits("g", 16, 8));
+  EXPECT_FALSE(accessFits("outer", 0, 8)); // spans %N.0 and %N.1
+  EXPECT_FALSE(accessFits("g", 16, 0));    // degenerate width
 }
 
 } // namespace
