@@ -1176,6 +1176,79 @@ TEST(EJitOptimizer, FullPipelineEndToEnd) {
   opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3);
 }
 
+/// Verify the optimization pipeline folds llvm.expect-guarded constant
+/// branches and DCEs the dead calls they guard. The AOT IR carries
+/// __builtin_expect / LIKELY hints on top of may_const conditions; once
+/// specialization turns the condition into a constant, the expect intrinsic
+/// blocks InstCombine/SCCP from folding the branch unless LowerExpectIntrinsic
+/// runs first. Without it the dead block (and its calls) survive ADCE and the
+/// specialization does the same work as AOT plus JIT overhead.
+TEST(EJitOptimizer, FoldsExpectGuardedConstantBranch) {
+  LLVMContext Ctx;
+  auto M = std::make_unique<Module>("expect_fold", Ctx);
+  M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  IRBuilder<> B(Ctx);
+  Type *I32Ty = B.getInt32Ty();
+  Type *I64Ty = B.getInt64Ty();
+
+  FunctionCallee ExpectFn = M->getOrInsertFunction(
+      "llvm.expect.i64", FunctionType::get(I64Ty, {I64Ty, I64Ty}, false));
+  FunctionCallee HeavyFn = M->getOrInsertFunction(
+      "heavy_dead_call", FunctionType::get(B.getVoidTy(), {}, false));
+
+  FunctionType *FT = FunctionType::get(I32Ty, {}, false);
+  auto *F = Function::Create(FT, GlobalValue::ExternalLinkage, "test_expect", M.get());
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  BasicBlock *Taken = BasicBlock::Create(Ctx, "taken", F);
+  BasicBlock *Dead = BasicBlock::Create(Ctx, "dead", F);
+
+  // entry: %e = expect(0, 0); %c = icmp eq %e, 0; br %c, taken, dead
+  B.SetInsertPoint(Entry);
+  auto *E = B.CreateCall(ExpectFn, {B.getInt64(0), B.getInt64(0)}, "e");
+  auto *C = B.CreateICmpEQ(E, B.getInt64(0), "c");
+  B.CreateCondBr(C, Taken, Dead);
+
+  // taken: ret 0
+  B.SetInsertPoint(Taken);
+  B.CreateRet(B.getInt32(0));
+
+  // dead: call heavy(); ret 1   -- must be eliminated once the branch folds
+  B.SetInsertPoint(Dead);
+  B.CreateCall(HeavyFn, {});
+  B.CreateRet(B.getInt32(1));
+
+  PeriodArrayRegistry reg;
+  EJitOptimizerTestAccess opt(reg);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3);
+
+  // No llvm.expect should remain.
+  bool hasExpect = false;
+  bool hasHeavyCall = false;
+  unsigned retCount = 0;
+  for (BasicBlock &BB : *F)
+    for (Instruction &I : BB) {
+      if (auto *CI = dyn_cast<CallInst>(&I)) {
+        if (CI->getCalledFunction() &&
+            CI->getCalledFunction()->getName() == "llvm.expect.i64")
+          hasExpect = true;
+        if (CI->getCalledFunction() &&
+            CI->getCalledFunction()->getName() == "heavy_dead_call")
+          hasHeavyCall = true;
+      }
+      if (isa<ReturnInst>(&I))
+        ++retCount;
+    }
+  EXPECT_FALSE(hasExpect) << "llvm.expect was not lowered";
+  EXPECT_FALSE(hasHeavyCall) << "dead call in folded block was not DCE'd";
+  EXPECT_EQ(retCount, 1u);
+  // The single ret must be ret 0 (taken path), not ret 1 (dead path).
+  auto *Ret = dyn_cast<ReturnInst>(&F->back().back());
+  ASSERT_NE(Ret, nullptr);
+  auto *RetVal = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(RetVal, nullptr);
+  EXPECT_EQ(RetVal->getZExtValue(), 0u);
+}
+
 //===----------------------------------------------------------------------===//
 // EJitStructFieldPass tests
 //===----------------------------------------------------------------------===//
