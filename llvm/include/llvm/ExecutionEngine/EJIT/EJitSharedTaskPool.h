@@ -413,6 +413,19 @@ private:
   /// never-free safety precondition.
   SharedLookup cacheLookupSeq(uint32_t funcIndex, const EJitDimPair *dims,
                               uint32_t numDims);
+  /// Fixed-dimension load-only seqlock specializations (0-2 dims). Same
+  /// never-free seqlock discipline as cacheLookupSeq() but with the identity
+  /// hashing, slot identity comparison, and version comparison unrolled exactly
+  /// like cacheLookup0D/1D/2D — so a NO_RECLAIM fixed-dimension caller reaches
+  /// the shared slot resolution without the generic numDims loop, the
+  /// slotIdentityMatches() call, or variable-length dims[] handling. Behavior
+  /// is identical to cacheLookupSeq() with the matching numDims. 3D/4D keep
+  /// using the generic cacheLookupSeq() (rare on the hot path).
+  SharedLookup cacheLookupSeq0D(uint32_t funcIndex);
+  SharedLookup cacheLookupSeq1D(uint32_t funcIndex, uint32_t dim0,
+                                uint32_t inst0);
+  SharedLookup cacheLookupSeq2D(uint32_t funcIndex, uint32_t dim0,
+                                uint32_t inst0, uint32_t dim1, uint32_t inst1);
 #endif
   /// Fixed-dimension specializations of cacheLookup() (0-4 dims). Identity
   /// hashing, slot identity comparison, and version comparison are all unrolled
