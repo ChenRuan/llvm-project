@@ -2259,6 +2259,167 @@ TEST_F(SharedTaskPoolTest, HitTokenDisciplineAndVersionInvalidation) {
 }
 
 //===----------------------------------------------------------------------===//
+// Slot-depth diagnostics: 0D identities whose funcIndex is a multiple of
+// kEJitSharedCacheBuckets all hash to bucket 0 and fill its slots 0,1,2,... in
+// publish order (cachePublish uses first-empty). This deterministically places
+// a target at a chosen linear-scan depth, exercising the per-slot scan (and the
+// identityHash-first fast-reject reorder) and proving the deepest slot is still
+// found and correctly identified.
+//===----------------------------------------------------------------------===//
+namespace {
+// Return the linear slot index at which \p funcIndex is Ready in its bucket, or
+// -1 if not found. Pure diagnostic scan (no lock needed in the single-thread
+// test).
+int slotDepthOf(EJitSharedTaskPoolState *st, uint32_t funcIndex,
+                uint32_t numDims) {
+  uint32_t bucket = funcIndex % kEJitSharedCacheBuckets; // 0D key == funcIndex
+  auto &B = st->buckets[bucket];
+  for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+    auto &Slot = B.slots[s];
+    if (Slot.state.loadAcquire() ==
+            static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
+        Slot.funcIndex == funcIndex && Slot.numDims == numDims)
+      return static_cast<int>(s);
+  }
+  return -1;
+}
+} // namespace
+
+TEST_F(SharedTaskPoolTest, SlotDepthHitsAtEveryDepth) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  const uint32_t kB = kEJitSharedCacheBuckets;
+
+  // Fill bucket 0 slots 0..15 with distinct 0D colliders.
+  for (uint32_t d = 0; d < kEJitSharedCacheSlots; ++d) {
+    uint32_t fi = d * kB;
+    ASSERT_EQ(owner.compileOrGet(fi, nullptr, 0, codeFor(fi)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(owner.pollOne());
+    EXPECT_EQ(slotDepthOf(state_.get(), fi, 0), static_cast<int>(d));
+  }
+
+  // Every colliding identity — including the deepest slot 15 — must still be a
+  // correct cache hit with its own specialization pointer.
+  for (uint32_t d = 0; d < kEJitSharedCacheSlots; ++d) {
+    uint32_t fi = d * kB;
+    auto hit = owner.tryCacheHit0D(fi);
+    ASSERT_TRUE(hit.fastPathTerminal) << "depth " << d;
+    EXPECT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit) << "depth " << d;
+    EXPECT_EQ(hit.fnPtr, codeFor(fi)) << "depth " << d;
+    if (hit.hasReadToken)
+      owner.releaseRead(hit.bucketIndex);
+  }
+
+  // An unpublished colliding key in the same (now full) bucket is a clean miss.
+  auto miss = owner.tryCacheHit0D(kEJitSharedCacheSlots * kB);
+  EXPECT_NE(miss.status, EJitCompileOrGetStatus::CacheHit);
+  if (miss.hasReadToken)
+    owner.releaseRead(miss.bucketIndex);
+}
+
+// The identityHash-first reorder must never alias two identities that share a
+// bucket: a wrong-funcIndex query with the same bucket must miss even when a
+// different identity is Ready there.
+TEST_F(SharedTaskPoolTest, SlotDepthNoIdentityAliasAcrossBucket) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  const uint32_t kB = kEJitSharedCacheBuckets;
+  // Publish only funcIndex 5*kB at slot 0 of bucket 0.
+  uint32_t present = 5 * kB;
+  ASSERT_EQ(owner.compileOrGet(present, nullptr, 0, codeFor(present)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  // A different colliding funcIndex (same bucket, different identity) misses.
+  auto miss = owner.tryCacheHit0D(9 * kB);
+  EXPECT_NE(miss.status, EJitCompileOrGetStatus::CacheHit);
+  if (miss.hasReadToken)
+    owner.releaseRead(miss.bucketIndex);
+  // The present one still hits with the right pointer.
+  auto hit = owner.tryCacheHit0D(present);
+  EXPECT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(hit.fnPtr, codeFor(present));
+  if (hit.hasReadToken)
+    owner.releaseRead(hit.bucketIndex);
+}
+
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+//===----------------------------------------------------------------------===//
+// NO_RECLAIM fixed-dimension seqlock specializations (cacheLookupSeq0D/1D/2D):
+// the unrolled seqlock lookups reached by tryCacheHit0D/1D/2D must return the
+// SAME result as the generic seqlock path (cacheLookupSeq via tryCacheHit), for
+// hits, deep-slot hits, misses, disabled instances, and version invalidation.
+//===----------------------------------------------------------------------===//
+TEST_F(SharedTaskPoolTest, SeqFixedDimMatchesGeneric0D1D2D) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(1, 2, true);
+  owner.setInstanceEnabled(3, 4, true);
+
+  // Publish a 0D, a 1D and a 2D specialization.
+  ASSERT_EQ(owner.compileOrGet(21, nullptr, 0, codeFor(21)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  EJitDimPair d1[1] = {dim(1, 2)};
+  ASSERT_EQ(owner.compileOrGet(22, d1, 1, codeFor(22)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  EJitDimPair d2[2] = {dim(1, 2), dim(3, 4)};
+  ASSERT_EQ(owner.compileOrGet(23, d2, 2, codeFor(23)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  // Fixed-dim seqlock entry vs generic seqlock entry: identical outcomes.
+  auto fixed0 = owner.tryCacheHit0D(21);
+  auto gen0 = owner.tryCacheHit(21, nullptr, 0);
+  EXPECT_EQ(fixed0.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(fixed0.status, gen0.status);
+  EXPECT_EQ(fixed0.fnPtr, gen0.fnPtr);
+  EXPECT_EQ(fixed0.fnPtr, codeFor(21));
+
+  auto fixed1 = owner.tryCacheHit1D(22, 1, 2);
+  auto gen1 = owner.tryCacheHit(22, d1, 1);
+  EXPECT_EQ(fixed1.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(fixed1.status, gen1.status);
+  EXPECT_EQ(fixed1.fnPtr, gen1.fnPtr);
+  EXPECT_EQ(fixed1.fnPtr, codeFor(22));
+
+  auto fixed2 = owner.tryCacheHit2D(23, 1, 2, 3, 4);
+  auto gen2 = owner.tryCacheHit(23, d2, 2);
+  EXPECT_EQ(fixed2.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(fixed2.status, gen2.status);
+  EXPECT_EQ(fixed2.fnPtr, gen2.fnPtr);
+  EXPECT_EQ(fixed2.fnPtr, codeFor(23));
+
+  // A miss and a wrong-dim query must also agree (both miss).
+  EXPECT_NE(owner.tryCacheHit0D(99).status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_NE(owner.tryCacheHit1D(22, 1, 3).status,
+            EJitCompileOrGetStatus::CacheHit); // wrong instanceId
+}
+
+// Version bump after a seqlock fixed-dim publish must invalidate the old slot.
+TEST_F(SharedTaskPoolTest, SeqFixedDimVersionBumpMisses) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(2, 7, true);
+  EJitDimPair d1[1] = {dim(2, 7)};
+  ASSERT_EQ(owner.compileOrGet(31, d1, 1, codeFor(31)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_EQ(owner.tryCacheHit1D(31, 2, 7).status,
+            EJitCompileOrGetStatus::CacheHit);
+  // Deactivate (bumps version): stale slot must not be served.
+  owner.setInstanceEnabled(2, 7, false);
+  EXPECT_NE(owner.tryCacheHit1D(31, 2, 7).status,
+            EJitCompileOrGetStatus::CacheHit);
+}
+#endif // EJIT_SRE_TASKPOOL_NO_RECLAIM
+
+//===----------------------------------------------------------------------===//
 // Phase-1 hot-hit micro-benchmark (DISABLED by default; run explicitly with
 //   --gtest_also_run_disabled_tests --gtest_filter='*HotHitMicroBench*'
 // on an aarch64 host). Measures the per-hit cost of the shared taskpool hit
