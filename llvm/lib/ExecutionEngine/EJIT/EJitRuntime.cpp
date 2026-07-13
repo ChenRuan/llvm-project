@@ -31,7 +31,7 @@ extern "C" uint64_t SRE_CycleCountGet64(void);
 #endif
 
 #ifndef EJIT_WRAPPER_TIMING_REPORT_EVERY
-#define EJIT_WRAPPER_TIMING_REPORT_EVERY 1024u
+#define EJIT_WRAPPER_TIMING_REPORT_EVERY 10000u
 #endif
 
 namespace {
@@ -56,30 +56,13 @@ struct WrapperTimingSlot {
   uint32_t BucketIndex = 0;
   uint64_t Count = 0;
   uint64_t GetFnSum = 0;
-  uint64_t GetFnMin = 0;
-  uint64_t GetFnMax = 0;
   uint64_t FnCallSum = 0;
-  uint64_t FnCallMin = 0;
-  uint64_t FnCallMax = 0;
   uint64_t ReleaseSum = 0;
-  uint64_t ReleaseMin = 0;
-  uint64_t ReleaseMax = 0;
   uint64_t TotalSum = 0;
-  uint64_t TotalMin = 0;
-  uint64_t TotalMax = 0;
 };
 
 static TimingSpinLock gWrapperTimingLock;
 static WrapperTimingSlot gWrapperTimingSlots[32];
-
-static void updateTimingRange(uint64_t V, uint64_t &Sum, uint64_t &Min,
-                              uint64_t &Max, bool First) {
-  Sum += V;
-  if (First || V < Min)
-    Min = V;
-  if (First || V > Max)
-    Max = V;
-}
 
 static void resetTimingSlot(WrapperTimingSlot &S, uint32_t FuncIndex,
                             uint32_t Status, void *FnPtr,
@@ -90,34 +73,25 @@ static void resetTimingSlot(WrapperTimingSlot &S, uint32_t FuncIndex,
   S.FnPtr = FnPtr;
   S.BucketIndex = BucketIndex;
   S.Count = 0;
-  S.GetFnSum = S.GetFnMin = S.GetFnMax = 0;
-  S.FnCallSum = S.FnCallMin = S.FnCallMax = 0;
-  S.ReleaseSum = S.ReleaseMin = S.ReleaseMax = 0;
-  S.TotalSum = S.TotalMin = S.TotalMax = 0;
+  S.GetFnSum = 0;
+  S.FnCallSum = 0;
+  S.ReleaseSum = 0;
+  S.TotalSum = 0;
 }
 
-static void reportTimingSlot(const WrapperTimingSlot &S) {
+// [[maybe_unused]]: only called from the EVERY>0 periodic branch; an EVERY=0
+// build (suppress periodic output) would otherwise flag this as unused.
+[[maybe_unused]] static void reportTimingSlot(const WrapperTimingSlot &S) {
   if (S.Count == 0)
     return;
   EJIT_DIAG("wrapper_timing_agg func=%u status=%u fn=%p bucket=%u count=%llu "
-            "get_fn_avg=%llu min=%llu max=%llu "
-            "fn_call_avg=%llu min=%llu max=%llu "
-            "release_avg=%llu min=%llu max=%llu "
-            "total_avg=%llu min=%llu max=%llu",
+            "get_fn_avg=%llu fn_call_avg=%llu release_avg=%llu total_avg=%llu",
             S.FuncIndex, S.Status, S.FnPtr, S.BucketIndex,
             static_cast<unsigned long long>(S.Count),
             static_cast<unsigned long long>(S.GetFnSum / S.Count),
-            static_cast<unsigned long long>(S.GetFnMin),
-            static_cast<unsigned long long>(S.GetFnMax),
             static_cast<unsigned long long>(S.FnCallSum / S.Count),
-            static_cast<unsigned long long>(S.FnCallMin),
-            static_cast<unsigned long long>(S.FnCallMax),
             static_cast<unsigned long long>(S.ReleaseSum / S.Count),
-            static_cast<unsigned long long>(S.ReleaseMin),
-            static_cast<unsigned long long>(S.ReleaseMax),
-            static_cast<unsigned long long>(S.TotalSum / S.Count),
-            static_cast<unsigned long long>(S.TotalMin),
-            static_cast<unsigned long long>(S.TotalMax));
+            static_cast<unsigned long long>(S.TotalSum / S.Count));
 }
 } // namespace
 
@@ -886,27 +860,40 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
   unsigned SlotIdx = funcIndex % (sizeof(gWrapperTimingSlots) /
                                   sizeof(gWrapperTimingSlots[0]));
   WrapperTimingSlot &S = gWrapperTimingSlots[SlotIdx];
-  if (!S.Valid || S.FuncIndex != funcIndex || S.Status != status ||
-      S.FnPtr != fnPtr || S.BucketIndex != bucketIndex) {
-    reportTimingSlot(S);
+  // Aggregate by (funcIndex, status) only - fnPtr/bucket are deliberately NOT
+  // part of the key. With EJIT_SRE_SHARED_CODE_POINTERS off the same function
+  // returns a different fnPtr per core, and recompilation changes fnPtr too;
+  // keying on it displaced the slot on nearly every hit, so reportTimingSlot
+  // fired on every churn and flooded the log regardless of
+  // EJIT_WRAPPER_TIMING_REPORT_EVERY (which only gates the periodic print
+  // below). On a real function change we now reset SILENTLY: the displaced
+  // window is always a partial (< EVERY) one, and printing it on every churn
+  // was the flood source. Stable functions still report via the EVERY periodic
+  // print; colliding functions (>32, funcIndex % 32) just reset silently.
+  if (!S.Valid || S.FuncIndex != funcIndex || S.Status != status) {
     resetTimingSlot(S, funcIndex, status, fnPtr, bucketIndex);
+  } else {
+    // Same function: refresh the informational fnPtr/bucket to the latest hit
+    // so the report's fn=/bucket= reflect the current specialization/core
+    // rather than a stale first-seen value.
+    S.FnPtr = fnPtr;
+    S.BucketIndex = bucketIndex;
   }
 
-  bool First = S.Count == 0;
   ++S.Count;
-  updateTimingRange(getFn, S.GetFnSum, S.GetFnMin, S.GetFnMax, First);
-  updateTimingRange(fnCall, S.FnCallSum, S.FnCallMin, S.FnCallMax, First);
-  updateTimingRange(release, S.ReleaseSum, S.ReleaseMin, S.ReleaseMax, First);
-  updateTimingRange(total, S.TotalSum, S.TotalMin, S.TotalMax, First);
+  S.GetFnSum += getFn;
+  S.FnCallSum += fnCall;
+  S.ReleaseSum += release;
+  S.TotalSum += total;
 
 #if EJIT_WRAPPER_TIMING_REPORT_EVERY > 0
   if ((S.Count % EJIT_WRAPPER_TIMING_REPORT_EVERY) == 0) {
     reportTimingSlot(S);
     S.Count = 0;
-    S.GetFnSum = S.GetFnMin = S.GetFnMax = 0;
-    S.FnCallSum = S.FnCallMin = S.FnCallMax = 0;
-    S.ReleaseSum = S.ReleaseMin = S.ReleaseMax = 0;
-    S.TotalSum = S.TotalMin = S.TotalMax = 0;
+    S.GetFnSum = 0;
+    S.FnCallSum = 0;
+    S.ReleaseSum = 0;
+    S.TotalSum = 0;
   }
 #else
   (void)tAfterRelease;

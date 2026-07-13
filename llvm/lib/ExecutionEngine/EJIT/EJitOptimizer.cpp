@@ -13,6 +13,7 @@
 // #include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
+#include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
 #include "llvm/Transforms/Scalar/SCCP.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Scalar/IndVarSimplify.h"
@@ -50,6 +51,15 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
   //   (SimplifyCFG). Folding a branch merges blocks and exposes fresh constants
   //   and dead code, so a second InstCombine + SimplifyCFG round catches that
   //   cascade; ADCE then removes whatever became dead.
+  //   LowerExpectIntrinsic must run FIRST: the AOT IR carries llvm.expect
+  //   guards (__builtin_expect / LIKELY) on top of may_const conditions. Once
+  //   StructFieldPass (phase 1c) turns those conditions into constants, the
+  //   expect intrinsic is the only thing preventing InstCombine/SCCP from
+  //   folding the branch - without lowering it the constant branches stay,
+  //   their dead blocks/calls survive ADCE, and the specialization does the
+  //   same work as AOT (plus JIT overhead), i.e. a slowdown. Lowering
+  //   expect(x,y) -> x lets the rest of the pipeline fold and DCE.
+  mainFPM_.addPass(LowerExpectIntrinsicPass());
   mainFPM_.addPass(InstCombinePass());
   mainFPM_.addPass(SCCPPass());
   mainFPM_.addPass(SimplifyCFGPass());
