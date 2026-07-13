@@ -306,6 +306,32 @@ TEST_F(FieldOffsetTest, AcceptsAccessNoWiderThanTheField) {
   EXPECT_TRUE(accessFits("g", 16, 1)); // narrower access stays inside
 }
 
+//===----------------------------------------------------------------------===//
+// Volatile / atomic. The offset list records a may_const field regardless of
+// volatility, so an offset match must not resurrect a marker the frontend
+// deliberately withheld. ejitMayConstFieldOffset is a pure pointer computation
+// and stays width- and volatility-agnostic; the callers own that rejection, and
+// these pin the pointer arithmetic they rely on.
+//===----------------------------------------------------------------------===//
+
+TEST_F(FieldOffsetTest, OffsetIsComputedForVolatileAndAtomicLoadsToo) {
+  // The helper still resolves the field; it is reAnnotateMayConst and
+  // isMayConstLoad that must refuse to act on the result.
+  auto VolOff = offsetOf(R"(
+    %p = getelementptr [16 x %S], ptr @g, i64 0, i64 %ci, i32 4
+    %v = load volatile i32, ptr %p
+  )");
+  ASSERT_TRUE(VolOff.has_value());
+  EXPECT_EQ(*VolOff, kField4Offset);
+
+  auto AtomOff = offsetOf(R"(
+    %p = getelementptr [16 x %S], ptr @g, i64 0, i64 %ci, i32 4
+    %v = load atomic i32, ptr %p monotonic, align 4
+  )");
+  ASSERT_TRUE(AtomOff.has_value());
+  EXPECT_EQ(*AtomOff, kField4Offset);
+}
+
 TEST_F(FieldOffsetTest, RejectsWideLoadOverlappingAdjacentField) {
   // The case that matters: an 8-byte access starting at a 4-byte may_const field
   // also covers the field beside it, which is free to change. Substituting it

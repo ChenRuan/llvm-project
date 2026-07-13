@@ -164,6 +164,14 @@ static void reAnnotateMayConst(Module &M) {
         auto *LI = dyn_cast<LoadInst>(&I);
         if (!LI || LI->hasMetadata(MayConstKind))
           continue;
+        // A volatile or atomic access must be performed exactly as written, so
+        // it can never be folded to a constant. Clang already withholds the
+        // per-load marker from a volatile may_const field (CGExpr.cpp), but
+        // collectMayConstFieldOffsets still records that field's GV-level
+        // offset, so matching on offset alone would hand the marker back and
+        // let PASS6 substitute the load. Honour the frontend's exclusion.
+        if (LI->isVolatile() || LI->isAtomic())
+          continue;
         // The recorded offsets are relative to the array ELEMENT, so compare
         // against the field coordinate, not the total offset from the global.
         // Using the total offset only ever matched element 0, and bailing on a

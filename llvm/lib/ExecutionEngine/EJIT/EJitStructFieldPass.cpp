@@ -138,6 +138,16 @@ accumulateFullOffset(const DataLayout &DL, const Value *PtrOp) {
 static bool
 isMayConstLoad(LoadInst *LI, const MayConstOffsetMap &mayConstFieldMap,
                const DataLayout &DL) {
+  // A volatile or atomic access must happen exactly as written and can never be
+  // replaced by a constant. Checked ahead of the metadata, not just ahead of the
+  // offset fallback: an optimization that copies !ejit.may_const onto a volatile
+  // or atomic load would otherwise defeat the frontend's exclusion (clang
+  // withholds the marker from volatile may_const fields, see CGExpr.cpp). Both
+  // producer and consumer reject these, so the invariant survives an unexpected
+  // metadata propagation.
+  if (LI->isVolatile() || LI->isAtomic())
+    return false;
+
   if (LI->hasMetadata(MD_EJIT_MAY_CONST))
     return true;
 
