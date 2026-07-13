@@ -164,20 +164,11 @@ static void reAnnotateMayConst(Module &M) {
         auto *LI = dyn_cast<LoadInst>(&I);
         if (!LI || LI->hasMetadata(MayConstKind))
           continue;
-        // A volatile or atomic access must be performed exactly as written, so
-        // it can never be folded to a constant. Clang already withholds the
-        // per-load marker from a volatile may_const field (CGExpr.cpp), but
-        // collectMayConstFieldOffsets still records that field's GV-level
-        // offset, so matching on offset alone would hand the marker back and
-        // let PASS6 substitute the load. Honour the frontend's exclusion.
+        // Never folded, so never re-annotated.
         if (LI->isVolatile() || LI->isAtomic())
           continue;
-        // The recorded offsets are relative to the array ELEMENT, so compare
-        // against the field coordinate, not the total offset from the global.
-        // Using the total offset only ever matched element 0, and bailing on a
-        // variable array index meant `g_cfg[ci].field` was never re-annotated at
-        // all — so any load whose marker an earlier pass dropped stayed
-        // unspecialized for every index but 0.
+        // The recorded offsets are element-relative, so match on the field
+        // coordinate rather than the total offset from the global.
         const GlobalVariable *GV = nullptr;
         auto Off = ejitMayConstFieldOffset(LI->getPointerOperand(), DL, GV);
         if (!Off || !GV)
@@ -187,11 +178,8 @@ static void reAnnotateMayConst(Module &M) {
           continue;
         if (!is_contained(it->second, *Off))
           continue;
-        // An offset match only says the load *starts* at a may_const field. A
-        // widened load (e.g. an i64 formed from a memcpy spanning a may_const
-        // i32 and the mutable i32 beside it) would otherwise be annotated
-        // whole, letting PASS6 freeze the adjacent field as part of the same
-        // constant.
+        // The offset only says where the load starts. A wider load straddles the
+        // next field, which is free to change.
         TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
         if (AccessSize.isScalable() ||
             !ejitAccessFitsMayConstField(GV, *Off, AccessSize.getFixedValue(),

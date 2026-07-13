@@ -138,35 +138,24 @@ accumulateFullOffset(const DataLayout &DL, const Value *PtrOp) {
 static bool
 isMayConstLoad(LoadInst *LI, const MayConstOffsetMap &mayConstFieldMap,
                const DataLayout &DL) {
-  // A volatile or atomic access must happen exactly as written and can never be
-  // replaced by a constant. Checked ahead of the metadata, not just ahead of the
-  // offset fallback: an optimization that copies !ejit.may_const onto a volatile
-  // or atomic load would otherwise defeat the frontend's exclusion (clang
-  // withholds the marker from volatile may_const fields, see CGExpr.cpp). Both
-  // producer and consumer reject these, so the invariant survives an unexpected
-  // metadata propagation.
+  // Never substituted. Checked ahead of the metadata, not just ahead of the
+  // fallback, so that a pass which copies !ejit.may_const onto a volatile or
+  // atomic load cannot defeat the frontend's exclusion.
   if (LI->isVolatile() || LI->isAtomic())
     return false;
 
   if (LI->hasMetadata(MD_EJIT_MAY_CONST))
     return true;
 
-  // v1.7 fallback: check GV-level may_const field offsets. Those offsets are
-  // relative to the array ELEMENT, so the load's field coordinate — not its
-  // total offset from the global — is what must match. Comparing the total
-  // offset silently restricted this fallback to element 0: `g_cfg[3].bandWidth`
-  // is at byte 100, which is in no field-offset list, so any load whose
-  // !ejit.may_const an earlier pass had dropped went unspecialized for every
-  // index but 0.
+  // v1.7 fallback for loads whose marker an earlier pass dropped. The recorded
+  // offsets are element-relative, so match on the field coordinate rather than
+  // the total offset from the global, and require the access to fit inside the
+  // field it starts at.
   const GlobalVariable *RootGV = nullptr;
   auto Off = ejitMayConstFieldOffset(LI->getPointerOperand(), DL, RootGV);
   if (Off && RootGV) {
     auto It = mayConstFieldMap.find(RootGV);
     if (It != mayConstFieldMap.end() && is_contained(It->second, *Off)) {
-      // Matching the field's start offset does not bound the access width: the
-      // metadata records offsets only. A load wider than the field it begins at
-      // straddles the next one, and substituting it would freeze bytes that are
-      // free to change.
       TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
       if (!AccessSize.isScalable() &&
           ejitAccessFitsMayConstField(RootGV, *Off, AccessSize.getFixedValue(),

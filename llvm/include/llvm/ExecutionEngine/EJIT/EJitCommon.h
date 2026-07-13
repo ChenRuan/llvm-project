@@ -161,25 +161,16 @@ inline uint32_t getMDIntValue(const MDNode *Node, StringRef Tag) {
 ///   getelementptr %S,        @g, %ci             decayed array-to-pointer
 ///   getelementptr i8,        @g, 100             post-InstCombine byte offset
 ///
-/// Struct indices contribute their field offset. Constant sequential indices
-/// contribute their stride. Exactly ONE dynamic sequential index may be skipped:
-/// the one selecting an element of the root period array. Its contribution is a
-/// whole number of elements, which the closing `% ElemSize` erases, so skipping
-/// it is equivalent to including it. That is what lets `g_cfg[ci].field` resolve
+/// Struct indices contribute their field offset, constant sequential indices
+/// their stride. Exactly ONE dynamic sequential index may be skipped: the one
+/// selecting an element of the root period array. Its contribution is a whole
+/// number of elements, which the closing `% ElemSize` erases, so skipping it is
+/// equivalent to including it -- and that is what lets `g_cfg[ci].field` resolve
 /// at AOT time, before the JIT replaces `ci` with a constant.
 ///
-/// Every other dynamic sequential index is rejected. Typed pointer arithmetic
-/// can wear the same shape while walking *within* an element, e.g.
-///
-///   %e = getelementptr [16 x %S], @g, 0, %ci   ; element selector
-///   %p = getelementptr i32,       %e,  %j      ; ((int *)&g[ci])[j]
-///
-/// Skipping `%j` would resolve the access to offset 0 and wrongly attribute it
-/// to the field living there. The load would then be annotated may_const even
-/// though the frontend never marked it, and once `%j` specialized to a constant
-/// the JIT would fold a field that is free to change. Because the root global is
-/// only known after the whole chain is walked, the path is collected first and
-/// each dynamic index validated against the root array's stride afterwards.
+/// Any other dynamic index is rejected: typed pointer arithmetic wears the same
+/// shape while walking *within* an element, e.g. `((int *)&g[ci])[j]`, where
+/// skipping `%j` would misattribute the access to the field at offset 0.
 ///
 /// Returns nullopt when the access cannot be attributed to a fixed field.
 inline std::optional<uint64_t>
@@ -187,9 +178,9 @@ ejitMayConstFieldOffset(const Value *Ptr, const DataLayout &DL,
                         const GlobalVariable *&RootGV) {
   RootGV = nullptr;
 
-  // Phase 1: walk to the root global, remembering the path. No index can be
-  // judged before the root is known, because "is this the element selector?"
-  // is a question about the root array's element stride.
+  // Phase 1: walk to the root global, remembering the path. An index cannot be
+  // judged before the root is known: "is this the element selector?" is a
+  // question about the root array's stride.
   SmallVector<const GEPOperator *, 4> Path;
   const Value *V = Ptr;
   while (V) {
@@ -272,17 +263,12 @@ ejitMayConstFieldOffset(const Value *Ptr, const DataLayout &DL,
 /// Size in bytes of the may_const field beginning at \p Off inside the period
 /// element of \p RootGV, or nullopt when \p Off is not the start of a field.
 ///
-/// The `ejit_may_const_field` metadata records a field's *offset* and nothing
-/// else, so an offset match alone does not bound how many bytes of the element
-/// an access may legitimately read. Recovering the size from the aggregate
-/// layout supplies that bound.
-///
-/// A nested aggregate shares its offset with its own first field, so the descent
-/// continues to the innermost field starting at \p Off and reports that field's
-/// size. This is the conservative choice: it is the largest access guaranteed to
-/// stay inside a single may_const field. An access wider than the innermost field
-/// (say an i64 load formed from a memcpy over a may_const i32 and the mutable i32
-/// beside it) is therefore rejected, which is the point.
+/// The `ejit_may_const_field` metadata records offsets and nothing else, so it
+/// cannot bound how many bytes an access may read; the aggregate layout supplies
+/// that bound. A nested aggregate shares its offset with its own first field, so
+/// the descent continues to the innermost field starting at \p Off. That is the
+/// conservative choice, and it is what rejects a widened load (say an i64 formed
+/// from a memcpy over a may_const i32 and the mutable i32 beside it).
 inline std::optional<uint64_t>
 ejitMayConstFieldSize(const GlobalVariable *RootGV, uint64_t Off,
                       const DataLayout &DL) {

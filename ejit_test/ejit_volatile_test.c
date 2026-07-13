@@ -28,6 +28,15 @@ struct Cfg {
 #define N 8
 ejit_period_arr(cell) struct Cfg g_cfg[N];
 
+/* Union members alias, so a may_const member shares its offset with a mutable
+   sibling. Folding a load of the mutable member would be a miscompile. */
+union Sel {
+  ejit_may_const uint32_t konst;
+  uint32_t mut;
+};
+struct UCfg { union Sel u; };
+ejit_period_arr(ucell) struct UCfg g_ucfg[N];
+
 ejit_entry
 uint32_t read_vol(ejit_period_arr_ind(cell) uint8_t ci) {
   return g_cfg[ci].vol + g_cfg[ci].norm;
@@ -36,6 +45,11 @@ uint32_t read_vol(ejit_period_arr_ind(cell) uint8_t ci) {
 ejit_entry
 uint32_t read_atomic(ejit_period_arr_ind(cell) uint8_t ci) {
   return __atomic_load_n(&g_cfg[ci].atom, __ATOMIC_RELAXED) + g_cfg[ci].norm;
+}
+
+ejit_entry
+uint32_t read_union_mut(ejit_period_arr_ind(ucell) uint8_t ci) {
+  return g_ucfg[ci].u.mut; /* the MUTABLE member: must NOT be folded */
 }
 
 static int failures = 0;
@@ -86,6 +100,19 @@ int main(int argc, char **argv) {
   CHECK(read_atomic(ci) == 160,
         "atomic field is re-read after it changes (want 160, got %u)",
         read_atomic(ci));
+
+  /* Union: the may_const member aliases the mutable one, so an offset match
+     cannot tell them apart. The mutable member must still be re-read. */
+  g_ucfg[ci].u.mut = 7;
+  ejit_activate("ucell", ci);
+  (void)read_union_mut(ci);
+  ejit_drain_taskpool();
+  CHECK(read_union_mut(ci) == 7, "union: JIT-served read of mutable member = 7");
+  g_ucfg[ci].u.mut = 9;
+  CHECK(read_union_mut(ci) == 9,
+        "union: mutable member aliasing a may_const member is re-read "
+        "(want 9, got %u)",
+        read_union_mut(ci));
 
   ejit_shutdown();
 
