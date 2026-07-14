@@ -68,14 +68,23 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
 static void collectMayConstFieldOffsets(ASTContext &Ctx, const RecordDecl *RD,
                                         uint64_t BaseOffset,
                                         SmallVectorImpl<uint64_t> &Offsets) {
+  // Union members all share an offset, so an offset cannot identify one member:
+  // recording a may_const member would also match a load of a mutable sibling.
+  // The per-load !ejit.may_const marker stays, so a genuine may_const union
+  // member is still specialized; only the offset-based fallback is withheld.
+  if (RD->isUnion())
+    return;
+
   const ASTRecordLayout &Layout = Ctx.getASTRecordLayout(RD);
   for (const FieldDecl *FD : RD->fields()) {
     if (FD->isBitField())
       continue;
     uint64_t FieldOff = BaseOffset + Layout.getFieldOffset(FD->getFieldIndex()) / 8;
-    if (FD->hasAttr<EjitMayConstAttr>())
+    // A volatile field is read exactly as written and can never be folded, so
+    // clang withholds its per-load marker (see EmitLValueForField). Recording
+    // its offset would let the fallback hand that marker back.
+    if (FD->hasAttr<EjitMayConstAttr>() && !FD->getType().isVolatileQualified())
       Offsets.push_back(FieldOff);
-    // Recurse into nested structs
     if (const auto *InnerRD = FD->getType()->getAsRecordDecl())
       collectMayConstFieldOffsets(Ctx, InnerRD, FieldOff, Offsets);
   }
