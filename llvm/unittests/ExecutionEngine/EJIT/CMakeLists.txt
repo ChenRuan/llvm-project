@@ -148,3 +148,52 @@ if(EJIT_BUILD_CACHE_QUERY_BENCH)
       EJIT_SRE_SHARED_CODE_POINTERS)
   endif()
 endif()
+
+# EJIT post-compile hot-path benchmark: measures the full "wrapper cache hit"
+# path the business sees (AOT ~9us vs JIT wrapper ~15us) across three strictly
+# separated tiers — internal cache-query, the real same-ABI C shell, and the
+# wrapper end-to-end with a real indirect call. It has its own main() (NOT a
+# gtest), links only the shared-taskpool sources + platform + the faithful
+# C-ABI/wrapper TU, and prints a machine-readable table so `perf stat` can
+# attribute instructions/cycles per hit. Only LLVMSupport is linked (unused by
+# the bench itself; kept for symmetry with the sibling benches).
+option(EJIT_TEST_STATS
+  "Build EJITHotPathBench with EJIT_STATS_ENABLE (measure counter cost)" OFF)
+if(NOT WIN32)
+  # Link only LLVMSupport (the sibling taskpool tests do the same): the bench
+  # compiles the shared-taskpool sources directly and must NOT pull in
+  # OrcJIT/EJIT/the full LLVM.
+  set(EJIT_HOTPATH_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
+  set(LLVM_LINK_COMPONENTS Support)
+  add_llvm_executable(EJITHotPathBench
+    EJitHotPathBench.cpp
+    EJitHotPathBenchAbi.cpp
+    ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
+    ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
+
+    PARTIAL_SOURCES_INTENDED
+    )
+  set(LLVM_LINK_COMPONENTS "${EJIT_HOTPATH_LINK_COMPONENTS_SAVED}")
+  target_compile_definitions(EJITHotPathBench PRIVATE
+    EJIT_SRE_TASKPOOL
+    EJIT_SRE_SHARED_TASKPOOL
+    EJIT_SRE_TASKPOOL_TESTING
+    EJIT_SRE_TASKPOOL_BUCKETS=32
+    EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
+    EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=1048576
+    )
+  # Match the embedded production optimization level so the measured
+  # instruction/cycle counts reflect the shipped build.
+  target_compile_options(EJITHotPathBench PRIVATE -Os)
+  # Opt-in: mirror EJIT_TEST_NO_RECLAIM so the benchmark exercises the load-only
+  # seqlock hit path + cross-core code sharing (the production premise).
+  if(EJIT_TEST_NO_RECLAIM)
+    target_compile_definitions(EJITHotPathBench PRIVATE
+      EJIT_SRE_TASKPOOL_NO_RECLAIM
+      EJIT_SRE_SHARED_CODE_POINTERS)
+  endif()
+  # Opt-in: embed the statistics counters to measure their per-hit cost.
+  if(EJIT_TEST_STATS)
+    target_compile_definitions(EJITHotPathBench PRIVATE EJIT_STATS_ENABLE)
+  endif()
+endif()
