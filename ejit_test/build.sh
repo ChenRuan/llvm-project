@@ -190,6 +190,7 @@ ALL_TESTS=(
   ejit_perf_bench
   ejit_ptr_period_test
   ejit_trace_test
+  ejit_volatile_test
 )
 
 # Per-test compile flags (e.g. for disabling global constructors)

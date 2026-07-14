@@ -14,12 +14,19 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITCOMMON_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITCOMMON_H
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 
 namespace llvm {
@@ -139,6 +146,182 @@ inline uint32_t getMDIntValue(const MDNode *Node, StringRef Tag) {
     }
   }
   return 0;
+}
+
+/// Byte offset of a field access *within its period-array element*, which is
+/// the coordinate the `ejit_may_const_field` entries on a period-array global
+/// are expressed in (they are relative to the element struct, NOT to the array
+/// base). Writes the root global to \p RootGV.
+///
+/// A load's pointer may take any of these shapes, all of which must reduce to
+/// the same field offset:
+///
+///   getelementptr [16 x %S], @g, 0, %ci, i32 4   AOT: dynamic element index
+///   getelementptr [16 x %S], @g, 0, 3,   i32 4   constant element index
+///   getelementptr %S,        @g, %ci             decayed array-to-pointer
+///   getelementptr i8,        @g, 100             post-InstCombine byte offset
+///
+/// Struct indices contribute their field offset, constant sequential indices
+/// their stride. Exactly ONE dynamic sequential index may be skipped: the one
+/// selecting an element of the root period array. Its contribution is a whole
+/// number of elements, which the closing `% ElemSize` erases, so skipping it is
+/// equivalent to including it -- and that is what lets `g_cfg[ci].field` resolve
+/// at AOT time, before the JIT replaces `ci` with a constant.
+///
+/// Any other dynamic index is rejected: typed pointer arithmetic wears the same
+/// shape while walking *within* an element, e.g. `((int *)&g[ci])[j]`, where
+/// skipping `%j` would misattribute the access to the field at offset 0.
+///
+/// Returns nullopt when the access cannot be attributed to a fixed field.
+inline std::optional<uint64_t>
+ejitMayConstFieldOffset(const Value *Ptr, const DataLayout &DL,
+                        const GlobalVariable *&RootGV) {
+  RootGV = nullptr;
+
+  // Phase 1: walk to the root global, remembering the path. An index cannot be
+  // judged before the root is known: "is this the element selector?" is a
+  // question about the root array's stride.
+  SmallVector<const GEPOperator *, 4> Path;
+  const Value *V = Ptr;
+  while (V) {
+    V = V->stripPointerCasts();
+    if (const auto *GV = dyn_cast<GlobalVariable>(V)) {
+      RootGV = GV;
+      break;
+    }
+    const auto *GEP = dyn_cast<GEPOperator>(V);
+    if (!GEP)
+      return std::nullopt;
+    Path.push_back(GEP);
+    V = GEP->getPointerOperand();
+  }
+  if (!RootGV)
+    return std::nullopt;
+
+  // Element stride of the period array. Zero when the global is not an array (a
+  // scalar `ejit_period` global), in which case no dynamic index is admissible.
+  uint64_t ElemSize = 0;
+  if (const auto *ATy = dyn_cast<ArrayType>(RootGV->getValueType())) {
+    TypeSize TS = DL.getTypeAllocSize(ATy->getElementType());
+    if (TS.isScalable())
+      return std::nullopt;
+    ElemSize = TS.getFixedValue();
+  }
+
+  // Only the GEP applied directly to the global can carry the element selector.
+  const GEPOperator *RootGEP = Path.empty() ? nullptr : Path.back();
+
+  // Phase 2: accumulate, validating each dynamic index against the root stride.
+  // At most ONE dynamic index may be skipped: an array has a single element
+  // selector. Two indices can both match the stride test (e.g. `[16 x [1 x i32]]`
+  // where the element and its own element are the same size), so the acceptance
+  // has to be recorded rather than re-derived per index.
+  bool SkippedDynamic = false;
+  uint64_t Off = 0;
+  for (const GEPOperator *GEP : Path) {
+    for (auto GTI = gep_type_begin(GEP), GTE = gep_type_end(GEP); GTI != GTE;
+         ++GTI) {
+      if (StructType *STy = GTI.getStructTypeOrNull()) {
+        const auto *CI = dyn_cast<ConstantInt>(GTI.getOperand());
+        if (!CI)
+          return std::nullopt; // struct indices are constant in valid IR
+        Off += DL.getStructLayout(STy)->getElementOffset(CI->getZExtValue());
+        continue;
+      }
+
+      TypeSize TS = DL.getTypeAllocSize(GTI.getIndexedType());
+      if (TS.isScalable())
+        return std::nullopt;
+      const uint64_t Stride = TS.getFixedValue();
+
+      if (const auto *CI = dyn_cast<ConstantInt>(GTI.getOperand())) {
+        // GEP indices are signed; a negative one cannot be attributed to a
+        // field, and zero-extending it would wrap into a plausible offset.
+        const int64_t Idx = CI->getSExtValue();
+        if (Idx < 0)
+          return std::nullopt;
+        Off += static_cast<uint64_t>(Idx) * Stride;
+        continue;
+      }
+
+      // Dynamic index: admissible only as the root array's element selector,
+      // and only once.
+      if (!SkippedDynamic && GEP == RootGEP && ElemSize != 0 &&
+          Stride == ElemSize) {
+        SkippedDynamic = true;
+        continue;
+      }
+      return std::nullopt;
+    }
+  }
+
+  if (ElemSize)
+    Off %= ElemSize; // drop whole elements: keep only the field coordinate
+  return Off;
+}
+
+/// Size in bytes of the may_const field beginning at \p Off inside the period
+/// element of \p RootGV, or nullopt when \p Off is not the start of a field.
+///
+/// The `ejit_may_const_field` metadata records offsets and nothing else, so it
+/// cannot bound how many bytes an access may read; the aggregate layout supplies
+/// that bound. A nested aggregate shares its offset with its own first field, so
+/// the descent continues to the innermost field starting at \p Off. That is the
+/// conservative choice, and it is what rejects a widened load (say an i64 formed
+/// from a memcpy over a may_const i32 and the mutable i32 beside it).
+inline std::optional<uint64_t>
+ejitMayConstFieldSize(const GlobalVariable *RootGV, uint64_t Off,
+                      const DataLayout &DL) {
+  if (!RootGV)
+    return std::nullopt;
+  Type *Ty = RootGV->getValueType();
+  if (const auto *ATy = dyn_cast<ArrayType>(Ty))
+    Ty = ATy->getElementType();
+
+  // Descend into whichever element contains Off, rebasing Off as we go. Only at
+  // the leaf does Off == 0 mean "this is where a field begins".
+  while (true) {
+    if (auto *STy = dyn_cast<StructType>(Ty)) {
+      if (STy->isOpaque())
+        return std::nullopt;
+      const StructLayout *SL = DL.getStructLayout(STy);
+      if (Off >= SL->getSizeInBytes())
+        return std::nullopt;
+      const unsigned Idx = SL->getElementContainingOffset(Off);
+      Off -= SL->getElementOffset(Idx);
+      Ty = STy->getElementType(Idx);
+      continue;
+    }
+    if (auto *ATy = dyn_cast<ArrayType>(Ty)) {
+      if (ATy->getNumElements() == 0)
+        return std::nullopt;
+      TypeSize ES = DL.getTypeAllocSize(ATy->getElementType());
+      if (ES.isScalable() || ES.getFixedValue() == 0)
+        return std::nullopt;
+      Off %= ES.getFixedValue();
+      Ty = ATy->getElementType();
+      continue;
+    }
+    break;
+  }
+
+  if (Off != 0)
+    return std::nullopt; // lands inside a field, not at its start
+
+  TypeSize TS = DL.getTypeStoreSize(Ty);
+  if (TS.isScalable())
+    return std::nullopt;
+  return TS.getFixedValue();
+}
+
+/// True when [\p Off, \p Off + \p AccessSize) lies entirely within the may_const
+/// field that begins at \p Off. Guards the offset-matching paths, which would
+/// otherwise let a widened load freeze the bytes of an adjacent mutable field.
+inline bool ejitAccessFitsMayConstField(const GlobalVariable *RootGV,
+                                        uint64_t Off, uint64_t AccessSize,
+                                        const DataLayout &DL) {
+  std::optional<uint64_t> FieldSize = ejitMayConstFieldSize(RootGV, Off, DL);
+  return FieldSize && AccessSize != 0 && AccessSize <= *FieldSize;
 }
 
 //===----------------------------------------------------------------------===//
