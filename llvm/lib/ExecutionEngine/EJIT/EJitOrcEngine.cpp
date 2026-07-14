@@ -604,8 +604,25 @@ EJitOrcEngine::Create(const Config &config,
     return JTMBOrErr.takeError();
   }
 
-  // Use Large code model so JITLink can generate 64-bit absolute relocations.
+  // A code-pool allocation keeps every section in one LinkGraph within a
+  // single (normally 2MiB) slab. The AArch64 Small model can therefore use
+  // shorter PC-relative references for object-local constants, jump tables,
+  // and unwind data. Process-external declarations are made
+  // non-dso-local in loadBitcodeModule, so they still use range-independent
+  // GOT/PLT entries in this slab. Other memory managers retain Large because
+  // they do not provide the same section-proximity guarantee.
+#if defined(EJIT_SRE_CODE_POOL)
+  // Small also emits signed 32-bit .eh_frame deltas. Keep Large if a future
+  // pool configuration no longer guarantees that every graph fits that span.
+  constexpr uint64_t MaxSmallGraphSpan = 0x7fffffffULL;
+  if (JTMBOrErr->getTargetTriple().isAArch64() &&
+      static_cast<uint64_t>(EJIT_SRE_CODE_POOL_SIZE) <= MaxSmallGraphSpan)
+    JTMBOrErr->setCodeModel(CodeModel::Small);
+  else
+    JTMBOrErr->setCodeModel(CodeModel::Large);
+#else
   JTMBOrErr->setCodeModel(CodeModel::Large);
+#endif
 
   // Build a TargetMachine (same options the JIT compiles with) for the
   // name-filtered ASM diagnostic dump. Failure is non-fatal — the dump is
