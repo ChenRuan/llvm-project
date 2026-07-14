@@ -285,13 +285,10 @@ bool EJitSharedTaskPool::queuePop(EJitCompileRequest &out) {
 uint64_t EJitSharedTaskPool::hashIdentity(uint32_t funcIndex,
                                           const EJitDimPair *dims,
                                           uint32_t numDims) const {
-  uint64_t key = static_cast<uint64_t>(funcIndex);
-  for (uint32_t i = 0; i < numDims; ++i) {
-    key ^= (static_cast<uint64_t>(dims[i].dimType) << 32) |
-           static_cast<uint64_t>(dims[i].instanceId);
-    key *= 0x9e3779b97f4a7c15ULL;
-  }
-  return key;
+  uint64_t key = ejitHashSeed(funcIndex, numDims);
+  for (uint32_t i = 0; i < numDims; ++i)
+    key = ejitHashDim(key, dims[i].dimType, dims[i].instanceId);
+  return ejitFinalize64(key);
 }
 
 static bool slotIdentityMatches(const EJitSharedCacheSlot &s,
@@ -596,14 +593,14 @@ EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
 // loop, no dims[] indirection, no generic numDims>4 guard. The matched-slot
 // fnPtr gate and cold peer preparation are shared via resolveMatchedSlot(), so
 // each specialization stays small. Results are identical to cacheLookup() with
-// the matching numDims. kHashMul mirrors the mixing constant in hashIdentity().
+// the matching numDims. The key composes the ejitHash* helpers so it cannot
+// drift from hashIdentity().
 //===----------------------------------------------------------------------===//
-static constexpr uint64_t kHashMul = 0x9e3779b97f4a7c15ULL;
 
 EJitSharedTaskPool::SharedLookup
 EJitSharedTaskPool::cacheLookup0D(uint32_t funcIndex) {
   SharedLookup R;
-  uint64_t key = static_cast<uint64_t>(funcIndex); // hashIdentity(fi, _, 0)
+  uint64_t key = ejitFinalize64(ejitHashSeed(funcIndex, 0));
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   EJitSharedCacheBucket &B = state_->buckets[bucket];
   if (!bucketTryRead(B))
@@ -631,9 +628,9 @@ EJitSharedTaskPool::SharedLookup
 EJitSharedTaskPool::cacheLookup1D(uint32_t funcIndex, uint32_t dim0,
                                   uint32_t inst0) {
   SharedLookup R;
-  uint64_t key = static_cast<uint64_t>(funcIndex);
-  key ^= (static_cast<uint64_t>(dim0) << 32) | static_cast<uint64_t>(inst0);
-  key *= kHashMul;
+  uint64_t key = ejitHashSeed(funcIndex, 1);
+  key = ejitHashDim(key, dim0, inst0);
+  key = ejitFinalize64(key);
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   EJitSharedCacheBucket &B = state_->buckets[bucket];
   if (!bucketTryRead(B))
@@ -665,11 +662,10 @@ EJitSharedTaskPool::cacheLookup2D(uint32_t funcIndex, uint32_t dim0,
                                   uint32_t inst0, uint32_t dim1,
                                   uint32_t inst1) {
   SharedLookup R;
-  uint64_t key = static_cast<uint64_t>(funcIndex);
-  key ^= (static_cast<uint64_t>(dim0) << 32) | static_cast<uint64_t>(inst0);
-  key *= kHashMul;
-  key ^= (static_cast<uint64_t>(dim1) << 32) | static_cast<uint64_t>(inst1);
-  key *= kHashMul;
+  uint64_t key = ejitHashSeed(funcIndex, 2);
+  key = ejitHashDim(key, dim0, inst0);
+  key = ejitHashDim(key, dim1, inst1);
+  key = ejitFinalize64(key);
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   EJitSharedCacheBucket &B = state_->buckets[bucket];
   if (!bucketTryRead(B))
@@ -705,13 +701,11 @@ EJitSharedTaskPool::cacheLookup3D(uint32_t funcIndex, uint32_t dim0,
                                   uint32_t inst0, uint32_t dim1, uint32_t inst1,
                                   uint32_t dim2, uint32_t inst2) {
   SharedLookup R;
-  uint64_t key = static_cast<uint64_t>(funcIndex);
-  key ^= (static_cast<uint64_t>(dim0) << 32) | static_cast<uint64_t>(inst0);
-  key *= kHashMul;
-  key ^= (static_cast<uint64_t>(dim1) << 32) | static_cast<uint64_t>(inst1);
-  key *= kHashMul;
-  key ^= (static_cast<uint64_t>(dim2) << 32) | static_cast<uint64_t>(inst2);
-  key *= kHashMul;
+  uint64_t key = ejitHashSeed(funcIndex, 3);
+  key = ejitHashDim(key, dim0, inst0);
+  key = ejitHashDim(key, dim1, inst1);
+  key = ejitHashDim(key, dim2, inst2);
+  key = ejitFinalize64(key);
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   EJitSharedCacheBucket &B = state_->buckets[bucket];
   if (!bucketTryRead(B))
@@ -752,15 +746,12 @@ EJitSharedTaskPool::cacheLookup4D(uint32_t funcIndex, uint32_t dim0,
                                   uint32_t dim2, uint32_t inst2, uint32_t dim3,
                                   uint32_t inst3) {
   SharedLookup R;
-  uint64_t key = static_cast<uint64_t>(funcIndex);
-  key ^= (static_cast<uint64_t>(dim0) << 32) | static_cast<uint64_t>(inst0);
-  key *= kHashMul;
-  key ^= (static_cast<uint64_t>(dim1) << 32) | static_cast<uint64_t>(inst1);
-  key *= kHashMul;
-  key ^= (static_cast<uint64_t>(dim2) << 32) | static_cast<uint64_t>(inst2);
-  key *= kHashMul;
-  key ^= (static_cast<uint64_t>(dim3) << 32) | static_cast<uint64_t>(inst3);
-  key *= kHashMul;
+  uint64_t key = ejitHashSeed(funcIndex, 4);
+  key = ejitHashDim(key, dim0, inst0);
+  key = ejitHashDim(key, dim1, inst1);
+  key = ejitHashDim(key, dim2, inst2);
+  key = ejitHashDim(key, dim3, inst3);
+  key = ejitFinalize64(key);
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   EJitSharedCacheBucket &B = state_->buckets[bucket];
   if (!bucketTryRead(B))
