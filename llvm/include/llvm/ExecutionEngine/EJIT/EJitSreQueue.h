@@ -76,17 +76,6 @@ inline uint64_t ejitHashDim(uint64_t key, uint32_t dimType,
   return key * kEJitHashMul;
 }
 
-/// fmix64 avalanche. Multiplication only carries bits upward, so without this
-/// dimType (high half) and numDims (top byte) never reach the bucket index.
-inline uint64_t ejitFinalize64(uint64_t k) {
-  k ^= k >> 33;
-  k *= 0xff51afd7ed558ccdULL;
-  k ^= k >> 33;
-  k *= 0xc4ceb9fe1a85ec53ULL;
-  k ^= k >> 33;
-  return k;
-}
-
 struct EJitCompileRequest {
   uint32_t funcIndex;
   uint32_t numDims;

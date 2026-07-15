@@ -104,7 +104,7 @@ uint64_t EJitTaskPoolCache::hashKey(uint32_t funcIndex, const EJitDimPair *dims,
   uint64_t key = ejitHashSeed(funcIndex, numDims);
   for (uint32_t i = 0; i < numDims; ++i)
     key = ejitHashDim(key, dims[i].dimType, dims[i].instanceId);
-  return ejitFinalize64(key);
+  return key;
 }
 
 bool EJitTaskPoolCache::identityMatches(const EJitCacheEntry &e,

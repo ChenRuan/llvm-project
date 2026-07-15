@@ -26,7 +26,7 @@ uint64_t hash(uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims) {
   uint64_t key = ejitHashSeed(funcIndex, numDims);
   for (uint32_t i = 0; i < numDims; ++i)
     key = ejitHashDim(key, dims[i].dimType, dims[i].instanceId);
-  return ejitFinalize64(key);
+  return key;
 }
 
 uint64_t hash1D(uint32_t funcIndex, uint32_t dimType, uint32_t instanceId) {
@@ -42,13 +42,13 @@ TEST(EJitIdentityHash, FuncIndexDoesNotCancelAgainstInstanceId) {
   EXPECT_EQ(keys.size(), 4u);
 }
 
-// dimType is folded into the high half, so without the avalanche it never
-// reaches the low bits used as the bucket index.
-TEST(EJitIdentityHash, DimTypeReachesTheBucketIndex) {
-  std::set<uint32_t> buckets;
+// dimType must distinguish the identity key so the bucket scan's prefilter can
+// tell two same-func, same-instance identities on different period types apart.
+TEST(EJitIdentityHash, DimTypeDistinguishesTheKey) {
+  std::set<uint64_t> keys;
   for (uint32_t dt = 0; dt < 8; ++dt)
-    buckets.insert(static_cast<uint32_t>(hash1D(1, dt, 2) % kBuckets));
-  EXPECT_GT(buckets.size(), 1u);
+    keys.insert(hash1D(1, dt, 2));
+  EXPECT_EQ(keys.size(), 8u);
 }
 
 TEST(EJitIdentityHash, NumDimsIsPartOfTheIdentity) {

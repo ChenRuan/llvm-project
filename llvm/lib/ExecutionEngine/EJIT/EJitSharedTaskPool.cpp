@@ -288,7 +288,7 @@ uint64_t EJitSharedTaskPool::hashIdentity(uint32_t funcIndex,
   uint64_t key = ejitHashSeed(funcIndex, numDims);
   for (uint32_t i = 0; i < numDims; ++i)
     key = ejitHashDim(key, dims[i].dimType, dims[i].instanceId);
-  return ejitFinalize64(key);
+  return key;
 }
 
 static bool slotIdentityMatches(const EJitSharedCacheSlot &s,
@@ -600,7 +600,7 @@ EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
 EJitSharedTaskPool::SharedLookup
 EJitSharedTaskPool::cacheLookup0D(uint32_t funcIndex) {
   SharedLookup R;
-  uint64_t key = ejitFinalize64(ejitHashSeed(funcIndex, 0));
+  uint64_t key = ejitHashSeed(funcIndex, 0);
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   EJitSharedCacheBucket &B = state_->buckets[bucket];
   if (!bucketTryRead(B))
@@ -630,7 +630,6 @@ EJitSharedTaskPool::cacheLookup1D(uint32_t funcIndex, uint32_t dim0,
   SharedLookup R;
   uint64_t key = ejitHashSeed(funcIndex, 1);
   key = ejitHashDim(key, dim0, inst0);
-  key = ejitFinalize64(key);
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   EJitSharedCacheBucket &B = state_->buckets[bucket];
   if (!bucketTryRead(B))
@@ -665,7 +664,6 @@ EJitSharedTaskPool::cacheLookup2D(uint32_t funcIndex, uint32_t dim0,
   uint64_t key = ejitHashSeed(funcIndex, 2);
   key = ejitHashDim(key, dim0, inst0);
   key = ejitHashDim(key, dim1, inst1);
-  key = ejitFinalize64(key);
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   EJitSharedCacheBucket &B = state_->buckets[bucket];
   if (!bucketTryRead(B))
@@ -705,7 +703,6 @@ EJitSharedTaskPool::cacheLookup3D(uint32_t funcIndex, uint32_t dim0,
   key = ejitHashDim(key, dim0, inst0);
   key = ejitHashDim(key, dim1, inst1);
   key = ejitHashDim(key, dim2, inst2);
-  key = ejitFinalize64(key);
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   EJitSharedCacheBucket &B = state_->buckets[bucket];
   if (!bucketTryRead(B))
@@ -751,7 +748,6 @@ EJitSharedTaskPool::cacheLookup4D(uint32_t funcIndex, uint32_t dim0,
   key = ejitHashDim(key, dim1, inst1);
   key = ejitHashDim(key, dim2, inst2);
   key = ejitHashDim(key, dim3, inst3);
-  key = ejitFinalize64(key);
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   EJitSharedCacheBucket &B = state_->buckets[bucket];
   if (!bucketTryRead(B))

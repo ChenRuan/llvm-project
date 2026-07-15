@@ -762,7 +762,6 @@ TEST_F(SharedTaskPoolTest, BigEndianFieldSemantics) {
   uint64_t key = ejitHashSeed(func, 2);
   for (uint32_t i = 0; i < 2; ++i)
     key = ejitHashDim(key, d0[i].dimType, d0[i].instanceId);
-  key = ejitFinalize64(key);
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   const EJitSharedCacheBucket &B = state_->buckets[bucket];
   bool found = false;
