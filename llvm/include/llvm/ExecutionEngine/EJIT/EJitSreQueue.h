@@ -52,6 +52,30 @@ struct EJitDimPair {
   uint32_t instanceId;
 };
 
+//===----------------------------------------------------------------------===//
+// Compile-identity hash for (funcIndex, numDims, dims[]). Callers take the low
+// bits as a cache bucket index. Every hash site composes these helpers: a
+// lookup that hashes differently from the publish that stored the slot probes a
+// different bucket and never matches.
+//===----------------------------------------------------------------------===//
+constexpr uint64_t kEJitHashMul = 0x9e3779b97f4a7c15ULL;
+
+/// Seed from the scalar part. funcIndex is diffused before any dim is folded in:
+/// used raw it shares the low bits of instanceId and XOR-cancels against it.
+inline uint64_t ejitHashSeed(uint32_t funcIndex, uint32_t numDims) {
+  return (static_cast<uint64_t>(funcIndex) * kEJitHashMul) ^
+         (static_cast<uint64_t>(numDims) << 56);
+}
+
+/// Fold one (dimType, instanceId) pair in. The multiply keeps the fold
+/// order-sensitive, so f(a, b) and f(b, a) stay distinct.
+inline uint64_t ejitHashDim(uint64_t key, uint32_t dimType,
+                            uint32_t instanceId) {
+  key ^= (static_cast<uint64_t>(dimType) << 32) |
+         static_cast<uint64_t>(instanceId);
+  return key * kEJitHashMul;
+}
+
 struct EJitCompileRequest {
   uint32_t funcIndex;
   uint32_t numDims;

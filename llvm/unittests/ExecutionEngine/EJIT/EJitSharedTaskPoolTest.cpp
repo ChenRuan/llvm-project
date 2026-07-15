@@ -758,13 +758,10 @@ TEST_F(SharedTaskPoolTest, BigEndianFieldSemantics) {
 
   // Inspect the published slot directly: each field equals exactly what we put
   // in (correct on aarch64_be precisely because access is by-field, by-value).
-  uint64_t key = 0; // recompute the same identity hash the pool uses
-  key = static_cast<uint64_t>(func);
-  for (uint32_t i = 0; i < 2; ++i) {
-    key ^= (static_cast<uint64_t>(d0[i].dimType) << 32) |
-           static_cast<uint64_t>(d0[i].instanceId);
-    key *= 0x9e3779b97f4a7c15ULL;
-  }
+  // Recompute the same identity hash the pool uses.
+  uint64_t key = ejitHashSeed(func, 2);
+  for (uint32_t i = 0; i < 2; ++i)
+    key = ejitHashDim(key, d0[i].dimType, d0[i].instanceId);
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   const EJitSharedCacheBucket &B = state_->buckets[bucket];
   bool found = false;

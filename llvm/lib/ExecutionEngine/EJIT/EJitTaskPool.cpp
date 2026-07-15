@@ -101,12 +101,9 @@ EJitTaskQueue::tryEnqueue(const EJitCompileRequest &req) {
 
 uint64_t EJitTaskPoolCache::hashKey(uint32_t funcIndex, const EJitDimPair *dims,
                                     uint32_t numDims) const {
-  uint64_t key = static_cast<uint64_t>(funcIndex);
-  for (uint32_t i = 0; i < numDims; ++i) {
-    key ^= (static_cast<uint64_t>(dims[i].dimType) << 32) |
-           static_cast<uint64_t>(dims[i].instanceId);
-    key *= 0x9e3779b97f4a7c15ULL;
-  }
+  uint64_t key = ejitHashSeed(funcIndex, numDims);
+  for (uint32_t i = 0; i < numDims; ++i)
+    key = ejitHashDim(key, dims[i].dimType, dims[i].instanceId);
   return key;
 }
 
