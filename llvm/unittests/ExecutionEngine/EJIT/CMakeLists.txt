@@ -104,10 +104,29 @@ target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
 # path.
 option(EJIT_TEST_NO_RECLAIM
   "Build EJITSharedTaskPoolTests with EJIT_SRE_TASKPOOL_NO_RECLAIM" OFF)
-if(EJIT_TEST_NO_RECLAIM)
+if(EJIT_TEST_NO_RECLAIM OR EJIT_SRE_TASKPOOL_NO_RECLAIM)
   target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
     EJIT_SRE_TASKPOOL_NO_RECLAIM
     EJIT_SRE_SHARED_CODE_POINTERS)
+endif()
+
+# BENCHMARK ONLY / UNSAFE FOR GENERAL USE. Opt-in funcIndex-only cache-hit fast
+# path (a deliberately-cheating benchmark experiment). It is LEGAL ONLY together
+# with the cross-core shared taskpool + the NO_RECLAIM never-reclaim code pool.
+# Tests may get NO_RECLAIM from the test-only switch above or the product
+# EJIT_SRE_TASKPOOL_NO_RECLAIM option. Any other combination is a hard
+# configure-time error. Off by default: normal builds are unchanged.
+if(EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
+  if(NOT EJIT_TEST_NO_RECLAIM AND NOT EJIT_SRE_TASKPOOL_NO_RECLAIM)
+    message(FATAL_ERROR
+      "EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP (BENCHMARK ONLY / UNSAFE FOR GENERAL "
+      "USE) requires EJIT_TEST_NO_RECLAIM=ON or "
+      "EJIT_SRE_TASKPOOL_NO_RECLAIM=ON. Reconfigure with one of those options "
+      "or disable "
+      "EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP.")
+  endif()
+  target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
+    EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
 endif()
 
 # Convenience target: build + run only the cross-core shared taskpool tests.
@@ -145,9 +164,17 @@ if(EJIT_BUILD_CACHE_QUERY_BENCH)
   # Opt-in: build the benchmark with the load-only NO_RECLAIM seqlock hit path.
   # Cross-core code sharing stays enabled in both variants so token and
   # NO_RECLAIM measurements exercise the same peer-hit workload.
-  if(EJIT_TEST_NO_RECLAIM)
+  if(EJIT_TEST_NO_RECLAIM OR EJIT_SRE_TASKPOOL_NO_RECLAIM)
     target_compile_definitions(EJITSharedCacheQueryBench PRIVATE
       EJIT_SRE_TASKPOOL_NO_RECLAIM)
+  endif()
+  # BENCHMARK ONLY / UNSAFE FOR GENERAL USE: build the benchmark with the
+  # funcIndex-only fast path so its mt0dfunconly / single0dfunconly modes are
+  # available. Enforced above to require EJIT_TEST_NO_RECLAIM (shared taskpool +
+  # NO_RECLAIM), so the fast path's preconditions hold.
+  if(EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
+    target_compile_definitions(EJITSharedCacheQueryBench PRIVATE
+      EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
   endif()
   target_link_libraries(EJITSharedCacheQueryBench PRIVATE ${LLVM_PTHREAD_LIB})
 endif()

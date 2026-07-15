@@ -206,6 +206,25 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
                                               uint32_t inst2, uint32_t dim3,
                                               uint32_t inst3, void **outFn,
                                               uint32_t *outBucket);
+#if defined(EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
+// BENCHMARK ONLY / UNSAFE FOR GENERAL USE. Thin funcIndex-only cache-hit entry:
+// a hit needs ONLY funcIndex (no dims / identity hash / version / active checks
+// / read token); a miss falls back to compileOrGet with the entry's original
+// 0D/1D/2D dimensions.
+// This symbol exists ONLY in an EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP build (shared
+// taskpool + NO_RECLAIM). It never returns a stale or unexecutable pointer and
+// does not replace any existing generic entry. See EJitSharedTaskPool.cpp for
+// the strict correctness preconditions this experimental path assumes.
+ejit_status_t ejit_taskpool_compile_or_get_func_only(uint32_t funcIndex,
+                                                     void **outFn,
+                                                     uint32_t *outBucket);
+ejit_status_t ejit_taskpool_compile_or_get_func_only_1d(
+    uint32_t funcIndex, uint32_t dim0, uint32_t inst0, void **outFn,
+    uint32_t *outBucket);
+ejit_status_t ejit_taskpool_compile_or_get_func_only_2d(
+    uint32_t funcIndex, uint32_t dim0, uint32_t inst0, uint32_t dim1,
+    uint32_t inst1, void **outFn, uint32_t *outBucket);
+#endif
 void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
                                         uint32_t enabled);
 void ejit_taskpool_release_read(uint32_t bucketIndex);

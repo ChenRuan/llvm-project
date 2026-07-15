@@ -78,6 +78,20 @@ constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_3D =
     "ejit_taskpool_compile_or_get_3d";
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_4D =
     "ejit_taskpool_compile_or_get_4d";
+// BENCHMARK ONLY / UNSAFE FOR GENERAL USE. Thin funcIndex-only cache-hit entry
+// emitted only when the hidden wrapper option
+// -ejit-wrapper-bench-funcindex-only is set (default off => this symbol is
+// never referenced and the wrapper IR is byte-for-byte unchanged). Backed by
+// ejit_taskpool_compile_or_get_func_only, which is compiled only in an
+// EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP build (requires the shared taskpool +
+// NO_RECLAIM never-reclaim code pool). See EJitSharedTaskPool.cpp for the
+// correctness preconditions this path assumes.
+constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_FUNC_ONLY =
+    "ejit_taskpool_compile_or_get_func_only";
+constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_FUNC_ONLY_1D =
+    "ejit_taskpool_compile_or_get_func_only_1d";
+constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_FUNC_ONLY_2D =
+    "ejit_taskpool_compile_or_get_func_only_2d";
 constexpr const char *FN_TASKPOOL_RELEASE_READ = "ejit_taskpool_release_read";
 constexpr const char *FN_TASKPOOL_TRACE_NOW = "ejit_taskpool_trace_now";
 constexpr const char *FN_TASKPOOL_TRACE_WRAPPER =

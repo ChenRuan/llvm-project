@@ -339,6 +339,41 @@ public:
                                    uint32_t inst2, uint32_t dim3,
                                    uint32_t inst3);
   void releaseRead(uint32_t bucketIndex);
+#if defined(EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
+  //--- BENCHMARK ONLY / UNSAFE FOR GENERAL USE ------------------------------//
+  // funcIndex-only cache-hit fast path. Correct ONLY under the strict
+  // benchmark preconditions documented in EJitSharedTaskPool.cpp: exactly one
+  // specialization per funcIndex; cell/trp/dimensions/active state/version and
+  // may_const globals never change during the run; the code pool never
+  // reclaims (EJIT_SRE_TASKPOOL_NO_RECLAIM). It must NEVER be used on the
+  // production path — it skips the identity hash, per-dimension version and
+  // active checks, and the read-token/seqlock validation.
+
+  /// Raw funcIndex-only direct-hint probe. Returns true and writes *outFn ONLY
+  /// when the funcIndex hint resolves to a Ready, current-generation slot whose
+  /// funcIndex matches and whose code the CALLING core may already execute
+  /// (owner core, or a peer core that has already memoized execute permission
+  /// for that slot). Returns false — never a stale or unexecutable pointer — on
+  /// an out-of-range funcIndex, a missing/poisoned/stale hint, a non-Ready or
+  /// wrong-generation/wrong-funcIndex slot, a null fnPtr, or a cold (not-yet-
+  /// prepared) peer. Takes NO read token and performs NO atomic RMW on the
+  /// bucket. On a false return the caller falls back to the full lookup (which
+  /// handles cold-peer preparation and true misses).
+  bool funcIndexOnlyDirectHit(uint32_t funcIndex, void **outFn);
+
+  /// Ready-gated direct-hint probe. A hit is terminal; a hint miss is
+  /// deliberately non-terminal so dimension-aware C ABI entries can preserve
+  /// their original dimensions when they enter compileOrGet.
+  CompileOrGetResult tryFuncIndexOnlyDirect(uint32_t funcIndex);
+
+  /// Full funcIndex-only cache-hit entry with a clean fallback. Runs the Ready
+  /// gate then funcIndexOnlyDirectHit(); on a direct hit returns a terminal
+  /// CacheHit (no read token, sentinel bucketIndex, cacheHits++). On any
+  /// miss/fallback it defers to the generic 0D seqlock lookup
+  /// (cacheLookupSeq0D), which resolves a cold-peer first touch or a true miss
+  /// exactly as tryCacheHit0D would. Same terminal semantics as tryCacheHit0D.
+  CompileOrGetResult tryCacheHitFuncIndexOnly(uint32_t funcIndex);
+#endif
   bool setInstanceEnabled(uint32_t dimType, uint32_t instanceId, bool enabled);
   /// Query the shared activation bit for a lifecycle instance — the read
   /// counterpart of setInstanceEnabled, and the single cross-core source of

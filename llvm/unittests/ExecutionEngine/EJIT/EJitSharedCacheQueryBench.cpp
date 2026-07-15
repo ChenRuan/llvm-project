@@ -55,6 +55,22 @@ bool benchCompile(void * /*ctx*/, const EJitCompileRequest &req, void **outFn) {
   return true;
 }
 
+// 0D cache-hit lookup selector. When funcOnly is set (only meaningful in an
+// EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP build) it drives the BENCHMARK ONLY /
+// UNSAFE FOR GENERAL USE funcIndex-only fast path; otherwise the standard 0D
+// fixed-dimension cache-hit path. Both return the same CompileOrGetResult
+// shape, so callers stay identical.
+inline EJitSharedTaskPool::CompileOrGetResult
+lookup0D(EJitSharedTaskPool &pool, uint32_t funcIndex, bool funcOnly) {
+#ifdef EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP
+  if (funcOnly)
+    return pool.tryCacheHitFuncIndexOnly(funcIndex);
+#else
+  (void)funcOnly;
+#endif
+  return pool.tryCacheHit0D(funcIndex);
+}
+
 // Owner-side resolver: hand back a fixed 2MiB pool range so peer preparation
 // (4K/2M) and codeStart/codeSize metadata are exercised.
 struct RangeCtx {
@@ -136,7 +152,8 @@ struct Bench {
 
 // --- 0D slot-depth sweep -----------------------------------------------------
 // Publish (depth+1) 0D colliders into bucket 0, then hammer the deepest one.
-uint64_t bench0D(uint32_t depth, uint64_t iters, bool peer, double *nsPerHit) {
+uint64_t bench0D(uint32_t depth, uint64_t iters, bool peer, double *nsPerHit,
+                 bool funcOnly = false) {
   Bench B;
   B.bringUpOwner(/*codeSharing=*/peer);
   const uint32_t kB = kEJitSharedCacheBuckets;
@@ -150,7 +167,8 @@ uint64_t bench0D(uint32_t depth, uint64_t iters, bool peer, double *nsPerHit) {
   if (peer) {
     core = 1;
     EJitCoreId::setCurrentForTest(core);
-    // Warm the memoized execute-permission bit for this peer core.
+    // Warm the memoized execute-permission bit for this peer core via the full
+    // path (prepares), so the timed funcIndex-only / 0D path is a warm hit.
     auto w = B.pool.tryCacheHit0D(targetFunc);
     if (w.hasReadToken)
       B.pool.releaseRead(w.bucketIndex);
@@ -159,7 +177,7 @@ uint64_t bench0D(uint32_t depth, uint64_t iters, bool peer, double *nsPerHit) {
   uint64_t t0 = nowNs();
   uint64_t hits = 0;
   for (uint64_t i = 0; i < iters; ++i) {
-    auto r = B.pool.tryCacheHit0D(targetFunc);
+    auto r = lookup0D(B.pool, targetFunc, funcOnly);
     gSink += reinterpret_cast<uintptr_t>(r.fnPtr);
     if (r.status == EJitCompileOrGetStatus::CacheHit)
       ++hits;
@@ -171,10 +189,16 @@ uint64_t bench0D(uint32_t depth, uint64_t iters, bool peer, double *nsPerHit) {
   return hits;
 }
 
-uint64_t bench1D(uint32_t depth, uint64_t iters, double *nsPerHit) {
+uint64_t bench1D(uint32_t depth, uint64_t iters, double *nsPerHit,
+                 bool funcOnly = false) {
+  if (funcOnly && depth != 0) {
+    std::fprintf(stderr,
+                 "funcIndex-only 1D benchmark requires slotDepth=0: distinct "
+                 "specializations deliberately poison the hint\n");
+    std::exit(2);
+  }
   Bench B;
   B.bringUpOwner(false);
-  const uint32_t kB = kEJitSharedCacheBuckets;
   // 1D identities colliding into one bucket: vary funcIndex by multiples that
   // keep the same hash bucket is nontrivial, so instead vary instanceId and
   // accept the natural bucket; publish depth+1 entries and hammer the last.
@@ -187,7 +211,13 @@ uint64_t bench1D(uint32_t depth, uint64_t iters, double *nsPerHit) {
   uint64_t t0 = nowNs();
   uint64_t hits = 0;
   for (uint64_t i = 0; i < iters; ++i) {
+#ifdef EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP
+    auto r = funcOnly ? B.pool.tryFuncIndexOnlyDirect(targetFunc)
+                      : B.pool.tryCacheHit1D(targetFunc, 0, depth);
+#else
+    (void)funcOnly;
     auto r = B.pool.tryCacheHit1D(targetFunc, 0, depth);
+#endif
     gSink += reinterpret_cast<uintptr_t>(r.fnPtr);
     if (r.status == EJitCompileOrGetStatus::CacheHit)
       ++hits;
@@ -199,7 +229,7 @@ uint64_t bench1D(uint32_t depth, uint64_t iters, double *nsPerHit) {
   return hits;
 }
 
-uint64_t bench2D(uint64_t iters, double *nsPerHit) {
+uint64_t bench2D(uint64_t iters, double *nsPerHit, bool funcOnly = false) {
   Bench B;
   B.bringUpOwner(false);
   uint32_t targetFunc = 9;
@@ -208,7 +238,13 @@ uint64_t bench2D(uint64_t iters, double *nsPerHit) {
   uint64_t t0 = nowNs();
   uint64_t hits = 0;
   for (uint64_t i = 0; i < iters; ++i) {
+#ifdef EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP
+    auto r = funcOnly ? B.pool.tryFuncIndexOnlyDirect(targetFunc)
+                      : B.pool.tryCacheHit2D(targetFunc, 0, 1, 1, 2);
+#else
+    (void)funcOnly;
     auto r = B.pool.tryCacheHit2D(targetFunc, 0, 1, 1, 2);
+#endif
     gSink += reinterpret_cast<uintptr_t>(r.fnPtr);
     if (r.status == EJitCompileOrGetStatus::CacheHit)
       ++hits;
@@ -238,7 +274,7 @@ struct alignas(64) StartGate {
 // contention. Each thread has its own sink/result cache line so the harness
 // does not add an unrelated shared-write bottleneck.
 void benchMultiThread0D(uint32_t threadCount, uint64_t iters, bool sameIdentity,
-                        uint32_t depth) {
+                        uint32_t depth, bool funcOnly = false) {
   if (threadCount == 0 || threadCount > 63 || depth >= kEJitSharedCacheSlots) {
     std::fprintf(stderr, "invalid threads/depth: threads=%u depth=%u\n",
                  threadCount, depth);
@@ -278,7 +314,8 @@ void benchMultiThread0D(uint32_t threadCount, uint64_t iters, bool sameIdentity,
       EJitCoreId::setCurrentForTest(t + 1u);
       const uint32_t target = targetFuncs[t];
 
-      // Prepare/memoize this peer's execute permission before timing.
+      // Prepare/memoize this peer's execute permission before timing via the
+      // full path (which prepares), so the timed loop is a warm hit.
       auto warm = B.pool.tryCacheHit0D(target);
       if (warm.hasReadToken)
         B.pool.releaseRead(warm.bucketIndex);
@@ -294,7 +331,7 @@ void benchMultiThread0D(uint32_t threadCount, uint64_t iters, bool sameIdentity,
       uintptr_t sink = 0;
       uint64_t begin = nowNs();
       for (uint64_t i = 0; i < iters; ++i) {
-        auto r = B.pool.tryCacheHit0D(target);
+        auto r = lookup0D(B.pool, target, funcOnly);
         sink += reinterpret_cast<uintptr_t>(r.fnPtr);
         if (r.status == EJitCompileOrGetStatus::CacheHit)
           ++hits;
@@ -334,6 +371,8 @@ void benchMultiThread0D(uint32_t threadCount, uint64_t iters, bool sameIdentity,
 #else
   const char *discipline = "read-token";
 #endif
+  if (funcOnly)
+    discipline = "funcindex-only";
   std::printf("mt0d mode=%s discipline=%s threads=%u depth=%u "
               "iters/thread=%llu min=%.3f median=%.3f max=%.3f ns/hit "
               "throughput=%.3f Mhit/s hits=%llu/%llu sink=%llu\n",
@@ -380,6 +419,14 @@ void runTable(uint64_t iters) {
 //   bench single2d <iters>
 //   bench mt0dsame <iters/thread> [threads=16] [slotDepth=0]
 //   bench mt0dspread <iters/thread> [threads=16]
+// BENCHMARK ONLY / UNSAFE FOR GENERAL USE (only in an
+// EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP build):
+//   bench single0dfunconly <d> <iters>
+//   bench single0dpeerfunconly <d> <iters>
+//   bench single1dfunconly <iters>
+//   bench single2dfunconly <iters>
+//   bench mt0dsamefunconly <iters/thread> [threads=16] [slotDepth=0]
+//   bench mt0dspreadfunconly <iters/thread> [threads=16]
 int main(int argc, char **argv) {
   uint64_t iters = 20000000ull;
   if (argc >= 2 && std::strncmp(argv[1], "mt0d", 4) == 0) {
@@ -391,6 +438,25 @@ int main(int argc, char **argv) {
       benchMultiThread0D(threadCount, iters, /*sameIdentity=*/true, depth);
     } else if (std::strcmp(argv[1], "mt0dspread") == 0) {
       benchMultiThread0D(threadCount, iters, /*sameIdentity=*/false, 0);
+    } else if (std::strcmp(argv[1], "mt0dsamefunconly") == 0) {
+#ifdef EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP
+      uint32_t depth = argc >= 5 ? (uint32_t)strtoul(argv[4], nullptr, 10) : 0u;
+      benchMultiThread0D(threadCount, iters, /*sameIdentity=*/true, depth,
+                         /*funcOnly=*/true);
+#else
+      std::fprintf(stderr, "mt0dsamefunconly needs "
+                           "EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP\n");
+      return 2;
+#endif
+    } else if (std::strcmp(argv[1], "mt0dspreadfunconly") == 0) {
+#ifdef EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP
+      benchMultiThread0D(threadCount, iters, /*sameIdentity=*/false, 0,
+                         /*funcOnly=*/true);
+#else
+      std::fprintf(stderr, "mt0dspreadfunconly needs "
+                           "EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP\n");
+      return 2;
+#endif
     } else {
       std::fprintf(stderr, "unknown multi-thread mode %s\n", argv[1]);
       return 2;
@@ -416,6 +482,44 @@ int main(int argc, char **argv) {
     } else if (std::strcmp(what, "single2d") == 0) {
       iters = argc >= 3 ? strtoull(argv[2], nullptr, 10) : iters;
       h = bench2D(iters, &ns);
+    } else if (std::strcmp(what, "single0dfunconly") == 0) {
+#ifdef EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP
+      uint32_t d = argc >= 3 ? (uint32_t)strtoul(argv[2], nullptr, 10) : 0;
+      iters = argc >= 4 ? strtoull(argv[3], nullptr, 10) : iters;
+      h = bench0D(d, iters, /*peer=*/false, &ns, /*funcOnly=*/true);
+#else
+      std::fprintf(stderr, "single0dfunconly needs "
+                           "EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP\n");
+      return 2;
+#endif
+    } else if (std::strcmp(what, "single0dpeerfunconly") == 0) {
+#ifdef EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP
+      uint32_t d = argc >= 3 ? (uint32_t)strtoul(argv[2], nullptr, 10) : 0;
+      iters = argc >= 4 ? strtoull(argv[3], nullptr, 10) : iters;
+      h = bench0D(d, iters, /*peer=*/true, &ns, /*funcOnly=*/true);
+#else
+      std::fprintf(stderr, "single0dpeerfunconly needs "
+                           "EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP\n");
+      return 2;
+#endif
+    } else if (std::strcmp(what, "single1dfunconly") == 0) {
+#ifdef EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP
+      iters = argc >= 3 ? strtoull(argv[2], nullptr, 10) : iters;
+      h = bench1D(/*depth=*/0, iters, &ns, /*funcOnly=*/true);
+#else
+      std::fprintf(stderr, "single1dfunconly needs "
+                           "EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP\n");
+      return 2;
+#endif
+    } else if (std::strcmp(what, "single2dfunconly") == 0) {
+#ifdef EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP
+      iters = argc >= 3 ? strtoull(argv[2], nullptr, 10) : iters;
+      h = bench2D(iters, &ns, /*funcOnly=*/true);
+#else
+      std::fprintf(stderr, "single2dfunconly needs "
+                           "EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP\n");
+      return 2;
+#endif
     } else {
       std::fprintf(stderr, "unknown single mode %s\n", what);
       return 2;

@@ -2620,4 +2620,310 @@ TEST_F(SharedTaskPoolTest, DISABLED_HotHitContendedBench) {
 }
 #endif // __aarch64__
 
+#if defined(EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
+//===----------------------------------------------------------------------===//
+// BENCHMARK ONLY / UNSAFE FOR GENERAL USE — funcIndex-only cache-hit fast path.
+//
+// These tests validate that the deliberately-cheating funcIndex-only path is
+// memory-safe and never mis-hits: it hits on a valid, current-generation,
+// funcIndex-matching Ready slot the caller may execute, and cleanly falls back
+// (never returns a stale/unexecutable pointer) on every other case. They only
+// build in an EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP configuration (which requires
+// the shared taskpool + NO_RECLAIM + shared code pointers).
+//===----------------------------------------------------------------------===//
+
+// Test 1: a direct funcIndex hit returns the correct fnPtr on the owner core.
+TEST_F(SharedTaskPoolTest, FuncIndexOnly_DirectHitReturnsCorrectFnPtr) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  publish(owner, 7);
+  EJitCoreId::setCurrentForTest(0);
+  void *fn = nullptr;
+  EXPECT_TRUE(owner.funcIndexOnlyDirectHit(7, &fn));
+  EXPECT_EQ(fn, codeFor(7));
+
+  auto r = owner.tryCacheHitFuncIndexOnly(7);
+  EXPECT_TRUE(r.fastPathTerminal);
+  EXPECT_EQ(r.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(r.fnPtr, codeFor(7));
+}
+
+// Test 2: a hit does NOT consult the identity hash. Corrupt the slot's
+// identityHash: the funcIndex-only path still hits, while the generic identity
+// lookup (which fast-rejects on identityHash) now misses.
+TEST_F(SharedTaskPoolTest, FuncIndexOnly_HitDoesNotUseIdentityHash) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  publish(owner, 8);
+  EJitCoreId::setCurrentForTest(0);
+  EJitSharedCacheSlot *slot = findReadySlot(8);
+  ASSERT_NE(slot, nullptr);
+  slot->identityHash = 0xDEADBEEFDEADBEEFull; // corrupt: never equals key(8)
+
+  void *fn = nullptr;
+  EXPECT_TRUE(owner.funcIndexOnlyDirectHit(8, &fn));
+  EXPECT_EQ(fn, codeFor(8));
+  // The generic identity lookup fast-rejects on identityHash -> clean miss.
+  auto generic = owner.tryCacheHit0D(8);
+  EXPECT_NE(generic.status, EJitCompileOrGetStatus::CacheHit);
+}
+
+// Test 3: a hit does NOT read per-dimension versions. Publish a 1D entry (which
+// snapshots a version), corrupt the slot's versions, and confirm the
+// funcIndex-only path still hits, while the generic 1D lookup misses on the
+// version mismatch.
+TEST_F(SharedTaskPoolTest, FuncIndexOnly_HitDoesNotReadPerDimVersions) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  owner.setInstanceEnabled(0, 1, true);
+  EJitCoreId::setCurrentForTest(0);
+  EJitDimPair d1[1] = {dim(0, 1)};
+  ASSERT_EQ(owner.compileOrGet(50, d1, 1, codeFor(50)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  EJitSharedCacheSlot *slot = findReadySlot(50);
+  ASSERT_NE(slot, nullptr);
+  slot->versions[0] = 0xC0FFEEu; // corrupt the snapshot version
+
+  void *fn = nullptr;
+  EXPECT_TRUE(owner.funcIndexOnlyDirectHit(50, &fn));
+  EXPECT_EQ(fn, codeFor(50));
+  // The generic 1D lookup compares versions -> clean miss on the corruption.
+  auto generic = owner.tryCacheHit1D(50, 0, 1);
+  EXPECT_NE(generic.status, EJitCompileOrGetStatus::CacheHit);
+}
+
+// Test 4: a slot whose funcIndex no longer matches the request is a clean
+// fallback (no mis-hit, no pointer).
+TEST_F(SharedTaskPoolTest, FuncIndexOnly_FuncIndexMismatchCleanFallback) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  publish(owner, 9);
+  EJitCoreId::setCurrentForTest(0);
+  EJitSharedCacheSlot *slot = findReadySlot(9);
+  ASSERT_NE(slot, nullptr);
+  slot->funcIndex = 999; // hint still points here, but funcIndex now differs
+
+  void *fn = reinterpret_cast<void *>(0x1);
+  EXPECT_FALSE(owner.funcIndexOnlyDirectHit(9, &fn));
+  EXPECT_EQ(fn, nullptr);
+}
+
+// Test 5: bumping the owner generation invalidates every existing hint.
+TEST_F(SharedTaskPoolTest, FuncIndexOnly_GenerationChangeInvalidatesHint) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  publish(owner, 11);
+  EJitCoreId::setCurrentForTest(0);
+  void *fn = nullptr;
+  ASSERT_TRUE(owner.funcIndexOnlyDirectHit(11, &fn));
+
+  // A generation change (e.g. an owner re-init) makes the slot's stored
+  // generation stale, so the funcIndex-only path rejects it.
+  state_->generation.storeRelease(state_->generation.loadRelaxed() + 1);
+  fn = reinterpret_cast<void *>(0x1);
+  EXPECT_FALSE(owner.funcIndexOnlyDirectHit(11, &fn));
+  EXPECT_EQ(fn, nullptr);
+}
+
+// Test 6: after an in-place overwrite (recompile) the path returns the NEW
+// pointer, never the old one.
+TEST_F(SharedTaskPoolTest, FuncIndexOnly_OverwriteDoesNotReturnOldFnPtr) {
+  SeqCompiler seq;
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompileSeq, &seq);
+  owner.setCodeSharingEnabled(true);
+  owner.setMode(EJitCompileMode::Async);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  owner.setInstanceEnabled(0, 1, true);
+
+  EJitDimPair d1[1] = {dim(0, 1)};
+  ASSERT_EQ(owner.compileOrGet(30, d1, 1, codeFor(30)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  void *oldFn = nullptr;
+  ASSERT_TRUE(owner.funcIndexOnlyDirectHit(30, &oldFn));
+  ASSERT_NE(oldFn, nullptr);
+
+  // Toggle off/on advances the version so the same identity recompiles into the
+  // SAME slot at a new address (SeqCompiler hands out distinct pointers).
+  owner.setInstanceEnabled(0, 1, false);
+  owner.setInstanceEnabled(0, 1, true);
+  ASSERT_EQ(owner.compileOrGet(30, d1, 1, codeFor(30)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  void *newFn = nullptr;
+  EXPECT_TRUE(owner.funcIndexOnlyDirectHit(30, &newFn));
+  EXPECT_NE(newFn, nullptr);
+  EXPECT_NE(newFn, oldFn); // never the retired pointer
+}
+
+// Test 7: an owner re-init clears the hint table; a stale hint cannot resolve.
+TEST_F(SharedTaskPoolTest, FuncIndexOnly_ReinitClearsHint) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  publish(owner, 12);
+  EJitCoreId::setCurrentForTest(0);
+  void *fn = nullptr;
+  ASSERT_TRUE(owner.funcIndexOnlyDirectHit(12, &fn));
+
+  owner.ownerShutdown();
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EXPECT_EQ(state_->funcHint[12].loadAcquire(), 0u); // cleared on reinit
+  fn = reinterpret_cast<void *>(0x1);
+  EXPECT_FALSE(owner.funcIndexOnlyDirectHit(12, &fn));
+  EXPECT_EQ(fn, nullptr);
+}
+
+// Test 8: a peer core that has NOT yet prepared execute permission gets NO
+// pointer from the fast path (it must fall back to the prepare path).
+TEST_F(SharedTaskPoolTest, FuncIndexOnly_PeerNotPreparedReturnsNoPointer) {
+  PrepareLog plog;
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setCodeSharingEnabled(true);
+  owner.setPrepareCodeCallback(&mockPrepareCode, &plog);
+  owner.setMode(EJitCompileMode::Async);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  publish(owner, 77);
+
+  EJitCoreId::setCurrentForTest(5); // cold peer core
+  void *fn = reinterpret_cast<void *>(0x1);
+  EXPECT_FALSE(owner.funcIndexOnlyDirectHit(77, &fn));
+  EXPECT_EQ(fn, nullptr);
+  EXPECT_TRUE(plog.cores.empty()); // fast path never ran a prepare callback
+}
+
+// Test 9: once a peer has prepared (memoized) execute permission, the fast path
+// hits directly without re-preparing.
+TEST_F(SharedTaskPoolTest, FuncIndexOnly_PeerPreparedHits) {
+  PrepareLog plog;
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setCodeSharingEnabled(true);
+  owner.setPrepareCodeCallback(&mockPrepareCode, &plog);
+  owner.setMode(EJitCompileMode::Async);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  publish(owner, 78);
+
+  EJitCoreId::setCurrentForTest(6);
+  // Warm via the full path (prepares + memoizes this peer's permission).
+  auto warm = owner.tryCacheHit0D(78);
+  ASSERT_EQ(warm.status, EJitCompileOrGetStatus::CacheHit);
+  if (warm.hasReadToken)
+    owner.releaseRead(warm.bucketIndex);
+  ASSERT_EQ(plog.cores.size(), 1u);
+
+  void *fn = nullptr;
+  EXPECT_TRUE(owner.funcIndexOnlyDirectHit(78, &fn)); // now a direct hit
+  EXPECT_EQ(fn, codeFor(78));
+  EXPECT_EQ(plog.cores.size(), 1u); // no additional prepare
+}
+
+// Test 10: a NO_RECLAIM funcIndex-only hit takes no read token and performs no
+// RMW on the bucket reader counter.
+TEST_F(SharedTaskPoolTest, FuncIndexOnly_HitTakesNoReadToken) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  publish(owner, 13);
+  EJitCoreId::setCurrentForTest(0);
+  EJitSharedCacheSlot *slot = findReadySlot(13);
+  ASSERT_NE(slot, nullptr);
+  EJitSharedCacheBucket *bucket = nullptr;
+  for (uint32_t b = 0; b < kEJitSharedCacheBuckets && !bucket; ++b)
+    for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s)
+      if (&state_->buckets[b].slots[s] == slot) {
+        bucket = &state_->buckets[b];
+        break;
+      }
+  ASSERT_NE(bucket, nullptr);
+  EXPECT_EQ(bucket->readers.loadAcquire(), 0u);
+
+  auto r = owner.tryCacheHitFuncIndexOnly(13);
+  EXPECT_EQ(r.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_FALSE(r.hasReadToken);
+  EXPECT_EQ(r.bucketIndex, kEJitSharedCacheBuckets); // out-of-range sentinel
+  EXPECT_EQ(bucket->readers.loadAcquire(), 0u);      // no reader RMW happened
+  owner.releaseRead(r.bucketIndex);                  // safe no-op on sentinel
+  EXPECT_EQ(bucket->readers.loadAcquire(), 0u);
+}
+
+// Test 11: an out-of-range funcIndex is a clean fallback and never indexes the
+// hint table out of bounds.
+TEST_F(SharedTaskPoolTest, FuncIndexOnly_OutOfRangeFuncIndexCleanFallback) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  void *fn = reinterpret_cast<void *>(0x1);
+  EXPECT_FALSE(owner.funcIndexOnlyDirectHit(kEJitSharedMaxFuncIndex, &fn));
+  EXPECT_EQ(fn, nullptr);
+  fn = reinterpret_cast<void *>(0x1);
+  EXPECT_FALSE(
+      owner.funcIndexOnlyDirectHit(kEJitSharedMaxFuncIndex + 123u, &fn));
+  EXPECT_EQ(fn, nullptr);
+}
+
+// Test 12: when the same funcIndex has two distinct dimension sets, the hint is
+// poisoned so the funcIndex-only path never mis-hits.
+TEST_F(SharedTaskPoolTest, FuncIndexOnly_SameFuncIndexDifferentDimsNoMisHit) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  owner.setInstanceEnabled(0, 1, true);
+  owner.setInstanceEnabled(0, 2, true);
+  EJitCoreId::setCurrentForTest(0);
+  EJitDimPair dA[1] = {dim(0, 1)};
+  EJitDimPair dB[1] = {dim(0, 2)};
+  ASSERT_EQ(owner.compileOrGet(60, dA, 1, codeFor(60)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  // Second, DISTINCT specialization of the same funcIndex -> poisons the hint.
+  ASSERT_EQ(owner.compileOrGet(60, dB, 1, codeFor(60)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  EXPECT_EQ(state_->funcHint[60].loadAcquire(), 0xFFFFFFFFu); // poisoned
+  void *fn = reinterpret_cast<void *>(0x1);
+  EXPECT_FALSE(owner.funcIndexOnlyDirectHit(60, &fn));
+  EXPECT_EQ(fn, nullptr);
+  // The generic identity lookups still resolve each specialization correctly.
+  auto hitA = owner.tryCacheHit1D(60, 0, 1);
+  EXPECT_EQ(hitA.status, EJitCompileOrGetStatus::CacheHit);
+  if (hitA.hasReadToken)
+    owner.releaseRead(hitA.bucketIndex);
+}
+
+// The direct-only wrapper helper must leave a hint miss non-terminal. This is
+// what lets the 1D/2D C ABI preserve its original dimensions when it falls
+// through to compileOrGet instead of accidentally compiling a 0D identity.
+TEST_F(SharedTaskPoolTest, FuncIndexOnly_DirectMissPreservesCallerFallback) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+
+  auto miss = owner.tryFuncIndexOnlyDirect(61);
+  EXPECT_FALSE(miss.fastPathTerminal);
+  EXPECT_EQ(miss.fnPtr, nullptr);
+
+  owner.setInstanceEnabled(0, 3, true);
+  EJitDimPair d1[1] = {dim(0, 3)};
+  ASSERT_EQ(owner.compileOrGet(61, d1, 1, codeFor(61)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  auto hit = owner.tryFuncIndexOnlyDirect(61);
+  EXPECT_TRUE(hit.fastPathTerminal);
+  EXPECT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(hit.fnPtr, codeFor(61));
+}
+#endif // EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP
+
 } // namespace

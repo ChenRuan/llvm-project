@@ -754,6 +754,118 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
   return taskpoolStatus(r.status);
 }
 
+#if defined(EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
+//===----------------------------------------------------------------------===//
+// BENCHMARK ONLY / UNSAFE FOR GENERAL USE — thin funcIndex-only C ABI entry.
+//
+// Additive, opt-in entries that resolve a cache HIT from the funcIndex-only
+// direct-hint fast path: on a hit it needs ONLY funcIndex (no dims, no identity
+// hash, no per-dimension version/active checks, no read token). On a miss it
+// falls back to the existing generic compileOrGet with the entry's original
+// 0D/1D/2D dimensions, so enqueue / dedup / compile / publish are unchanged.
+// Under the benchmark's immutable-single-specialization preconditions, they
+// do not return a stale or unexecutable pointer. These symbols only exist in an
+// EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP build
+// (which requires the shared taskpool + NO_RECLAIM never-reclaim code pool); it
+// does not exist and cannot be called in a production build. It does not
+// replace or modify any existing generic C ABI entry.
+//===----------------------------------------------------------------------===//
+ejit_status_t ejit_taskpool_compile_or_get_func_only(uint32_t funcIndex,
+                                                     void **outFn,
+                                                     uint32_t *outBucket) {
+  if (outFn)
+    *outFn = nullptr;
+  if (outBucket)
+    *outBucket = 0;
+  if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  auto *tp = activeTaskPool();
+  if (!tp)
+    return EJIT_ERR_NOT_ACTIVE;
+
+  auto fast = tp->tryFuncIndexOnlyDirect(funcIndex);
+  if (fast.fastPathTerminal) {
+    if (outFn)
+      *outFn = fast.fnPtr;
+    if (outBucket)
+      *outBucket = fast.bucketIndex;
+    return taskpoolStatus(fast.status);
+  }
+  // True miss: fall back to the generic path with zero dims (0D identity).
+  auto r = tp->compileOrGet(funcIndex, nullptr, 0, /*fallback=*/nullptr);
+  if (outFn)
+    *outFn = r.fnPtr;
+  if (outBucket)
+    *outBucket = r.bucketIndex;
+  return taskpoolStatus(r.status);
+}
+
+ejit_status_t ejit_taskpool_compile_or_get_func_only_1d(
+    uint32_t funcIndex, uint32_t dim0, uint32_t inst0, void **outFn,
+    uint32_t *outBucket) {
+  if (outFn)
+    *outFn = nullptr;
+  if (outBucket)
+    *outBucket = 0;
+  if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  auto *tp = activeTaskPool();
+  if (!tp)
+    return EJIT_ERR_NOT_ACTIVE;
+
+  auto fast = tp->tryFuncIndexOnlyDirect(funcIndex);
+  if (fast.fastPathTerminal) {
+    if (outFn)
+      *outFn = fast.fnPtr;
+    if (outBucket)
+      *outBucket = fast.bucketIndex;
+    return taskpoolStatus(fast.status);
+  }
+  if (!ejitTaskpoolDimInRange(dim0, inst0))
+    return EJIT_ERR_INVALID_PARAM;
+  const EJitDimPair dims[1] = {{dim0, inst0}};
+  auto r = tp->compileOrGet(funcIndex, dims, 1, /*fallback=*/nullptr);
+  if (outFn)
+    *outFn = r.fnPtr;
+  if (outBucket)
+    *outBucket = r.bucketIndex;
+  return taskpoolStatus(r.status);
+}
+
+ejit_status_t ejit_taskpool_compile_or_get_func_only_2d(
+    uint32_t funcIndex, uint32_t dim0, uint32_t inst0, uint32_t dim1,
+    uint32_t inst1, void **outFn, uint32_t *outBucket) {
+  if (outFn)
+    *outFn = nullptr;
+  if (outBucket)
+    *outBucket = 0;
+  if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  auto *tp = activeTaskPool();
+  if (!tp)
+    return EJIT_ERR_NOT_ACTIVE;
+
+  auto fast = tp->tryFuncIndexOnlyDirect(funcIndex);
+  if (fast.fastPathTerminal) {
+    if (outFn)
+      *outFn = fast.fnPtr;
+    if (outBucket)
+      *outBucket = fast.bucketIndex;
+    return taskpoolStatus(fast.status);
+  }
+  if (!ejitTaskpoolDimInRange(dim0, inst0) ||
+      !ejitTaskpoolDimInRange(dim1, inst1))
+    return EJIT_ERR_INVALID_PARAM;
+  const EJitDimPair dims[2] = {{dim0, inst0}, {dim1, inst1}};
+  auto r = tp->compileOrGet(funcIndex, dims, 2, /*fallback=*/nullptr);
+  if (outFn)
+    *outFn = r.fnPtr;
+  if (outBucket)
+    *outBucket = r.bucketIndex;
+  return taskpoolStatus(r.status);
+}
+#endif // EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP
+
 void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
                                         uint32_t enabled) {
   EJIT_DIAG_VERBOSE("taskpool_set_instance_enabled dim=%u inst=%u enabled=%u",

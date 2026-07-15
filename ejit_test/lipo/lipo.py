@@ -374,6 +374,11 @@ def doit_gc_merge(args):
         "ejit_taskpool_compile_or_get_0d", "ejit_taskpool_compile_or_get_1d",
         "ejit_taskpool_compile_or_get_2d", "ejit_taskpool_compile_or_get_3d",
         "ejit_taskpool_compile_or_get_4d",
+        # BENCHMARK ONLY / UNSAFE FOR GENERAL USE: optional root, retained only
+        # when the runtime was built with EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP.
+        "ejit_taskpool_compile_or_get_func_only",
+        "ejit_taskpool_compile_or_get_func_only_1d",
+        "ejit_taskpool_compile_or_get_func_only_2d",
         "ejit_taskpool_set_instance_enabled", "ejit_taskpool_pending_count",
         "ejit_taskpool_get_stats", "ejit_taskpool_print_stats", "ejit_taskpool_get_worker_core",
         "ejit_taskpool_print_compiled", "ejit_taskpool_trace_now",

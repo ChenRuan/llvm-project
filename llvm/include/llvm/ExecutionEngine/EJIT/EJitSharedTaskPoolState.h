@@ -45,6 +45,28 @@
 #include <type_traits>
 
 //===----------------------------------------------------------------------===//
+// BENCHMARK ONLY / UNSAFE FOR GENERAL USE — funcIndex-only cache-hit fast path.
+//
+// EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP enables a deliberately-cheating, benchmark-
+// only cache-hit query path that resolves a hit from a funcIndex -> (bucket,
+// slot) direct hint WITHOUT recomputing the identity hash, without the per-
+// dimension version/active checks, and without any read-token / atomic RMW. It
+// is correct ONLY under the strict preconditions documented in
+// EJitSharedTaskPool.cpp (one specialization per funcIndex, no version/active
+// changes, never-reclaimed code pool). It is therefore hard-gated to the
+// shared taskpool + never-reclaim build and refuses to compile otherwise so it
+// can never silently alter the production path. Default OFF: the field and code
+// below do not exist, so the shared-memory layout, ABI, and behavior are
+// byte-for-byte unchanged.
+//===----------------------------------------------------------------------===//
+#if defined(EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
+#if !defined(EJIT_SRE_SHARED_TASKPOOL) || !defined(EJIT_SRE_TASKPOOL_NO_RECLAIM)
+#error                                                                         \
+    "EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP (BENCHMARK ONLY / UNSAFE FOR GENERAL USE) requires both EJIT_SRE_SHARED_TASKPOOL and EJIT_SRE_TASKPOOL_NO_RECLAIM"
+#endif
+#endif
+
+//===----------------------------------------------------------------------===//
 // Compile-time capacities (overridable by the build via -D). Defaults mirror
 // the non-shared taskpool so the two stay aligned.
 //===----------------------------------------------------------------------===//
@@ -390,6 +412,21 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   //--- result cache (own cache line; each bucket is itself cache-line aligned)
   alignas(kEJitSharedCacheLine)
       EJitSharedCacheBucket buckets[kEJitSharedCacheBuckets];
+
+#if defined(EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
+  //--- BENCHMARK ONLY / UNSAFE FOR GENERAL USE: funcIndex -> (bucket, slot)
+  //    direct hint table for the funcIndex-only cache-hit fast path. One
+  //    EJitAtomicU32 per dense funcIndex: 0 = no hint, 0xFFFFFFFF = poisoned
+  //    (a second distinct specialization was published for this funcIndex, so
+  //    the funcIndex-only path must not mis-hit and cleanly falls back), else
+  //    the valid bit (0x80000000) OR-ed with (bucket << 8) | slot. Written only
+  //    by the single owner worker at publish; read lock-free by every core.
+  //    Memory cost: kEJitSharedMaxFuncIndex * 4 bytes (default 4096 * 4 = 16
+  //    KiB), on its own cache line so it never false-shares with the buckets.
+  //    This field ONLY exists in an EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP build; the
+  //    production (default OFF) layout is byte-for-byte unchanged.
+  alignas(kEJitSharedCacheLine) EJitAtomicU32 funcHint[kEJitSharedMaxFuncIndex];
+#endif
 };
 
 //===----------------------------------------------------------------------===//

@@ -121,6 +121,33 @@ constexpr uint32_t kReady = static_cast<uint32_t>(EJitSharedInitState::Ready);
 /// cacheLookupNd block can also reference it.
 constexpr uint64_t kHashMul = 0x9e3779b97f4a7c15ULL;
 
+#if defined(EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
+//===----------------------------------------------------------------------===//
+// BENCHMARK ONLY / UNSAFE FOR GENERAL USE — funcIndex -> (bucket, slot) direct
+// hint encoding for the funcIndex-only cache-hit fast path. One EJitAtomicU32
+// per dense funcIndex:
+//   * kFuncHintEmpty  (0)          — no hint published yet.
+//   * kFuncHintPoison (0xFFFFFFFF) — a second, DISTINCT (bucket, slot) was
+//     published for this funcIndex (i.e. more than one specialization), so the
+//     funcIndex-only path can no longer prove which slot a request wants and
+//     MUST cleanly fall back to the full identity lookup — it never mis-hits.
+//   * otherwise                    — valid: kFuncHintValidBit | (bucket << 8) |
+//     slot. bucket < kEJitSharedCacheBuckets (<=256) and slot <
+//     kEJitSharedCacheSlots (<=256) both fit in a byte, so the value can never
+//     collide with the empty or poison sentinels.
+//===----------------------------------------------------------------------===//
+constexpr uint32_t kFuncHintEmpty = 0u;
+constexpr uint32_t kFuncHintPoison = 0xFFFFFFFFu;
+constexpr uint32_t kFuncHintValidBit = 0x80000000u;
+inline uint32_t funcHintPack(uint32_t bucket, uint32_t slot) {
+  return kFuncHintValidBit | ((bucket & 0xFFu) << 8) | (slot & 0xFFu);
+}
+inline void funcHintUnpack(uint32_t v, uint32_t &bucket, uint32_t &slot) {
+  bucket = (v >> 8) & 0xFFu;
+  slot = v & 0xFFu;
+}
+#endif
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -1201,6 +1228,26 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   target->executableCoreMask.storeRelease(
       OwnerCore < 64 ? (uint64_t{1} << OwnerCore) : 0);
   target->state.storeRelease(static_cast<uint32_t>(EJitSharedSlotState::Ready));
+#if defined(EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
+  // BENCHMARK ONLY / UNSAFE FOR GENERAL USE. Record the funcIndex -> (bucket,
+  // slot) direct hint for the funcIndex-only fast path. Only the single owner
+  // worker publishes, so no publisher/publisher race exists here; a release
+  // store is sufficient for the lock-free readers. If a DIFFERENT (bucket,
+  // slot) was already recorded for this funcIndex (a second distinct
+  // specialization / dimension set), poison the hint so the funcIndex-only path
+  // can never mis-hit and instead falls back to the full identity lookup. A
+  // same-slot recompile keeps the hint (its live fnPtr is re-read on every hit,
+  // so the fast path always returns the current pointer, never a stale one).
+  if (req.funcIndex < kEJitSharedMaxFuncIndex) {
+    const uint32_t slotIndex = static_cast<uint32_t>(target - &B.slots[0]);
+    const uint32_t desired = funcHintPack(bucket, slotIndex);
+    const uint32_t cur = state_->funcHint[req.funcIndex].loadAcquire();
+    if (cur == kFuncHintEmpty || cur == desired)
+      state_->funcHint[req.funcIndex].storeRelease(desired);
+    else
+      state_->funcHint[req.funcIndex].storeRelease(kFuncHintPoison);
+  }
+#endif
   bucketWriteRelease(B);
 
   // Release the slot's PREVIOUS code OUTSIDE the bucket lock (the callback may
@@ -1338,6 +1385,15 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
       Slot.rangeReserved = 0;
     }
   }
+#if defined(EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
+  // BENCHMARK ONLY / UNSAFE FOR GENERAL USE. Clear the funcIndex-only direct
+  // hint table on every (re)initialization so a stale hint from an earlier
+  // generation can never resolve after a shutdown/reinit. (Generation-tagged
+  // slots would already reject a stale hint, but clearing keeps the table
+  // consistent and lets a fresh generation start from a clean map.)
+  for (uint32_t i = 0; i < kEJitSharedMaxFuncIndex; ++i)
+    st->funcHint[i].storeRelaxed(kFuncHintEmpty);
+#endif
 }
 } // namespace
 
@@ -1672,6 +1728,135 @@ EJitSharedTaskPool::tryCacheHit4D(uint32_t funcIndex, uint32_t dim0,
                                    inst2, dim3, inst3));
 #endif
 }
+
+#if defined(EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
+//===----------------------------------------------------------------------===//
+// BENCHMARK ONLY / UNSAFE FOR GENERAL USE — funcIndex-only cache-hit fast path.
+//
+// This path INTENTIONALLY cheats for a performance experiment. It is memory-
+// and type-safe, but it is NOT a correct general cache lookup: it trusts the
+// funcIndex -> (bucket, slot) hint and validates ONLY funcIndex, generation,
+// Ready state, and the fnPtr cross-core gate. It DOES NOT recompute the
+// identity hash, DOES NOT compare the dimension identity, and DOES NOT check
+// per-instance versions or active state. It is correct ONLY when EVERY one of
+// these benchmark preconditions holds for the whole run:
+//   * exactly ONE specialization exists per funcIndex (a 2nd distinct set of
+//     dimensions poisons the hint at publish, forcing a clean fallback);
+//   * cell/trp/dimensions, instance active state, and versions never change;
+//   * may_const-associated globals never change;
+//   * the code pool never reclaims (guaranteed by
+//   EJIT_SRE_TASKPOOL_NO_RECLAIM),
+//     so a published fnPtr is never freed and a token-free read can never
+//     dangle.
+// Outside these conditions it can return a pointer that a correct lookup would
+// have rejected. It must NEVER be enabled on the production path.
+//===----------------------------------------------------------------------===//
+bool EJitSharedTaskPool::funcIndexOnlyDirectHit(uint32_t funcIndex,
+                                                void **outFn) {
+  if (outFn)
+    *outFn = nullptr;
+  if (!state_)
+    return false;
+  // funcIndex out of range: clean fallback, never index the hint table OOB.
+  if (funcIndex >= kEJitSharedMaxFuncIndex)
+    return false;
+
+  const uint32_t hint = state_->funcHint[funcIndex].loadAcquire();
+  if (hint == kFuncHintEmpty || hint == kFuncHintPoison)
+    return false; // no hint, or poisoned (2nd specialization) -> fall back.
+
+  uint32_t bucket = 0, slot = 0;
+  funcHintUnpack(hint, bucket, slot);
+  if (bucket >= kEJitSharedCacheBuckets || slot >= kEJitSharedCacheSlots)
+    return false; // corrupt/stale encoding -> fall back, never index OOB.
+
+  EJitSharedCacheSlot &Slot = state_->buckets[bucket].slots[slot];
+  // Ready gate: an acquire load of Ready synchronizes with the publisher's
+  // release store of Ready, which is written LAST — after fnPtr and identity —
+  // so every field read below is consistent.
+  if (Slot.state.loadAcquire() !=
+      static_cast<uint32_t>(EJitSharedSlotState::Ready))
+    return false;
+  // Generation gate: a hint from an earlier owner generation (an intervening
+  // shutdown/reinit) is silently rejected.
+  if (Slot.generation != state_->generation.loadAcquire())
+    return false;
+  // funcIndex gate: guards against a stale hint whose slot was reused by a
+  // different funcIndex (eviction). No identity-hash / dim / version compare.
+  if (Slot.funcIndex != funcIndex)
+    return false;
+
+  void *fn = reinterpret_cast<void *>(Slot.fnPtr.loadAcquire());
+  if (!fn)
+    return false;
+
+  // fnPtr cross-core gate (§11): only hand back a pointer the CALLING core may
+  // legally execute. NO read token and NO atomic RMW are taken here — safe only
+  // because published code is never freed in a NO_RECLAIM build.
+  const uint32_t self = EJitCoreId::current();
+  const uint32_t owner = state_->ownerCoreId.loadRelaxed();
+#if defined(EJIT_SRE_SHARED_CODE_POINTERS)
+  constexpr bool mayReadPtr = true;
+#else
+  const bool mayReadPtr = (self == owner);
+#endif
+  if (!mayReadPtr)
+    return false;
+  // Owner already sealed the code before publishing: direct return.
+  if (self == owner) {
+    if (outFn)
+      *outFn = fn;
+    return true;
+  }
+  // Peer that has already memoized execute permission for THIS slot: direct
+  // return. A cold peer (bit not yet set) returns false so the caller runs the
+  // existing prepare/fallback path — the fast path never prepares here.
+  const bool canMemoize = self < kEJitSharedMaxMemoCores;
+  const uint64_t coreBit = canMemoize ? (uint64_t{1} << self) : uint64_t{0};
+  if (canMemoize && (Slot.executableCoreMask.loadAcquire() & coreBit) != 0) {
+    if (outFn)
+      *outFn = fn;
+    return true;
+  }
+  return false; // cold peer -> caller falls back to prepare/full lookup.
+}
+
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::tryFuncIndexOnlyDirect(uint32_t funcIndex) {
+  CompileOrGetResult R;
+  // Ready check (§5.2 step 0): a not-yet-Ready pool is a clean fallback.
+  if (!state_ || state_->initState.loadAcquire() != kReady) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  void *fn = nullptr;
+  if (funcIndexOnlyDirectHit(funcIndex, &fn)) {
+    EJIT_STAT_INC(state_->counters.cacheHits);
+    R.status = EJitCompileOrGetStatus::CacheHit;
+    R.fnPtr = fn;
+    // No read token was taken; use the out-of-range sentinel so a wrapper
+    // releaseRead() cleanly no-ops (same convention as the seqlock hit).
+    R.bucketIndex = kEJitSharedCacheBuckets;
+    R.hasReadToken = false;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  return R;
+}
+
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::tryCacheHitFuncIndexOnly(uint32_t funcIndex) {
+  CompileOrGetResult R = tryFuncIndexOnlyDirect(funcIndex);
+  if (R.fastPathTerminal)
+    return R;
+  // Direct hint missed / poisoned / cold peer: fall back to the full 0D seqlock
+  // lookup, which resolves a cold-peer first touch (peerPrepareSlot) or a true
+  // miss exactly as tryCacheHit0D would. classifyHit increments cacheHits on a
+  // fallback hit, so the counter is bumped exactly once per hit.
+  return classifyHit(cacheLookupSeq0D(funcIndex));
+}
+#endif // EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP
 
 EJitSharedTaskPool::CompileOrGetResult
 EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,

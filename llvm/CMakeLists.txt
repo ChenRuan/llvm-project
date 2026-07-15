@@ -777,6 +777,32 @@ if(EJIT_SRE_SHARED_TASKPOOL)
                  "sharedSection=${_ejit_shared_section})")
 endif()
 
+# Never reclaim or overwrite published taskpool code. This enables the
+# load-only seqlock cache-hit reader and removes the read-token RMW/release
+# pair. It is an explicit whole-runtime lifetime contract, not a debug switch.
+option(EJIT_SRE_TASKPOOL_NO_RECLAIM
+  "Never reclaim published EmbeddedJIT taskpool code (enables load-only cache hits)" OFF)
+if(EJIT_SRE_TASKPOOL_NO_RECLAIM AND NOT EJIT_SRE_SHARED_TASKPOOL)
+  message(FATAL_ERROR
+    "EJIT_SRE_TASKPOOL_NO_RECLAIM requires EJIT_SRE_SHARED_TASKPOOL=ON")
+endif()
+
+# Deliberately unsafe benchmark experiment: cache hits are selected only by
+# funcIndex. The wrapper still carries 1D/2D scalar dimensions for a true miss,
+# but the hit path skips identity, active-state and version validation.
+option(EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP
+  "BENCHMARK ONLY: use funcIndex-only shared-taskpool cache hits" OFF)
+if(EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
+  if(NOT EJIT_SRE_TASKPOOL_NO_RECLAIM)
+    message(FATAL_ERROR
+      "EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP requires "
+      "EJIT_SRE_TASKPOOL_NO_RECLAIM=ON")
+  endif()
+  message(WARNING
+    "EmbeddedJIT: benchmark-only funcIndex lookup enabled; valid only when "
+    "each funcIndex has one immutable specialization")
+endif()
+
 set(LLVM_TARGETS_TO_BUILD "all"
     CACHE STRING "Semicolon-separated list of targets to build, or \"all\".")
 

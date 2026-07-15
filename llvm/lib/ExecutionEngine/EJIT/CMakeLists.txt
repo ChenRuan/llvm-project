@@ -128,6 +128,15 @@ add_llvm_component_library(LLVMEJIT
   # ExecutionEngine is not listed — it's already pulled by OrcJIT.
   )
 
+if(EJIT_SRE_TASKPOOL_NO_RECLAIM)
+  target_compile_definitions(LLVMEJIT PRIVATE
+    EJIT_SRE_TASKPOOL_NO_RECLAIM)
+endif()
+if(EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
+  target_compile_definitions(LLVMEJIT PRIVATE
+    EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP)
+endif()
+
 # Propagate the target triple setting to the C++ code
 if(EJIT_DEFAULT_TARGET_TRIPLE)
   target_compile_definitions(LLVMEJIT PUBLIC

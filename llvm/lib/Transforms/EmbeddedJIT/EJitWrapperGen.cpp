@@ -58,6 +58,19 @@ static cl::opt<bool> EJitWrapperTiming(
     cl::desc("Emit diagnostic timing probes around taskpool lookup, indirect "
              "JIT call, and read-token release in ejit_entry wrappers"));
 
+// BENCHMARK ONLY / UNSAFE FOR GENERAL USE. When set, a 0/1/2-dimension
+// ejit_entry wrapper calls a thin funcIndex-only cache-hit entry instead of
+// the corresponding fixed-dimension entry. Dimension scalars are retained by
+// the 1D/2D ABI only for the miss path; a hit reads only funcIndex. Default
+// OFF: the wrapper IR is byte-for-byte unchanged. The runtime symbols exist in
+// an
+// EJIT_BENCH_FUNCINDEX_ONLY_LOOKUP build (shared taskpool + NO_RECLAIM); do not
+// enable this for a production board image.
+static cl::opt<bool> EJitWrapperBenchFuncIndexOnly(
+    "ejit-wrapper-bench-funcindex-only", cl::init(false), cl::Hidden,
+    cl::desc("BENCHMARK ONLY / UNSAFE FOR GENERAL USE: emit the funcIndex-only "
+             "cache-hit entries for 0/1/2-dim ejit_entry wrappers"));
+
 // Wrapper generation now unconditionally uses the unified taskpool API
 // (ejit_taskpool_compile_or_get + ejit_taskpool_release_read). Both Sync
 // and Async modes are runtime-configurable — the AOT wrapper code is
@@ -496,9 +509,15 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     // fixed 3D/4D C APIs still exist and are semantically correct for direct
     // callers; the wrapper just does not select them.
     bool UseFixed = EJitWrapperFixedDimEntry && DimCount <= 2;
+    // BENCHMARK ONLY / UNSAFE FOR GENERAL USE. 0/1/2-dim entries may call a
+    // thin funcIndex-only hit entry. The 1D/2D scalar dimensions are consumed
+    // only after a direct-hint miss, preserving normal compile semantics.
+    bool UseFuncOnly = EJitWrapperBenchFuncIndexOnly && DimCount <= 2;
+    if (UseFuncOnly)
+      UseFixed = false;
     auto *DimPairTy = StructType::get(I32Ty, I32Ty);
     auto *I64Ty = Type::getInt64Ty(Ctx);
-    Value *DimsAlloca = UseFixed
+    Value *DimsAlloca = (UseFixed || UseFuncOnly)
                             ? nullptr
                             : Builder.CreateAlloca(ArrayType::get(DimPairTy, 4),
                                                    nullptr, "ejit_dims");
@@ -576,6 +595,30 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       FunctionCallee FixedFn = M.getOrInsertFunction(
           FixedNames[DimCount], FunctionType::get(I32Ty, ParamTys, false));
       Status = Builder.CreateCall(FixedFn, Args);
+    } else if (UseFuncOnly) {
+      // BENCHMARK ONLY / UNSAFE FOR GENERAL USE.
+      static const char *const FuncOnlyNames[] = {
+          FN_TASKPOOL_COMPILE_OR_GET_FUNC_ONLY,
+          FN_TASKPOOL_COMPILE_OR_GET_FUNC_ONLY_1D,
+          FN_TASKPOOL_COMPILE_OR_GET_FUNC_ONLY_2D};
+      SmallVector<Type *, 8> ParamTys;
+      SmallVector<Value *, 8> Args;
+      ParamTys.push_back(I32Ty);
+      Args.push_back(FuncIdx);
+      for (unsigned I = 0; I < DimCount; ++I) {
+        ParamTys.push_back(I32Ty);
+        ParamTys.push_back(I32Ty);
+        Args.push_back(emitDimTypeVal(I));
+        Args.push_back(emitInstanceVal(I));
+      }
+      ParamTys.push_back(PtrTy);
+      ParamTys.push_back(PtrTy);
+      Args.push_back(OutFnArg);
+      Args.push_back(OutBucketArg);
+      FunctionCallee FuncOnlyFn = M.getOrInsertFunction(
+          FuncOnlyNames[DimCount],
+          FunctionType::get(I32Ty, ParamTys, false));
+      Status = Builder.CreateCall(FuncOnlyFn, Args);
     } else {
       for (unsigned I = 0; I < DimCount; ++I) {
         Value *Idxs[] = {ConstantInt::get(I32Ty, 0),
