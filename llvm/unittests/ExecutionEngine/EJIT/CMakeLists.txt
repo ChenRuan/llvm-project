@@ -138,15 +138,16 @@ if(EJIT_BUILD_CACHE_QUERY_BENCH)
     EJIT_SRE_TASKPOOL
     EJIT_SRE_SHARED_TASKPOOL
     EJIT_SRE_TASKPOOL_TESTING
+    EJIT_SRE_SHARED_CODE_POINTERS
     EJIT_SRE_TASKPOOL_BUCKETS=32
     EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
     )
-  # Opt-in: build the benchmark with the load-only NO_RECLAIM seqlock hit path
-  # + cross-core code sharing (so peer hits and the fixed-dim seqlock lookups
-  # are exercised), mirroring EJIT_TEST_NO_RECLAIM above.
+  # Opt-in: build the benchmark with the load-only NO_RECLAIM seqlock hit path.
+  # Cross-core code sharing stays enabled in both variants so token and
+  # NO_RECLAIM measurements exercise the same peer-hit workload.
   if(EJIT_TEST_NO_RECLAIM)
     target_compile_definitions(EJITSharedCacheQueryBench PRIVATE
-      EJIT_SRE_TASKPOOL_NO_RECLAIM
-      EJIT_SRE_SHARED_CODE_POINTERS)
+      EJIT_SRE_TASKPOOL_NO_RECLAIM)
   endif()
+  target_link_libraries(EJITSharedCacheQueryBench PRIVATE ${LLVM_PTHREAD_LIB})
 endif()

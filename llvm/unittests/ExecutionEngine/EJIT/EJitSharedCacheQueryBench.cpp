@@ -28,12 +28,15 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <memory>
+#include <thread>
 #include <vector>
 
 using namespace llvm::ejit;
@@ -217,6 +220,131 @@ uint64_t bench2D(uint64_t iters, double *nsPerHit) {
   return hits;
 }
 
+struct alignas(64) ThreadResult {
+  uint64_t elapsedNs = 0;
+  uint64_t hits = 0;
+  uintptr_t sink = 0;
+};
+
+struct alignas(64) StartGate {
+  std::atomic<uint32_t> ready{0};
+  std::atomic<bool> go{false};
+};
+
+// Real-thread contention test. In sameIdentity mode every thread reads the
+// same slot in bucket 0, mirroring many SRE cores calling one hot
+// specialization. In spread mode each thread reads a different 0D identity in
+// a different bucket, isolating thread/runtime overhead from bucket-line
+// contention. Each thread has its own sink/result cache line so the harness
+// does not add an unrelated shared-write bottleneck.
+void benchMultiThread0D(uint32_t threadCount, uint64_t iters, bool sameIdentity,
+                        uint32_t depth) {
+  if (threadCount == 0 || threadCount > 63 || depth >= kEJitSharedCacheSlots) {
+    std::fprintf(stderr, "invalid threads/depth: threads=%u depth=%u\n",
+                 threadCount, depth);
+    std::exit(2);
+  }
+  if (!sameIdentity && threadCount >= kEJitSharedCacheBuckets) {
+    std::fprintf(stderr, "spread mode needs fewer than %u threads\n",
+                 kEJitSharedCacheBuckets);
+    std::exit(2);
+  }
+
+  Bench B;
+  B.bringUpOwner(/*codeSharing=*/true);
+  std::vector<uint32_t> targetFuncs(threadCount);
+  if (sameIdentity) {
+    uint32_t target = 0;
+    for (uint32_t d = 0; d <= depth; ++d) {
+      target = d * kEJitSharedCacheBuckets;
+      B.publish0D(target);
+    }
+    std::fill(targetFuncs.begin(), targetFuncs.end(), target);
+  } else {
+    for (uint32_t t = 0; t < threadCount; ++t) {
+      targetFuncs[t] = t + 1u; // buckets 1..threadCount for <=31 threads.
+      B.publish0D(targetFuncs[t]);
+    }
+  }
+
+  StartGate gate;
+  std::unique_ptr<ThreadResult[]> results(new ThreadResult[threadCount]);
+  std::vector<std::thread> threads;
+  threads.reserve(threadCount);
+
+  for (uint32_t t = 0; t < threadCount; ++t) {
+    threads.emplace_back([&, t] {
+      // Core 0 owns the pool. Host workers model peer cores 1..threadCount.
+      EJitCoreId::setCurrentForTest(t + 1u);
+      const uint32_t target = targetFuncs[t];
+
+      // Prepare/memoize this peer's execute permission before timing.
+      auto warm = B.pool.tryCacheHit0D(target);
+      if (warm.hasReadToken)
+        B.pool.releaseRead(warm.bucketIndex);
+      bool warmOk = warm.status == EJitCompileOrGetStatus::CacheHit;
+
+      gate.ready.fetch_add(1, std::memory_order_release);
+      while (!gate.go.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      if (!warmOk)
+        return;
+
+      uint64_t hits = 0;
+      uintptr_t sink = 0;
+      uint64_t begin = nowNs();
+      for (uint64_t i = 0; i < iters; ++i) {
+        auto r = B.pool.tryCacheHit0D(target);
+        sink += reinterpret_cast<uintptr_t>(r.fnPtr);
+        if (r.status == EJitCompileOrGetStatus::CacheHit)
+          ++hits;
+        if (r.hasReadToken)
+          B.pool.releaseRead(r.bucketIndex);
+      }
+      results[t].elapsedNs = nowNs() - begin;
+      results[t].hits = hits;
+      results[t].sink = sink;
+    });
+  }
+
+  while (gate.ready.load(std::memory_order_acquire) != threadCount)
+    std::this_thread::yield();
+  uint64_t wallBegin = nowNs();
+  gate.go.store(true, std::memory_order_release);
+  for (std::thread &T : threads)
+    T.join();
+  uint64_t wallNs = nowNs() - wallBegin;
+
+  uint64_t totalHits = 0;
+  uintptr_t sink = 0;
+  std::vector<double> perThreadNs;
+  perThreadNs.reserve(threadCount);
+  for (uint32_t t = 0; t < threadCount; ++t) {
+    totalHits += results[t].hits;
+    sink ^= results[t].sink;
+    perThreadNs.push_back(double(results[t].elapsedNs) / double(iters));
+  }
+  std::sort(perThreadNs.begin(), perThreadNs.end());
+  double median = perThreadNs[threadCount / 2u];
+  double throughputMHits =
+      double(totalHits) * 1000.0 / static_cast<double>(wallNs);
+
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  const char *discipline = "noreclaim-seqlock";
+#else
+  const char *discipline = "read-token";
+#endif
+  std::printf("mt0d mode=%s discipline=%s threads=%u depth=%u "
+              "iters/thread=%llu min=%.3f median=%.3f max=%.3f ns/hit "
+              "throughput=%.3f Mhit/s hits=%llu/%llu sink=%llu\n",
+              sameIdentity ? "same" : "spread", discipline, threadCount,
+              sameIdentity ? depth : 0u, (unsigned long long)iters,
+              perThreadNs.front(), median, perThreadNs.back(), throughputMHits,
+              (unsigned long long)totalHits,
+              (unsigned long long)(iters * threadCount),
+              (unsigned long long)sink);
+}
+
 void runTable(uint64_t iters) {
   std::printf("# config,dim,slotDepth,core,nsPerHit,hits/iters\n");
   double ns;
@@ -250,8 +378,25 @@ void runTable(uint64_t iters) {
 //   bench single0dpeer <d> <iters>
 //   bench single1d <d> <iters>
 //   bench single2d <iters>
+//   bench mt0dsame <iters/thread> [threads=16] [slotDepth=0]
+//   bench mt0dspread <iters/thread> [threads=16]
 int main(int argc, char **argv) {
   uint64_t iters = 20000000ull;
+  if (argc >= 2 && std::strncmp(argv[1], "mt0d", 4) == 0) {
+    iters = argc >= 3 ? strtoull(argv[2], nullptr, 10) : 1000000ull;
+    uint32_t threadCount =
+        argc >= 4 ? (uint32_t)strtoul(argv[3], nullptr, 10) : 16u;
+    if (std::strcmp(argv[1], "mt0dsame") == 0) {
+      uint32_t depth = argc >= 5 ? (uint32_t)strtoul(argv[4], nullptr, 10) : 0u;
+      benchMultiThread0D(threadCount, iters, /*sameIdentity=*/true, depth);
+    } else if (std::strcmp(argv[1], "mt0dspread") == 0) {
+      benchMultiThread0D(threadCount, iters, /*sameIdentity=*/false, 0);
+    } else {
+      std::fprintf(stderr, "unknown multi-thread mode %s\n", argv[1]);
+      return 2;
+    }
+    return 0;
+  }
   if (argc >= 2 && std::strncmp(argv[1], "single", 6) == 0) {
     double ns;
     uint64_t h = 0;
