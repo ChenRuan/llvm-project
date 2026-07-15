@@ -194,6 +194,24 @@ Observations:
   the business observes as the AOT/JIT gap — and §5 shows it is dominated by the
   cache query, not the indirect branch.
 
+### 4.3 16-thread same-wrapper contention
+
+After stacking this audit on PR #82, the benchmark was extended with 16 real
+Linux threads. `same` runs the exact 0D wrapper on every thread; `spread` runs
+the same C-ABI -> indirect call -> release sequence with one funcIndex/bucket
+per thread. Each thread executes 1,000,000 calls and all calls hit.
+
+| protocol | same wrapper/slot | separate funcIndex buckets |
+|---|---:|---:|
+| read-token | 1.05-1.10 us/call median | 27.2-27.3 ns/call median |
+| NO_RECLAIM seqlock | 15.09-15.14 ns/call median | 14.66-14.70 ns/call median |
+
+Same-slot scaling makes the mechanism explicit: read-token grows from about
+28 ns at one thread to 1.30 us at 16 threads, while NO_RECLAIM remains about
+15 ns from one through 16 threads. The token's two shared atomic RMW operations
+cause cache-line bouncing; PR #82's load-only path removes that contention
+under the never-physically-reclaim premise.
+
 ---
 
 ## 5. Where the ~216 instructions go (answer to "is it < 100?")
@@ -357,12 +375,13 @@ Risk / why it is **not** in a production commit this round:
 
 ## 9. Relationship to PR #78 / PR #82
 
-* **PR #82** (`codex/ejit-cache-query-audit`): adds unrolled fixed-dimension
+* This branch is now **stacked directly on PR #82**
+  (`codex/ejit-cache-query-audit`), which adds unrolled fixed-dimension
   **seqlock** lookups (`cacheLookupSeq0D/1D/2D`), identityHash-first slot scan,
   slot-depth diagnostics, and a cache-query microbenchmark. This audit
-  **independently confirms** that the generic `cacheLookupSeq` is the dominant
-  cost in the baseline `NO_RECLAIM` 0D path (§5) and therefore that PR #82's fix
-  is the right lever — but **does not re-implement it**. This audit's
+  confirms that the cache lookup remains the dominant fixed cost and validates
+  PR #82 through the complete C-ABI/wrapper path. This audit does not
+  re-implement the production optimization. Its
   contribution is complementary: the *full three-tier* benchmark (internal +
   real C-ABI + wrapper end-to-end), the token-vs-seqlock and stats-on/off
   quantification, and the C-ABI/wrapper-plumbing analysis PR #82 does not cover.
@@ -388,4 +407,5 @@ Risk / why it is **not** in a production commit this round:
 
 ## 11. Push status
 
-Not pushed. No PR opened. Local commits only, working tree clean.
+PR #83 is open as a draft. The stacked rebase and 16-thread benchmark extension
+are local and have not been force-pushed.

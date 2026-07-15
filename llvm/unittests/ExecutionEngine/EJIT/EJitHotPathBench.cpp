@@ -35,12 +35,14 @@
 #include "EJitHotPathBenchAbi.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <memory>
+#include <thread>
 #include <vector>
 
 using namespace llvm::ejit;
@@ -381,6 +383,123 @@ void wrapperE2E(uint64_t iters) {
   row("wrapper", "wrapper_hit_trusted", wtS);
 }
 
+struct alignas(64) ThreadResult {
+  uint64_t elapsedNs = 0;
+  uint64_t hits = 0;
+  uint64_t sink = 0;
+};
+
+struct alignas(64) StartGate {
+  std::atomic<uint32_t> ready{0};
+  std::atomic<bool> go{false};
+};
+
+// Model multiple target cores calling either one hot wrapper/slot or separate
+// funcIndex buckets. The same mode executes the exact wrapper function. The
+// spread mode spells out the wrapper's C-ABI/indirect-call/release sequence so
+// each thread can use a different funcIndex without generating 16 wrappers.
+void wrapperMultiThread(uint64_t iters, uint32_t threadCount, bool sameSlot) {
+  if (threadCount == 0 || threadCount >= kEJitSharedCacheBuckets) {
+    std::fprintf(stderr, "mt threads must be in [1,%u)\n",
+                 kEJitSharedCacheBuckets);
+    std::exit(2);
+  }
+
+  Bench B;
+  B.bringUpOwner(/*codeSharing=*/true);
+  if (sameSlot) {
+    B.publish0D(0);
+  } else {
+    for (uint32_t t = 0; t < threadCount; ++t)
+      B.publish0D(t + 1u); // 0D identities map to distinct buckets 1..N.
+  }
+
+  StartGate gate;
+  std::unique_ptr<ThreadResult[]> results(new ThreadResult[threadCount]);
+  std::vector<std::thread> threads;
+  threads.reserve(threadCount);
+  for (uint32_t t = 0; t < threadCount; ++t) {
+    threads.emplace_back([&, t] {
+      EJitCoreId::setCurrentForTest(t + 1u);
+      uint32_t target = sameSlot ? 0u : t + 1u;
+
+      // Complete peer execute-permission preparation before timing.
+      void *warmFn = nullptr;
+      uint32_t warmBucket = 0;
+      uint32_t warmStatus = bench_cabi_0d(target, &warmFn, &warmBucket);
+      bool warmOk = warmStatus == BENCH_OK && warmFn;
+      if (warmOk && warmBucket < kB)
+        bench_cabi_release_read(warmBucket);
+
+      gate.ready.fetch_add(1, std::memory_order_release);
+      while (!gate.go.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      if (!warmOk)
+        return;
+
+      uint64_t acc = 0;
+      uint64_t hits = 0;
+      uint64_t begin = nowNs();
+      if (sameSlot) {
+        for (uint64_t i = 0; i < iters; ++i) {
+          acc += static_cast<uint64_t>(bench_wrapper_0d_hit((long)i));
+          ++hits;
+        }
+      } else {
+        for (uint64_t i = 0; i < iters; ++i) {
+          void *fn = nullptr;
+          uint32_t bucket = 0;
+          uint32_t status = bench_cabi_0d(target, &fn, &bucket);
+          if (status == BENCH_OK && fn) {
+            acc += static_cast<uint64_t>(
+                reinterpret_cast<long (*)(long)>(fn)((long)i));
+            bench_cabi_release_read(bucket);
+            ++hits;
+          }
+        }
+      }
+      results[t].elapsedNs = nowNs() - begin;
+      results[t].hits = hits;
+      results[t].sink = acc;
+    });
+  }
+
+  while (gate.ready.load(std::memory_order_acquire) != threadCount)
+    std::this_thread::yield();
+  uint64_t wallBegin = nowNs();
+  gate.go.store(true, std::memory_order_release);
+  for (std::thread &T : threads)
+    T.join();
+  uint64_t wallNs = nowNs() - wallBegin;
+
+  uint64_t totalHits = 0;
+  uint64_t sink = 0;
+  std::vector<double> nsPerCall;
+  nsPerCall.reserve(threadCount);
+  for (uint32_t t = 0; t < threadCount; ++t) {
+    totalHits += results[t].hits;
+    sink ^= results[t].sink;
+    nsPerCall.push_back(double(results[t].elapsedNs) / double(iters));
+  }
+  std::sort(nsPerCall.begin(), nsPerCall.end());
+  gSink += sink;
+
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  const char *discipline = "noreclaim-seqlock";
+#else
+  const char *discipline = "read-token";
+#endif
+  double throughput = double(totalHits) * 1000.0 / double(wallNs);
+  std::printf(
+      "mt-wrapper mode=%s discipline=%s threads=%u iters/thread=%llu "
+      "min=%.3f median=%.3f max=%.3f ns/call "
+      "throughput=%.3f Mcall/s hits=%llu/%llu sink=%llu\n",
+      sameSlot ? "same" : "spread", discipline, threadCount,
+      (unsigned long long)iters, nsPerCall.front(), nsPerCall[threadCount / 2u],
+      nsPerCall.back(), throughput, (unsigned long long)totalHits,
+      (unsigned long long)(iters * threadCount), (unsigned long long)sink);
+}
+
 // Tight single-workload loops for `perf stat` attribution. No timing calls, no
 // other tiers — run `perf stat -e instructions,cycles ./bench single <name> N`
 // and subtract the `empty` run to get net instructions/cycles per op.
@@ -439,6 +558,18 @@ int runSingle(const char *name, uint64_t iters) {
 } // namespace
 
 int main(int argc, char **argv) {
+  if (argc >= 2 && !std::strcmp(argv[1], "mt-wrapper")) {
+    const char *mode = argc >= 3 ? argv[2] : "same";
+    uint64_t n = argc >= 4 ? strtoull(argv[3], nullptr, 10) : 1000000ull;
+    uint32_t threads =
+        argc >= 5 ? (uint32_t)strtoul(argv[4], nullptr, 10) : 16u;
+    if (std::strcmp(mode, "same") != 0 && std::strcmp(mode, "spread") != 0) {
+      std::fprintf(stderr, "mt-wrapper mode must be same or spread\n");
+      return 2;
+    }
+    wrapperMultiThread(n, threads, std::strcmp(mode, "same") == 0);
+    return 0;
+  }
   if (argc >= 2 && !std::strcmp(argv[1], "single")) {
     const char *name = argc >= 3 ? argv[2] : "empty";
     uint64_t n = argc >= 4 ? strtoull(argv[3], nullptr, 10) : 50000000ull;

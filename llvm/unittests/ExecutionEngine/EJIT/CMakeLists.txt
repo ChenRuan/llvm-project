@@ -177,6 +177,7 @@ if(NOT WIN32)
   target_compile_definitions(EJITHotPathBench PRIVATE
     EJIT_SRE_TASKPOOL
     EJIT_SRE_SHARED_TASKPOOL
+    EJIT_SRE_SHARED_CODE_POINTERS
     EJIT_SRE_TASKPOOL_TESTING
     EJIT_SRE_TASKPOOL_BUCKETS=32
     EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
@@ -189,11 +190,11 @@ if(NOT WIN32)
   # seqlock hit path + cross-core code sharing (the production premise).
   if(EJIT_TEST_NO_RECLAIM)
     target_compile_definitions(EJITHotPathBench PRIVATE
-      EJIT_SRE_TASKPOOL_NO_RECLAIM
-      EJIT_SRE_SHARED_CODE_POINTERS)
+      EJIT_SRE_TASKPOOL_NO_RECLAIM)
   endif()
   # Opt-in: embed the statistics counters to measure their per-hit cost.
   if(EJIT_TEST_STATS)
     target_compile_definitions(EJITHotPathBench PRIVATE EJIT_STATS_ENABLE)
   endif()
+  target_link_libraries(EJITHotPathBench PRIVATE ${LLVM_PTHREAD_LIB})
 endif()
