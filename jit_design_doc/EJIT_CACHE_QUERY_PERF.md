@@ -25,8 +25,11 @@ perf stat -e instructions,cycles ./bench single0d 15 100000000
 ```
 
 Or via CMake: configure with `-DEJIT_BUILD_CACHE_QUERY_BENCH=ON` (and
-`-DEJIT_TEST_NO_RECLAIM=ON` for the seqlock + code-sharing variant), build
-`EJITSharedCacheQueryBench`.
+`-DEJIT_TEST_NO_RECLAIM=ON` for a benchmark-only seqlock + code-sharing
+variant), then build `EJITSharedCacheQueryBench`. Production builds enable the
+same implementation with `-DEJIT_SRE_TASKPOOL_NO_RECLAIM=ON`; this requires
+`EJIT_SRE_SHARED_TASKPOOL=ON` and is safe only while published JIT code is never
+physically reclaimed. The `ejit-minimal-aarch64_be` preset enables it.
 
 ---
 

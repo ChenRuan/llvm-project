@@ -718,6 +718,8 @@ endif()
 # requires EJIT_SRE_TASKPOOL (it reuses the request/identity model and macros).
 option(EJIT_SRE_SHARED_TASKPOOL
   "Enable the EmbeddedJIT cross-core shared taskpool (single shared worker owner)" ON)
+option(EJIT_SRE_TASKPOOL_NO_RECLAIM
+  "Use load-only shared-cache reads when published JIT code is never reclaimed" OFF)
 # Fixed cache slots per bucket in the shared POD cache (no std::unordered_map can
 # live in shared memory, so each bucket is a fixed slot array).
 set(EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS "16" CACHE STRING
@@ -775,6 +777,11 @@ if(EJIT_SRE_SHARED_TASKPOOL)
                  "platformCoreId=${EJIT_FREESTANDING}, "
                  "codePointers=${EJIT_SRE_SHARED_CODE_POINTERS}, "
                  "sharedSection=${_ejit_shared_section})")
+endif()
+
+if(EJIT_SRE_TASKPOOL_NO_RECLAIM AND NOT EJIT_SRE_SHARED_TASKPOOL)
+  message(FATAL_ERROR
+    "EJIT_SRE_TASKPOOL_NO_RECLAIM requires EJIT_SRE_SHARED_TASKPOOL=ON")
 endif()
 
 set(LLVM_TARGETS_TO_BUILD "all"

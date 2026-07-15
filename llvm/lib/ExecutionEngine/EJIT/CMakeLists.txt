@@ -126,7 +126,14 @@ add_llvm_component_library(LLVMEJIT
   # and AggressiveInstCombine.  Instead, they are added manually to the
   # ejit_minimal target below (see §6.5 of EJIT_LIBRARY_TRIMMING.md).
   # ExecutionEngine is not listed — it's already pulled by OrcJIT.
-  )
+)
+
+if(EJIT_SRE_TASKPOOL_NO_RECLAIM)
+  target_compile_definitions(LLVMEJIT PRIVATE
+    EJIT_SRE_TASKPOOL_NO_RECLAIM)
+  message(STATUS
+    "EmbeddedJIT: NO_RECLAIM shared-cache hot path enabled (JIT code must never be physically reclaimed)")
+endif()
 
 # Propagate the target triple setting to the C++ code
 if(EJIT_DEFAULT_TARGET_TRIPLE)
