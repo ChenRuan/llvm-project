@@ -1215,6 +1215,13 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
 }
 
 void EJitSharedTaskPool::releaseRead(uint32_t bucketIndex) {
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  // A load-only seqlock hit takes no read token and deliberately returns the
+  // one-past-the-end bucket as a sentinel. Wrappers still call releaseRead()
+  // uniformly, so this is an expected no-op rather than a rejected release.
+  if (bucketIndex == kEJitSharedCacheBuckets)
+    return;
+#endif
   if (!state_ || bucketIndex >= kEJitSharedCacheBuckets) {
     EJIT_DIAG("shared releaseRead reject: state=%p bucket=%u (max=%u)",
               (void *)state_, bucketIndex, kEJitSharedCacheBuckets);
