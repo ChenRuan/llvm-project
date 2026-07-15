@@ -19,6 +19,8 @@
 #include "llvm/ExecutionEngine/EJIT/EJitPassBuilder.h"
 
 namespace llvm {
+class TargetMachine;
+
 namespace ejit {
 
 /// JIT optimization pipeline. Runs on the extracted bitcode module during
@@ -27,14 +29,14 @@ namespace ejit {
 /// every compilation.
 class EJitOptimizer {
 public:
-  EJitOptimizer(PeriodArrayRegistry &reg);
+  EJitOptimizer(PeriodArrayRegistry &reg, const TargetMachine *TM = nullptr);
 
   /// Run the full JIT specialization pipeline:
   ///   1. Parameter substitution (ejit_period_arr_ind → constants)
   ///   2. InstCombine (fold GEP chains from substituted params)
-  ///   3. Inline (L2+: expand callee bodies so may_const GEPs are traceable)
-  ///   4. StructFieldPass (may_const loads → runtime constants)
-  ///   5. Core optimization pipeline (L1/L2/L3)
+  ///   3. StructFieldPass (may_const loads → runtime constants)
+  ///   4. Scalar and loop specialization cleanup
+  ///   5. Target-aware vectorization of remaining runtime-sized loops
   void runPipeline(Module &M, const SpecializationContext &ctx);
 
   /// Clear all cached analysis results. Must be called between compilations

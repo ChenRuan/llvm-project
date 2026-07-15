@@ -13,24 +13,27 @@
 // #include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
+#include "llvm/Transforms/Scalar/IndVarSimplify.h"
+#include "llvm/Transforms/Scalar/InstSimplifyPass.h"
+#include "llvm/Transforms/Scalar/LoopDeletion.h"
+#include "llvm/Transforms/Scalar/LoopPassManager.h"
+#include "llvm/Transforms/Scalar/LoopRotation.h"
+#include "llvm/Transforms/Scalar/LoopUnrollPass.h"
 #include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
 #include "llvm/Transforms/Scalar/SCCP.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
-#include "llvm/Transforms/Scalar/IndVarSimplify.h"
-#include "llvm/Transforms/Scalar/LoopDeletion.h"
-#include "llvm/Transforms/Scalar/LoopPassManager.h"
-#include "llvm/Transforms/Scalar/LoopUnrollPass.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
+#include "llvm/Transforms/Vectorize/LoopVectorize.h"
 
 using namespace llvm;
 using namespace llvm::ejit;
 
 #define DEBUG_TYPE "ejit-optimizer"
 
-EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
+EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, const TargetMachine *TM)
     : registry_(reg) {
-  EJitPassBuilder::registerFunctionAnalyses(FAM_);
+  EJitPassBuilder::registerFunctionAnalyses(FAM_, TM);
   EJitPassBuilder::registerLoopAnalyses(LAM_);
   EJitPassBuilder::registerCGSCCAnalyses(CGAM_);
   EJitPassBuilder::registerModuleAnalyses(MAM_);
@@ -91,6 +94,24 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
   cleanupFPM_.addPass(SCCPPass());
   cleanupFPM_.addPass(SimplifyCFGPass());
   cleanupFPM_.addPass(ADCEPass());
+
+  // ADCE can expose identities after the preceding InstCombine opportunity.
+  // InstSimplify catches those without InstCombine's broader canonicalization,
+  // which can occasionally grow otherwise-good target code.
+  cleanupFPM_.addPass(InstSimplifyPass());
+
+  // Specialization can leave runtime-sized data loops after all may_const
+  // branches have folded. Canonicalize and rotate them before target-aware
+  // vectorization, then clean up the generated vector and remainder loops.
+  cleanupFPM_.addPass(LoopSimplifyPass());
+  {
+    LoopPassManager LPM;
+    LPM.addPass(LoopRotatePass());
+    cleanupFPM_.addPass(createFunctionToLoopPassAdaptor(std::move(LPM)));
+  }
+  cleanupFPM_.addPass(LoopVectorizePass());
+  cleanupFPM_.addPass(InstCombinePass());
+  cleanupFPM_.addPass(SimplifyCFGPass());
 }
 
 void EJitOptimizer::clearAnalyses() {

@@ -25,15 +25,18 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #endif
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
+#include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #ifdef EJIT_SRE_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
 #endif
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
 #ifndef EJIT_FREESTANDING
@@ -1247,6 +1250,101 @@ TEST(EJitOptimizer, FoldsExpectGuardedConstantBranch) {
   auto *RetVal = dyn_cast<ConstantInt>(Ret->getReturnValue());
   ASSERT_NE(RetVal, nullptr);
   EXPECT_EQ(RetVal->getZExtValue(), 0u);
+}
+
+TEST(EJitOptimizer, RemovesIdentitySelectAfterCleanup) {
+  LLVMContext Ctx;
+  auto M = createTestModule(Ctx, "identity_select");
+  IRBuilder<> B(Ctx);
+  Type *I32Ty = B.getInt32Ty();
+  FunctionType *FT = FunctionType::get(I32Ty, {I32Ty, I32Ty}, false);
+  Function *F =
+      Function::Create(FT, GlobalValue::ExternalLinkage, "identity", M.get());
+  auto AI = F->arg_begin();
+  Value *A = &*AI++;
+  Value *BArg = &*AI;
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  B.SetInsertPoint(Entry);
+  Value *Sum = B.CreateAdd(A, BArg, "sum");
+  Value *IsZero = B.CreateICmpEQ(Sum, B.getInt32(0), "iszero");
+  // Construct the redundant add explicitly so IRBuilder does not fold it.
+  Value *Copy = BinaryOperator::CreateAdd(B.getInt32(0), Sum, "copy", Entry);
+  B.CreateRet(B.CreateSelect(IsZero, B.getInt32(0), Copy, "result"));
+
+  PeriodArrayRegistry Reg;
+  EJitOptimizerTestAccess Opt(Reg);
+  Opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+
+  EXPECT_FALSE(any_of(instructions(F),
+                      [](Instruction &I) { return isa<SelectInst>(I); }));
+}
+
+TEST(EJitOptimizer, VectorizesRuntimeSizedDataLoopWithTargetTTI) {
+  ASSERT_FALSE(InitializeNativeTarget());
+  auto JTMB = orc::JITTargetMachineBuilder::detectHost();
+  ASSERT_TRUE(!!JTMB) << toString(JTMB.takeError());
+  auto TM = JTMB->createTargetMachine();
+  ASSERT_TRUE(!!TM) << toString(TM.takeError());
+
+  LLVMContext Ctx;
+  auto M = std::make_unique<Module>("vector_loop", Ctx);
+  M->setTargetTriple((*TM)->getTargetTriple());
+  M->setDataLayout((*TM)->createDataLayout());
+  IRBuilder<> B(Ctx);
+  Type *I16Ty = B.getInt16Ty();
+  Type *I32Ty = B.getInt32Ty();
+  Type *I64Ty = B.getInt64Ty();
+  FunctionType *FT = FunctionType::get(
+      I32Ty, {PointerType::getUnqual(Ctx), PointerType::getUnqual(Ctx), I64Ty},
+      false);
+  Function *F = Function::Create(FT, GlobalValue::ExternalLinkage,
+                                 "runtime_data_loop", M.get());
+  auto AI = F->arg_begin();
+  Value *LHS = &*AI++;
+  Value *RHS = &*AI++;
+  Value *Count = &*AI;
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  BasicBlock *Loop = BasicBlock::Create(Ctx, "loop", F);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", F);
+  B.SetInsertPoint(Entry);
+  Value *IsEmpty = B.CreateICmpEQ(Count, B.getInt64(0));
+  B.CreateCondBr(IsEmpty, Exit, Loop);
+
+  B.SetInsertPoint(Loop);
+  PHINode *Index = B.CreatePHI(I64Ty, 2, "index");
+  PHINode *Sum = B.CreatePHI(I32Ty, 2, "sum");
+  Index->addIncoming(B.getInt64(0), Entry);
+  Sum->addIncoming(B.getInt32(0), Entry);
+  Value *L =
+      B.CreateZExt(B.CreateLoad(I16Ty, B.CreateGEP(I16Ty, LHS, Index)), I32Ty);
+  Value *R =
+      B.CreateZExt(B.CreateLoad(I16Ty, B.CreateGEP(I16Ty, RHS, Index)), I32Ty);
+  Value *NextSum = B.CreateAdd(Sum, B.CreateAdd(B.CreateMul(L, B.getInt32(3)),
+                                                B.CreateMul(R, B.getInt32(5))));
+  Value *NextIndex = B.CreateAdd(Index, B.getInt64(1));
+  Value *Done = B.CreateICmpEQ(NextIndex, Count);
+  B.CreateCondBr(Done, Exit, Loop);
+  Index->addIncoming(NextIndex, Loop);
+  Sum->addIncoming(NextSum, Loop);
+
+  B.SetInsertPoint(Exit);
+  PHINode *Result = B.CreatePHI(I32Ty, 2);
+  Result->addIncoming(B.getInt32(0), Entry);
+  Result->addIncoming(NextSum, Loop);
+  B.CreateRet(Result);
+
+  PeriodArrayRegistry Reg;
+  EJitOptimizerTestAccess Opt(Reg, TM->get());
+  Opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+
+  bool HasVectorInstruction = false;
+  for (Instruction &I : instructions(F)) {
+    HasVectorInstruction |= I.getType()->isVectorTy();
+    for (Value *Op : I.operands())
+      HasVectorInstruction |= Op->getType()->isVectorTy();
+  }
+  EXPECT_TRUE(HasVectorInstruction);
 }
 
 //===----------------------------------------------------------------------===//

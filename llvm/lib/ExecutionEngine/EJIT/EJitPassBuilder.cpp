@@ -15,6 +15,7 @@
 #include "llvm/Analysis/DemandedBits.h"
 #include "llvm/Analysis/LastRunTrackingAnalysis.h"
 #include "llvm/Analysis/LazyValueInfo.h"
+#include "llvm/Analysis/LoopAccessAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/MemoryDependenceAnalysis.h"
 #include "llvm/Analysis/MemorySSA.h"
@@ -28,12 +29,14 @@
 #include "llvm/Analysis/TypeBasedAliasAnalysis.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/PassInstrumentation.h"
+#include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/Scalar/SimpleLoopUnswitch.h"
+#include "llvm/Transforms/Vectorize/LoopVectorize.h"
 
 using namespace llvm;
 
 void ejit::EJitPassBuilder::registerFunctionAnalyses(
-    FunctionAnalysisManager &FAM) {
+    FunctionAnalysisManager &FAM, const TargetMachine *TM) {
   // AAManager and its sub-analyses.  AAManager() runs its internal
   // sub-analyses (BasicAA etc.) via FAM.  Register them all in FAM
   // so the AAManager Result can access them during run().
@@ -52,6 +55,7 @@ void ejit::EJitPassBuilder::registerFunctionAnalyses(
   FAM.registerPass([&] { return DemandedBitsAnalysis(); });
   FAM.registerPass([&] { return DominatorTreeAnalysis(); });
   FAM.registerPass([&] { return LazyValueAnalysis(); });
+  FAM.registerPass([&] { return LoopAccessAnalysis(); });
   FAM.registerPass([&] { return LoopAnalysis(); });
   // LastRunTrackingAnalysis needed by SimplifyCFG pass infrastructure.
   FAM.registerPass([&] { return LastRunTrackingAnalysis(); });
@@ -63,7 +67,9 @@ void ejit::EJitPassBuilder::registerFunctionAnalyses(
   FAM.registerPass([&] { return PassInstrumentationAnalysis(); });
   FAM.registerPass([&] { return PostDominatorTreeAnalysis(); });
   FAM.registerPass([&] { return ScalarEvolutionAnalysis(); });
-  FAM.registerPass([&] { return TargetIRAnalysis(); });
+  FAM.registerPass([&] { return ShouldRunExtraVectorPasses(); });
+  FAM.registerPass(
+      [TM] { return TM ? TM->getTargetIRAnalysis() : TargetIRAnalysis(); });
   FAM.registerPass([&] { return TargetLibraryAnalysis(); });
 }
 

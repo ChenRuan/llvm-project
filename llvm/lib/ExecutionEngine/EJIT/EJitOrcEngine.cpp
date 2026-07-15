@@ -107,12 +107,14 @@ struct EJitOrcEngine::Impl {
   std::map<std::string, void *> userSymbols;
   /// If non-empty, dump JIT-optimized IR to this directory.
   std::string dumpJITDir;
-  /// Persistent optimizer — analysis managers are registered once and reused.
-  std::unique_ptr<EJitOptimizer> optimizer;
-  /// TargetMachine used for the name-filtered ASM diagnostic dump (created
-  /// once from the same JITTargetMachineBuilder the JIT compiles with, so the
-  /// emitted assembly matches the real JIT output). Null if creation failed.
+  /// TargetMachine shared by target-aware optimizer analyses and the
+  /// name-filtered ASM diagnostic dump. It is created from the same
+  /// JITTargetMachineBuilder used by the JIT. Null if creation failed.
   std::unique_ptr<TargetMachine> dumpTM;
+  /// Persistent optimizer — analysis managers are registered once and reused.
+  /// Declared after dumpTM so it is destroyed before the TargetMachine whose
+  /// target-aware TTI callback it holds.
+  std::unique_ptr<EJitOptimizer> optimizer;
 };
 
 namespace llvm {
@@ -669,7 +671,8 @@ EJitOrcEngine::Create(const Config &config,
 
   // Create persistent optimizer — analysis managers are registered once here
   // and reused across compilations (cleared between runs).
-  engine->P->optimizer = std::make_unique<EJitOptimizer>(periodReg);
+  engine->P->optimizer =
+      std::make_unique<EJitOptimizer>(periodReg, engine->P->dumpTM.get());
 
   // Register all known global variable addresses from the PeriodArrayRegistry
   // so that external global references in any loaded bitcode module resolve

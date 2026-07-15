@@ -31,6 +31,7 @@ if(EJIT_FREESTANDING_MUTEX)
   # Targets are created before this CMakeLists.txt runs, so they exist.
   foreach(_tgt LLVMOrcJIT LLVMJITLink LLVMSupport LLVMCodeGen LLVMCore
               LLVMAnalysis LLVMTransformUtils LLVMInstCombine LLVMScalarOpts
+              LLVMVectorize LLVMSandboxIR
               LLVMipo LLVMObject LLVMMC LLVMMCParser LLVMTarget
               LLVMSelectionDAG LLVMGlobalISel LLVMAsmPrinter LLVMPasses
               LLVMExecutionEngine LLVMOrcShared LLVMRuntimeDyld LLVMOrcTargetProcess
@@ -120,6 +121,7 @@ add_llvm_component_library(LLVMEJIT
   InstCombine
   TransformUtils
   Analysis
+  Vectorize
   ${EJIT_TARGET_COMPONENTS}
   # IPO and Scalar are not listed here — their LINK_COMPONENTS would
   # recursively pull in BitWriter, Instrumentation, Linker, AsmParser,
@@ -162,7 +164,7 @@ endif()
 # Resolve LLVM component names → library names (e.g. "Core" → "LLVMCore")
 llvm_map_components_to_libnames(EJIT_LLVM_LIBS
   BitReader Core OrcJIT JITLink Support
-  InstCombine TransformUtils Analysis
+  InstCombine TransformUtils Analysis Vectorize SandboxIR
   ${EJIT_TARGET_COMPONENTS}
   )
 # IPO and Scalar are added manually to avoid their LINK_COMPONENTS

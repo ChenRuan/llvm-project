@@ -19,18 +19,21 @@
 #include "llvm/Analysis/LoopAnalysisManager.h"
 
 namespace llvm {
+class TargetMachine;
+
 namespace ejit {
 
 /// Registers only the analyses required by EJIT's optimization pipeline.
 ///
-/// EJIT uses 8 passes: InstCombine, SCCP, ADCE, SimplifyCFG,
-/// LoopFullUnroll, LoopSimplify, AlwaysInliner, Promote (Mem2Reg).
+/// EJIT uses a compact specialization pipeline plus target-aware loop
+/// vectorization. This helper registers only the analyses that pipeline needs.
 ///
 /// PassBuilder::registerFunctionAnalyses registers ~40 analyses; we register
-/// only the ~13 that these 8 passes actually need.
+/// a smaller explicit subset to keep the embedded link surface controlled.
 namespace EJitPassBuilder {
 
-void registerFunctionAnalyses(FunctionAnalysisManager &FAM);
+void registerFunctionAnalyses(FunctionAnalysisManager &FAM,
+                              const TargetMachine *TM = nullptr);
 void registerLoopAnalyses(LoopAnalysisManager &LAM);
 void registerCGSCCAnalyses(CGSCCAnalysisManager &CGAM);
 void registerModuleAnalyses(ModuleAnalysisManager &MAM);
