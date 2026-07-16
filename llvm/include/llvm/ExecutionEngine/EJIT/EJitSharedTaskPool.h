@@ -149,10 +149,22 @@ public:
     NoState,             ///< bind() not called.
   };
 
+  /// Returned by every lookup, so its size is on the per-call hot path: AAPCS64
+  /// returns an aggregate <= 16 bytes in x0:x1 but passes anything larger via
+  /// sret, i.e. the callee stores the fields to caller stack and the caller
+  /// loads them straight back. Ordering fnPtr first (no padding before it) and
+  /// packing the flags into bucketIndex's spare bits keeps this at 16 bytes.
+  /// bucketIndex only ever holds 0..kEJitSharedCacheBuckets (the out-of-range
+  /// sentinel), so 26 bits is many more than it needs.
   struct CompileOrGetResult {
-    EJitCompileOrGetStatus status = EJitCompileOrGetStatus::CompileFailed;
     void *fnPtr = nullptr;
-    uint32_t bucketIndex = 0;
+    EJitCompileOrGetStatus status = EJitCompileOrGetStatus::CompileFailed;
+    /// Narrowed to a byte purely to close the struct at 16 bytes (see above);
+    /// it holds 0..kEJitSharedCacheBuckets, the latter being the out-of-range
+    /// sentinel. A byte field costs a plain ldrb/strb, whereas packing these
+    /// four into a bit-field would trade the sret round-trip for ubfx/bfi
+    /// masking on every access.
+    uint8_t bucketIndex = 0;
     bool hasReadToken = false;
     /// True when a Ready result exists but this core may not read the
     /// cross-core pointer (code sharing not platform-validated): a clean
@@ -167,6 +179,12 @@ public:
     /// mapping or the C ABI.
     bool fastPathTerminal = false;
   };
+  static_assert(kEJitSharedCacheBuckets < 255,
+                "bucketIndex is a uint8_t: the bucket count and its sentinel "
+                "must fit in a byte");
+  static_assert(sizeof(CompileOrGetResult) <= 16,
+                "CompileOrGetResult must stay <= 16 bytes so AAPCS returns it "
+                "in registers rather than through sret memory");
 
   EJitSharedTaskPool() = default;
   EJitSharedTaskPool(const EJitSharedTaskPool &) = delete;
