@@ -115,6 +115,12 @@ void bucketWriteRelease(EJitSharedCacheBucket &b) {
 
 constexpr uint32_t kReady = static_cast<uint32_t>(EJitSharedInitState::Ready);
 
+/// Mixing constant shared by hashIdentity() and every unrolled fixed-dimension
+/// lookup (cacheLookupNd / cacheLookupSeqNd). Kept here so the NO_RECLAIM
+/// fixed-dimension seqlock specializations defined above the generic
+/// cacheLookupNd block can also reference it.
+constexpr uint64_t kHashMul = 0x9e3779b97f4a7c15ULL;
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -321,12 +327,12 @@ EJitSharedTaskPool::cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
   uint32_t curGen = state_->generation.loadAcquire();
   for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
     EJitSharedCacheSlot &Slot = B.slots[s];
+    if (Slot.identityHash != key)
+      continue; // plain-load fast reject before the acquiring state load.
     if (Slot.state.loadAcquire() !=
         static_cast<uint32_t>(EJitSharedSlotState::Ready))
       continue;
     if (Slot.generation != curGen) // stale across an owner re-init: ignore.
-      continue;
-    if (Slot.identityHash != key)
       continue;
     if (!slotIdentityMatches(Slot, funcIndex, dims, numDims))
       continue;
@@ -378,12 +384,12 @@ EJitSharedTaskPool::cacheLookupSeq(uint32_t funcIndex, const EJitDimPair *dims,
     SharedLookup hit;
     for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
       EJitSharedCacheSlot &Slot = B.slots[s];
+      if (Slot.identityHash != key)
+        continue; // plain-load fast reject before the acquiring state load.
       if (Slot.state.loadAcquire() !=
           static_cast<uint32_t>(EJitSharedSlotState::Ready))
         continue;
       if (Slot.generation != curGen)
-        continue;
-      if (Slot.identityHash != key)
         continue;
       if (!slotIdentityMatches(Slot, funcIndex, dims, numDims))
         continue;
@@ -409,6 +415,149 @@ EJitSharedTaskPool::cacheLookupSeq(uint32_t funcIndex, const EJitDimPair *dims,
     return hit; // validated hit (noTokenHit) or clean miss
   }
   return R; // repeated contention -> clean fallback to the slow path
+}
+
+//===----------------------------------------------------------------------===//
+// Fixed-dimension load-only seqlock specializations (0-2 dims, NO_RECLAIM
+// build only). Each mirrors the matching cacheLookup0D/1D/2D scan (unrolled
+// identity hash, unrolled identity + version comparison, plain-identityHash
+// fast reject before the acquiring state load) wrapped in the same bounded
+// seqlock retry as cacheLookupSeq(). A NO_RECLAIM fixed-dimension caller thus
+// avoids the generic numDims loop / slotIdentityMatches() call entirely.
+// Behavior is identical to cacheLookupSeq() with the matching numDims; the
+// cross-core fnPtr gate and cold peer preparation stay shared via
+// resolveMatchedSlot().
+//===----------------------------------------------------------------------===//
+EJitSharedTaskPool::SharedLookup
+EJitSharedTaskPool::cacheLookupSeq0D(uint32_t funcIndex) {
+  SharedLookup R;
+  uint64_t key = static_cast<uint64_t>(funcIndex); // hashIdentity(fi, _, 0)
+  uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
+  EJitSharedCacheBucket &B = state_->buckets[bucket];
+  for (uint32_t attempt = 0; attempt < 4; ++attempt) {
+    uint32_t seq0;
+    if (!bucketSeqBegin(B, seq0)) {
+      cpuRelax();
+      continue;
+    }
+    uint32_t curGen = state_->generation.loadAcquire();
+    SharedLookup hit;
+    for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+      EJitSharedCacheSlot &Slot = B.slots[s];
+      if (Slot.identityHash != key)
+        continue; // plain-load fast reject before the acquiring state load.
+      if (Slot.state.loadAcquire() !=
+          static_cast<uint32_t>(EJitSharedSlotState::Ready))
+        continue;
+      if (Slot.generation != curGen)
+        continue;
+      if (Slot.funcIndex != funcIndex || Slot.numDims != 0)
+        continue;
+      hit = resolveMatchedSlot(B, bucket, s);
+      break;
+    }
+    if (hit.fnPtr && !hit.coldPrepared && !bucketSeqStable(B, seq0)) {
+      cpuRelax();
+      continue;
+    }
+    return hit;
+  }
+  return R;
+}
+
+EJitSharedTaskPool::SharedLookup
+EJitSharedTaskPool::cacheLookupSeq1D(uint32_t funcIndex, uint32_t dim0,
+                                     uint32_t inst0) {
+  SharedLookup R;
+  uint64_t key = static_cast<uint64_t>(funcIndex);
+  key ^= (static_cast<uint64_t>(dim0) << 32) | static_cast<uint64_t>(inst0);
+  key *= kHashMul;
+  uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
+  EJitSharedCacheBucket &B = state_->buckets[bucket];
+  for (uint32_t attempt = 0; attempt < 4; ++attempt) {
+    uint32_t seq0;
+    if (!bucketSeqBegin(B, seq0)) {
+      cpuRelax();
+      continue;
+    }
+    uint32_t curGen = state_->generation.loadAcquire();
+    SharedLookup hit;
+    for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+      EJitSharedCacheSlot &Slot = B.slots[s];
+      if (Slot.identityHash != key)
+        continue;
+      if (Slot.state.loadAcquire() !=
+          static_cast<uint32_t>(EJitSharedSlotState::Ready))
+        continue;
+      if (Slot.generation != curGen)
+        continue;
+      if (Slot.funcIndex != funcIndex || Slot.numDims != 1)
+        continue;
+      if (Slot.dims[0].dimType != dim0 || Slot.dims[0].instanceId != inst0)
+        continue;
+      if (Slot.versions[0] != instanceVersion(dim0, inst0))
+        break; // identity matched but stale -> clean miss.
+      hit = resolveMatchedSlot(B, bucket, s);
+      break;
+    }
+    if (hit.fnPtr && !hit.coldPrepared && !bucketSeqStable(B, seq0)) {
+      cpuRelax();
+      continue;
+    }
+    return hit;
+  }
+  return R;
+}
+
+EJitSharedTaskPool::SharedLookup
+EJitSharedTaskPool::cacheLookupSeq2D(uint32_t funcIndex, uint32_t dim0,
+                                     uint32_t inst0, uint32_t dim1,
+                                     uint32_t inst1) {
+  SharedLookup R;
+  uint64_t key = static_cast<uint64_t>(funcIndex);
+  key ^= (static_cast<uint64_t>(dim0) << 32) | static_cast<uint64_t>(inst0);
+  key *= kHashMul;
+  key ^= (static_cast<uint64_t>(dim1) << 32) | static_cast<uint64_t>(inst1);
+  key *= kHashMul;
+  uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
+  EJitSharedCacheBucket &B = state_->buckets[bucket];
+  for (uint32_t attempt = 0; attempt < 4; ++attempt) {
+    uint32_t seq0;
+    if (!bucketSeqBegin(B, seq0)) {
+      cpuRelax();
+      continue;
+    }
+    uint32_t curGen = state_->generation.loadAcquire();
+    SharedLookup hit;
+    for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+      EJitSharedCacheSlot &Slot = B.slots[s];
+      if (Slot.identityHash != key)
+        continue;
+      if (Slot.state.loadAcquire() !=
+          static_cast<uint32_t>(EJitSharedSlotState::Ready))
+        continue;
+      if (Slot.generation != curGen)
+        continue;
+      if (Slot.funcIndex != funcIndex || Slot.numDims != 2)
+        continue;
+      if (Slot.dims[0].dimType != dim0 || Slot.dims[0].instanceId != inst0)
+        continue;
+      if (Slot.dims[1].dimType != dim1 || Slot.dims[1].instanceId != inst1)
+        continue;
+      if (Slot.versions[0] != instanceVersion(dim0, inst0))
+        break;
+      if (Slot.versions[1] != instanceVersion(dim1, inst1))
+        break;
+      hit = resolveMatchedSlot(B, bucket, s);
+      break;
+    }
+    if (hit.fnPtr && !hit.coldPrepared && !bucketSeqStable(B, seq0)) {
+      cpuRelax();
+      continue;
+    }
+    return hit;
+  }
+  return R;
 }
 #endif // EJIT_SRE_TASKPOOL_NO_RECLAIM
 
@@ -598,7 +747,6 @@ EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
 // each specialization stays small. Results are identical to cacheLookup() with
 // the matching numDims. kHashMul mirrors the mixing constant in hashIdentity().
 //===----------------------------------------------------------------------===//
-static constexpr uint64_t kHashMul = 0x9e3779b97f4a7c15ULL;
 
 EJitSharedTaskPool::SharedLookup
 EJitSharedTaskPool::cacheLookup0D(uint32_t funcIndex) {
@@ -611,12 +759,12 @@ EJitSharedTaskPool::cacheLookup0D(uint32_t funcIndex) {
   uint32_t curGen = state_->generation.loadAcquire();
   for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
     EJitSharedCacheSlot &Slot = B.slots[s];
+    if (Slot.identityHash != key)
+      continue; // plain-load fast reject before the acquiring state load.
     if (Slot.state.loadAcquire() !=
         static_cast<uint32_t>(EJitSharedSlotState::Ready))
       continue;
     if (Slot.generation != curGen)
-      continue;
-    if (Slot.identityHash != key)
       continue;
     if (Slot.funcIndex != funcIndex || Slot.numDims != 0)
       continue;
@@ -641,12 +789,12 @@ EJitSharedTaskPool::cacheLookup1D(uint32_t funcIndex, uint32_t dim0,
   uint32_t curGen = state_->generation.loadAcquire();
   for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
     EJitSharedCacheSlot &Slot = B.slots[s];
+    if (Slot.identityHash != key)
+      continue; // plain-load fast reject before the acquiring state load.
     if (Slot.state.loadAcquire() !=
         static_cast<uint32_t>(EJitSharedSlotState::Ready))
       continue;
     if (Slot.generation != curGen)
-      continue;
-    if (Slot.identityHash != key)
       continue;
     if (Slot.funcIndex != funcIndex || Slot.numDims != 1)
       continue;
@@ -677,12 +825,12 @@ EJitSharedTaskPool::cacheLookup2D(uint32_t funcIndex, uint32_t dim0,
   uint32_t curGen = state_->generation.loadAcquire();
   for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
     EJitSharedCacheSlot &Slot = B.slots[s];
+    if (Slot.identityHash != key)
+      continue; // plain-load fast reject before the acquiring state load.
     if (Slot.state.loadAcquire() !=
         static_cast<uint32_t>(EJitSharedSlotState::Ready))
       continue;
     if (Slot.generation != curGen)
-      continue;
-    if (Slot.identityHash != key)
       continue;
     if (Slot.funcIndex != funcIndex || Slot.numDims != 2)
       continue;
@@ -719,12 +867,12 @@ EJitSharedTaskPool::cacheLookup3D(uint32_t funcIndex, uint32_t dim0,
   uint32_t curGen = state_->generation.loadAcquire();
   for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
     EJitSharedCacheSlot &Slot = B.slots[s];
+    if (Slot.identityHash != key)
+      continue; // plain-load fast reject before the acquiring state load.
     if (Slot.state.loadAcquire() !=
         static_cast<uint32_t>(EJitSharedSlotState::Ready))
       continue;
     if (Slot.generation != curGen)
-      continue;
-    if (Slot.identityHash != key)
       continue;
     if (Slot.funcIndex != funcIndex || Slot.numDims != 3)
       continue;
@@ -768,12 +916,12 @@ EJitSharedTaskPool::cacheLookup4D(uint32_t funcIndex, uint32_t dim0,
   uint32_t curGen = state_->generation.loadAcquire();
   for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
     EJitSharedCacheSlot &Slot = B.slots[s];
+    if (Slot.identityHash != key)
+      continue; // plain-load fast reject before the acquiring state load.
     if (Slot.state.loadAcquire() !=
         static_cast<uint32_t>(EJitSharedSlotState::Ready))
       continue;
     if (Slot.generation != curGen)
-      continue;
-    if (Slot.identityHash != key)
       continue;
     if (Slot.funcIndex != funcIndex || Slot.numDims != 4)
       continue;
@@ -1067,6 +1215,13 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
 }
 
 void EJitSharedTaskPool::releaseRead(uint32_t bucketIndex) {
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  // A load-only seqlock hit takes no read token and deliberately returns the
+  // one-past-the-end bucket as a sentinel. Wrappers still call releaseRead()
+  // uniformly, so this is an expected no-op rather than a rejected release.
+  if (bucketIndex == kEJitSharedCacheBuckets)
+    return;
+#endif
   if (!state_ || bucketIndex >= kEJitSharedCacheBuckets) {
     EJIT_DIAG("shared releaseRead reject: state=%p bucket=%u (max=%u)",
               (void *)state_, bucketIndex, kEJitSharedCacheBuckets);
@@ -1420,7 +1575,7 @@ EJitSharedTaskPool::tryCacheHit0D(uint32_t funcIndex) {
     return R;
   }
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-  return classifyHit(cacheLookupSeq(funcIndex, nullptr, 0));
+  return classifyHit(cacheLookupSeq0D(funcIndex));
 #else
   return classifyHit(cacheLookup0D(funcIndex));
 #endif
@@ -1442,8 +1597,7 @@ EJitSharedTaskPool::tryCacheHit1D(uint32_t funcIndex, uint32_t dim0,
     return R;
   }
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-  const EJitDimPair d1[1] = {{dim0, inst0}};
-  return classifyHit(cacheLookupSeq(funcIndex, d1, 1));
+  return classifyHit(cacheLookupSeq1D(funcIndex, dim0, inst0));
 #else
   return classifyHit(cacheLookup1D(funcIndex, dim0, inst0));
 #endif
@@ -1466,8 +1620,7 @@ EJitSharedTaskPool::tryCacheHit2D(uint32_t funcIndex, uint32_t dim0,
     return R;
   }
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-  const EJitDimPair d2[2] = {{dim0, inst0}, {dim1, inst1}};
-  return classifyHit(cacheLookupSeq(funcIndex, d2, 2));
+  return classifyHit(cacheLookupSeq2D(funcIndex, dim0, inst0, dim1, inst1));
 #else
   return classifyHit(cacheLookup2D(funcIndex, dim0, inst0, dim1, inst1));
 #endif
