@@ -152,10 +152,9 @@ public:
   /// Returned by every lookup, so its size is on the per-call hot path: AAPCS64
   /// returns an aggregate <= 16 bytes in x0:x1 but passes anything larger via
   /// sret, i.e. the callee stores the fields to caller stack and the caller
-  /// loads them straight back. Ordering fnPtr first (no padding before it) and
-  /// packing the flags into bucketIndex's spare bits keeps this at 16 bytes.
-  /// bucketIndex only ever holds 0..kEJitSharedCacheBuckets (the out-of-range
-  /// sentinel), so 26 bits is many more than it needs.
+  /// loads them straight back. Two things keep this at 16: fnPtr comes first,
+  /// so its alignment forces no padding ahead of it, and bucketIndex is a byte,
+  /// which leaves the three flags exactly filling the tail.
   struct CompileOrGetResult {
     void *fnPtr = nullptr;
     EJitCompileOrGetStatus status = EJitCompileOrGetStatus::CompileFailed;
