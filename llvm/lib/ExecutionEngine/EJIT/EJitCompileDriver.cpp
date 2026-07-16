@@ -25,6 +25,25 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+#ifdef EJIT_DIAG_ENABLE
+namespace {
+#ifdef EJIT_FREESTANDING
+extern "C" uint64_t SRE_CycleCountGet64(void);
+uint64_t compileTimingNow() { return SRE_CycleCountGet64(); }
+constexpr const char *kCompileTimingUnit = "cycles";
+#else
+uint64_t compileTimingNow() {
+  using Clock = std::chrono::steady_clock;
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          Clock::now().time_since_epoch())
+          .count());
+}
+constexpr const char *kCompileTimingUnit = "ns";
+#endif
+} // namespace
+#endif
+
 #ifdef EJIT_SRE_TASKPOOL
 namespace {
 /// Adapter so the taskpool can call back into the driver's cold compile path
@@ -382,7 +401,19 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
 
   jitEngine_->setActiveContext(&ctx);
 
+#ifdef EJIT_DIAG_ENABLE
+  const uint64_t CompileBegin = compileTimingNow();
+  const uint64_t LoadBegin = CompileBegin;
+#endif
   if (auto Err = jitEngine_->loadBitcodeModule(bitcode, cacheKey, funcName)) {
+#ifdef EJIT_DIAG_ENABLE
+    const uint64_t LoadEnd = compileTimingNow();
+    EJIT_DIAG("compile_timing phase=load_bitcode result=fail key=0x%016lx "
+              "func=%s bytes=%zu elapsed=%llu unit=%s",
+              cacheKey, funcName.c_str(), bitcode.size(),
+              static_cast<unsigned long long>(LoadEnd - LoadBegin),
+              kCompileTimingUnit);
+#endif
     jitEngine_->setActiveContext(nullptr);
     EJIT_DIAG("compile FAIL key=0x%016lx func=%s: load bitcode module failed",
               cacheKey, funcName.c_str());
@@ -396,10 +427,34 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
     return nullptr;
   }
 
+#ifdef EJIT_DIAG_ENABLE
+  const uint64_t LoadEnd = compileTimingNow();
+  EJIT_DIAG("compile_timing phase=load_bitcode result=ok key=0x%016lx "
+            "func=%s bytes=%zu elapsed=%llu unit=%s",
+            cacheKey, funcName.c_str(), bitcode.size(),
+            static_cast<unsigned long long>(LoadEnd - LoadBegin),
+            kCompileTimingUnit);
+  const uint64_t LookupBegin = LoadEnd;
+#endif
   auto addrOrErr = jitEngine_->lookup(cacheKey, funcName);
+#ifdef EJIT_DIAG_ENABLE
+  const uint64_t LookupEnd = compileTimingNow();
+#endif
   jitEngine_->setActiveContext(nullptr);
 
   if (!addrOrErr) {
+#ifdef EJIT_DIAG_ENABLE
+    EJIT_DIAG("compile_timing phase=lookup result=fail key=0x%016lx func=%s "
+              "elapsed=%llu unit=%s",
+              cacheKey, funcName.c_str(),
+              static_cast<unsigned long long>(LookupEnd - LookupBegin),
+              kCompileTimingUnit);
+    EJIT_DIAG("compile_timing phase=compile_total result=fail key=0x%016lx "
+              "func=%s elapsed=%llu unit=%s",
+              cacheKey, funcName.c_str(),
+              static_cast<unsigned long long>(LookupEnd - CompileBegin),
+              kCompileTimingUnit);
+#endif
     EJIT_DIAG("compile FAIL key=0x%016lx func=%s: lookup after compile failed",
               cacheKey, funcName.c_str());
 #ifndef EJIT_FREESTANDING
@@ -415,6 +470,18 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
 
   void *funcPtr = *addrOrErr;
 
+#ifdef EJIT_DIAG_ENABLE
+  EJIT_DIAG("compile_timing phase=lookup result=ok key=0x%016lx func=%s "
+            "elapsed=%llu unit=%s",
+            cacheKey, funcName.c_str(),
+            static_cast<unsigned long long>(LookupEnd - LookupBegin),
+            kCompileTimingUnit);
+  EJIT_DIAG("compile_timing phase=compile_total result=ok key=0x%016lx "
+            "func=%s elapsed=%llu unit=%s",
+            cacheKey, funcName.c_str(),
+            static_cast<unsigned long long>(LookupEnd - CompileBegin),
+            kCompileTimingUnit);
+#endif
   EJIT_DIAG("compile OK key=0x%016lx func=%s → pfn=%p", cacheKey,
             funcName.c_str(), funcPtr);
   return funcPtr;
