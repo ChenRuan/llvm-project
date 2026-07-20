@@ -6,6 +6,12 @@
  * Tier-2 is armed by the 64th Tier-1 cache hit in the current implementation.
  * The function body contains a strongly biased runtime branch so PGO has useful
  * control-flow data; may_const fields provide the normal EJIT specialization.
+ *
+ * SRE multicore launch order:
+ *   1. Switch the shell to core 8 and run test_ejit_period once. Core 8 wins
+ *      shared-taskpool owner election, creates the compile worker, then sleeps.
+ *   2. Broadcast test_ejit_period to the remaining cores, excluding core 8.
+ *      Those calls attach to the existing shared taskpool and run the benchmark.
  */
 
 #include <stdint.h>
@@ -13,13 +19,23 @@
 
 #include "ejit_test_helpers.h"
 
+#define PGO_WORKER_CORE 8u
+
 #if defined(EJIT_FREESTANDING)
 extern uint64_t SRE_CycleCountGet64(void);
 extern int SRE_printf(const char *format, ...);
 extern uint32_t SRE_TaskDelay(uint32_t tick);
+extern uint8_t g_ucLocalCoreID;
 #define BENCH_PRINT(...) SRE_printf(__VA_ARGS__)
 static uint64_t benchNow(void) { return SRE_CycleCountGet64(); }
 static void benchYield(void) { (void)SRE_TaskDelay(1); }
+static uint32_t benchCurrentCore(void) { return (uint32_t)g_ucLocalCoreID; }
+static void benchKeepCoreAlive(void) {
+  for (;;) {
+    (void)SRE_TaskDelay(40000u);
+  }
+}
+static void benchShutdown(void) {}
 #else
 #include <stdio.h>
 #include <time.h>
@@ -33,6 +49,8 @@ static void benchYield(void) {
   struct timespec ts = {0, 1000000};
   nanosleep(&ts, 0);
 }
+static uint32_t benchCurrentCore(void) { return 0u; }
+static void benchShutdown(void) { ejit_shutdown(); }
 #endif
 
 #define PGO_INNER_ITERS 5000u
@@ -135,6 +153,7 @@ static int waitForCompiles(uint64_t expected) {
 
 int test_ejit_period(void) {
   const uint8_t cellIdx = 0;
+  const uint32_t currentCore = benchCurrentCore();
   ejit_config_t cfg;
   ejit_taskpool_stats_t stats;
   struct BenchResult aot;
@@ -142,6 +161,8 @@ int test_ejit_period(void) {
   struct BenchResult tier2;
 
   BENCH_PRINT("=== EJIT Online-PGO Performance Benchmark ===\n");
+  BENCH_PRINT("[PGO-BENCH] current_core=%u expected_worker_core=%u\n",
+              (unsigned)currentCore, (unsigned)PGO_WORKER_CORE);
   BENCH_PRINT("inner=%u tier1_samples=%u trigger_calls=%u tier2_samples=%u\n",
               PGO_INNER_ITERS, PGO_TIER1_SAMPLES, PGO_TRIGGER_CALLS,
               PGO_TIER2_SAMPLES);
@@ -150,9 +171,6 @@ int test_ejit_period(void) {
   g_pgoCells[cellIdx].coldMul = 11;
   g_pgoCells[cellIdx].biasLimit = 1000; // About 97.7% hot / 2.3% cold.
   g_pgoCells[cellIdx].salt = 0x12345678u;
-
-  aot = runBench("AOT-direct", pgo_biased_work_aot, cellIdx,
-                 PGO_TIER1_SAMPLES, 0x2000u);
 
   ejit_default_config(&cfg);
   // This standalone board test must not depend on whether its C compilation
@@ -168,9 +186,31 @@ int test_ejit_period(void) {
       return -1;
     }
   }
+
+#if defined(EJIT_FREESTANDING)
+  {
+    const uint32_t workerCore = ejit_taskpool_get_worker_core();
+    BENCH_PRINT("[PGO-BENCH] shared worker owner=%u current=%u\n",
+                (unsigned)workerCore, (unsigned)currentCore);
+    if (workerCore != PGO_WORKER_CORE) {
+      BENCH_PRINT("[PGO-BENCH] FAIL: worker owner is core %u, expected core %u; "
+                  "reset and run core 8 first\n",
+                  (unsigned)workerCore, (unsigned)PGO_WORKER_CORE);
+      return -1;
+    }
+    if (currentCore == workerCore) {
+      BENCH_PRINT("[PGO-BENCH] worker core ready; sleeping so the compile task "
+                  "can run. Broadcast the test to all other cores now.\n");
+      benchKeepCoreAlive();
+    }
+  }
+#endif
+
+  aot = runBench("AOT-direct", pgo_biased_work_aot, cellIdx,
+                 PGO_TIER1_SAMPLES, 0x2000u);
   if (ejit_activate("cell", cellIdx) != EJIT_OK) {
     BENCH_PRINT("[PGO-BENCH] FAIL: activate cell=%u\n", cellIdx);
-    ejit_shutdown();
+    benchShutdown();
     return -1;
   }
 
@@ -179,7 +219,7 @@ int test_ejit_period(void) {
   if (!waitForCompiles(1)) {
     BENCH_PRINT("[PGO-BENCH] FAIL: Tier-1 did not publish\n");
     ejit_taskpool_print_stats();
-    ejit_shutdown();
+    benchShutdown();
     return -1;
   }
 
@@ -194,7 +234,7 @@ int test_ejit_period(void) {
   if (!waitForCompiles(2)) {
     BENCH_PRINT("[PGO-BENCH] FAIL: Tier-2 did not publish\n");
     ejit_taskpool_print_stats();
-    ejit_shutdown();
+    benchShutdown();
     return -1;
   }
 
@@ -215,7 +255,7 @@ int test_ejit_period(void) {
                 (unsigned long long)aot.checksum,
                 (unsigned long long)tier1.checksum,
                 (unsigned long long)tier2.checksum);
-    ejit_shutdown();
+    benchShutdown();
     return -1;
   }
 
@@ -232,8 +272,14 @@ int test_ejit_period(void) {
   runBench("Tier2-PGOUse-steady", pgo_biased_work, cellIdx,
            PGO_TIER2_SAMPLES, 0x4000u);
 
-  ejit_shutdown();
   BENCH_PRINT("=== PGO Benchmark Complete sink=0x%llx ===\n",
               (unsigned long long)g_pgoSink);
+#if defined(EJIT_FREESTANDING)
+  BENCH_PRINT("[PGO-BENCH] keeping core %u attached; no shared shutdown\n",
+              (unsigned)currentCore);
+  benchKeepCoreAlive();
+#else
+  benchShutdown();
+#endif
   return 0;
 }
