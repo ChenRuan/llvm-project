@@ -155,9 +155,18 @@ int test_ejit_period(void) {
                  PGO_TIER1_SAMPLES, 0x2000u);
 
   ejit_default_config(&cfg);
-  if (ejit_init_pgo(&cfg) != EJIT_OK) {
-    BENCH_PRINT("[PGO-BENCH] FAIL: ejit_init_pgo\n");
-    return -1;
+  // This standalone board test must not depend on whether its C compilation
+  // received -DEJIT_SRE_SHARED_TASKPOOL. Without that define the helper picks
+  // Sync mode, which intentionally starts no worker.
+  cfg.compileMode = EJIT_COMPILE_ASYNC;
+  BENCH_PRINT("[PGO-BENCH] init mode=%u (Async=%u)\n",
+              (unsigned)cfg.compileMode, (unsigned)EJIT_COMPILE_ASYNC);
+  {
+    ejit_status_t initRc = ejit_init_pgo(&cfg);
+    if (initRc != EJIT_OK) {
+      BENCH_PRINT("[PGO-BENCH] FAIL: ejit_init_pgo rc=%d\n", (int)initRc);
+      return -1;
+    }
   }
   if (ejit_activate("cell", cellIdx) != EJIT_OK) {
     BENCH_PRINT("[PGO-BENCH] FAIL: activate cell=%u\n", cellIdx);
@@ -228,4 +237,3 @@ int test_ejit_period(void) {
               (unsigned long long)g_pgoSink);
   return 0;
 }
-
