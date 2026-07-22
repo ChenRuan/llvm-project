@@ -151,7 +151,7 @@ using DumpMutexType = std::mutex;
 #endif
 
 #ifndef EJIT_DUMP_PRINT_THROTTLE_TICKS
-#define EJIT_DUMP_PRINT_THROTTLE_TICKS 1
+#define EJIT_DUMP_PRINT_THROTTLE_TICKS 50
 #endif
 
 static void throttleDumpPrint(unsigned printedLines) {
