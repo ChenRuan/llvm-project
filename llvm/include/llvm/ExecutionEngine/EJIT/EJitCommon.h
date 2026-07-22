@@ -64,6 +64,13 @@ constexpr const char *FN_REGISTER_PERIOD_ARRAY = "ejit_register_period_array";
 constexpr const char *FN_REGISTER_STATIC_VAR = "ejit_register_static_var";
 constexpr const char *FN_REGISTER_LIFECYCLE = "ejit_register_lifecycle";
 constexpr const char *FN_REGISTER_FUNCINDEX = "ejit_register_funcindex";
+// Per-function inline-cache slot registration: the wrapper's per-function
+// @__ejit_icache_fn_<name> global (a frozen, sticky specialization pointer) is
+// registered by name so the runtime can backfill it on a successful resolve
+// (icacheFill). The wrapper reads it directly with an inline atomic load - no
+// ejit_icache_try call - so the hit path is one load + null-check + indirect
+// call. Signature: void ejit_register_icache_slot(const char *name, void *slot).
+constexpr const char *FN_REGISTER_ICACHE_SLOT = "ejit_register_icache_slot";
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET =
     "ejit_taskpool_compile_or_get";
 // Fixed-dimension fast-path C ABI entries (0-4 dims), emitted by the wrapper
@@ -82,6 +89,12 @@ constexpr const char *FN_TASKPOOL_RELEASE_READ = "ejit_taskpool_release_read";
 constexpr const char *FN_TASKPOOL_TRACE_NOW = "ejit_taskpool_trace_now";
 constexpr const char *FN_TASKPOOL_TRACE_WRAPPER =
     "ejit_taskpool_trace_wrapper";
+// Wrapper-timing sentinel status passed to ejit_taskpool_trace_wrapper for
+// icache-hit samples so they aggregate as their own report line (get_fn_avg =
+// probe cost, release_avg = 0), separate from the slow-path compile_or_get
+// samples. Collision-free: real ejit_status_t as uint32_t is 0 or
+// 0xFFFFFFF6..0xFFFFFFFF (EJIT_OK / EJIT_ERR_* = -1..-10).
+constexpr uint32_t kEJitIcacheHitTimingStatus = 0xFEu;
 // Lifecycle activation is keyed by period/lifecycle name + instance index only.
 // PASS4 emits these name-level calls at ejit_period_lc entry/exit; there is no
 // array-pointer dimension in the active-state hot path.
