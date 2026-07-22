@@ -28,12 +28,14 @@
 #ifdef EJIT_SRE_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
 #endif
+#include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
 #ifndef EJIT_FREESTANDING
@@ -55,6 +57,7 @@ struct EJitOptimizerTestAccess : EJitOptimizer {
   using EJitOptimizer::EJitOptimizer;
   using EJitOptimizer::preReplacePeriodIndices;
   using EJitOptimizer::runInstCombine;
+  using EJitOptimizer::runInterproceduralPropagation;
   using EJitOptimizer::runOptimizationPipeline;
   using EJitOptimizer::runStructFieldPass;
 };
@@ -2463,6 +2466,140 @@ TEST(EJitEndToEnd, PipelineLevelEquivalenceBranch) {
   EXPECT_EQ(L2, L3) << "L2 vs L3 IR differs — level changed the pipeline";
   EXPECT_NE(L1.find("ret i32 100"), std::string::npos)
       << "pipeline did not fold the may_const branch to the constant 100";
+}
+
+//===----------------------------------------------------------------------===//
+// Interprocedural propagation (phase 1d)
+//===----------------------------------------------------------------------===//
+
+// The AOT inliner keeps a call edge wherever it chose not to inline, so a
+// specialization used to stop at every such edge: the entry's substituted
+// dims arrive at the callee as ordinary constant arguments, but the callee
+// body still indexes the period array with a runtime value and re-tests
+// guards. These tests pin phase 1d (internalize + IPSCCP): the constants
+// cross the edge, the callee's may_const load becomes substitutable, and the
+// callee folds to a constant return like the entry does.
+namespace {
+
+/// Entry (has ejit_entry metadata) calls a callee with a constant cell index
+/// — the shape phase 1a leaves behind. The callee loads field 1 of
+/// g_ipcfg[cell] (may_const) and branches on it.
+std::unique_ptr<Module> parseInterprocModule(LLVMContext &Ctx) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    target datalayout = "e-m:e-i64:64-i128:128-n32:64-S128"
+    %S = type { i32, i32 }
+    @g_ipcfg = external global [4 x %S], !ejit.metadata !0
+
+    define i32 @ip_callee(i8 noundef %cell) {
+      %idx = zext i8 %cell to i64
+      %gep = getelementptr inbounds [4 x %S], ptr @g_ipcfg, i64 0, i64 %idx, i32 1
+      %v = load i32, ptr %gep, align 4, !ejit.may_const !2
+      %c = icmp eq i32 %v, 7
+      br i1 %c, label %then, label %else
+    then:
+      ret i32 100
+    else:
+      ret i32 200
+    }
+
+    define i32 @ip_entry() !ejit.metadata !3 {
+      %r = call i32 @ip_callee(i8 noundef 2)
+      ret i32 %r
+    }
+
+    !0 = !{!1}
+    !1 = !{!"ejit_period_arr", !"cell", i32 4}
+    !2 = !{}
+    !3 = !{!4}
+    !4 = !{!"ejit_entry"}
+  )",
+                              Err, Ctx);
+  if (!M)
+    Err.print("parseInterprocModule", errs());
+  return M;
+}
+
+/// Per-cell mock backing for @g_ipcfg; cell 2 has field 1 == 7 → callee
+/// returns 100 when specialized for cell 2.
+struct IpMockElem {
+  int32_t a, b;
+};
+
+unsigned countLoadsIn(const Function &F) {
+  unsigned n = 0;
+  for (const BasicBlock &BB : F)
+    for (const Instruction &I : BB)
+      n += isa<LoadInst>(&I);
+  return n;
+}
+
+} // anonymous namespace
+
+// Without phase 1d the callee is untouched: its load survives the whole
+// pipeline because the cell index stays a runtime argument inside it. This is
+// the baseline that motivates the pass.
+TEST(EJitInterprocedural, ConstantsStopAtCallEdgeWithoutIPSCCP) {
+  LLVMContext Ctx;
+  auto M = parseInterprocModule(Ctx);
+  ASSERT_NE(M, nullptr);
+
+  IpMockElem mock[4] = {{0, 1}, {0, 3}, {0, 7}, {0, 9}};
+  PeriodArrayRegistry reg;
+  reg.registerArray("cell", "g_ipcfg", mock, 4);
+
+  EJitOptimizerTestAccess opt(reg);
+  opt.runInstCombine(*M);
+  opt.runStructFieldPass(*M);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+
+  Function *Callee = M->getFunction("ip_callee");
+  ASSERT_NE(Callee, nullptr);
+  EXPECT_EQ(countLoadsIn(*Callee), 1u)
+      << "callee folded without IPSCCP — baseline assumption changed";
+}
+
+// With phase 1d in its pipeline position (after 1c, before the 1e/1f
+// re-fold), the constant argument crosses the edge, the callee's may_const
+// load folds against cell 2's runtime value, and the guard collapses: the
+// callee body becomes `ret i32 100`.
+TEST(EJitInterprocedural, IPSCCPPropagatesDimsIntoCallee) {
+  LLVMContext Ctx;
+  auto M = parseInterprocModule(Ctx);
+  ASSERT_NE(M, nullptr);
+
+  IpMockElem mock[4] = {{0, 1}, {0, 3}, {0, 7}, {0, 9}};
+  PeriodArrayRegistry reg;
+  reg.registerArray("cell", "g_ipcfg", mock, 4);
+
+  EJitOptimizerTestAccess opt(reg);
+  // Same order as runPipeline: 1b InstCombine, 1c StructField, 1d IPSCCP,
+  // 1e/1f re-fold, phases 2-4.
+  opt.runInstCombine(*M);
+  opt.runStructFieldPass(*M);
+  opt.runInterproceduralPropagation(*M);
+  opt.runInstCombine(*M);
+  opt.runStructFieldPass(*M);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+
+  Function *Callee = M->getFunction("ip_callee");
+  Function *Entry = M->getFunction("ip_entry");
+  ASSERT_NE(Callee, nullptr);
+  ASSERT_NE(Entry, nullptr);
+
+  // The callee was internalized so IPSCCP could trust its call-site set; the
+  // entry must stay externally visible — it is the symbol the JIT looks up.
+  EXPECT_TRUE(Callee->hasLocalLinkage());
+  EXPECT_FALSE(Entry->hasLocalLinkage());
+
+  // The callee's period load and guard folded to the constant return.
+  EXPECT_EQ(countLoadsIn(*Callee), 0u) << "callee may_const load survived";
+  ASSERT_EQ(Callee->size(), 1u) << "callee guard branch survived";
+  auto *Ret = dyn_cast<ReturnInst>(Callee->getEntryBlock().getTerminator());
+  ASSERT_NE(Ret, nullptr);
+  auto *RetVal = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(RetVal, nullptr) << "callee return did not fold";
+  EXPECT_EQ(RetVal->getSExtValue(), 100); // mock[2].b == 7 → then-branch
 }
 
 //===----------------------------------------------------------------------===//
