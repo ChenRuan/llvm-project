@@ -845,16 +845,21 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
 
   Triple TT((*ModuleOrErr)->getTargetTriple());
   if (TT.isAArch64() && TT.isOSBinFormatELF()) {
-    // These declarations resolve to process addresses, not co-located JIT
-    // storage. Clearing dso_local forces AArch64 PIC codegen to use GOT/PLT
-    // style indirection instead of near-page ADRP relocations.
+    // External-symbol access from JIT specializations. The JIT slab is
+    // SRE_MemAlloc'd ~2-3GB from the main binary's .text/.data - beyond the
+    // AArch64 BL reach (±128MB) but within ADRP reach (±4GB). Treat the two
+    // kinds differently rather than clearing dso_local on both:
+    //   * Functions: clear dso_local so calls route through JITLink PLT stubs
+    //     (PointerJumpStub = ADRP x16; LDR x16,[x16]; BR x16), which bridge the
+    //     ±128MB BL gap via a GOT entry. A direct BL to a 2-3GB-distant target
+    //     would overflow.
+    //   * Globals: keep dso_local so data access is ADRP+LDR (direct, ±4GB
+    //     reaches the slab). Clearing them forced a per-global GOT load (62 GOT
+    //     loads / ~1700c on DlschCcScheduler vs 0 in AOT) for no reach benefit,
+    //     since ADRP already reaches. So globals are NOT cleared.
     for (Function &F : (*ModuleOrErr)->functions()) {
       if (F.isDeclaration() && !F.isIntrinsic())
         F.setDSOLocal(false);
-    }
-    for (GlobalVariable &GV : (*ModuleOrErr)->globals()) {
-      if (GV.isDeclaration())
-        GV.setDSOLocal(false);
     }
   }
 
