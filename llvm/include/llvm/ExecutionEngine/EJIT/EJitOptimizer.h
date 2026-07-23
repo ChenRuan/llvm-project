@@ -51,12 +51,23 @@ private:
   /// Run EJitStructFieldPass on all functions.
   void runStructFieldPass(Module &M);
 
-  /// Run the post-specialization optimization pipeline: lower llvm.expect, then
-  /// the real LLVM -Ox function-simplification pipeline (selected by `level`:
-  /// L1->O1, L2->O2, L3->O3) to exploit the just-substituted period-index /
-  /// may_const constants (fold/DCE/loop-unroll), re-specialize the array
-  /// accesses that unrolling turns into constant-index GEPs (second
-  /// StructFieldPass), then a light cleanup fold.
+  /// Push the specialized constants across call edges. The AOT inliner keeps a
+  /// call edge wherever it chose not to inline, so after phase 1 every call
+  /// site passes the period dims (and values derived from them) as ordinary
+  /// constant arguments — but the callee bodies still re-derive cell addressing
+  /// and re-test guards the entry already resolved. Internalizes every defined
+  /// non-ejit_entry function (IPSCCP only reasons about arguments of functions
+  /// whose call sites it can enumerate: local linkage, not address-taken), then
+  /// runs IPSCCP to propagate constant arguments into callee bodies and
+  /// constant returns back to call sites.
+  void runInterproceduralPropagation(Module &M);
+
+  /// Run the EJIT optimization pipeline: a single fused sequence that exploits
+  /// the just-substituted period-index / may_const constants to their fixed
+  /// point (scalar fold/propagate/simplify), folds loops whose bounds became
+  /// constant, re-specializes the array accesses that unrolling turns into
+  /// constant-index GEPs, then does a final cleanup. `level` is accepted for ABI
+  /// compatibility and does not affect the pipeline.
   void runOptimizationPipeline(Module &M, OptimizationLevel level);
 
   /// Pick the cached function-simplification FPM for an EJIT optimization tier.
