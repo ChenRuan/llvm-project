@@ -154,6 +154,15 @@ void ejit_register_lifecycle(const char *lifecycleName, uint32_t *slotOut);
 // funcIndex global; a capacity failure is recorded so ejit_init can fail.
 void ejit_register_funcindex(const char *funcName, uint32_t *slotOut);
 
+// Register the wrapper's per-function inline-cache slot (@__ejit_icache_fn_<name>
+// global address) by name. The runtime writes the frozen specialization pointer
+// through it on a successful resolve (icacheFill); the wrapper reads it directly
+// on the hit path (one atomic load + null-check + indirect call, no
+// ejit_icache_try call). Keys the slot by the SAME registry funcIndex assigned
+// by ejit_register_funcindex. Called by AOT auto-registration. A null slot or
+// capacity exhaustion is recorded; the slot stays null and the probe misses.
+void ejit_register_icache_slot(const char *funcName, void *slot);
+
 // Lifecycle. Activation is keyed by lifecycle/period name + instance index
 // only; there is no array-pointer dimension in the active state (a period name
 // with multiple arrays is activated as a whole for that instance).
@@ -209,6 +218,7 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
 void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
                                         uint32_t enabled);
 void ejit_taskpool_release_read(uint32_t bucketIndex);
+
 unsigned ejit_taskpool_pending_count(void);
 
 // Diagnostic wrapper timing helpers. AOT wrappers only call these when built
@@ -222,7 +232,6 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
                                  void *fnPtr, uint32_t bucketIndex,
                                  uint64_t tBeforeLookup,
                                  uint64_t tAfterLookup,
-                                 uint64_t tBeforeFn,
                                  uint64_t tAfterFn,
                                  uint64_t tAfterRelease);
 

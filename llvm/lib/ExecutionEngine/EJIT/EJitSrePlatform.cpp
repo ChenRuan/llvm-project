@@ -23,6 +23,8 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 
+#include <cstdint>
+
 #ifndef EJIT_SRE_CODE_POOL_SIZE
 #define EJIT_SRE_CODE_POOL_SIZE                                                \
   (static_cast<unsigned long long>(2) * 1024 * 1024)
@@ -72,6 +74,58 @@ extern "C" void *SRE_MemDbgAlloc(unsigned int mid, unsigned char ptNo,
                                  unsigned long size, const char *func,
                                  unsigned int line);
 
+namespace {
+/// Make newly-written JIT code in [Va, Va + Size) observable to instruction
+/// fetch. On AArch64 the I-cache does not snoop D-cache writes, so code
+/// written into a RW page is not executable until the D-cache is cleaned and
+/// the I-cache invalidated for that range, then the core context-syncs.
+/// enable_ex makes the page executable but does NOT perform this cache sync,
+/// so the seal path does it explicitly before making the page executable.
+///
+/// Per-core: every core that executes JIT code seals in its own translation
+/// context, so each executing core syncs its own I-cache before first
+/// execution.
+///
+/// Inline asm rather than __builtin___clear_cache / llvm::sys::Memory::
+/// InvalidateInstructionCache: both resolve to the external __clear_cache
+/// symbol, which the freestanding SRE link does not provide.
+void syncCodeCaches(uintptr_t Va, size_t Size) {
+  if (Size == 0)
+    return;
+#ifdef __aarch64__
+  uint64_t Ctr;
+  __asm__ __volatile__("mrs %0, ctr_el0" : "=r"(Ctr));
+  size_t DLine = static_cast<size_t>(4) << ((Ctr >> 16) & 0xF);
+  size_t ILine = static_cast<size_t>(4) << (Ctr & 0xF);
+
+  uintptr_t End = Va + Size;
+  uintptr_t P = Va & ~static_cast<uintptr_t>(DLine - 1);
+  for (; P < End; P += DLine)
+    __asm__ __volatile__("dc cvau, %0" :: "r"(P) : "memory");
+  __asm__ __volatile__("dsb ish" ::: "memory");
+
+  P = Va & ~static_cast<uintptr_t>(ILine - 1);
+  for (; P < End; P += ILine)
+    __asm__ __volatile__("ic ivau, %0" :: "r"(P) : "memory");
+  __asm__ __volatile__("dsb ish" ::: "memory");
+  __asm__ __volatile__("isb" ::: "memory");
+#else
+  // Non-AArch64 (host) fallback: compiler-rt/libgcc is available here, so the
+  // builtin's __clear_cache resolves. The SRE target is always AArch64.
+  __builtin___clear_cache(reinterpret_cast<char *>(Va),
+                          reinterpret_cast<char *>(Va + Size));
+#endif
+}
+
+/// Seal one code range on the calling core: make the just-written JIT code
+/// observable to instruction fetch (syncCodeCaches), then make the page
+/// executable (enable_ex). Returns enable_ex's rc (0 = success).
+unsigned sealAndSyncCache(uintptr_t Va, size_t Size) {
+  syncCodeCaches(Va, Size);
+  return ejit_sre_enable_ex(1, static_cast<unsigned long long>(Va));
+}
+} // namespace
+
 std::unique_ptr<llvm::ejit::EJitCodePoolManager>
 llvm::ejit::makeSreCodePoolManager() {
   EJitCodePoolManager::Options Opts;
@@ -95,8 +149,14 @@ llvm::ejit::makeSreCodePoolManager() {
   auto Seal = [](void *Va) -> unsigned {
 #ifdef EJIT_SRE_ENABLE_EX
     // In 4K seal mode Va is a single 4KiB page; in legacy mode it is the 2MiB
-    // pool base. enable_ex flips the page containing Va to RX either way.
-    return ejit_sre_enable_ex(1, reinterpret_cast<unsigned long long>(Va));
+    // pool base. sealAndSyncCache syncs caches for the written range then makes
+    // the page executable (enable_ex does not sync caches).
+#ifdef EJIT_CODE_POOL_4K_SEAL
+    return sealAndSyncCache(reinterpret_cast<uintptr_t>(Va), k4KiB);
+#else
+    return sealAndSyncCache(reinterpret_cast<uintptr_t>(Va),
+                            static_cast<size_t>(kSrePoolSize));
+#endif
 #else
     // Code-pool routing without permission flips (bring-up / measurement).
     (void)Va;
@@ -131,7 +191,7 @@ bool llvm::ejit::prepareSreCodeForCurrentCore(const void *FnPtr) {
   }
   const auto Address = reinterpret_cast<uintptr_t>(FnPtr);
   const auto PoolBase = Address & ~(static_cast<uintptr_t>(k2MiB) - 1);
-  unsigned Rc = ejit_sre_enable_ex(1, static_cast<unsigned long long>(PoolBase));
+  unsigned Rc = sealAndSyncCache(PoolBase, static_cast<size_t>(kSrePoolSize));
   if (Rc != 0) {
     EJIT_DIAG("prepareSreCode FAIL: enable_ex poolBase=0x%llx rc=%u",
               static_cast<unsigned long long>(PoolBase), Rc);
@@ -179,9 +239,11 @@ bool llvm::ejit::ejitSreSealPageForCurrentCore(uintptr_t PageVA) {
     return false;
   }
   // Per-core: flips the 4KiB page containing PageVA to RX in the calling core's
-  // translation context. enable_ex performs its own permission/cache sync, so
-  // no __builtin___clear_cache here.
-  unsigned Rc = ejit_sre_enable_ex(1, static_cast<unsigned long long>(PageVA));
+  // translation context AND syncs its I-cache for that page. enable_ex does NOT
+  // do the cache sync, so it is done here (see sealAndSyncCache). Every core
+  // that executes shared JIT code seals its own translation context here before
+  // first execution.
+  unsigned Rc = sealAndSyncCache(PageVA, k4KiB);
   if (Rc != 0) {
     EJIT_DIAG("sealPageForCurrentCore FAIL: enable_ex pageVA=0x%llx rc=%u",
               static_cast<unsigned long long>(PageVA), Rc);

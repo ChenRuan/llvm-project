@@ -86,7 +86,8 @@
         "EJIT_SHARED_SECTION_ATTR": "__attribute__((section(\".mc_shared\")))",
         "EJIT_DIAG_ENABLE": "ON",
         "EJIT_SRE_DIAG": "ON",
-        "EJIT_DUMP_ASM": "ON"
+        "EJIT_DUMP_ASM": "ON",
+        "EJIT_STATS_ENABLE": "ON"
       }
     },
     {

@@ -78,8 +78,10 @@ allocate(RW, 来自 2MiB 池)
    -> 返回函数指针（此时指向 RX 内存，可安全执行）
 ```
 
-> 注意：`enable_ex` 内部已完成权限/cache 同步，所以本实现在 SRE 模式下
-> **不调用 `__builtin___clear_cache`**。
+> 注意：`enable_ex` 只置页面可执行，**不做** cache 同步。因此 SRE 模式下由 seal
+> 路径（`EJitSrePlatform.cpp` 的 `sealAndSyncCache`）显式做 cache 同步（清 D-cache
+> + 失效 I-cache），**不依赖 `enable_ex`**，也不用 `__clear_cache` 外部符号
+> （freestanding SRE 链接里没有）。
 
 ---
 
@@ -156,8 +158,8 @@ allocate(RW, 来自 2MiB 池)
 - `EJitCodePoolMemoryManager::allocate` 仿照 `InProcessMemoryManager`，用
   `BasicLayout` 计算各 segment 大小，但 slab **来自 `EJitCodePoolManager` 的 2MiB 对齐
   池**（而非 mmap）；**allocate 阶段绝不 `enable_ex`**。
-- `finalize()` **刻意不做任何 mprotect**；也不调用 `InvalidateInstructionCache`（由
-  `enable_ex` 负责）。
+- `finalize()` **刻意不做任何 mprotect**；也不调用 `InvalidateInstructionCache`
+  （由 SRE seal 回调 `sealAndSyncCache` 负责：置可执行 + cache 同步，见 §3）。
 - 真正的 RW→RX 封固时机按模式不同：
   - **4K 模式（默认）**：在 `finalize()` 中（所有写入/relocation/fixup 完成后）对该
     allocation 覆盖到的 4K 页逐页 `enable_ex`；任一页失败则 `finalize` 返回 Error，
@@ -361,7 +363,7 @@ for (page = pageStart; page < pageEnd; page += 4KiB)
 - **任何一页 `enable_ex` 失败 → 返回 Error，绝不返回可调用函数指针。** 封固发生在
   JITLink memory manager 的 `finalize` 中，失败会让 `finalize`（进而 `lookup`）返回
   Error。
-- 封固后**不**调用 `__builtin___clear_cache`：`enable_ex` 自身完成权限/cache 同步。
+- 封固后**不**调用 `__builtin___clear_cache`：cache 同步由 seal 回调 `sealAndSyncCache` 完成（`enable_ex` 只置可执行，不做 cache 同步）。
 
 ### 13.4 避免写入已 RX 页（分配策略）
 
