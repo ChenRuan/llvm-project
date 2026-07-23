@@ -5,11 +5,13 @@
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitLinkDiagPlugin.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLibcallStubs.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorSymbolDef.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
@@ -23,7 +25,10 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include <cstdlib>
+#include <cstring>
 #include <map>
+#include <memory>
 #include <string>
 
 #ifdef EJIT_FREESTANDING
@@ -39,7 +44,6 @@ extern "C" uint32_t SRE_TaskDelay(uint32_t tick);
 #ifdef EJIT_SRE_CODE_POOL
 #include "llvm/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
-#include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
 #endif
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
@@ -581,6 +585,16 @@ EJitOrcEngine::Create(const Config &config,
   }
 
   engine->P->J = std::move(*J);
+
+  // Attach the JITLink branch-relocation diagnostic plugin. It appends a
+  // PostFixup pass that audits every AArch64 branch relocation and reports
+  // which ones JITLink bridged through a $__STUBS PointerJumpStub + $__GOT
+  // (because the direct BL target is external / out of +-128MB) instead of a
+  // direct BL. Zero-cost unless the log level is VERBOSE; output via
+  // EJIT_DIAG_VERBOSE (SRE_printf on bare-metal).
+  if (auto *OLL = dyn_cast<orc::ObjectLinkingLayer>(
+          &engine->P->J->getObjLinkingLayer()))
+    OLL->addPlugin(std::make_shared<EJitLinkDiagPlugin>());
 
   // Override the default error reporter (logErrorsToStdErr → errs() →
   // raw_fd_ostream) with a bare-metal-safe version using EJIT_DIAG.  On
