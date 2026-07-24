@@ -19,7 +19,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
-#include <cstdlib>
 #include <memory>
 #include <thread>
 #include <type_traits>
@@ -1595,12 +1594,12 @@ TEST_F(SharedTaskPoolTest, FourKGenerationChangeDuringPrepareNotReturned) {
   EXPECT_TRUE(r.readyButNotShareable);
 }
 
-// 16/17 ABI v6 layout: the slot carries the executable range as fixed-width,
+// 16/17 ABI v7 layout: the slot carries the executable range as fixed-width,
 // naturally-aligned scalars (read back by value — endian-safe), the pool-split
-// table is POD, dump slots use dynamic payload pointers, and each bucket
-// carries the NO_RECLAIM seqlock publishSeq word.
+// table is POD, dump state contains metadata only, and each bucket carries the
+// NO_RECLAIM seqlock publishSeq word.
 TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
-  EXPECT_EQ(kEJitSharedAbiVersion, 6u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 7u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -1628,41 +1627,40 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   EXPECT_EQ(slot->rangeReserved, 0u);
 }
 
-TEST_F(SharedTaskPoolTest, DumpDynamicPayloadsClearedOnInit) {
-  state_->magic = kEJitSharedAbiMagic;
-  state_->abiVersion = kEJitSharedAbiVersion;
-  state_->structSize = sizeof(EJitSharedTaskPoolState);
+TEST_F(SharedTaskPoolTest, DumpStateHoldsOnlySmallMetadata) {
+  EXPECT_TRUE(std::is_standard_layout<EJitSharedDumpState>::value);
+  EXPECT_TRUE(std::is_trivially_destructible<EJitSharedDumpState>::value);
+  EXPECT_LE(sizeof(EJitSharedDumpState), 2u * kEJitSharedDumpNameBytes + 256u);
+}
 
-  char *IR = static_cast<char *>(std::malloc(8));
-  char *ASM = static_cast<char *>(std::malloc(8));
-  ASSERT_NE(IR, nullptr);
-  ASSERT_NE(ASM, nullptr);
-  state_->dump.slots[0].valid.storeRelaxed(1);
-  state_->dump.slots[0].truncated.storeRelaxed(7);
-  state_->dump.slots[0].nameLen = 4;
-  state_->dump.slots[0].irPtr = reinterpret_cast<uintptr_t>(IR);
-  state_->dump.slots[0].asmPtr = reinterpret_cast<uintptr_t>(ASM);
-  state_->dump.slots[0].irSize = 7;
-  state_->dump.slots[0].asmSize = 7;
-  state_->dump.slots[0].keyHi = 0x12;
-  state_->dump.slots[0].keyLo = 0x34;
-  state_->dump.slots[0].name[0] = 'f';
-  state_->dump.nextSlot = 1;
-
+TEST_F(SharedTaskPoolTest, DumpMetadataClearedOnInit) {
+  state_->dump.filterEnabled.storeRelaxed(1);
+  state_->dump.hasDump.storeRelaxed(1);
+  state_->dump.status.storeRelaxed(4);
+  state_->dump.filterLen = 4;
+  state_->dump.resultNameLen = 4;
+  state_->dump.irSize = 123;
+  state_->dump.asmSize = 456;
+  state_->dump.keyHi = 0x12;
+  state_->dump.keyLo = 0x34;
+  state_->dump.workerCore = 7;
+  state_->dump.filterName[0] = 'f';
+  state_->dump.resultName[0] = 'g';
   EJitSharedTaskPool owner;
   bringUpOwner(owner);
 
-  EXPECT_EQ(state_->dump.slots[0].valid.loadRelaxed(), 0u);
-  EXPECT_EQ(state_->dump.slots[0].truncated.loadRelaxed(), 0u);
-  EXPECT_EQ(state_->dump.slots[0].nameLen, 0u);
-  EXPECT_EQ(state_->dump.slots[0].irPtr, 0u);
-  EXPECT_EQ(state_->dump.slots[0].asmPtr, 0u);
-  EXPECT_EQ(state_->dump.slots[0].irSize, 0u);
-  EXPECT_EQ(state_->dump.slots[0].asmSize, 0u);
-  EXPECT_EQ(state_->dump.slots[0].keyHi, 0u);
-  EXPECT_EQ(state_->dump.slots[0].keyLo, 0u);
-  EXPECT_EQ(state_->dump.slots[0].name[0], 0);
-  EXPECT_EQ(state_->dump.nextSlot, 0u);
+  EXPECT_EQ(state_->dump.filterEnabled.loadRelaxed(), 0u);
+  EXPECT_EQ(state_->dump.hasDump.loadRelaxed(), 0u);
+  EXPECT_EQ(state_->dump.status.loadRelaxed(), 0u);
+  EXPECT_EQ(state_->dump.filterLen, 0u);
+  EXPECT_EQ(state_->dump.resultNameLen, 0u);
+  EXPECT_EQ(state_->dump.irSize, 0u);
+  EXPECT_EQ(state_->dump.asmSize, 0u);
+  EXPECT_EQ(state_->dump.keyHi, 0u);
+  EXPECT_EQ(state_->dump.keyLo, 0u);
+  EXPECT_EQ(state_->dump.workerCore, kEJitInvalidCoreId);
+  EXPECT_EQ(state_->dump.filterName[0], 0);
+  EXPECT_EQ(state_->dump.resultName[0], 0);
 }
 
 // 18/ Code-sharing OFF in 4K mode: a non-owner cleanly rejects and triggers NO

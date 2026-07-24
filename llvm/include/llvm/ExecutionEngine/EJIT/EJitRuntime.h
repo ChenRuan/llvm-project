@@ -273,13 +273,19 @@ uint32_t ejit_taskpool_get_worker_core();
 /// \p name is JIT-compiled, the engine saves (in memory) its post-optimization
 /// IR and emitted assembly for later printing. Pass NULL or "" to disable
 /// further capture (already-saved entries are retained). Capture is exact-name
-/// only, and shared IR/ASM payloads are allocated to the generated text size.
+/// unless name is "*", which captures every specialization. Full payloads stay
+/// on the worker core and are never copied into shared taskpool memory.
 void ejit_dump_func(const char *name);
 
-/// Print the saved IR+ASM for \p name through the platform log, one line per
-/// IR/ASM line. Names with no saved capture are reported as missing. Passing
-/// NULL or "" only lists captured names; it does not dump all payloads.
+/// Print the saved worker-local IR+ASM for \p name through the platform log.
+/// Passing NULL or "" prints every entry saved on the calling core. A
+/// non-worker core reports which worker owns the latest matching capture.
 void ejit_print_dumped(const char *name);
+
+/// Enable or disable capture of every JIT-compiled specialization. Equivalent
+/// to ejit_dump_func("*") when enabled. Captures are keyed by function name in
+/// the worker-local store and replaced when the same function is recompiled.
+void ejit_dump_all(bool enable);
 
 /// Runtime diagnostic log level. Mirrors the EJIT_DIAG* macro thresholds.
 ///   EJIT_LOG_OFF    — no diagnostic output

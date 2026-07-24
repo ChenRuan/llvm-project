@@ -20,7 +20,6 @@
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
-#include <cstdlib>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -1345,10 +1344,6 @@ namespace {
 // the non-shared EJitRuntimeState::isActive default (no entry => inactive).
 // setInstanceEnabled(true) flips 0->1 and bumps version on first activate.
 void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
-  bool canFreeDumpPayload =
-      st->magic == kEJitSharedAbiMagic &&
-      st->abiVersion == kEJitSharedAbiVersion &&
-      st->structSize == sizeof(EJitSharedTaskPoolState);
   for (uint32_t d = 0; d < kEJitSharedDimTypes; ++d)
     for (uint32_t i = 0; i < kEJitSharedInstances; ++i) {
       st->enabled[d][i].storeRelaxed(0);
@@ -1396,29 +1391,19 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
   }
   st->dump.lock.storeRelaxed(0);
   st->dump.filterEnabled.storeRelaxed(0);
+  st->dump.hasDump.storeRelaxed(0);
+  st->dump.status.storeRelaxed(0);
   st->dump.filterLen = 0;
-  st->dump.nextSlot = 0;
+  st->dump.resultNameLen = 0;
+  st->dump.irSize = 0;
+  st->dump.asmSize = 0;
+  st->dump.keyHi = 0;
+  st->dump.keyLo = 0;
+  st->dump.workerCore = kEJitInvalidCoreId;
   st->dump.reserved0 = 0;
-  for (uint32_t i = 0; i < kEJitSharedDumpNameBytes; ++i)
+  for (uint32_t i = 0; i < kEJitSharedDumpNameBytes; ++i) {
     st->dump.filterName[i] = 0;
-  for (uint32_t s = 0; s < kEJitSharedDumpSlotCount; ++s) {
-    EJitSharedDumpSlot &Slot = st->dump.slots[s];
-    Slot.valid.storeRelaxed(0);
-    Slot.truncated.storeRelaxed(0);
-    Slot.nameLen = 0;
-    Slot.irSize = 0;
-    Slot.asmSize = 0;
-    Slot.keyHi = 0;
-    Slot.keyLo = 0;
-    Slot.reserved0 = 0;
-    if (canFreeDumpPayload && Slot.irPtr)
-      std::free(reinterpret_cast<void *>(Slot.irPtr));
-    if (canFreeDumpPayload && Slot.asmPtr)
-      std::free(reinterpret_cast<void *>(Slot.asmPtr));
-    Slot.irPtr = 0;
-    Slot.asmPtr = 0;
-    for (uint32_t i = 0; i < kEJitSharedDumpNameBytes; ++i)
-      Slot.name[i] = 0;
+    st->dump.resultName[i] = 0;
   }
   for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b) {
     st->buckets[b].writeFlag.storeRelaxed(0);
