@@ -11,9 +11,16 @@ set(LLVM_LINK_COMPONENTS
   TargetParser
   )
 
-add_llvm_unittest(EJITTests
+set(EJIT_UNITTEST_SOURCES
   EJitRuntimeTest.cpp
   EJitFieldOffsetTest.cpp
+  )
+if(EJIT_DIRECT_CALL_STUBS OR EJIT_INLINE_LONG_CALLS)
+  list(APPEND EJIT_UNITTEST_SOURCES EJitDirectCallStubsTest.cpp)
+endif()
+
+add_llvm_unittest(EJITTests
+  ${EJIT_UNITTEST_SOURCES}
 
   PARTIAL_SOURCES_INTENDED
   )

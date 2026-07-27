@@ -6,23 +6,29 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// ORC ObjectLinkingLayer plugin that rewrites AArch64 JITLink PLT
-// pointer-jump stubs into direct PC-relative stubs.
+// ORC ObjectLinkingLayer plugin that optimizes AArch64 far calls after external
+// symbols have been resolved.
 //
 // Background: the JIT code slab is SRE_MemAlloc'd ~1.5-2.2GB above AOT .text,
-// beyond AArch64 BL's +-128MB reach (so a call stub is unavoidable) but within
-// ADRP's +-4GB reach. JITLink therefore routes external calls through a
-// PointerJumpStub (ADRP x16,page; LDR x16,[x16,#off]; BR x16) that loads the
+// beyond AArch64 BL's +-128MB reach (so a register-indirect long-call sequence
+// is unavoidable) but within ADRP's +-4GB reach. JITLink normally routes
+// external calls through a PointerJumpStub (ADRP x16,page;
+// LDR x16,[x16,#off]; BR x16) that loads the
 // target address from a GOT entry - one data memory load + one indirect branch
 // per call. This plugin rewrites such stubs, when the target is within +-4GB,
 // into a direct form (ADRP x16,page; ADD x16,x16,#off; BR x16) that addresses
 // the target directly, dropping the GOT data load. The indirect branch remains
-// (unavoidable for >128MB calls on AArch64); eliminating it entirely requires
-// co-locating the slab within +-128MB (a separate, deferred platform change).
+// unavoidable unless the slab can be placed within BL's +-128MB range.
 //
-// Safety: if a target is beyond +-4GB (the slab base is uncontrolled) or its
-// address is unavailable, the stub is left as the original GOT-indirect form -
-// zero regression. AArch64 ELF only; no-op on other targets.
+// With EJIT_INLINE_LONG_CALLS, CodeGen emits ADRP+LDR+BLR at the call site. The
+// plugin resolves the GOT edge and rewrites the LDR to ADD, producing
+// ADRP+ADD+BLR with no separate stub. If the same helper is called repeatedly,
+// CodeGen may hoist ADRP+LDR and reuse the resolved register, leaving only BLR
+// at subsequent calls.
+//
+// Safety: if a target is beyond +-4GB (the slab base is uncontrolled), its
+// address is unavailable, or the relocation/instruction shape is unexpected,
+// the original GOT form is retained. AArch64 ELF only; no-op on other targets.
 //
 //===----------------------------------------------------------------------===//
 
@@ -36,13 +42,16 @@
 namespace llvm {
 namespace ejit {
 
+/// Rewrite inline AArch64 GOT address materializations that target callable
+/// symbols from ADRP+LDR to ADRP+ADD. Exposed for deterministic LinkGraph unit
+/// tests; production invokes it through EJitDirectCallStubsPlugin.
+Error relaxAArch64InlineGOTCalls(jitlink::LinkGraph &G);
+
 /// Plugin installed on the ORC ObjectLinkingLayer (when
-/// EJIT_DIRECT_CALL_STUBS is defined) to rewrite AArch64 PLT stubs as
-/// described above. The rewrite runs as a PreFixup JITLink pass: by then
-/// external symbols have been resolved to absolute addresses (lookup +
-/// applyLookupResult complete) and block content is still mutable, but
-/// fixups have not yet been applied - so retargeted edges are fixed up with
-/// the real target address.
+/// EJIT_DIRECT_CALL_STUBS or EJIT_INLINE_LONG_CALLS is defined) to run the
+/// selected AArch64 rewrites. The rewrite runs as a PreFixup JITLink pass: by
+/// then external symbols have been resolved to absolute addresses and block
+/// content is still mutable, but fixups have not yet been applied.
 class EJitDirectCallStubsPlugin : public orc::LinkGraphLinkingLayer::Plugin {
 public:
   void modifyPassConfig(orc::MaterializationResponsibility &MR,

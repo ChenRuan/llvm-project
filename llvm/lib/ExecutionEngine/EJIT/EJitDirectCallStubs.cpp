@@ -20,9 +20,11 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitDirectCallStubs.h"
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
 #include "llvm/ExecutionEngine/JITLink/aarch64.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/MathExtras.h"
 
 #include <cstring>
@@ -49,6 +51,23 @@ constexpr char DirectJumpStubContent[12] = {
     0x10, 0x02, 0x00, (char)0x91u, // ADD  x16, x16, <imm>@pageoff12
     0x00, 0x02, 0x1f, (char)0xd6u  // BR   x16
 };
+
+static Symbol *resolveGOTTarget(Symbol &GOTEntry) {
+  if (!GOTEntry.isDefined())
+    return nullptr;
+  for (Edge &E : GOTEntry.getBlock().edges())
+    if (E.getOffset() == 0 && E.getKind() == aarch64::Pointer64)
+      return &E.getTarget();
+  return nullptr;
+}
+
+static bool isPageReachable(orc::ExecutorAddr PC, orc::ExecutorAddr Target) {
+  if (PC.isNull() || Target.isNull())
+    return false;
+  uint64_t TargetPage = Target.getValue() & ~static_cast<uint64_t>(0xfff);
+  uint64_t PCPage = PC.getValue() & ~static_cast<uint64_t>(0xfff);
+  return isInt<33>(static_cast<int64_t>(TargetPage - PCPage));
+}
 
 // Resolve the real target symbol T that a GOT-indirect PLT stub jumps to.
 //
@@ -85,18 +104,13 @@ static Symbol *resolveStubTarget(Block &B, Symbol *&GOTEntryOut,
     return nullptr; // both edges must share the same GOT entry
 
   Symbol &G = Page21->getTarget();
-  if (!G.isDefined())
+  Symbol *Target = resolveGOTTarget(G);
+  if (!Target)
     return nullptr;
-  Block &GOTBlock = G.getBlock();
-  for (Edge &E : GOTBlock.edges()) {
-    if (E.getOffset() == 0 && E.getKind() == aarch64::Pointer64) {
-      GOTEntryOut = &G;
-      Page21EdgeOut = Page21;
-      PageOff12EdgeOut = PageOff12;
-      return &E.getTarget();
-    }
-  }
-  return nullptr;
+  GOTEntryOut = &G;
+  Page21EdgeOut = Page21;
+  PageOff12EdgeOut = PageOff12;
+  return Target;
 }
 
 static Error rewriteDirectCallStubs(LinkGraph &G) {
@@ -104,7 +118,8 @@ static Error rewriteDirectCallStubs(LinkGraph &G) {
   if (!G.getTargetTriple().isAArch64())
     return Error::success();
 
-  Section *Stubs = G.findSectionByName(aarch64::PLTTableManager::getSectionName());
+  Section *Stubs =
+      G.findSectionByName(aarch64::PLTTableManager::getSectionName());
   if (!Stubs)
     return Error::success();
 
@@ -127,10 +142,7 @@ static Error rewriteDirectCallStubs(LinkGraph &G) {
     // Reachability: mirror aarch64::applyFixup's Page21 check exactly so a
     // rewritten stub never triggers a fixup-time out-of-range error. The ADRP
     // sits at offset 0, so PCPage = stub address & ~0xfff; addend is 0.
-    uint64_t TargetPage = tAddr.getValue() & ~static_cast<uint64_t>(0xfff);
-    uint64_t PCPage = B->getAddress().getValue() & ~static_cast<uint64_t>(0xfff);
-    int64_t PageDelta = static_cast<int64_t>(TargetPage - PCPage);
-    if (!isInt<33>(PageDelta)) {
+    if (!isPageReachable(B->getAddress(), tAddr)) {
       ++Fallback; // beyond ADRP's +-4GiB - keep the GOT-indirect stub
       continue;
     }
@@ -139,7 +151,8 @@ static Error rewriteDirectCallStubs(LinkGraph &G) {
     // (the same buffer applyFixup writes to). ADRP/BR bytes are identical, so
     // only bytes [4..7] change.
     MutableArrayRef<char> Content = B->getAlreadyMutableContent();
-    std::memcpy(&Content[0], DirectJumpStubContent, sizeof(DirectJumpStubContent));
+    std::memcpy(&Content[0], DirectJumpStubContent,
+                sizeof(DirectJumpStubContent));
 
     // Retarget both edges from the GOT entry to the real target. addend stays
     // 0; the fixup phase will apply Page21 (ADRP -> target page) and
@@ -162,10 +175,106 @@ static Error rewriteDirectCallStubs(LinkGraph &G) {
 
 } // namespace
 
+Error relaxAArch64InlineGOTCalls(LinkGraph &G) {
+  if (!G.getTargetTriple().isAArch64() ||
+      !G.getTargetTriple().isOSBinFormatELF())
+    return Error::success();
+
+  struct Candidate {
+    Block *B;
+    Edge *Page;
+    Edge *Offset;
+    Symbol *Target;
+  };
+  SmallVector<Candidate, 16> Candidates;
+
+  // Collect before mutating edges. CodeGen may hoist one ADRP+LDR pair away
+  // from its BLR users, so relocation identity and register flow are the
+  // contract; adjacency to BLR is deliberately not required.
+  for (Section &Sec : G.sections()) {
+    if (Sec.getName() == aarch64::PLTTableManager::getSectionName())
+      continue;
+    for (Block *B : Sec.blocks()) {
+      ArrayRef<char> Content = B->getContent();
+      for (Edge &Low : B->edges()) {
+        if (Low.getKind() != aarch64::PageOffset12 || Low.getAddend() != 0 ||
+            Low.getOffset() + 4 > Content.size())
+          continue;
+
+        uint32_t Ldr = support::endian::read32le(
+            Content.data() + static_cast<size_t>(Low.getOffset()));
+        if ((Ldr & 0xffc00000u) != 0xf9400000u)
+          continue; // not LDR Xt, [Xn, #imm12]
+        unsigned BaseReg = (Ldr >> 5) & 0x1fu;
+
+        Edge *BestPage = nullptr;
+        for (Edge &Page : B->edges()) {
+          if (Page.getKind() != aarch64::Page21 || Page.getAddend() != 0 ||
+              &Page.getTarget() != &Low.getTarget() ||
+              Page.getOffset() > Low.getOffset() ||
+              Page.getOffset() + 4 > Content.size())
+            continue;
+          uint32_t Adrp = support::endian::read32le(
+              Content.data() + static_cast<size_t>(Page.getOffset()));
+          if ((Adrp & 0x9f000000u) != 0x90000000u || (Adrp & 0x1fu) != BaseReg)
+            continue;
+          if (!BestPage || Page.getOffset() > BestPage->getOffset())
+            BestPage = &Page;
+        }
+        if (!BestPage)
+          continue;
+
+        Symbol *Target = resolveGOTTarget(Low.getTarget());
+        if (!Target || !Target->isCallable())
+          continue;
+        Candidates.push_back({B, BestPage, &Low, Target});
+      }
+    }
+  }
+
+  uint64_t Rewritten = 0;
+  uint64_t Fallback = 0;
+  for (Candidate &C : Candidates) {
+    orc::ExecutorAddr PagePC = C.B->getAddress() + C.Page->getOffset();
+    if (!isPageReachable(PagePC, C.Target->getAddress())) {
+      ++Fallback;
+      continue;
+    }
+
+    MutableArrayRef<char> Content = C.B->getAlreadyMutableContent();
+    char *LdrPtr = Content.data() + static_cast<size_t>(C.Offset->getOffset());
+    uint32_t Ldr = support::endian::read32le(LdrPtr);
+    unsigned Rt = Ldr & 0x1fu;
+    unsigned Rn = (Ldr >> 5) & 0x1fu;
+    uint32_t Add = 0x91000000u | (Rn << 5) | Rt;
+    support::endian::write32le(LdrPtr, Add);
+
+    C.Page->setTarget(*C.Target);
+    C.Offset->setTarget(*C.Target);
+    ++Rewritten;
+  }
+
+  if (Rewritten || Fallback)
+    EJIT_DIAG_VERBOSE("inline-long-call: rewritten=%lu fallback=%lu in %s",
+                      (unsigned long)Rewritten, (unsigned long)Fallback,
+                      G.getName().c_str());
+  return Error::success();
+}
+
 void EJitDirectCallStubsPlugin::modifyPassConfig(
     orc::MaterializationResponsibility &MR, jitlink::LinkGraph &G,
     jitlink::PassConfiguration &Config) {
-  Config.PreFixupPasses.push_back(rewriteDirectCallStubs);
+  Config.PreFixupPasses.push_back([](LinkGraph &G) -> Error {
+#ifdef EJIT_INLINE_LONG_CALLS
+    if (auto Err = relaxAArch64InlineGOTCalls(G))
+      return Err;
+#endif
+#ifdef EJIT_DIRECT_CALL_STUBS
+    return rewriteDirectCallStubs(G);
+#else
+    return Error::success();
+#endif
+  });
 }
 
 } // namespace ejit

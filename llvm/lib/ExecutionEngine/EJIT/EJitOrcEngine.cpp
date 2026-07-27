@@ -44,7 +44,7 @@ extern "C" uint32_t SRE_TaskDelay(uint32_t tick);
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
 #endif
-#ifdef EJIT_DIRECT_CALL_STUBS
+#if defined(EJIT_DIRECT_CALL_STUBS) || defined(EJIT_INLINE_LONG_CALLS)
 #include "llvm/ExecutionEngine/EJIT/EJitDirectCallStubs.h"
 #include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
 #endif
@@ -586,12 +586,9 @@ EJitOrcEngine::Create(const Config &config,
 
   engine->P->J = std::move(*J);
 
-#ifdef EJIT_DIRECT_CALL_STUBS
-  // Install the direct-call-stub rewrite plugin on the ObjectLinkingLayer. It
-  // rewrites AArch64 PLT pointer-jump stubs (ADRP+LDR+BR via GOT) into direct
-  // ADRP+ADD+BR stubs when the target is within ADRP's +-4GiB reach, dropping
-  // the per-call GOT data load. No-op on non-AArch64; auto-falls back to the
-  // GOT-indirect stub beyond +-4GiB. See EJitDirectCallStubs.{h,cpp}.
+#if defined(EJIT_DIRECT_CALL_STUBS) || defined(EJIT_INLINE_LONG_CALLS)
+  // Install the configured AArch64 stub and inline far-call rewrites. Both are
+  // no-ops on other targets and retain their GOT fallback beyond +-4GiB.
   if (auto *OLL = dyn_cast<orc::ObjectLinkingLayer>(
           &engine->P->J->getObjLinkingLayer()))
     OLL->addPlugin(EJitDirectCallStubsPlugin::create());
@@ -793,9 +790,20 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     //     loads / ~1700c on DlschCcScheduler vs 0 in AOT) for no reach benefit,
     //     since ADRP already reaches. So globals are NOT cleared.
     for (Function &F : (*ModuleOrErr)->functions()) {
-      if (F.isDeclaration() && !F.isIntrinsic())
+      if (F.isDeclaration() && !F.isIntrinsic()) {
         F.setDSOLocal(false);
+#ifdef EJIT_INLINE_LONG_CALLS
+        // Emit ADRP+LDR+BLR at the call site. JITLink resolves the GOT target
+        // and rewrites LDR to ADD when the AOT address is within +-4GiB.
+        F.addFnAttr(Attribute::NonLazyBind);
+#endif
+      }
     }
+#ifdef EJIT_INLINE_LONG_CALLS
+    // Apply the inline-GOT policy to runtime libcalls introduced during
+    // CodeGen, which may not have an IR Function declaration.
+    (*ModuleOrErr)->setRtLibUseGOT();
+#endif
   }
 
   // ejit_entry functions may have internal linkage (e.g. declared `static` in

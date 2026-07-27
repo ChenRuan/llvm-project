@@ -677,6 +677,18 @@ if(EJIT_DIRECT_CALL_STUBS)
   add_definitions(-DEJIT_DIRECT_CALL_STUBS)
 endif()
 
+# Emit external AArch64 calls as an inline GOT sequence
+# (ADRP+LDR+BLR), then let the EJIT JITLink plugin relax it to
+# ADRP+ADD+BLR when the resolved AOT target is within +-4GiB. Compared with
+# BL+ADRP+ADD+BR through a direct stub this removes the extra branch into the
+# stub and executes three instructions instead of four. The original GOT
+# sequence remains a safe fallback for targets outside ADRP range.
+option(EJIT_INLINE_LONG_CALLS
+  "EJIT: inline AArch64 far calls as ADRP+ADD+BLR when the resolved target is within +-4GiB" OFF)
+if(EJIT_INLINE_LONG_CALLS)
+  add_definitions(-DEJIT_INLINE_LONG_CALLS)
+endif()
+
 #===-- EmbeddedJIT per-function inline cache (multi-version) -------------===#
 # EJIT_ICACHE_DIM_SIZE: the per-dimension bound D of the per-function
 # @__ejit_icache_fn_<name> [D]^numDims inline-cache array. MUST be a power of 2

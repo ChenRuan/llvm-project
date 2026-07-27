@@ -72,9 +72,9 @@ set(EJIT_SOURCES
   EJitSrePlatform.cpp
 )
 
-# AArch64 direct-call-stub rewrite plugin (drop GOT load from PLT stubs).
-# Self-contained JITLink pass; only linked in when the option is on.
-if(EJIT_DIRECT_CALL_STUBS)
+# AArch64 far-call rewrite plugin. It can optimize PLT stubs, inline GOT call
+# sequences, or both, depending on the two independent top-level options.
+if(EJIT_DIRECT_CALL_STUBS OR EJIT_INLINE_LONG_CALLS)
   list(APPEND EJIT_SOURCES EJitDirectCallStubs.cpp)
 endif()
 
