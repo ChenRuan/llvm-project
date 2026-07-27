@@ -734,6 +734,10 @@ void link_ELF_aarch64(std::unique_ptr<LinkGraph> G,
 
     // Add an in-place GOT/TLS/Stubs build pass.
     Config.PostPrunePasses.push_back(buildTables_ELF_aarch64);
+
+    // Once external symbols have resolved and block addresses are final, bypass
+    // pointer-jump stubs for Branch26 targets within the architectural range.
+    Config.PreFixupPasses.push_back(aarch64::optimizePointerJumpStubBranches);
   }
 
   if (auto Err = Ctx->modifyPassConfig(*G, Config))

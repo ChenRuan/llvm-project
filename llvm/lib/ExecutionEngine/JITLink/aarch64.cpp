@@ -224,6 +224,71 @@ void PLTTableManager::registerExistingEntries() {
   }
 }
 
+Error optimizePointerJumpStubBranches(LinkGraph &G) {
+  LLVM_DEBUG(dbgs() << "Optimizing AArch64 pointer-jump stubs:\n");
+
+  auto *StubsSection = G.findSectionByName(PLTTableManager::getSectionName());
+  if (!StubsSection)
+    return Error::success();
+
+  for (auto *B : G.blocks()) {
+    for (auto &E : B->edges()) {
+      if (E.getKind() != Branch26PCRel || !E.getTarget().isDefined())
+        continue;
+
+      Block &StubBlock = E.getTarget().getBlock();
+      if (&StubBlock.getSection() != StubsSection ||
+          StubBlock.getSize() != sizeof(PointerJumpStubContent) ||
+          StubBlock.edges_size() != 2)
+        continue;
+
+      Edge *PageEdge = nullptr;
+      Edge *OffsetEdge = nullptr;
+      for (auto &StubEdge : StubBlock.edges()) {
+        if (StubEdge.getKind() == Page21 && StubEdge.getOffset() == 0)
+          PageEdge = &StubEdge;
+        else if (StubEdge.getKind() == PageOffset12 &&
+                 StubEdge.getOffset() == 4)
+          OffsetEdge = &StubEdge;
+      }
+      if (!PageEdge || !OffsetEdge ||
+          &PageEdge->getTarget() != &OffsetEdge->getTarget())
+        continue;
+
+      Symbol &GOTEntry = PageEdge->getTarget();
+      if (!GOTEntry.isDefined())
+        continue;
+      Block &GOTBlock = GOTEntry.getBlock();
+      if (GOTBlock.getSize() != G.getPointerSize() ||
+          GOTBlock.edges_size() != 1)
+        continue;
+
+      Edge &PointerEdge = *GOTBlock.edges().begin();
+      if (PointerEdge.getKind() != Pointer64 || PointerEdge.getAddend() != 0)
+        continue;
+
+      Symbol &Target = PointerEdge.getTarget();
+      if (Target.isExternal())
+        continue;
+
+      orc::ExecutorAddr FixupAddress = B->getFixupAddress(E);
+      int64_t Displacement = Target.getAddress() - FixupAddress + E.getAddend();
+      if ((static_cast<uint64_t>(Displacement) & 0x3) != 0 ||
+          Displacement < -(1LL << 27) || Displacement > ((1LL << 27) - 1))
+        continue;
+
+      E.setTarget(Target);
+      LLVM_DEBUG({
+        dbgs() << "  Replaced stub branch with direct branch:\n    ";
+        printEdge(dbgs(), *B, E, getEdgeKindName(E.getKind()));
+        dbgs() << "\n";
+      });
+    }
+  }
+
+  return Error::success();
+}
+
 const char *getPointerSigningFunctionSectionName() { return "$__ptrauth_sign"; }
 
 /// Creates a pointer signing function section, block, and symbol to reserve

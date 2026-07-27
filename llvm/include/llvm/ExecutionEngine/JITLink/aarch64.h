@@ -918,6 +918,11 @@ public:
   Section *StubsSection = nullptr;
 };
 
+/// Replace branches through a standard AArch64 pointer-jump stub with a direct
+/// Branch26PCRel edge when the resolved target is within range. Out-of-range
+/// and unresolved targets retain the original stub path.
+LLVM_ABI Error optimizePointerJumpStubBranches(LinkGraph &G);
+
 /// Returns the name of the pointer signing function section.
 LLVM_ABI const char *getPointerSigningFunctionSectionName();
 

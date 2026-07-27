@@ -88,3 +88,49 @@ TEST(AArch64, GOTAndStubs) {
     EXPECT_EQ(PLTSec->blocks_size(), 1U);
   }
 }
+
+static void checkPointerJumpStubRelaxation(StringRef TripleName,
+                                           uint64_t CallAddress,
+                                           uint64_t TargetAddress,
+                                           bool ExpectDirect) {
+  LinkGraph G("stub-relax", std::make_shared<orc::SymbolStringPool>(),
+              Triple(TripleName), SubtargetFeatures(), getEdgeKindName);
+
+  auto &Text =
+      G.createSection("__text", orc::MemProt::Read | orc::MemProt::Exec);
+  const char CallContent[4] = {0x00, 0x00, 0x00, (char)0x94u};
+  auto &CallBlock = G.createContentBlock(Text, CallContent,
+                                         orc::ExecutorAddr(CallAddress), 4, 0);
+  auto &Target = G.addExternalSymbol("aot_target", 0, true);
+  CallBlock.addEdge(Branch26PCRel, 0, Target, 0);
+  Edge &CallEdge = *CallBlock.edges().begin();
+
+  GOTTableManager GOT(G);
+  PLTTableManager PLT(G, GOT);
+  ASSERT_TRUE(PLT.visitEdge(G, &CallBlock, CallEdge));
+  Symbol *Stub = &CallEdge.getTarget();
+  ASSERT_NE(Stub, &Target);
+
+  G.makeAbsolute(Target, orc::ExecutorAddr(TargetAddress));
+  cantFail(optimizePointerJumpStubBranches(G));
+
+  if (ExpectDirect)
+    EXPECT_EQ(&CallEdge.getTarget(), &Target);
+  else
+    EXPECT_EQ(&CallEdge.getTarget(), Stub);
+}
+
+TEST(AArch64, PointerJumpStubBranchRelaxedInRange) {
+  checkPointerJumpStubRelaxation("aarch64-unknown-linux-gnu", 0x10000000,
+                                 0x17fffffc, true);
+}
+
+TEST(AArch64, PointerJumpStubBranchRetainedOutOfRange) {
+  checkPointerJumpStubRelaxation("aarch64-unknown-linux-gnu", 0x10000000,
+                                 0x18000000, false);
+}
+
+TEST(AArch64, PointerJumpStubBranchRelaxedInRangeBigEndian) {
+  checkPointerJumpStubRelaxation("aarch64_be-unknown-linux-gnu", 0x10000000,
+                                 0x10004000, true);
+}
