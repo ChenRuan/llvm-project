@@ -192,6 +192,7 @@ ALL_TESTS=(
   ejit_ptr_period_test
   ejit_trace_test
   ejit_volatile_test
+  ejit_direct_stub_test
 )
 
 # Per-test compile flags (e.g. for disabling global constructors)
@@ -230,6 +231,10 @@ declare -A EXTRA_SRCS
 EXTRA_SRCS[ejit_multi_tu_test]="ejit_multi_tu_test_b.c"
 EXTRA_SRCS[ejit_baremetal_link_test]="ejit_multi_tu_test_b.c"
 EXTRA_SRCS[ejit_lto_inline_test]="ejit_lto_inline_test_b.c"
+# Two-TU test: the AOT helper lives in a separate TU so the JIT entry sees it
+# as an external declaration and routes the call through a PLT stub (the stub
+# EJitDirectCallStubsPlugin rewrites on AArch64).
+EXTRA_SRCS[ejit_direct_stub_test]="ejit_direct_stub_helper.c"
 
 declare -A TEST_ARGS
 TEST_ARGS[ejit_complex_test]="0 1 2 3"
@@ -255,6 +260,7 @@ TEST_ARGS[ejit_baremetal_link_test]="0 3"
 TEST_ARGS[ejit_sync_mode_test]="0"
 TEST_ARGS[ejit_new_attr_test]="0"
 TEST_ARGS[ejit_fixed_dim_test]="0 1"
+TEST_ARGS[ejit_direct_stub_test]="0"
 
 if [[ ${#SELECTED[@]} -eq 0 ]]; then
   SELECTED=("${ALL_TESTS[@]}")
