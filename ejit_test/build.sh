@@ -176,6 +176,7 @@ ALL_TESTS=(
   ejit_jit_verify_test
   ejit_inline_asm_test
   ejit_likely_test
+  ejit_lto_inline_test
   ejit_lifecycle_test
   ejit_multidim_test
   ejit_multiversion_test
@@ -200,6 +201,11 @@ COMPILE_FLAGS[ejit_manual_register_test]="-mllvm -enable-ejit-global-ctors=false
 # registry tables walked via linker-script-provided __start_/__stop_ symbols.
 COMPILE_FLAGS[ejit_baremetal_link_test]="-mllvm -enable-ejit-global-ctors=false"
 COMPILE_FLAGS[ejit_fixed_dim_test]=""
+COMPILE_FLAGS[ejit_lto_inline_test]="-flto=thin"
+
+# Per-test link flags (e.g. -flto=thin for ThinLTO tests).
+declare -A LINK_FLAGS
+LINK_FLAGS[ejit_lto_inline_test]="-flto=thin"
 
 # Override the primary source file for a test (default: <name>.c). Lets a test
 # reuse existing sources under a different build/link recipe without copying.
@@ -223,6 +229,7 @@ LINKER_SCRIPT[ejit_manual_register_test]="ejit_baremetal.ld"
 declare -A EXTRA_SRCS
 EXTRA_SRCS[ejit_multi_tu_test]="ejit_multi_tu_test_b.c"
 EXTRA_SRCS[ejit_baremetal_link_test]="ejit_multi_tu_test_b.c"
+EXTRA_SRCS[ejit_lto_inline_test]="ejit_lto_inline_test_b.c"
 
 declare -A TEST_ARGS
 TEST_ARGS[ejit_complex_test]="0 1 2 3"
@@ -232,6 +239,7 @@ TEST_ARGS[ejit_multiversion_test]="0 3 7"
 TEST_ARGS[ejit_jit_verify_test]="0 1 5"
 TEST_ARGS[ejit_inline_asm_test]=""
 TEST_ARGS[ejit_likely_test]="0 1 7"
+TEST_ARGS[ejit_lto_inline_test]="0"
 TEST_ARGS[ejit_external_idx_test]="3 1"
 TEST_ARGS[ejit_lifecycle_test]="3 7 2"
 TEST_ARGS[ejit_multidim_test]="0"
@@ -295,15 +303,16 @@ build_one() {
   fi
 
   echo "  Linking ${name} (${ARCH}) ..."
+  local link_flags="${LINK_FLAGS[${name}]:-}"
   if ${USE_LIPO}; then
     "${CXX}" -fuse-ld="${LD_LLD}" \
-      -Os -Wl,--gc-sections ${STRIP_FLAG} ${lds_flag} \
+      -Os -Wl,--gc-sections ${STRIP_FLAG} ${lds_flag} ${link_flags} \
       "${LIPO_ABS}" \
       ${LINK_LIBS} \
       "${objs[@]}" -o "${bin}"
   else
     "${CXX}" -fuse-ld="${LD_LLD}" \
-      -Os -Wl,--gc-sections ${STRIP_FLAG} ${lds_flag} \
+      -Os -Wl,--gc-sections ${STRIP_FLAG} ${lds_flag} ${link_flags} \
       -Wl,--whole-archive "${EJIT_RUNTIME}" -Wl,--no-whole-archive \
       ${OTHER_LIBS} \
       ${LINK_LIBS} \
