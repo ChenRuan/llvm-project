@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-register-bitcode -ejit-cross-inline -S %s | FileCheck %s
+; RUN: opt -passes='default<O2>' -enable-ejit-bitcode -ejit-cross-inline -S %s | FileCheck %s
 ;
 ; Cross-inline mode embeds the full module regardless of whether ejit_entry
 ; functions exist (link-stage processing decides what to extract).

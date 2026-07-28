@@ -807,7 +807,8 @@ void ObjFile<ELFT>::initializeSections(bool ignoreComdats,
     case SHT_FINI_ARRAY:
     case SHT_PREINIT_ARRAY: {
       StringRef name = check(obj.getSectionName(sec, shstrtab));
-      if (ctx.ejitCrossLinked && name == ".ejit_cross")
+      if (name == ".ejit_cross" &&
+          ctx.ejitCrossConsumedFiles.contains(mb.getBufferIdentifier()))
         this->sections[i] = &InputSection::discarded;
       else
         this->sections[i] = createInputSection(i, sec, name);

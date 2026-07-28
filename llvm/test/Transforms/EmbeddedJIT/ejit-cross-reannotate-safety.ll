@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-register-bitcode -ejit-cross-inline -S %s | FileCheck %s
+; RUN: opt -passes='default<O2>' -enable-ejit-bitcode -ejit-cross-inline -S %s | FileCheck %s
 ;
 ; Verify cross-inline mode handles edge cases:
 ; 1. Normal metadata preserved

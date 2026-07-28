@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-register-bitcode -ejit-cross-inline -S %s | FileCheck --check-prefix=STAGE1 %s
+; RUN: opt -passes='default<O2>' -enable-ejit-bitcode -ejit-cross-inline -S %s | FileCheck --check-prefix=STAGE1 %s
 ; RUN: opt -passes=ejit-register-bitcode -S %s | FileCheck --check-prefix=DEFAULT %s
 ;
 ; End-to-end test: Stage 1 (cross-inline) vs default mode.

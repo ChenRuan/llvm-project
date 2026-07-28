@@ -17,7 +17,6 @@
 #include "Arch/SystemZ.h"
 #include "clang/Config/config.h" // for GCC_INSTALL_PREFIX
 #include "clang/Driver/CommonArgs.h"
-#include "../EJitCrossLink.h"
 #include "clang/Driver/Compilation.h"
 #include "clang/Driver/Driver.h"
 #include "clang/Driver/MultilibBuilder.h"
@@ -463,16 +462,20 @@ void tools::gnutools::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   bool NeedsXRayDeps = addXRayRuntime(ToolChain, Args, CmdArgs);
   addLinkerCompressDebugSectionsOption(ToolChain, Args, CmdArgs);
 
-  // EJIT cross-TU inlining at link time.
+  // EJIT cross-TU inlining. ld.lld is the single owner of the merge; the clang
+  // driver never performs it. When -fejit-cross-inline is requested we require
+  // ld.lld and forward the request via --ejit-cross-inline. Any other linker
+  // cannot consume the .ejit_cross sections, so we emit a hard error rather
+  // than produce an output that still carries the (large) .ejit_cross data and
+  // no registry -- which would silently fall back to per-TU AOT bitcode.
   if (Args.hasArg(options::OPT_fejit_cross_inline)) {
-    std::vector<std::string> InputFiles;
-    for (const auto &II : Inputs)
-      if (II.isFilename())
-        InputFiles.push_back(II.getFilename());
-    std::string TmpBC =
-        runEJitCrossLink(InputFiles, ToolChain.getTriple().str());
-    if (!TmpBC.empty())
-      CmdArgs.push_back(Args.MakeArgString(TmpBC));
+    bool LinkerIsLLD = false;
+    (void)ToolChain.GetLinkerPath(&LinkerIsLLD);
+    if (!LinkerIsLLD)
+      ToolChain.getDriver().Diag(diag::err_drv_argument_only_allowed_with)
+          << "-fejit-cross-inline" << "-fuse-ld=lld";
+    else
+      CmdArgs.push_back("--ejit-cross-inline");
   }
 
   AddLinkerInputs(ToolChain, Inputs, Args, CmdArgs, JA);

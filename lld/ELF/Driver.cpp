@@ -23,8 +23,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "Driver.h"
-#include "EJitCrossLink.h"
 #include "Config.h"
+#include "EJitCrossLink.h"
 #include "ICF.h"
 #include "InputFiles.h"
 #include "InputSection.h"
@@ -62,6 +62,7 @@
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SaveAndRestore.h"
+#include "llvm/Support/Signals.h"
 #include "llvm/Support/TarWriter.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/TimeProfiler.h"
@@ -1483,6 +1484,7 @@ static void readConfigs(Ctx &ctx, opt::InputArgList &args) {
       args.hasFlag(OPT_mmap_output_file, OPT_no_mmap_output_file, false);
   ctx.arg.nmagic = args.hasFlag(OPT_nmagic, OPT_no_nmagic, false);
   ctx.arg.noinhibitExec = args.hasArg(OPT_noinhibit_exec);
+  ctx.arg.ejitCrossInline = args.hasArg(OPT_ejit_cross_inline);
   ctx.arg.nostdlib = args.hasArg(OPT_nostdlib);
   ctx.arg.oFormatBinary = isOutputFormatBinary(ctx, args);
   ctx.arg.omagic = args.hasFlag(OPT_omagic, OPT_no_omagic, false);
@@ -3145,21 +3147,61 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
   for (StringRef name : ctx.arg.undefined)
     ctx.symtab->addUnusedUndefined(name)->referenced = true;
 
-  // EJIT cross-TU inlining: if any input has .ejit_cross sections,
-  // merge them, inline cross-TU child functions, and add the result
-  // as a bitcode input to the link.
-  {
+  // EJIT cross-TU inlining. ld.lld is the single owner of this processing and
+  // runs it at most once per link, only when --ejit-cross-inline is present
+  // (clang emits that flag for -fejit-cross-inline links that use ld.lld). On
+  // any failure after a .ejit_cross section is observed the link fails rather
+  // than silently dropping back to the per-TU AOT bitcode.
+  SmallVector<std::string, 1> ejitCrossTemps;
+  if (ctx.arg.ejitCrossInline) {
     std::vector<std::string> InputPaths;
     for (auto *arg : args.filtered(OPT_INPUT))
       InputPaths.push_back(arg->getValue());
-    std::string TmpBC = runEJitCrossLink(InputPaths, /*TargetTriple=*/"");
-    if (!TmpBC.empty()) {
-      ctx.ejitCrossLinked = true;
-      addFile(ctx.saver.save(TmpBC), /*withLOption=*/false);
+    StringRef SaveTempsPrefix =
+        args.hasArg(OPT_save_temps) ? ctx.arg.outputFile : StringRef();
+    Expected<EJitCrossLinkResult> CrossResult =
+        runEJitCrossLink(InputPaths, /*TargetTriple=*/"", SaveTempsPrefix);
+    if (!CrossResult) {
+      ErrAlways(ctx) << toString(CrossResult.takeError());
+      return;
+    }
+    for (const std::string &path : CrossResult->consumedFiles)
+      ctx.ejitCrossConsumedFiles.insert(path);
+    if (!CrossResult->tempPath.empty()) {
+      llvm::sys::RemoveFileOnSignal(CrossResult->tempPath);
+      ejitCrossTemps.push_back(CrossResult->tempPath);
+      addFile(ctx.saver.save(CrossResult->tempPath), /*withLOption=*/false);
     }
   }
 
   parseFiles(ctx, files);
+
+  // The cross-inline temp bitcode is now resident in memory (parseFiles read
+  // it into an owned buffer), so reclaim the on-disk temp file immediately.
+  for (const std::string &p : ejitCrossTemps) {
+    llvm::sys::fs::remove(p);
+    llvm::sys::DontRemoveFileOnSignal(p);
+  }
+
+  auto rejectUnprocessedEJitCross = [&]() {
+    if (!ctx.arg.ejitCrossInline)
+      return false;
+    for (ELFFileBase *file : ctx.objectFiles) {
+      for (InputSectionBase *sec : file->getSections()) {
+        if (sec && sec != &InputSection::discarded &&
+            sec->name == ".ejit_cross") {
+          ErrAlways(ctx) << "ejit-cross-inline: selected input '"
+                         << file->getName()
+                         << "' contains an unprocessed .ejit_cross section "
+                            "(archive members, -l inputs, and linker-script "
+                            "inputs are not yet supported; link the object "
+                            "file directly)";
+          return true;
+        }
+      }
+    }
+    return false;
+  };
 
   // Create dynamic sections for dynamic linking and static PIE.
   ctx.hasDynsym = !ctx.sharedFiles.empty() || ctx.arg.isPic;
@@ -3230,6 +3272,8 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
   parallelForEach(ctx.objectFiles, postParseObjectFile);
   parallelForEach(ctx.bitcodeFiles,
                   [](BitcodeFile *file) { file->postParse(); });
+  if (rejectUnprocessedEJitCross())
+    return;
   for (auto &it : ctx.nonPrevailingSyms) {
     Symbol &sym = *it.first;
     Undefined(sym.file, sym.getName(), sym.binding, sym.stOther, sym.type,
@@ -3322,6 +3366,8 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
     initSectionsAndLocalSyms(file, /*ignoreComdats=*/true);
   });
   parallelForEach(newObjectFiles, postParseObjectFile);
+  if (rejectUnprocessedEJitCross())
+    return;
   for (const DuplicateSymbol &d : ctx.duplicates)
     reportDuplicate(ctx, *d.sym, d.file, d.section, d.value);
 

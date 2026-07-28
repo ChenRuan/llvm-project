@@ -216,6 +216,9 @@ public:
 // Most fields are initialized by the ctx.driver.
 struct Config {
   uint8_t osabi = 0;
+  // EJIT: opt-in cross-TU inline processing at link time. Set by clang for
+  // -fejit-cross-inline links that use ld.lld; ld.lld is the single owner.
+  bool ejitCrossInline = false;
   uint32_t andFeatures = 0;
   llvm::CachePruningPolicy thinLTOCachePolicy;
   llvm::SetVector<llvm::CachedHashString> dependencyFiles; // for --dependency-file
@@ -732,8 +735,10 @@ struct Ctx : CommonLinkerContext {
 
   std::optional<AArch64PauthAbiCoreInfo> aarch64PauthAbiCoreInfo;
 
-  // Set when EJIT cross-TU inlining has consumed .ejit_cross sections.
-  bool ejitCrossLinked = false;
+  // Input files whose .ejit_cross sections were consumed by the cross-TU
+  // linker. This is deliberately per-file: a global flag could discard an
+  // unprocessed section introduced through -l or a linker script.
+  llvm::StringSet<> ejitCrossConsumedFiles;
 };
 
 // The first two elements of versionDefinitions represent VER_NDX_LOCAL and

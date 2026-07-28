@@ -48,22 +48,28 @@
 │  链接期 (-fejit-cross-inline *.o -o output)                     │
 │  (-r 部分链接和最终链接处理逻辑完全相同)                          │
 │                                                                 │
-│  clang driver 或 ld.lld:                                        │
+│  链接期 (-fejit-cross-inline *.o -o output, 需 -fuse-ld=lld)     │
+│  (-r 部分链接和最终链接处理逻辑完全相同)                          │
+│                                                                 │
+│  ld.lld (唯一 owner, 仅在 --ejit-cross-inline 时执行一次):       │
 │    1. 扫描所有输入 .o, 提取 .ejit_cross section                 │
 │    2. parseBitcodeFile → 每个 section 解析为一个 Module          │
 │    3. llvm::Linker::linkInModule() → 合并所有 Module            │
-│    4. 找 ejit_entry → computeTransitiveClosure                  │
-│    5. AlwaysInliner → 内联跨 TU 子函数                          │
-│    6. preOptimizeBitcode + reAnnotateMayConst                   │
+│    4. 找 ejit_entry → computeTransitiveClosure (保守引用收集)    │
+│    5. AlwaysInliner + ModuleInlinerWrapperPass → 真实内联跨 TU  │
+│       普通函数 (成本模型驱动, 非仅 always_inline)               │
+│    6. reAnnotateMayConst (复用 EJitCommon.h canonical resolver)  │
 │    7. 对每个 ejit_entry 单独:                                   │
-│       CloneModule → computeTransitiveClosure                    │
-│       → serializeToBitcode → 独立 @__ejit_bitcode_<name>       │
-│    8. generateRegisterCall (每函数注册自己的 bitcode)            │
-│    9. WriteBitcodeToFile → 临时 .bc (lld 原生支持)              │
-│   10. lld 链接 (原始 .o + 临时 .bc)                             │
-│   11. lld 丢弃原始 .ejit_cross section (已消费)                 │
+│       CloneModule → computeTransitiveClosure → trim             │
+│       → verifyModule → 独立 @__ejit_bitcode_<name>             │
+│    8. generateRegistryTable (registry 全部常量属于 TmpM;         │
+│       external func/global 在 TmpM 内建 declaration)            │
+│    9. verifyModule(TmpM) → 失败则链接失败                       │
+│   10. WriteBitcodeToFile → 临时 .bc; 链接后由 Driver 清理        │
+│   11. lld 链接 (原始 .o + 临时 .bc), 丢弃原始 .ejit_cross        │
 │                                                                 │
-│  输出: output 中无 .ejit_cross, 只有 @__ejit_bitcode            │
+│  任一阶段失败 → 链接失败 (绝不静默 fallback 到 AOT)             │
+│  输出: output 中无 .ejit_cross, 只有一套 @__ejit_bitcode         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -128,8 +134,8 @@ static void embedBitcodeInSection(Module &M, const std::string &BC,
   GV->setSection(SectionName);
   GV->setAlignment(Align(1));
   // 加入 llvm.compiler.used 防止编译器丢弃此 unreferenced global，
-  // 但允许链接器 GC（--gc-sections）。ld.lld 在 cross-link 处理后
-  // 主动丢弃此 section（ctx.ejitCrossLinked → InputSection::discarded）。
+  // 但允许链接器 GC（--gc-sections）。ld.lld 在 cross-link 处理后仅对
+  // EJitCrossLinkResult::consumedFiles 中的输入主动丢弃此 section。
   appendToCompilerUsed(M, {GV});
 }
 ```
@@ -167,14 +173,16 @@ if (Args.hasArg(options::OPT_fejit_cross_inline)) {
 
 ### 4.1 核心函数
 
-新建文件：**`clang/lib/Driver/EJitCrossLink.cpp`**
+唯一实现文件：**`lld/ELF/EJitCrossLink.cpp`**（clang driver 复制版已删除）
 
 ```cpp
 /// 链接期跨 TU 内联处理。
 /// 从所有输入 .o 中提取 .ejit_cross section，合并、内联、生成 @__ejit_bitcode，
-/// 写入临时 .o 并返回路径。无 .ejit_cross 时返回空字符串。
-std::string runEJitCrossLink(ArrayRef<std::string> InputFiles,
-                              const std::string &TargetTriple);
+/// 写入临时 .bc，并返回路径及被精确消费的输入集合。
+/// 无 .ejit_cross 时返回空结果；检测后的任何失败返回 Error。
+Expected<EJitCrossLinkResult>
+runEJitCrossLink(ArrayRef<std::string> InputFiles, StringRef TargetTriple,
+                 StringRef SaveTempsPrefix = {});
 ```
 
 ### 4.2 处理流程
@@ -183,7 +191,7 @@ std::string runEJitCrossLink(ArrayRef<std::string> InputFiles,
 runEJitCrossLink(InputFiles, TargetTriple):
 
   1. 快速扫描: 检查是否有任何输入包含 .ejit_cross section
-     └─ 无 → return ""
+     └─ 无 → return EJitCrossLinkResult{}
 
   2. 提取并解析:
      for each input file:
@@ -199,66 +207,85 @@ runEJitCrossLink(InputFiles, TargetTriple):
 
   4. 闭包计算:
      collectEntryFunctions(Composite) → EntryFuncs
-     computeTransitiveClosure(EntryFuncs) → ClosureFuncs
-     eraseFromParent all non-closure non-decl functions
+     computeTransitiveClosure(EntryFuncs) → ClosureFuncs + ClosureGlobals
+     扫描 operand、常量表达式/聚合、alias/ifunc、全局 initializer
+     deleteBody/setInitializer(nullptr) + GlobalDCE 安全裁剪
 
   5. 内联跨 TU 子函数:
-     ModuleInlinerPass(O2, ThinOrFullLTOPhase::None).run(Composite)
+     将 JIT-only composite definitions 标记 dso_local
+     AlwaysInlinerPass + ModuleInlinerWrapperPass (成本模型)
 
-  6. 预优化 + metadata 恢复:
-     preOptimizeBitcode(Composite)  // AlwaysInline → Mem2Reg → InstCombine → SimplifyCFG
+  6. 轻量 cleanup + metadata 恢复:
+     Promote → InstCombine → SimplifyCFG
      reAnnotateMayConst(Composite)
 
   7. 对每个 ejit_entry 单独提取闭包 + 序列化:
      for each EntryFunc:
        PerFuncModule = CloneModule(Composite)
        computeTransitiveClosure({EntryFunc}, Closure, Globals)
-       删 PerFuncModule 中非闭包函数/全局变量
-       preOptimizeBitcode(*PerFuncModule)       // 轻量优化
-       serializeToBitcode(*PerFuncModule) → BC  // 只含当前函数+依赖
+       安全裁剪 PerFuncModule 中非闭包函数/全局变量
+       externalize mutable globals
+       collectExternalSymbols → 在 TmpModule 中建立稳定 declaration
+       verifyModule(*PerFuncModule)
+       serializeToBitcode(*PerFuncModule) → BC
 
-  8. 生成临时 Module (含 N 个 @__ejit_bitcode_<name> + ejit_auto_register):
+  8. 生成临时 Module (含 N 个 @__ejit_bitcode_<name> + 单一 registry):
      TmpModule = new Module("ejit_cross_link", Ctx)
      复制 DataLayout + TargetTriple
      for each EntryFunc + its BC:
        embedBitcode(TmpModule, BC, "__ejit_bitcode_" + funcName)
-     generateRegisterCall(TmpModule, EntryFuncBitcodeMap)
-       → 每函数注册自己的 bitcode
+     generateRegistryTable(TmpModule, entries, external symbols)
+     verifyModule(TmpModule)
 
   9. 写入临时 .bc:
      WriteBitcodeToFile(TmpModule) → 临时 .bc 文件
      lld 原生支持 .bc 输入，无需编译为 .o
 
-  10. return tmpfile path
+  10. return {tmpfile path, consumed input files}
 ```
 
-### 4.3 复用 PASS1 的内部函数
+### 4.3 与 PASS1 共享的语义
 
-`EJitRegisterBitcode.cpp` 中以下函数目前是 `static`，需要暴露为公共 API（放在头文件或新增 `EJitCrossLink.h` 中）：
+cross-link 的闭包、内联和 registry 生成属于 lld，不再复制一份 clang/PASS1
+实现。`may_const` 指针形态解析直接复用 `EJitCommon.h` 中的
+`ejitMayConstFieldOffset` 与 `ejitAccessFitsMayConstField`，保证与运行时优化 pass
+使用同一套保守规则。
 
-| 函数 | 用途 |
-|---|---|
-| `collectEntryFunctions()` | 找 ejit_entry |
-| `computeTransitiveClosure()` | 计算传递闭包 |
-| `preOptimizeBitcode()` | AOT 预优化 |
-| `reAnnotateMayConst()` | 恢复 metadata |
-| `embedBitcode()` | 创建 @__ejit_bitcode |
-| `generateRegisterCall()` | 创建 ejit_auto_register |
-| `collectReferencedGlobals()` | 收集引用的全局变量 |
+### 4.4 Driver 集成点（PR #102 hardening: ld.lld 为唯一 owner）
 
-### 4.4 Driver 集成点
+为保证跨 TU 合并/注册**恰好执行一次**，`ld.lld` 是唯一的 cross-link owner；clang
+driver 自身**不再**执行任何合并。协议如下：
 
-**两处集成**：
+1. **clang driver**: `clang/lib/Driver/ToolChains/Gnu.cpp` — `Linker::ConstructJob`
+   中，当 `-fejit-cross-inline` 生效时用 `ToolChain::GetLinkerPath(&LinkerIsLLD)`
+   判断链接器：
+   - 若不是 lld → `err_drv_argument_only_allowed_with` 硬报错（`-fejit-cross-inline`
+     只允许配合 `-fuse-ld=lld`）。绝不生成 GNU ld 无法消费的 `.bc`，也绝不把巨大的
+     `.ejit_cross` 静默留在最终产物。
+   - 若是 lld → 仅向链接命令行追加 `--ejit-cross-inline`，把处理交给 lld。
+2. **ld.lld**: `lld/ELF/Driver.cpp` — `LinkerDriver::link()` 中，`parseFiles` 之前，
+   **仅当 `--ejit-cross-inline` 存在**（`ctx.arg.ejitCrossInline`）时扫描 OPT_INPUT，
+   调用 `runEJitCrossLink`：
+   - 返回 `Expected<EJitCrossLinkResult>`：`Error` → `ErrAlways(ctx)` 令链接失败；
+     空 `tempPath` → 无 `.ejit_cross`（正常跳过，默认行为完全不变）；非空 →
+     临时 `.bc` 路径和被精确消费的输入文件集合。
+   - 生成的 `.bc` 通过 `addFile` 加入链接；`InputFiles.cpp` 只丢弃
+     `consumedFiles` 中输入的 `.ejit_cross` section，不能用全局布尔值误删后续由
+     `-l`、archive 或 linker script 引入但未处理的 section。
+   - 临时 `.bc` 在 `parseFiles` 读入内存后由 Driver 立即 `sys::fs::remove` 删除，
+     并在创建时 `RemoveFileOnSignal` 注册，保证不会在 `/tmp` 永久遗留。
 
-1. **clang driver**: `clang/lib/Driver/ToolChains/Gnu.cpp` — `Linker::ConstructJob` 中调 `runEJitCrossLink`，生成的 `.bc` 追加到 ld 命令行参数。
-2. **ld.lld**: `lld/ELF/Driver.cpp` — `LinkerDriver::link()` 中，`parseFiles` 之前，扫描 OPT_INPUT 收集路径，调用 `runEJitCrossLink`，生成的 `.bc` 通过 `addFile` 加入链接。同时设置 `ctx.ejitCrossLinked = true`，触发 `InputFiles.cpp` 中丢弃原始 `.ejit_cross` section。
+> clang 复制版 `clang/lib/Driver/EJitCrossLink.cpp` 已删除，因此实现只剩 lld 一份，
+> 不存在两份实现漂移（Area 6）。`.ejit_cross` 里的 may_const 语义直接复用
+> `EJitCommon.h` 的 `ejitMayConstFieldOffset` / `ejitAccessFitsMayConstField`
+> canonical resolver，不再维护过时的简化版。
 
 ```
-# clang 驱动
-clang -fejit-cross-inline -r tu_a.o tu_b.o -o combined.o
+# clang 驱动（必须使用 lld）
+clang -fejit-cross-inline -fuse-ld=lld -r tu_a.o tu_b.o -o combined.o
 
 # 直接用 ld.lld
-ld.lld -r tu_a.o tu_b.o -o combined.o
+ld.lld --ejit-cross-inline -r tu_a.o tu_b.o -o combined.o
 ```
 
 ### 4.5 每函数独立 bitcode 设计
@@ -315,7 +342,8 @@ add_llvm_component_library(LLVMEmbeddedJIT
 
 ### 5.2 clangDriver
 
-`EJitCrossLink.cpp` 编入 clang 自身（clang 已链接所有依赖）。
+clang driver 只负责校验选中的 linker 并转发 `--ejit-cross-inline`；不再链接
+BitReader/Object/Linker 等 cross-link 实现依赖。
 
 ---
 
@@ -333,15 +361,26 @@ add_llvm_component_library(LLVMEmbeddedJIT
 
 ## 7. 错误处理 & 边界情况
 
-### 7.1 错误处理
+### 7.1 错误处理（PR #102: 检测到 .ejit_cross 后绝不静默吞错）
+
+区分「输入没有 `.ejit_cross`」（正常跳过）与「已检测到 `.ejit_cross` 但处理失败」
+（硬失败）。`runEJitCrossLink` 返回 `Expected<EJitCrossLinkResult>`，每个错误都带
+**输入文件名 + 处理阶段 + 底层 llvm::Error** 文本，由 `ld.lld` 转成致命链接错误。
 
 | 场景 | 策略 |
 |---|---|
-| 无 .ejit_cross section 的链接 | 跳过，正常链接 |
-| bitcode 解析失败 | 跳过该 section，记录 warning |
-| 合并后无 ejit_entry | 跳过，不生成临时 .o |
-| 临时 .o 生成失败 | 记录 error，fallback 到正常链接 |
-| `-r` 链接的输入有旧的 `@__ejit_bitcode` | `.ejit_cross` 优先替换旧的 bitcode |
+| 无 .ejit_cross section 的链接 | 返回空结果，正常链接（默认行为不变） |
+| 普通非对象参数或不含该 section 的输入 | 跳过，非错误 |
+| **archive 成员含 .ejit_cross** | **硬报错**（明确诊断：暂不支持 archive 成员，请直接链接 .o） |
+| **bitcode 解析失败 / section 读取失败** | **链接失败**（带文件名+阶段+Error） |
+| **`Linker::linkInModule` 合并冲突** | **链接失败**（检查返回值） |
+| 合并后无 ejit_entry | **链接失败**（已承诺有 .ejit_cross，却无可注册入口） |
+| **per-entry / registry `verifyModule` 失败** | **链接失败**，不写出任何 bitcode |
+| **临时 .bc 创建 / 写入失败** | **链接失败**（删除半成品临时文件） |
+
+> 旧实现在上述多数场景 `continue` 或返回空串静默 fallback 到 AOT；现已全部改为
+> 通过 `Error` 传播到链接器用户。clang 与 lld 两条入口的错误语义一致（clang 仅在
+> 非 lld 链接器时报错，其余交给 lld）。
 
 ### 7.2 与 `-flto` 冲突
 
@@ -361,10 +400,12 @@ if (Args.hasArg(options::OPT_fejit_cross_inline) &&
 
 ### 7.3 `.ejit_cross` section 自动清除
 
-Cross-link 处理成功后，`ctx.ejitCrossLinked = true`。`InputFiles.cpp` 中检查此标记：
-- 如果为 true 且 section 名为 `.ejit_cross` → `sections[i] = &InputSection::discarded`
-- 原始 `.o` 中的 `.ejit_cross` section 被丢弃，不出现在输出中
-- `-r` 和最终链接都生效
+Cross-link 返回精确的 `consumedFiles`，Driver 写入
+`ctx.ejitCrossConsumedFiles`。`InputFiles.cpp` 只有在当前 input identifier 命中该
+集合且 section 名为 `.ejit_cross` 时才设为 `InputSection::discarded`：
+- 已处理的原始 `.o` section 不进入输出，`-r` 和最终链接都生效；
+- archive、`-l` 或 linker script 后续引入的未处理 section 不会被全局状态误删，
+  而是在 parse 后得到明确的 unsupported 诊断。
 
 ### 7.4 被调用的 TU 也需要 `-fejit-cross-inline`
 
@@ -393,25 +434,36 @@ clang -fejit-cross-inline -c tu_b.c -o tu_b.o   # child_func 在此, 必须
 
 ## 9. 文件改动清单
 
+PR #102 hardening 后（ld.lld 为唯一 owner）：
+
 | 文件 | 改动 |
 |---|---|
-| `clang/include/clang/Driver/Options.td` | +4: `-fejit-cross-inline` |
-| `clang/lib/Driver/ToolChains/Clang.cpp` | +10: 编译选项传递 + `-flto` 冲突检测 |
-| `clang/lib/Driver/ToolChains/Gnu.cpp` | +14: Linker::ConstructJob |
-| **新建** `clang/lib/Driver/EJitCrossLink.cpp` | ~420: 链接期处理核心（clang driver 副本） |
-| **新建** `clang/lib/Driver/EJitCrossLink.h` | ~18: API 声明 |
-| `clang/lib/Driver/CMakeLists.txt` | +8: 新增源 + LINK_COMPONENTS |
-| **新建** `lld/ELF/EJitCrossLink.cpp` | ~420: 链接期处理核心（lld 副本） |
-| **新建** `lld/ELF/EJitCrossLink.h` | ~18: API 声明 |
-| `lld/ELF/Driver.cpp` | +15: link() 中调 runEJitCrossLink |
-| `lld/ELF/InputFiles.cpp` | +10: 丢弃已消费的 .ejit_cross |
-| `lld/ELF/Config.h` | +3: ctx.ejitCrossLinked |
-| `lld/ELF/CMakeLists.txt` | +3: 新增源 + LINK_COMPONENTS |
-| `llvm/lib/Passes/PassBuilderPipelines.cpp` | +22: flag + 构造函数传参 |
-| `llvm/include/.../EJitPasses.h` | +4: CrossInline 成员 |
-| `llvm/.../EJitRegisterBitcode.cpp` | +31: 分支 + embedBitcodeInSection |
+| `clang/include/clang/Driver/Options.td` | `-fejit-cross-inline` |
+| `clang/lib/Driver/ToolChains/Clang.cpp` | 编译选项传递 + `-flto` 冲突检测（不变） |
+| `clang/lib/Driver/ToolChains/Gnu.cpp` | link 阶段：检测非 lld → 报错；lld → 追加 `--ejit-cross-inline`（不再自行合并） |
+| ~~`clang/lib/Driver/EJitCrossLink.cpp` / `.h`~~ | **已删除**（去重：实现只剩 lld 一份） |
+| `clang/lib/Driver/CMakeLists.txt` | 移除 `EJitCrossLink.cpp` 及其专用 LINK_COMPONENTS |
+| `lld/ELF/EJitCrossLink.cpp` | 链接期处理核心（唯一实现）：`Expected<EJitCrossLinkResult>`、保守闭包、真实 inliner、TmpM 内 registry + `verifyModule`、错误传播、临时文件清理 |
+| `lld/ELF/EJitCrossLink.h` | API 声明（`Expected<EJitCrossLinkResult>`） |
+| `lld/ELF/Options.td` | `--ejit-cross-inline`（gate，默认关闭时零扫描） |
+| `lld/ELF/Config.h` | `Config::ejitCrossInline`（arg）+ `Ctx::ejitCrossConsumedFiles`（精确消费集合） |
+| `lld/ELF/Driver.cpp` | 解析 flag；gated 调用 + `Expected`/`Error` 处理；临时文件清理（`+Signals.h`） |
+| `lld/ELF/InputFiles.cpp` | 仅丢弃精确匹配已消费输入的 `.ejit_cross` |
+| `lld/ELF/CMakeLists.txt` | 新增源（不变） |
+| `llvm/lib/Passes/PassBuilderPipelines.cpp` | flag + 构造函数传参（不变） |
+| `llvm/include/.../EJitPasses.h` | CrossInline 成员（不变） |
+| `llvm/.../EJitRegisterBitcode.cpp` | 分支 + embedBitcodeInSection（不变） |
+| `lld/test/ELF/ejit-cross-inline.ll` | **新建**：生产路径测试（exactly-once / discard / registry / external / malformed→fail / 默认不变） |
 
-总计约 **1400 行**新增代码。
+### 9.1 闭包支持的引用形态（Area 4）
+
+`computeTransitiveClosure` / `collectFromConstant` 统一、保守地收集引用：扫描所有
+指令 operand，穿透 `stripPointerCasts` / `ConstantExpr` / `ConstantAggregate`，解析
+`GlobalAlias` 与 `GlobalIFunc` 目标，扫描已保留全局的 initializer（函数指针表）。
+`CallInst` / `InvokeInst` / `CallBrInst`（均为 `CallBase`，callee 是 operand）自然覆盖，
+bitcast 后的 callee 也覆盖。运行时传入的真正间接目标无法静态推断，间接调用保持不变；
+module-owned 函数表目标由 initializer 扫描覆盖。trim 先 `deleteBody`，再由 `GlobalDCE`
+安全回收，Debug/Release 都不会断言或留下 dangling reference。
 
 ---
 
