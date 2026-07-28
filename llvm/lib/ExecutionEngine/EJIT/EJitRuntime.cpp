@@ -1139,8 +1139,13 @@ void ejit_dump_func(const char *name) {
 
 void ejit_print_dumped(const char *name) {
   // gDumpSharedState is bound once in ejit_init; no per-call rebind needed.
-  EJIT_DIAG("print_dumped name=%s", (name && name[0]) ? name : "(list)");
+  EJIT_DIAG("print_dumped name=%s", (name && name[0]) ? name : "(all)");
   printDumped(name);
+}
+
+void ejit_dump_all(bool enable) {
+  EJIT_DIAG("dump_all enable=%u", enable ? 1u : 0u);
+  setDumpFuncFilter(enable ? std::string("*") : std::string());
 }
 
 // Sentinel returned when no owner core is elected (e.g. not initialized or the
