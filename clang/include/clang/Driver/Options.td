@@ -1681,6 +1681,10 @@ def fembed_bitcode : Flag<["-"], "fembed-bitcode">, Group<f_Group>,
 def fembed_bitcode_marker : Flag<["-"], "fembed-bitcode-marker">,
   Alias<fembed_bitcode_EQ>, AliasArgs<["marker"]>,
   HelpText<"Embed placeholder LLVM IR data as a marker">;
+def fejit_cross_inline : Flag<["-"], "fejit-cross-inline">,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Enable cross-TU inlining for EJIT entry functions (defers bitcode "
+           "extraction to link time)">;
 defm gnu_inline_asm : BoolFOption<"gnu-inline-asm",
   LangOpts<"GNUAsm">, DefaultTrue,
   NegFlag<SetFalse, [], [ClangOption, CC1Option],

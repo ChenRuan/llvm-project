@@ -17,6 +17,7 @@
 #include "Arch/SystemZ.h"
 #include "clang/Config/config.h" // for GCC_INSTALL_PREFIX
 #include "clang/Driver/CommonArgs.h"
+#include "../EJitCrossLink.h"
 #include "clang/Driver/Compilation.h"
 #include "clang/Driver/Driver.h"
 #include "clang/Driver/MultilibBuilder.h"
@@ -461,6 +462,19 @@ void tools::gnutools::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   bool NeedsSanitizerDeps = addSanitizerRuntimes(ToolChain, Args, CmdArgs);
   bool NeedsXRayDeps = addXRayRuntime(ToolChain, Args, CmdArgs);
   addLinkerCompressDebugSectionsOption(ToolChain, Args, CmdArgs);
+
+  // EJIT cross-TU inlining at link time.
+  if (Args.hasArg(options::OPT_fejit_cross_inline)) {
+    std::vector<std::string> InputFiles;
+    for (const auto &II : Inputs)
+      if (II.isFilename())
+        InputFiles.push_back(II.getFilename());
+    std::string TmpBC =
+        runEJitCrossLink(InputFiles, ToolChain.getTriple().str());
+    if (!TmpBC.empty())
+      CmdArgs.push_back(Args.MakeArgString(TmpBC));
+  }
+
   AddLinkerInputs(ToolChain, Inputs, Args, CmdArgs, JA);
 
   addHIPRuntimeLibArgs(ToolChain, C, Args, CmdArgs);

@@ -1,11 +1,18 @@
 set(LLVM_LINK_COMPONENTS
   BinaryFormat
+  BitReader
+  BitWriter
+  Linker
   MC
   Object
   Option
+  Passes
   ProfileData
+  ScalarOpts
   Support
+  Target
   TargetParser
+  TransformUtils
   WindowsDriver
   )
 
@@ -20,6 +27,7 @@ add_clang_library(clangDriver
   Distro.cpp
   Driver.cpp
   DriverOptions.cpp
+  EJitCrossLink.cpp
   Job.cpp
   Multilib.cpp
   MultilibBuilder.cpp

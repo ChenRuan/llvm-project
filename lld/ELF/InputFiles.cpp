@@ -805,10 +805,14 @@ void ObjFile<ELFT>::initializeSections(bool ignoreComdats,
     case SHT_NOBITS:
     case SHT_INIT_ARRAY:
     case SHT_FINI_ARRAY:
-    case SHT_PREINIT_ARRAY:
-      this->sections[i] =
-          createInputSection(i, sec, check(obj.getSectionName(sec, shstrtab)));
+    case SHT_PREINIT_ARRAY: {
+      StringRef name = check(obj.getSectionName(sec, shstrtab));
+      if (ctx.ejitCrossLinked && name == ".ejit_cross")
+        this->sections[i] = &InputSection::discarded;
+      else
+        this->sections[i] = createInputSection(i, sec, name);
       break;
+    }
     case SHT_LLVM_LTO:
       // Discard .llvm.lto in a relocatable link that does not use the bitcode.
       // The concatenated output does not properly reflect the linking

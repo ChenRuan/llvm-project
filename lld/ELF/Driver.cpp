@@ -23,6 +23,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Driver.h"
+#include "EJitCrossLink.h"
 #include "Config.h"
 #include "ICF.h"
 #include "InputFiles.h"
@@ -3143,6 +3144,20 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
   // -u foo a.a b.so will extract a.a.
   for (StringRef name : ctx.arg.undefined)
     ctx.symtab->addUnusedUndefined(name)->referenced = true;
+
+  // EJIT cross-TU inlining: if any input has .ejit_cross sections,
+  // merge them, inline cross-TU child functions, and add the result
+  // as a bitcode input to the link.
+  {
+    std::vector<std::string> InputPaths;
+    for (auto *arg : args.filtered(OPT_INPUT))
+      InputPaths.push_back(arg->getValue());
+    std::string TmpBC = runEJitCrossLink(InputPaths, /*TargetTriple=*/"");
+    if (!TmpBC.empty()) {
+      ctx.ejitCrossLinked = true;
+      addFile(ctx.saver.save(TmpBC), /*withLOption=*/false);
+    }
+  }
 
   parseFiles(ctx, files);
 

@@ -731,6 +731,9 @@ struct Ctx : CommonLinkerContext {
   llvm::raw_fd_ostream openAuxiliaryFile(llvm::StringRef, std::error_code &);
 
   std::optional<AArch64PauthAbiCoreInfo> aarch64PauthAbiCoreInfo;
+
+  // Set when EJIT cross-TU inlining has consumed .ejit_cross sections.
+  bool ejitCrossLinked = false;
 };
 
 // The first two elements of versionDefinitions represent VER_NDX_LOCAL and

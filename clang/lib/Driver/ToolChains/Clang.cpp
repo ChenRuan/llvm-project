@@ -5311,6 +5311,16 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   if (Args.getLastArg(options::OPT_save_temps_EQ))
     Args.AddLastArg(CmdArgs, options::OPT_save_temps_EQ);
 
+  // EJIT cross-TU inlining: defer bitcode extraction to link time.
+  if (Args.hasArg(options::OPT_fejit_cross_inline)) {
+    if (IsUsingLTO) {
+      D.Diag(diag::err_drv_argument_not_allowed_with)
+          << "-fejit-cross-inline" << "-flto";
+    }
+    CmdArgs.push_back("-mllvm");
+    CmdArgs.push_back("-ejit-cross-inline");
+  }
+
   auto *MemProfArg = Args.getLastArg(options::OPT_fmemory_profile,
                                      options::OPT_fmemory_profile_EQ,
                                      options::OPT_fno_memory_profile);
