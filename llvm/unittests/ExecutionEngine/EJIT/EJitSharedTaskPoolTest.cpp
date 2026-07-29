@@ -2759,4 +2759,185 @@ TEST_F(SharedTaskPoolTest, InlineCacheMultiVersion) {
   ejitIcacheClearAll();
 }
 
+//===----------------------------------------------------------------------===//
+// Per-core L0 dispatch cache
+//
+// Nothing on the hit path re-checks what makes it safe, so each invariant is
+// pinned here. Getting one wrong yields a stale or dangling code pointer, which
+// no value assertion elsewhere would catch.
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// Process-globals standing in for core-private storage: no test may inherit
+/// them from the one before it.
+void resetL0ForTest() {
+  for (uint32_t i = 0; i < kEJitL0Slots; ++i)
+    gEJitL0[i] = EJitL0Entry{};
+  gEJitL0State = nullptr;
+  gEJitL0Hits = 0;
+}
+} // namespace
+
+TEST_F(SharedTaskPoolTest, L0ServesARepeatDispatchAndCountsIt) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 3;
+  const EJitDimPair dims[1] = {{0, 1}};
+
+  void *out = nullptr;
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out)) << "cold table must miss";
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  EXPECT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+  EXPECT_EQ(out, codeFor(kFunc));
+  EXPECT_EQ(gEJitL0Hits, 1u);
+
+  // A different identity must miss, not return the wrong pointer.
+  const EJitDimPair other[1] = {{0, 2}};
+  EXPECT_FALSE(pool.l0Try(kFunc, other, 1, &out));
+}
+
+TEST_F(SharedTaskPoolTest, L0RetiredByPublishAndByVersionChange) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 4;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+
+  publish(pool, 9);
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out)) << "publish must retire the L0";
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+
+  // L0 entries carry no version of their own.
+  pool.setInstanceEnabled(0, 1, true);
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out))
+      << "version change must retire the L0";
+}
+
+TEST_F(SharedTaskPoolTest, L0RetiredByExplicitFlush) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 5;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+
+  // ejit_clear_cache() / ejit_invalidate() / a compile-mode change reach the
+  // L0 only through this hook.
+  pool.retireDispatchCache();
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out));
+}
+
+TEST_F(SharedTaskPoolTest, L0EntryIsNotServedToAnotherCore) {
+  resetL0ForTest();
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  const uint32_t kFunc = 6;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  EJitCoreId::setCurrentForTest(0);
+  owner.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(owner.l0Try(kFunc, dims, 1, &out));
+
+  // Cannot arise on hardware (core-private table), but can where cores are
+  // simulated: a peer taking the owner's entry would skip peerPrepareSlot().
+  EJitCoreId::setCurrentForTest(1);
+  EXPECT_FALSE(owner.l0Try(kFunc, dims, 1, &out))
+      << "a peer must not be served the owner's entry";
+
+  EJitCoreId::setCurrentForTest(0);
+  EXPECT_TRUE(owner.l0Try(kFunc, dims, 1, &out)) << "owner still hits";
+}
+
+TEST_F(SharedTaskPoolTest, L0DoesNotSurviveANewSharedBlob) {
+  resetL0ForTest();
+  const uint32_t kFunc = 7;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+  ASSERT_NE(gEJitL0State, nullptr);
+
+  // The table outlives the shared blob. A fresh blob starts from a low
+  // dispatchEpoch, so the epoch alone cannot separate the two instances -- the
+  // entry must be rejected because it was armed against another state.
+  auto other = std::make_unique<EJitSharedTaskPoolState>();
+  EJitSharedTaskPool fresh;
+  EJitCoreId::setCurrentForTest(0);
+  fresh.bind(other.get());
+  fresh.setCompiler(&mockCompile, nullptr);
+  fresh.setMode(EJitCompileMode::Async);
+  ASSERT_EQ(fresh.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EXPECT_FALSE(fresh.l0Try(kFunc, dims, 1, &out))
+      << "an entry armed against a previous blob must not validate";
+}
+
+TEST_F(SharedTaskPoolTest, L0DoesNotSurviveAReInitialization) {
+  resetL0ForTest();
+  const uint32_t kFunc = 11;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+
+  // Same blob, torn down and stood back up: entries still point into a code
+  // pool that has been reset.
+  EJitCoreId::setCurrentForTest(0);
+  pool.ownerShutdown();
+  ASSERT_EQ(pool.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out))
+      << "an entry from the previous pool instance must not validate";
+
+  // ...and the cache re-arms normally afterwards.
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  EXPECT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+}
+
+TEST_F(SharedTaskPoolTest, L0RefusesToArmWhileAReleaserIsWired) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 8;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  // With a releaser wired, code can be freed under a caller, and an L0 hit
+  // carries no read token. Same gate the inline cache uses.
+  pool.setReleaser([](void *, void *) {}, nullptr);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out));
+  EXPECT_EQ(gEJitL0Hits, 0u);
+}
+
+TEST_F(SharedTaskPoolTest, ReleaseReadIgnoresTheNoBucketSentinel) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  // The wrapper calls releaseRead() unconditionally, so kEJitNoBucket must be
+  // a no-op rather than a spurious decrement of a real bucket.
+  pool.releaseRead(kEJitNoBucket);
+  for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
+    EXPECT_EQ(state_->buckets[b].readers.loadRelaxed(), 0u)
+        << "bucket " << b << " reader count disturbed";
+}
+
 } // namespace

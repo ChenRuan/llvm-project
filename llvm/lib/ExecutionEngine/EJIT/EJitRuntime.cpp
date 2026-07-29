@@ -451,14 +451,24 @@ void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn) {
 
 void ejit_clear_cache(void) {
   EJIT_DIAG("clear_cache");
-  if (gEJIT)
-    gEJIT->clearCache();
+  if (!gEJIT)
+    return;
+  gEJIT->clearCache();
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (auto *tp = gEJIT->sharedTaskPool())
+    tp->retireDispatchCache();
+#endif
 }
 
 void ejit_invalidate(const char *periodName, uint8_t cellIdx) {
   EJIT_DIAG("invalidate(%s,%u)", periodName, cellIdx);
-  if (gEJIT)
-    gEJIT->invalidateByPeriod(periodName, cellIdx);
+  if (!gEJIT)
+    return;
+  gEJIT->invalidateByPeriod(periodName, cellIdx);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (auto *tp = gEJIT->sharedTaskPool())
+    tp->retireDispatchCache();
+#endif
 }
 
 ejit_status_t ejit_get_stats(ejit_stats_t *stats) {
@@ -488,6 +498,11 @@ void ejit_set_compile_mode(ejit_compile_mode_t mode) {
   if (gEJIT)
     (void)gEJIT->setCompileMode(mode == EJIT_COMPILE_ASYNC ? CompileMode::Async
                                                            : CompileMode::Sync);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (gEJIT)
+    if (auto *tp = gEJIT->sharedTaskPool())
+      tp->retireDispatchCache();
+#endif
   else
     EJIT_DIAG("set_compile_mode reject: not initialized");
 }
@@ -713,6 +728,16 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
     return EJIT_ERR_INVALID_PARAM;
 
   const EJitDimPair dims[1] = {{dim0, inst0}};
+  // Per-core L0: steady-state hit with no rwlock, scan, or read token.
+  // kEJitNoBucket tells the caller no token was taken.
+  void *l0Fn = nullptr;
+  if (tp->l0Try(funcIndex, dims, 1, &l0Fn)) {
+    if (outFn)
+      *outFn = l0Fn;
+    if (outBucket)
+      *outBucket = kEJitNoBucket;
+    return EJIT_OK;
+  }
   auto fast = tp->tryCacheHit1D(funcIndex, dim0, inst0);
   if (fast.fastPathTerminal) {
     if (outFn)
@@ -720,6 +745,8 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
     if (outBucket)
       *outBucket = fast.bucketIndex;
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 1);
+    if (fast.fnPtr)
+      tp->l0Fill(funcIndex, fast.fnPtr, dims, 1);
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, dims, 1, /*fallback=*/nullptr);
@@ -728,6 +755,8 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
   if (outBucket)
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 1);
+  if (r.fnPtr)
+    tp->l0Fill(funcIndex, r.fnPtr, dims, 1);
   return taskpoolStatus(r.status);
 }
 
