@@ -42,6 +42,10 @@ def ejit_cross_inline: F<"ejit-cross-inline">,
   HelpText<"(EJIT) Merge .ejit_cross bitcode sections from the inputs, inline "
            "cross-TU callees into each ejit_entry, and add the resulting "
            "registry bitcode to the link. Emitted by clang -fejit-cross-inline.">;
+def ejit_cross_jit_helpers: F<"ejit-cross-jit-helpers">,
+  HelpText<"(EJIT) Preserve ordinary cross-TU callees as JIT-local helper "
+           "definitions; implies --ejit-cross-inline. Emitted by clang "
+           "-fejit-cross-jit-helpers.">;
 
 def Bno_symbolic: F<"Bno-symbolic">, HelpText<"Don't bind default visibility defined symbols locally for -shared (default)">;
 

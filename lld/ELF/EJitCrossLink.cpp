@@ -6,12 +6,12 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// ld.lld is the single owner of EJIT cross-TU inline processing. It runs at
-// most once per link, and only when --ejit-cross-inline is passed (clang emits
-// that flag exactly for -fejit-cross-inline links that use ld.lld). The clang
-// driver never performs the merge itself; when the selected linker is not lld
-// it emits a hard error instead of silently leaving a huge .ejit_cross section
-// in the output. See jit_design_doc/EJIT_CROSS_TU_INLINE.md.
+// ld.lld is the single owner of EJIT cross-TU processing. It runs at most once
+// per link when --ejit-cross-inline or its --ejit-cross-jit-helpers policy is
+// selected. The clang driver never performs the merge itself; when the
+// selected linker is not lld it emits a hard error instead of silently leaving
+// a huge .ejit_cross section in the output. See
+// jit_design_doc/EJIT_CROSS_TU_INLINE.md.
 //
 // Every stage that can fail after a .ejit_cross section has been observed
 // reports an llvm::Error carrying the input file name, the failing stage and
@@ -306,12 +306,10 @@ static void reAnnotateMayConst(Module &M) {
   }
 }
 
-/// Real, cost-model-driven inliner (Area 2): mandatory always-inline first,
-/// then the production module inliner (the same CGSCC inliner + inline cost
-/// model buildPerModuleDefaultPipeline uses), then a light cleanup. Ordinary
-/// (non always_inline) helpers are inlined when the cost model allows; large
-/// functions are not force-inlined.
-static void runRealInliner(Module &M) {
+/// Apply the selected cross-TU helper policy, then perform light cleanup.
+/// JIT-helper mode keeps ordinary functions in the transitive closure so the
+/// runtime can specialize and emit them beside the entry.
+static void runCrossTUInliner(Module &M, bool PreserveJitHelpers) {
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;
   CGSCCAnalysisManager CGAM;
@@ -325,7 +323,8 @@ static void runRealInliner(Module &M) {
 
   ModulePassManager MPM;
   MPM.addPass(AlwaysInlinerPass());
-  MPM.addPass(ModuleInlinerWrapperPass());
+  if (!PreserveJitHelpers)
+    MPM.addPass(ModuleInlinerWrapperPass());
   FunctionPassManager FPM;
   FPM.addPass(PromotePass());
   FPM.addPass(InstCombinePass());
@@ -491,6 +490,7 @@ namespace elf {
 
 Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
                                                StringRef TargetTriple,
+                                               bool PreserveJitHelpers,
                                                StringRef SaveTempsPrefix) {
   // ---- Phase 1: detect .ejit_cross. Distinguish "no section" (normal skip)
   // from "corrupt input" (Area 5). Non-object inputs (scripts, shared libs)
@@ -672,7 +672,7 @@ Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
   for (Function &F : *Composite)
     if (!F.isDeclaration())
       F.setDSOLocal(true);
-  runRealInliner(*Composite);
+  runCrossTUInliner(*Composite, PreserveJitHelpers);
   reAnnotateMayConst(*Composite);
 
   // ---- Phase 5: per-entry bitcode + one registry, all owned by TmpM.

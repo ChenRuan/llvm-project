@@ -1484,7 +1484,9 @@ static void readConfigs(Ctx &ctx, opt::InputArgList &args) {
       args.hasFlag(OPT_mmap_output_file, OPT_no_mmap_output_file, false);
   ctx.arg.nmagic = args.hasFlag(OPT_nmagic, OPT_no_nmagic, false);
   ctx.arg.noinhibitExec = args.hasArg(OPT_noinhibit_exec);
-  ctx.arg.ejitCrossInline = args.hasArg(OPT_ejit_cross_inline);
+  ctx.arg.ejitCrossJitHelpers = args.hasArg(OPT_ejit_cross_jit_helpers);
+  ctx.arg.ejitCrossInline =
+      args.hasArg(OPT_ejit_cross_inline) || ctx.arg.ejitCrossJitHelpers;
   ctx.arg.nostdlib = args.hasArg(OPT_nostdlib);
   ctx.arg.oFormatBinary = isOutputFormatBinary(ctx, args);
   ctx.arg.omagic = args.hasFlag(OPT_omagic, OPT_no_omagic, false);
@@ -3160,7 +3162,8 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
     StringRef SaveTempsPrefix =
         args.hasArg(OPT_save_temps) ? ctx.arg.outputFile : StringRef();
     Expected<EJitCrossLinkResult> CrossResult =
-        runEJitCrossLink(InputPaths, /*TargetTriple=*/"", SaveTempsPrefix);
+        runEJitCrossLink(InputPaths, /*TargetTriple=*/"",
+                         ctx.arg.ejitCrossJitHelpers, SaveTempsPrefix);
     if (!CrossResult) {
       ErrAlways(ctx) << toString(CrossResult.takeError());
       return;

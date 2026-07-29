@@ -1685,6 +1685,10 @@ def fejit_cross_inline : Flag<["-"], "fejit-cross-inline">,
   Visibility<[ClangOption, CC1Option]>,
   HelpText<"Enable cross-TU inlining for EJIT entry functions (defers bitcode "
            "extraction to link time)">;
+def fejit_cross_jit_helpers : Flag<["-"], "fejit-cross-jit-helpers">,
+  Visibility<[ClangOption]>,
+  HelpText<"Keep ordinary cross-TU helpers as JIT-local functions instead of "
+           "inlining them into EJIT entry functions">;
 defm gnu_inline_asm : BoolFOption<"gnu-inline-asm",
   LangOpts<"GNUAsm">, DefaultTrue,
   NegFlag<SetFalse, [], [ClangOption, CC1Option],

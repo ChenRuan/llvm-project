@@ -5311,11 +5311,14 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   if (Args.getLastArg(options::OPT_save_temps_EQ))
     Args.AddLastArg(CmdArgs, options::OPT_save_temps_EQ);
 
-  // EJIT cross-TU inlining: defer bitcode extraction to link time.
-  if (Args.hasArg(options::OPT_fejit_cross_inline)) {
+  // Both EJIT cross-TU policies defer bitcode extraction to link time.
+  if (Args.hasArg(options::OPT_fejit_cross_inline,
+                  options::OPT_fejit_cross_jit_helpers)) {
+    const char *ModeFlag = Args.hasArg(options::OPT_fejit_cross_jit_helpers)
+                               ? "-fejit-cross-jit-helpers"
+                               : "-fejit-cross-inline";
     if (IsUsingLTO) {
-      D.Diag(diag::err_drv_argument_not_allowed_with)
-          << "-fejit-cross-inline" << "-flto";
+      D.Diag(diag::err_drv_argument_not_allowed_with) << ModeFlag << "-flto";
     }
     CmdArgs.push_back("-mllvm");
     CmdArgs.push_back("-ejit-cross-inline");

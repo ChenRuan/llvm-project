@@ -1,4 +1,4 @@
-# REQUIRES: x86
+# REQUIRES: x86, aarch64
 ## ld.lld is the single owner of EJIT cross-TU inline processing (PR #102
 ## hardening). This exercises the real production path end to end:
 ##   * the merge/inline/registry runs only with --ejit-cross-inline (default
@@ -63,6 +63,41 @@
 # SECOND: call i32 @some_extern_fn(i32 5)
 # SECOND: load i32, ptr @extern_global
 
+## JIT-local helper mode consumes the same cross sections but expands only
+## mandatory always_inline calls. The ordinary A -> B -> C chain remains in
+## the per-entry bitcode so runtime specialization can optimize every body and
+## codegen can place all three functions in one JIT allocation.
+# RUN: ld.lld --ejit-cross-jit-helpers --save-temps -shared \
+# RUN:   --unresolved-symbols=ignore-all \
+# RUN:   %t/entry.o %t/helper.o -o %t/helpers.so
+# RUN: llvm-readelf -S %t/helpers.so | FileCheck %s --check-prefix=LINKED
+# RUN: llvm-dis %t/helpers.so.ejit-cross.ejit_entry_fn.bc -o - | \
+# RUN:   FileCheck %s --check-prefix=JITHELPERS
+# JITHELPERS-LABEL: define{{.*}} i32 @ejit_entry_fn()
+# JITHELPERS-NOT: call i32 @mandatory_helper()
+# JITHELPERS-COUNT-2: call i32 @helper()
+# JITHELPERS-LABEL: define{{.*}} i32 @helper()
+# JITHELPERS: call i32 @helper_leaf()
+# JITHELPERS-LABEL: define{{.*}} i32 @helper_leaf()
+# JITHELPERS-NOT: define{{.*}} i32 @unused_helper()
+
+## The second entry does not reach the helper chain, so per-entry closure
+## trimming must not copy those definitions into its bitcode.
+# RUN: llvm-dis %t/helpers.so.ejit-cross.ejit_entry_two.bc -o - | \
+# RUN:   FileCheck %s --check-prefix=JITHELPERS-SECOND
+# JITHELPERS-SECOND-LABEL: define{{.*}} i32 @ejit_entry_two()
+# JITHELPERS-SECOND-NOT: define{{.*}} i32 @helper
+
+## AArch64 codegen sees definitions, not declarations, and therefore emits
+## direct intra-module branches rather than an external GOT/PLT call.
+# RUN: llc -mtriple=aarch64-unknown-linux-gnu -O2 \
+# RUN:   %t/helpers.so.ejit-cross.ejit_entry_fn.bc -o - | \
+# RUN:   FileCheck %s --check-prefix=AARCH64
+# AARCH64-LABEL: ejit_entry_fn:
+# AARCH64-COUNT-2: bl helper
+# AARCH64-LABEL: helper:
+# AARCH64: bl helper_leaf
+
 ## Default (no flag): behaviour is unchanged. The .ejit_cross sections are left
 ## untouched and no registry is synthesised.
 # RUN: ld.lld -shared --unresolved-symbols=ignore-all \
@@ -103,16 +138,21 @@ target triple = "x86_64-unknown-linux-gnu"
 ; always_inline) that the real inliner must fold away. @some_extern_fn and
 ; @extern_global stay external and must be registered.
 declare i32 @helper()
+declare i32 @mandatory_helper()
 declare i32 @some_extern_fn(i32)
 @extern_global = external global i32
 @helper_table = external constant [1 x ptr]
 
 define i32 @ejit_entry_fn() !ejit.metadata !0 {
+  %m = call i32 @mandatory_helper()
   %h = call i32 @helper()
+  %h2 = call i32 @helper()
   %fp.addr = getelementptr [1 x ptr], ptr @helper_table, i64 0, i64 0
   %fp = load ptr, ptr %fp.addr
   %t = call i32 %fp()
-  %arg = add i32 %h, %t
+  %hh = add i32 %h, %h2
+  %hm = add i32 %hh, %m
+  %arg = add i32 %hm, %t
   %e = call i32 @some_extern_fn(i32 %arg)
   %g = load i32, ptr @extern_global
   %r = add i32 %e, %g
@@ -134,9 +174,14 @@ target triple = "x86_64-unknown-linux-gnu"
 
 @helper_table = constant [1 x ptr] [ptr @table_target]
 
+define i32 @mandatory_helper() #0 {
+  ret i32 3
+}
+
 define i32 @helper() {
   %v = call i32 @helper_leaf()
-  ret i32 %v
+  %r = add i32 %v, 1
+  ret i32 %r
 }
 
 define i32 @helper_leaf() {
@@ -146,6 +191,12 @@ define i32 @helper_leaf() {
 define i32 @table_target() {
   ret i32 7
 }
+
+define i32 @unused_helper() {
+  ret i32 999
+}
+
+attributes #0 = { alwaysinline }
 
 #--- bad.s
 .section .ejit_cross,"a",@progbits

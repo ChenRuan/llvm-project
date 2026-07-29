@@ -17,9 +17,11 @@ struct EJitCrossLinkResult {
   llvm::SmallVector<std::string, 4> consumedFiles;
 };
 
-/// Merge the .ejit_cross bitcode sections of \p InputFiles, inline cross-TU
-/// callees into each ejit_entry, and write a single registry bitcode module to
-/// a temporary file whose path is returned.
+/// Merge the .ejit_cross bitcode sections of \p InputFiles, apply the selected
+/// helper policy to each ejit_entry, and write a single registry bitcode module
+/// to a temporary file whose path is returned.
+/// With \p PreserveJitHelpers, only mandatory always_inline calls are expanded;
+/// ordinary transitive helper definitions remain in each per-entry module.
 ///
 /// Three-state result:
 ///   * an Error         - a .ejit_cross section was found but processing failed
@@ -31,7 +33,7 @@ struct EJitCrossLinkResult {
 ///                          cleanup of the temporary file.
 llvm::Expected<EJitCrossLinkResult>
 runEJitCrossLink(llvm::ArrayRef<std::string> InputFiles,
-                 llvm::StringRef TargetTriple,
+                 llvm::StringRef TargetTriple, bool PreserveJitHelpers = false,
                  llvm::StringRef SaveTempsPrefix = {});
 
 } // namespace elf

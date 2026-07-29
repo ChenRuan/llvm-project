@@ -2494,9 +2494,8 @@ TEST(EJitEndToEnd, PipelineFoldsMayConstBranchAtAllLevels) {
 // callee folds to a constant return like the entry does.
 namespace {
 
-/// Entry (has ejit_entry metadata) calls a callee with a constant cell index
-/// — the shape phase 1a leaves behind. The callee loads field 1 of
-/// g_ipcfg[cell] (may_const) and branches on it.
+/// Entry calls a two-level helper chain with a constant cell index.
+/// The leaf loads field 1 of g_ipcfg[cell] (may_const) and branches on it.
 std::unique_ptr<Module> parseInterprocModule(LLVMContext &Ctx) {
   SMDiagnostic Err;
   auto M = parseAssemblyString(R"(
@@ -2516,8 +2515,14 @@ std::unique_ptr<Module> parseInterprocModule(LLVMContext &Ctx) {
       ret i32 200
     }
 
+    define i32 @ip_mid(i8 noundef %cell) {
+      %r = call i32 @ip_callee(i8 noundef %cell)
+      %adjusted = add i32 %r, 1
+      ret i32 %adjusted
+    }
+
     define i32 @ip_entry() !ejit.metadata !3 {
-      %r = call i32 @ip_callee(i8 noundef 2)
+      %r = call i32 @ip_mid(i8 noundef 2)
       ret i32 %r
     }
 
@@ -2527,7 +2532,7 @@ std::unique_ptr<Module> parseInterprocModule(LLVMContext &Ctx) {
     !3 = !{!4}
     !4 = !{!"ejit_entry"}
   )",
-                              Err, Ctx);
+                               Err, Ctx);
   if (!M)
     Err.print("parseInterprocModule", errs());
   return M;
@@ -2576,7 +2581,7 @@ TEST(EJitInterprocedural, ConstantsStopAtCallEdgeWithoutIPSCCP) {
 // re-fold), the constant argument crosses the edge, the callee's may_const
 // load folds against cell 2's runtime value, and the guard collapses: the
 // callee body becomes `ret i32 100`.
-TEST(EJitInterprocedural, IPSCCPPropagatesDimsIntoCallee) {
+TEST(EJitInterprocedural, IPSCCPPropagatesDimsThroughNestedHelpers) {
   LLVMContext Ctx;
   auto M = parseInterprocModule(Ctx);
   ASSERT_NE(M, nullptr);
@@ -2596,13 +2601,16 @@ TEST(EJitInterprocedural, IPSCCPPropagatesDimsIntoCallee) {
   opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
 
   Function *Callee = M->getFunction("ip_callee");
+  Function *Mid = M->getFunction("ip_mid");
   Function *Entry = M->getFunction("ip_entry");
   ASSERT_NE(Callee, nullptr);
+  ASSERT_NE(Mid, nullptr);
   ASSERT_NE(Entry, nullptr);
 
   // The callee was internalized so IPSCCP could trust its call-site set; the
   // entry must stay externally visible — it is the symbol the JIT looks up.
   EXPECT_TRUE(Callee->hasLocalLinkage());
+  EXPECT_TRUE(Mid->hasLocalLinkage());
   EXPECT_FALSE(Entry->hasLocalLinkage());
 
   // The callee's period load and guard folded to the constant return.

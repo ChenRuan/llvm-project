@@ -1,6 +1,6 @@
 # EJIT Cross-TU Inlining 设计文档
 
-**版本**: 1.1
+**版本**: 1.2
 **日期**: 2026-07-30
 **关联**: SPEC4.md, PLAN4.md, PASS1_EJitRegisterBitcode.md
 
@@ -16,7 +16,11 @@
 
 ### 1.2 目标
 
-通过新选项 `-fejit-cross-inline`，让**只有** `__ejit_bitcode` 获得跨 TU 内联优化，AOT 代码走普通编译流程。
+提供两种只作用于 `__ejit_bitcode` 的跨 TU 优化策略，AOT 代码仍走普通编译流程：
+
+- `-fejit-cross-inline`：按 LLVM 成本模型内联普通 helper；
+- `-fejit-cross-jit-helpers`：仅展开 `always_inline`，普通 helper 的传递
+  闭包随 entry 进入 JIT module，在 code pool 内生成特化版本。
 
 ### 1.3 核心思路
 
@@ -31,7 +35,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  编译期 (-fejit-cross-inline -c)                                │
+│  编译期 (-fejit-cross-inline / -fejit-cross-jit-helpers -c)     │
 │                                                                 │
 │  clang → IR → PASS1(cross-inline 模式)                         │
 │                  │                                              │
@@ -56,8 +60,9 @@
 │    2. parseBitcodeFile → 每个 section 解析为一个 Module          │
 │    3. llvm::Linker::linkInModule() → 合并所有 Module            │
 │    4. 找 ejit_entry → computeTransitiveClosure (保守引用收集)    │
-│    5. AlwaysInliner + ModuleInlinerWrapperPass → 真实内联跨 TU  │
-│       普通函数 (成本模型驱动, 非仅 always_inline)               │
+│    5. helper 策略:                                               │
+│       cross-inline: AlwaysInliner + 成本模型 ModuleInliner       │
+│       jit-helpers: 仅 AlwaysInliner, 普通 helper 保留为定义      │
 │    6. reAnnotateMayConst (复用 EJitCommon.h canonical resolver)  │
 │    7. 对每个 ejit_entry 单独:                                   │
 │       CloneModule → computeTransitiveClosure → trim             │
@@ -83,6 +88,41 @@ clang -fejit-cross-inline combined.o tu_c.o -o app
   → 读取 tu_c.o 的 .ejit_cross + combined.o 的 @__ejit_bitcode
   → 合并处理 → 生成新的 @__ejit_bitcode
 ```
+
+### 2.2 JIT-local helper 模式
+
+```
+clang -fejit-cross-jit-helpers -c entry.c -o entry.o
+clang -fejit-cross-jit-helpers -c helper.c -o helper.o
+clang -fuse-ld=lld -fejit-cross-jit-helpers entry.o helper.o -o app
+```
+
+clang cc1 仍使用内部 `-ejit-cross-inline` 生成同一种 `.ejit_cross` 输入；
+driver 额外向 lld 传递 `--ejit-cross-jit-helpers`。因此两种策略可以使用同一批
+对象文件，区别只发生在 lld 合并后的 helper policy。
+
+对 `A -> B -> C`：
+
+1. 保守闭包收集将 B、C 的定义都放入 A 的 per-entry bitcode；
+2. runtime 将非 entry 定义 internalize；
+3. IPSCCP 把 entry 已固定的维度参数逐层传播到 B、C；
+4. 第二轮 InstCombine + StructFieldPass 折叠 helper 内的 may_const；
+5. A、B、C 一起 codegen/JITLink，内部调用生成 code-pool 内的直接 `BL`。
+
+该模式不提供跨 entry 的 helper 机器码共享：每个 specialization 拥有自己的
+helper 副本。这样无需新增 helper cache、失效协议、跨核发布或回收依赖，语义
+与现有 per-entry JITDylib 生命周期一致。
+
+限制：
+
+- helper 若通过运行时不可推断的函数指针调用，闭包只能保留静态可见候选，
+  IPSCCP 也不能假定参数恒定；
+- helper 被多个 entry 使用时，各 entry specialization 仍各自生成一份；
+- helper 与 entry 同属一个 JITLink graph/code allocation，现有 2 MiB pool 下
+  可使用 AArch64 直接 `BL`；若未来单个 graph 超过 `BL` 范围，需要重新引入
+  range extension thunk；
+- fully folded 的纯 helper 调用可能被后续 DCE 完全消除，这比保留 `BL` 更优，
+  不应视为模式失效。
 
 ---
 
@@ -342,8 +382,9 @@ add_llvm_component_library(LLVMEmbeddedJIT
 
 ### 5.2 clangDriver
 
-clang driver 只负责校验选中的 linker 并转发 `--ejit-cross-inline`；不再链接
-BitReader/Object/Linker 等 cross-link 实现依赖。
+clang driver 只负责校验选中的 linker 并转发 `--ejit-cross-inline`；helper
+模式再追加 `--ejit-cross-jit-helpers`。driver 不再链接 BitReader/Object/Linker
+等 cross-link 实现依赖。
 
 ---
 
@@ -353,9 +394,9 @@ BitReader/Object/Linker 等 cross-link 实现依赖。
 |---|---|
 | **PASS3 (WrapperGen)** | 不受影响 — wrapper 仍正常生成 |
 | **PASS2 (RegisterPeriod)** | 不受影响 |
-| **运行时 (libLLVMEJIT)** | 不受影响 — `ejit_init` 仍通过 `ejit_register_bitcode` 加载 `@__ejit_bitcode` |
-| **JIT 编译** | 受益 — bitcode 中跨 TU 子函数已内联，PASS6 可以追到 may_const load |
-| **默认编译路径** | 不受影响 — 不传 `-fejit-cross-inline` 时行为完全不变 |
+| **运行时 (libLLVMEJIT)** | ABI 不变；helper 模式复用 internalize + IPSCCP |
+| **JIT 编译** | inline 模式展开 helper；helper 模式生成同 module 特化 helper |
+| **默认编译路径** | 不受影响 — 不传两个 EJIT cross-TU flag 时行为完全不变 |
 
 ---
 
@@ -371,7 +412,7 @@ BitReader/Object/Linker 等 cross-link 实现依赖。
 |---|---|
 | 无 .ejit_cross section 的链接 | 返回空结果，正常链接（默认行为不变） |
 | 普通非对象参数或不含该 section 的输入 | 跳过，非错误 |
-| **archive 成员含 .ejit_cross** | **硬报错**（明确诊断：暂不支持 archive 成员，请直接链接 .o） |
+| **显式 archive 成员含 .ejit_cross** | 扫描并合并选中的 archive 成员 |
 | **bitcode 解析失败 / section 读取失败** | **链接失败**（带文件名+阶段+Error） |
 | **`Linker::linkInModule` 合并冲突** | **链接失败**（检查返回值） |
 | 合并后无 ejit_entry | **链接失败**（已承诺有 .ejit_cross，却无可注册入口） |
@@ -404,10 +445,11 @@ Cross-link 返回精确的 `consumedFiles`，Driver 写入
 `ctx.ejitCrossConsumedFiles`。`InputFiles.cpp` 只有在当前 input identifier 命中该
 集合且 section 名为 `.ejit_cross` 时才设为 `InputSection::discarded`：
 - 已处理的原始 `.o` section 不进入输出，`-r` 和最终链接都生效；
-- archive、`-l` 或 linker script 后续引入的未处理 section 不会被全局状态误删，
-  而是在 parse 后得到明确的 unsupported 诊断。
+- 显式输入的 archive 会扫描并消费选中成员；
+- `-l` 或 linker script 后续引入的未处理 section 不会被全局状态误删，而是在
+  parse 后得到明确的 unsupported 诊断。
 
-### 7.4 被调用的 TU 也需要 `-fejit-cross-inline`
+### 7.4 被调用的 TU 也需要相同 cross-TU 编译模式
 
 只有 `ejit_entry` 所在 TU 用该 flag 是不够的——`child_func()` 定义的 TU 也必须用，否则链接期看不到它的 IR。
 
@@ -416,19 +458,22 @@ clang -fejit-cross-inline -c tu_a.c -o tu_a.o   # ejit_entry 在此
 clang -fejit-cross-inline -c tu_b.c -o tu_b.o   # child_func 在此, 必须
 ```
 
+使用 JIT-local helper 模式时，将两条命令中的 flag 都替换为
+`-fejit-cross-jit-helpers`。
+
 ---
 
 ## 8. 与 ThinLTO/FullLTO 方案对比
 
-| 维度 | ThinLTO/FullLTO | `-fejit-cross-inline` |
-|---|---|---|
-| AOT 代码影响 | 全局跨模块优化 | 无影响 |
-| 编译时间 | 增加 (summary + 多阶段) | 仅编译期多一次序列化 |
-| 链接时间 | 增加 (LTO backend) | 增加 (合并 + 内联) |
-| JIT bitcode 质量 | 跨模块内联 ✓ | 跨模块内联 ✓ |
-| `!ejit.may_const` | 需要 noinline 保护 | 天然保留 (完整 Module) |
-| 构建系统改动 | clang flag | 同 |
-| `-r` 兼容性 | 复杂 | 简单 (标准 ELF section) |
+| 维度 | ThinLTO/FullLTO | `-fejit-cross-inline` | `-fejit-cross-jit-helpers` |
+|---|---|---|---|
+| AOT 代码影响 | 全局跨模块优化 | 无影响 | 无影响 |
+| 编译时间 | 增加 (summary + 多阶段) | 多一次序列化 | 多一次序列化 |
+| 链接时间 | 增加 (LTO backend) | 合并 + 内联 | 合并 + mandatory inline |
+| JIT bitcode | helper 展开 | 成本模型展开 | 传递 helper 闭包 |
+| 代码尺寸倾向 | 视 LTO 决策 | entry 可能膨胀 | helper 每 specialization 一份 |
+| 内部调用 | 可能消失 | 多数消失 | code pool 内直接 `BL` |
+| `-r` 兼容性 | 复杂 | 标准 ELF section | 标准 ELF section |
 
 ---
 
@@ -438,22 +483,24 @@ PR #102 hardening 后（ld.lld 为唯一 owner）：
 
 | 文件 | 改动 |
 |---|---|
-| `clang/include/clang/Driver/Options.td` | `-fejit-cross-inline` |
-| `clang/lib/Driver/ToolChains/Clang.cpp` | 编译选项传递 + `-flto` 冲突检测（不变） |
-| `clang/lib/Driver/ToolChains/Gnu.cpp` | link 阶段：检测非 lld → 报错；lld → 追加 `--ejit-cross-inline`（不再自行合并） |
+| `clang/include/clang/Driver/Options.td` | 两种 cross-TU 策略 flag |
+| `clang/lib/Driver/ToolChains/Clang.cpp` | 两种模式生成相同 `.ejit_cross` + `-flto` 冲突检测 |
+| `clang/lib/Driver/ToolChains/Gnu.cpp` | 校验 lld，转发 cross-link 与 helper policy |
 | ~~`clang/lib/Driver/EJitCrossLink.cpp` / `.h`~~ | **已删除**（去重：实现只剩 lld 一份） |
 | `clang/lib/Driver/CMakeLists.txt` | 移除 `EJitCrossLink.cpp` 及其专用 LINK_COMPONENTS |
-| `lld/ELF/EJitCrossLink.cpp` | 链接期处理核心（唯一实现）：`Expected<EJitCrossLinkResult>`、保守闭包、真实 inliner、TmpM 内 registry + `verifyModule`、错误传播、临时文件清理 |
+| `lld/ELF/EJitCrossLink.cpp` | 保守闭包、inline/JIT-helper policy、registry、错误传播 |
 | `lld/ELF/EJitCrossLink.h` | API 声明（`Expected<EJitCrossLinkResult>`） |
-| `lld/ELF/Options.td` | `--ejit-cross-inline`（gate，默认关闭时零扫描） |
-| `lld/ELF/Config.h` | `Config::ejitCrossInline`（arg）+ `Ctx::ejitCrossConsumedFiles`（精确消费集合） |
+| `lld/ELF/Options.td` | cross-link gate + JIT-helper policy |
+| `lld/ELF/Config.h` | 两种模式状态 + 精确消费集合 |
 | `lld/ELF/Driver.cpp` | 解析 flag；gated 调用 + `Expected`/`Error` 处理；临时文件清理（`+Signals.h`） |
 | `lld/ELF/InputFiles.cpp` | 仅丢弃精确匹配已消费输入的 `.ejit_cross` |
 | `lld/ELF/CMakeLists.txt` | 新增源（不变） |
 | `llvm/lib/Passes/PassBuilderPipelines.cpp` | flag + 构造函数传参（不变） |
 | `llvm/include/.../EJitPasses.h` | CrossInline 成员（不变） |
 | `llvm/.../EJitRegisterBitcode.cpp` | 分支 + embedBitcodeInSection（不变） |
-| `lld/test/ELF/ejit-cross-inline.ll` | **新建**：生产路径测试（exactly-once / discard / registry / external / malformed→fail / 默认不变） |
+| `lld/test/ELF/ejit-cross-inline.ll` | 两种 policy、嵌套闭包、AArch64 direct `BL` |
+| `llvm/unittests/.../EJitRuntimeTest.cpp` | IPSCCP 穿透 A→B→C noinline helper |
+| `ejit_test/ejit_jit_local_helpers_sre_*.c` | SRE worker-first 双 TU 功能 demo |
 
 ### 9.1 闭包支持的引用形态（Area 4）
 

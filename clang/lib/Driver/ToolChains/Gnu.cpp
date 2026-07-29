@@ -462,20 +462,23 @@ void tools::gnutools::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   bool NeedsXRayDeps = addXRayRuntime(ToolChain, Args, CmdArgs);
   addLinkerCompressDebugSectionsOption(ToolChain, Args, CmdArgs);
 
-  // EJIT cross-TU inlining. ld.lld is the single owner of the merge; the clang
-  // driver never performs it. When -fejit-cross-inline is requested we require
-  // ld.lld and forward the request via --ejit-cross-inline. Any other linker
-  // cannot consume the .ejit_cross sections, so we emit a hard error rather
-  // than produce an output that still carries the (large) .ejit_cross data and
-  // no registry -- which would silently fall back to per-TU AOT bitcode.
-  if (Args.hasArg(options::OPT_fejit_cross_inline)) {
+  // ld.lld is the single owner of both cross-TU helper policies. JIT-helper
+  // mode consumes the same sections but preserves ordinary helper definitions.
+  bool CrossInline = Args.hasArg(options::OPT_fejit_cross_inline);
+  bool JitHelpers = Args.hasArg(options::OPT_fejit_cross_jit_helpers);
+  if (CrossInline || JitHelpers) {
+    const char *ModeFlag =
+        JitHelpers ? "-fejit-cross-jit-helpers" : "-fejit-cross-inline";
     bool LinkerIsLLD = false;
     (void)ToolChain.GetLinkerPath(&LinkerIsLLD);
     if (!LinkerIsLLD)
       ToolChain.getDriver().Diag(diag::err_drv_argument_only_allowed_with)
-          << "-fejit-cross-inline" << "-fuse-ld=lld";
-    else
+          << ModeFlag << "-fuse-ld=lld";
+    else {
       CmdArgs.push_back("--ejit-cross-inline");
+      if (JitHelpers)
+        CmdArgs.push_back("--ejit-cross-jit-helpers");
+    }
   }
 
   AddLinkerInputs(ToolChain, Inputs, Args, CmdArgs, JA);

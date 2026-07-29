@@ -96,10 +96,10 @@ void EJitOptimizer::runPipeline(Module &M,
   //       compute the byte offset of each may_const field access.
   runInstCombine(M);
   EJIT_DIAG_DEBUG("pipeline phase1b done: InstCombine");
-  // Inlining is intentionally not run here: the AOT pre-optimization
-  // (EJitRegisterBitcodePass: AlwaysInline + ModuleInliner(O2)) already expanded
-  // callee bodies in the embedded bitcode, so their may_const GEP chains are
-  // already traceable to the global.
+  // Inlining is intentionally not run here. The cross-inline mode has already
+  // expanded profitable callees, while JIT-local-helper mode deliberately
+  // preserves them. The interprocedural phase below propagates specialization
+  // constants through calls without inflating the entry body.
   //   (c) Replace the may_const loads with their runtime constant values.
   runStructFieldPass(M);
   EJIT_DIAG_DEBUG("pipeline phase1c done: StructFieldPass");
@@ -244,4 +244,3 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
     if (!F.isDeclaration())
       cleanupFPM_.run(F, FAM_);
 }
-
