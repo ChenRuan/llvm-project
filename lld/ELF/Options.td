@@ -38,6 +38,11 @@ defm auxiliary: Eq<"auxiliary", "Set DT_AUXILIARY field to the specified name">;
 
 def be8: F<"be8">, HelpText<"write a Big Endian ELF file using BE8 format (AArch32 only)">;
 
+def ejit_cross_inline: F<"ejit-cross-inline">,
+  HelpText<"(EJIT) Merge .ejit_cross bitcode sections from the inputs, inline "
+           "cross-TU callees into each ejit_entry, and add the resulting "
+           "registry bitcode to the link. Emitted by clang -fejit-cross-inline.">;
+
 def Bno_symbolic: F<"Bno-symbolic">, HelpText<"Don't bind default visibility defined symbols locally for -shared (default)">;
 
 def Bsymbolic: F<"Bsymbolic">, HelpText<"Bind default visibility defined symbols locally for -shared">;

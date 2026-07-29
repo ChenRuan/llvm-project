@@ -7,7 +7,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
-#include "llvm/Support/CommandLine.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
@@ -647,9 +646,39 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
   appendToUsed(M, {GV});
 }
 
+/// Cross-inline stage 1: embed the full Module IR in a named ELF section.
+/// The final @__ejit_bitcode is generated at link time from all TUs' sections.
+static void embedBitcodeInSection(Module &M, StringRef SectionName) {
+  std::string FullBC;
+  {
+    raw_string_ostream OS(FullBC);
+    WriteBitcodeToFile(M, OS);
+  }
+  LLVMContext &Ctx = M.getContext();
+  auto *ArrTy = ArrayType::get(Type::getInt8Ty(Ctx), FullBC.size());
+  auto *Const =
+      ConstantDataArray::get(Ctx, ArrayRef<uint8_t>(
+          reinterpret_cast<const uint8_t *>(FullBC.data()), FullBC.size()));
+  auto *GV = new GlobalVariable(M, ArrTy, true, GlobalValue::InternalLinkage,
+                                Const, "__ejit_cross_module");
+  GV->setSection(SectionName);
+  GV->setAlignment(Align(1));
+  // Keep the compiler from dropping this unreferenced global.
+  // llvm.compiler.used allows --gc-sections at link time to reclaim it,
+  // but keeps it alive through compilation.
+  appendToCompilerUsed(M, {GV});
+}
+
 PreservedAnalyses
 EJitRegisterBitcodePass::run(Module &M, ModuleAnalysisManager &) {
   LLVM_DEBUG(dbgs() << "ejit-register-bitcode: running on " << M.getName() << "\n");
+
+  // Cross-inline path: defer extraction to link time.
+  if (CrossInline) {
+    embedBitcodeInSection(M, ".ejit_cross");
+    return PreservedAnalyses::none();
+  }
+
   SmallVector<Function *, 4> EntryFuncs;
   collectEntryFunctions(M, EntryFuncs);
   if (EntryFuncs.empty()) {

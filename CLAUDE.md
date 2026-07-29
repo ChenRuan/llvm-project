@@ -16,20 +16,24 @@ Use the top-level `build.sh` script for all builds:
 
 ### Incremental Build (use these daily)
 
-This machine has **limited CPU and memory**. Use targeted incremental builds:
+This machine has **limited CPU and memory**. Use targeted incremental builds.
+Always use `-j16` to limit parallelism:
 
 ```bash
 # Dev build (debug, shared libs)
-ninja -C build_debug_x86 clang opt lld
+ninja -j16 -C build_debug_x86 clang opt lld
 
 # Release build (static libs, for ejit_test)
-ninja -C build_release_x86 LLVMEJIT lld
+ninja -j16 -C build_release_x86 LLVMEJIT lld
 
 # Just the AOT passes library (runs inside clang)
-ninja -C build_debug_x86 clang
+ninja -j16 -C build_debug_x86 clang
 
 # Just the runtime library (linked into test binaries)
-ninja -C build_release_x86 LLVMEJIT
+ninja -j16 -C build_release_x86 LLVMEJIT
+
+# AArch64 build
+ninja -j16 -C build_release_aarch64 clang lld LLVMEJIT
 ```
 
 ### Build directory layout

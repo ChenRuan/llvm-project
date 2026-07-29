@@ -42,6 +42,7 @@ add_lld_library(lldELF
   DWARF.cpp
   Driver.cpp
   DriverUtils.cpp
+  EJitCrossLink.cpp
   EhFrame.cpp
   ICF.cpp
   InputFiles.cpp
@@ -64,7 +65,9 @@ add_lld_library(lldELF
   LINK_COMPONENTS
   ${LLVM_TARGETS_TO_BUILD}
   BinaryFormat
+  BitReader
   BitWriter
+  Linker
   Core
   DebugInfoDWARF
   Demangle
