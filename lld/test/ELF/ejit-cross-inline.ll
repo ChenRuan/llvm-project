@@ -78,13 +78,19 @@
 # RUN:   %t/bad.o -o /dev/null 2>&1 | FileCheck %s --check-prefix=BADERR
 # BADERR: ejit-cross-inline: parse bitcode failed for {{.*}}bad.o
 
-## A literal archive and an archive selected through -l are both rejected
-## explicitly. The latter is discovered after lld selects the member; it must
-## never be silently discarded under a global "cross linked" flag.
+## A literal archive with .ejit_cross members is processed inline (archive
+## support). The registry materialises and the consumed sections disappear.
 # RUN: llvm-ar crs %t/libcross.a %t/entry.o
-# RUN: not ld.lld --ejit-cross-inline -shared %t/libcross.a -o /dev/null \
-# RUN:   2>&1 | FileCheck %s --check-prefix=ARCHIVE
-# ARCHIVE: ejit-cross-inline: scan archive failed for {{.*}}libcross.a
+# RUN: ld.lld --ejit-cross-inline -shared --unresolved-symbols=ignore-all \
+# RUN:   %t/libcross.a %t/helper.o -o %t/archive.so
+# RUN: llvm-readelf -S %t/archive.so | FileCheck %s --check-prefix=ARCHIVE
+# ARCHIVE:     .ejit_bitcode
+# ARCHIVE-NOT: .ejit_cross
+
+## An archive selected through -l is not yet discovered by the cross-link scan
+## (it is resolved inside addLibrary and is not in OPT_INPUT). The member is
+## selected by lld but the .ejit_cross section passes through unconsumed,
+## producing a hard error. This is a documented limitation, not a silent drop.
 # RUN: not ld.lld --ejit-cross-inline -shared -u ejit_entry_fn -L%t -lcross \
 # RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=ARCHIVE-L
 # ARCHIVE-L: contains an unprocessed .ejit_cross section
