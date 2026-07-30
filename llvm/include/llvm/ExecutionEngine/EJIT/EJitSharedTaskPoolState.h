@@ -79,6 +79,8 @@ namespace ejit {
 //===----------------------------------------------------------------------===//
 // Fixed capacities and the cache-line size used to avoid false sharing.
 //===----------------------------------------------------------------------===//
+/// Max dims in one identity; matches EJitSharedCacheSlot::dims.
+constexpr uint32_t kEJitSharedMaxDims = 4u;
 constexpr uint32_t kEJitSharedDimTypes = 8u;
 constexpr uint32_t kEJitSharedInstances = 256u;
 constexpr uint32_t kEJitSharedMaxFuncIndex = EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX;
