@@ -1,19 +1,25 @@
 //===-- EJitOptimizer.cpp - JIT Optimization Pipeline ---------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalAlias.h"
+#include "llvm/IR/GlobalIFunc.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Debug.h"
 // The post-specialization cleanup is the real LLVM -O2 function-simplification
 // pipeline (PassBuilder::buildFunctionSimplificationPipeline); only the light
 // cleanupFPM_ and the LowerExpect prefix are hand-added below.
-#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/Transforms/IPO/SCCP.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
 #include "llvm/Transforms/Scalar/SCCP.h"
@@ -23,6 +29,169 @@ using namespace llvm;
 using namespace llvm::ejit;
 
 #define DEBUG_TYPE "ejit-optimizer"
+
+static Expected<uint32_t> repositoryMDInt(const MDNode &N, unsigned Index,
+                                          StringRef Context) {
+  if (Index >= N.getNumOperands())
+    return createStringError(inconvertibleErrorCode(),
+                             "EJIT repository %s: missing integer operand %u",
+                             Context.str().c_str(), Index);
+  auto *CI = mdconst::dyn_extract<ConstantInt>(N.getOperand(Index));
+  if (!CI || CI->getBitWidth() != 32)
+    return createStringError(inconvertibleErrorCode(),
+                             "EJIT repository %s: operand %u is not i32",
+                             Context.str().c_str(), Index);
+  return static_cast<uint32_t>(CI->getZExtValue());
+}
+
+Error llvm::ejit::prepareRepositoryForEntry(Module &M, StringRef EntryName) {
+  NamedMDNode *VersionMD = M.getNamedMetadata(MD_EJIT_REPOSITORY_VERSION);
+  if (!VersionMD)
+    return Error::success();
+
+  if (VersionMD->getNumOperands() != 1)
+    return createStringError(inconvertibleErrorCode(),
+                             "EJIT repository has invalid version metadata");
+  Expected<uint32_t> Version =
+      repositoryMDInt(*VersionMD->getOperand(0), 0, "version");
+  if (!Version)
+    return Version.takeError();
+  if (*Version != EJIT_REPOSITORY_VERSION)
+    return createStringError(
+        inconvertibleErrorCode(),
+        "EJIT repository version mismatch: got %u, expected %u", *Version,
+        EJIT_REPOSITORY_VERSION);
+
+  NamedMDNode *SCCMD = M.getNamedMetadata(MD_EJIT_REPOSITORY_SCCS);
+  NamedMDNode *EntryMD = M.getNamedMetadata(MD_EJIT_REPOSITORY_ENTRIES);
+  if (!SCCMD || !EntryMD)
+    return createStringError(inconvertibleErrorCode(),
+                             "EJIT repository manifest is incomplete");
+
+  SmallDenseSet<uint32_t, 16> SelectedSCCs;
+  bool FoundEntry = false;
+  for (MDNode *N : EntryMD->operands()) {
+    if (N->getNumOperands() == 0)
+      return createStringError(inconvertibleErrorCode(),
+                               "EJIT repository has empty entry manifest");
+    auto *Name = dyn_cast<MDString>(N->getOperand(0));
+    if (!Name)
+      return createStringError(inconvertibleErrorCode(),
+                               "EJIT repository entry name is not a string");
+    if (Name->getString() != EntryName)
+      continue;
+    if (FoundEntry)
+      return createStringError(inconvertibleErrorCode(),
+                               "EJIT repository has duplicate entry '%s'",
+                               EntryName.str().c_str());
+    FoundEntry = true;
+    for (unsigned I = 1; I < N->getNumOperands(); ++I) {
+      Expected<uint32_t> ID = repositoryMDInt(*N, I, "entry");
+      if (!ID)
+        return ID.takeError();
+      SelectedSCCs.insert(*ID);
+    }
+  }
+  if (!FoundEntry)
+    return createStringError(inconvertibleErrorCode(),
+                             "EJIT repository has no manifest for entry '%s'",
+                             EntryName.str().c_str());
+
+  StringMap<uint32_t> FunctionSCC;
+  SmallDenseSet<uint32_t, 16> KnownSCCs;
+  for (MDNode *N : SCCMD->operands()) {
+    Expected<uint32_t> ID = repositoryMDInt(*N, 0, "SCC");
+    if (!ID)
+      return ID.takeError();
+    if (!KnownSCCs.insert(*ID).second)
+      return createStringError(inconvertibleErrorCode(),
+                               "EJIT repository has duplicate SCC %u", *ID);
+    for (unsigned I = 1; I < N->getNumOperands(); ++I) {
+      auto *Name = dyn_cast<MDString>(N->getOperand(I));
+      if (!Name)
+        return createStringError(
+            inconvertibleErrorCode(),
+            "EJIT repository SCC %u has a non-string member", *ID);
+      if (!FunctionSCC.try_emplace(Name->getString(), *ID).second)
+        return createStringError(
+            inconvertibleErrorCode(),
+            "EJIT repository function '%s' belongs to multiple SCCs",
+            Name->getString().str().c_str());
+    }
+  }
+  for (uint32_t ID : SelectedSCCs)
+    if (!KnownSCCs.contains(ID))
+      return createStringError(
+          inconvertibleErrorCode(),
+          "EJIT repository entry '%s' references unknown SCC %u",
+          EntryName.str().c_str(), ID);
+
+  Function *Entry = M.getFunction(EntryName);
+  if (!Entry || Entry->isDeclaration())
+    return createStringError(inconvertibleErrorCode(),
+                             "EJIT repository entry '%s' has no definition",
+                             EntryName.str().c_str());
+
+  // The selected entry is the only externally-visible root. All helper and
+  // non-selected entry definitions become local, then GlobalDCE reconstructs
+  // exactly the selected call/global-initializer closure.
+  for (Function &F : M.functions()) {
+    if (F.isDeclaration())
+      continue;
+    F.setVisibility(GlobalValue::DefaultVisibility);
+    F.setLinkage(&F == Entry ? GlobalValue::ExternalLinkage
+                             : GlobalValue::InternalLinkage);
+    if (&F != Entry)
+      F.setComdat(nullptr);
+  }
+  for (GlobalVariable &GV : M.globals())
+    if (!GV.isDeclaration() && GV.isConstant()) {
+      GV.setVisibility(GlobalValue::DefaultVisibility);
+      GV.setLinkage(GlobalValue::InternalLinkage);
+      GV.setComdat(nullptr);
+    }
+  for (GlobalAlias &GA : M.aliases()) {
+    GA.setVisibility(GlobalValue::DefaultVisibility);
+    GA.setLinkage(GlobalValue::InternalLinkage);
+  }
+  for (GlobalIFunc &GI : M.ifuncs()) {
+    GI.setVisibility(GlobalValue::DefaultVisibility);
+    GI.setLinkage(GlobalValue::InternalLinkage);
+  }
+
+  ModuleAnalysisManager MAM;
+  PassBuilder PB;
+  PB.registerModuleAnalyses(MAM);
+  ModulePassManager MPM;
+  MPM.addPass(GlobalDCEPass());
+  MPM.run(M, MAM);
+
+  if (verifyModule(M, nullptr))
+    return createStringError(
+        inconvertibleErrorCode(),
+        "EJIT repository entry '%s' produced an invalid selected module",
+        EntryName.str().c_str());
+
+  for (Function &F : M.functions()) {
+    if (F.isDeclaration() || F.isIntrinsic())
+      continue;
+    auto It = FunctionSCC.find(F.getName());
+    if (It == FunctionSCC.end())
+      return createStringError(
+          inconvertibleErrorCode(),
+          "EJIT repository live function '%s' is absent from the SCC manifest",
+          F.getName().str().c_str());
+    if (!SelectedSCCs.contains(It->second))
+      return createStringError(
+          inconvertibleErrorCode(),
+          "EJIT repository live function '%s' is outside entry '%s' closure",
+          F.getName().str().c_str(), EntryName.str().c_str());
+  }
+
+  EJIT_DIAG_DEBUG("repository select entry=%s sccs=%u", EntryName.str().c_str(),
+                  static_cast<unsigned>(SelectedSCCs.size()));
+  return Error::success();
+}
 
 EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
     : registry_(reg) {

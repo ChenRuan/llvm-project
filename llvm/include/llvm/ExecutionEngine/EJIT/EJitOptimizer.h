@@ -9,17 +9,24 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITOPTIMIZER_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITOPTIMIZER_H
 
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Analysis/CGSCCPassManager.h"
+#include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
-#include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
-#include "llvm/Analysis/CGSCCPassManager.h"
-#include "llvm/Analysis/LoopAnalysisManager.h"
-#include "llvm/IR/Module.h"
 #include "llvm/ExecutionEngine/EJIT/EJitPassBuilder.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/Error.h"
 
 namespace llvm {
 namespace ejit {
+
+/// If M is a shared EJIT bitcode repository, make EntryName its sole public
+/// root, remove unreachable entry/helper definitions, and validate the result
+/// against the link-time SCC manifest. Legacy per-entry modules are unchanged.
+Error prepareRepositoryForEntry(Module &M, StringRef EntryName);
 
 /// JIT optimization pipeline. Runs on the extracted bitcode module during
 /// JIT compilation to specialize the code for the current time-window values.
@@ -32,8 +39,8 @@ public:
   /// Run the full JIT specialization pipeline:
   ///   1. Parameter substitution (ejit_period_arr_ind → constants)
   ///   2. InstCombine (fold GEP chains from substituted params)
-  ///   3. Inline (L2+: expand callee bodies so may_const GEPs are traceable)
-  ///   4. StructFieldPass (may_const loads → runtime constants)
+  ///   3. StructFieldPass (may_const loads → runtime constants)
+  ///   4. IPSCCP (propagate constants through JIT-local helpers)
   ///   5. Core optimization pipeline (L1/L2/L3)
   void runPipeline(Module &M, const SpecializationContext &ctx);
 

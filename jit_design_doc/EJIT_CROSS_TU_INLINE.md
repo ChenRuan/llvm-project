@@ -103,15 +103,18 @@ driver 额外向 lld 传递 `--ejit-cross-jit-helpers`。因此两种策略可�
 
 对 `A -> B -> C`：
 
-1. 保守闭包收集将 B、C 的定义都放入 A 的 per-entry bitcode；
-2. runtime 将非 entry 定义 internalize；
-3. IPSCCP 把 entry 已固定的维度参数逐层传播到 B、C；
-4. 第二轮 InstCombine + StructFieldPass 折叠 helper 内的 may_const；
-5. A、B、C 一起 codegen/JITLink，内部调用生成 code-pool 内的直接 `BL`。
+1. 链接器将全部 entry 的闭包存入一份 repository bitcode，B、C 模板只保存
+   一次；
+2. SCC manifest 记录每个 entry 依赖的函数强连通分量；
+3. runtime 以目标 entry 为唯一 root，通过 GlobalDCE 重建其临时闭包；
+4. IPSCCP 把 entry 已固定的维度参数逐层传播到 B、C；
+5. 第二轮 InstCombine + StructFieldPass 折叠 helper 内的 may_const；
+6. A、B、C 一起 codegen/JITLink，内部调用生成 code-pool 内的直接 `BL`。
 
-该模式不提供跨 entry 的 helper 机器码共享：每个 specialization 拥有自己的
-helper 副本。这样无需新增 helper cache、失效协议、跨核发布或回收依赖，语义
-与现有 per-entry JITDylib 生命周期一致。
+repository 复用的是最终镜像中的 helper bitcode 模板。每个 specialization
+仍拥有独立的临时 IR、机器码和 JITDylib，因此不同常量可以生成不同的 B/C
+版本且不会串号。详细格式与校验协议见
+`EJIT_BITCODE_REPOSITORY_SCC.md`。
 
 限制：
 

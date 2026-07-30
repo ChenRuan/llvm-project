@@ -266,6 +266,25 @@ TEST(EJitModuleLoader, SameNameSamePayloadIdempotent) {
   EXPECT_EQ(r->size(), 2u);
 }
 
+TEST(EJitModuleLoader, DifferentNamesMayShareRepositoryPayload) {
+  EJitModuleLoader loader;
+  const uint8_t repository[] = {0x42, 0x43, 0xc0, 0xde};
+  EXPECT_TRUE(
+      loader.registerBitcode("repo_entry_a", repository, sizeof(repository)));
+  EXPECT_TRUE(
+      loader.registerBitcode("repo_entry_b", repository, sizeof(repository)));
+
+  uint32_t A = EJitFuncRegistry::instance().lookup("repo_entry_a");
+  uint32_t B = EJitFuncRegistry::instance().lookup("repo_entry_b");
+  ASSERT_NE(A, B);
+  auto APayload = loader.getBitcodeByFuncIdx(A);
+  auto BPayload = loader.getBitcodeByFuncIdx(B);
+  ASSERT_TRUE(static_cast<bool>(APayload));
+  ASSERT_TRUE(static_cast<bool>(BPayload));
+  EXPECT_EQ(APayload->data(), BPayload->data());
+  EXPECT_EQ(APayload->size(), BPayload->size());
+}
+
 TEST(EJitModuleLoader, SameNameDifferentPayloadRejectedKeepsOriginal) {
   EJitModuleLoader loader;
   const uint8_t d1[] = {0x10};
@@ -2621,6 +2640,180 @@ TEST(EJitInterprocedural, IPSCCPPropagatesDimsThroughNestedHelpers) {
   auto *RetVal = dyn_cast<ConstantInt>(Ret->getReturnValue());
   ASSERT_NE(RetVal, nullptr) << "callee return did not fold";
   EXPECT_EQ(RetVal->getSExtValue(), 100); // mock[2].b == 7 → then-branch
+}
+
+TEST(EJitRepository, SelectsOneEntrySCCClosure) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    define i32 @entry_a(i32 %x) {
+      %v = call i32 @helper_b(i32 %x)
+      ret i32 %v
+    }
+    define i32 @entry_other(i32 %x) {
+      %v = call i32 @helper_other(i32 %x)
+      ret i32 %v
+    }
+    define i32 @helper_b(i32 %x) {
+      %v = call i32 @helper_c(i32 %x)
+      ret i32 %v
+    }
+    define i32 @helper_c(i32 %x) {
+      %done = icmp eq i32 %x, 0
+      br i1 %done, label %exit, label %again
+    again:
+      %next = sub i32 %x, 1
+      %v = call i32 @helper_b(i32 %next)
+      ret i32 %v
+    exit:
+      ret i32 7
+    }
+    define i32 @helper_other(i32 %x) {
+      %v = add i32 %x, 99
+      ret i32 %v
+    }
+
+    !ejit.repository.version = !{!0}
+    !ejit.repository.sccs = !{!1, !2, !3, !4}
+    !ejit.repository.entries = !{!5, !6}
+    !0 = !{i32 1}
+    !1 = !{i32 0, !"helper_b", !"helper_c"}
+    !2 = !{i32 1, !"entry_a"}
+    !3 = !{i32 2, !"helper_other"}
+    !4 = !{i32 3, !"entry_other"}
+    !5 = !{!"entry_a", i32 0, i32 1}
+    !6 = !{!"entry_other", i32 2, i32 3}
+  )",
+                               Err, Ctx);
+  ASSERT_NE(M, nullptr);
+
+  Error E = prepareRepositoryForEntry(*M, "entry_a");
+  if (E)
+    FAIL() << toString(std::move(E));
+
+  Function *Entry = M->getFunction("entry_a");
+  ASSERT_NE(Entry, nullptr);
+  EXPECT_FALSE(Entry->isDeclaration());
+  EXPECT_FALSE(Entry->hasLocalLinkage());
+  ASSERT_NE(M->getFunction("helper_b"), nullptr);
+  ASSERT_NE(M->getFunction("helper_c"), nullptr);
+  EXPECT_TRUE(M->getFunction("helper_b")->hasLocalLinkage());
+  EXPECT_TRUE(M->getFunction("helper_c")->hasLocalLinkage());
+  EXPECT_EQ(M->getFunction("entry_other"), nullptr);
+  EXPECT_EQ(M->getFunction("helper_other"), nullptr);
+}
+
+TEST(EJitRepository, SharedTemplateSpecializesIndependently) {
+  auto parseRepository = [](LLVMContext &Ctx) {
+    SMDiagnostic Err;
+    return parseAssemblyString(R"(
+      define i32 @entry_one() !ejit.metadata !6 {
+        %v = call i32 @shared_helper(i32 1)
+        ret i32 %v
+      }
+      define i32 @entry_two() !ejit.metadata !6 {
+        %v = call i32 @shared_helper(i32 2)
+        ret i32 %v
+      }
+      define i32 @shared_helper(i32 %x) {
+        %v = mul i32 %x, 10
+        ret i32 %v
+      }
+      !ejit.repository.version = !{!0}
+      !ejit.repository.sccs = !{!1, !2, !3}
+      !ejit.repository.entries = !{!4, !5}
+      !0 = !{i32 1}
+      !1 = !{i32 0, !"shared_helper"}
+      !2 = !{i32 1, !"entry_one"}
+      !3 = !{i32 2, !"entry_two"}
+      !4 = !{!"entry_one", i32 0, i32 1}
+      !5 = !{!"entry_two", i32 0, i32 2}
+      !6 = !{!7}
+      !7 = !{!"ejit_entry"}
+    )",
+                               Err, Ctx);
+  };
+
+  auto specialize = [&](StringRef EntryName) {
+    LLVMContext Ctx;
+    auto M = parseRepository(Ctx);
+    if (!M)
+      return int64_t{-1};
+    if (Error E = prepareRepositoryForEntry(*M, EntryName)) {
+      consumeError(std::move(E));
+      return int64_t{-2};
+    }
+
+    PeriodArrayRegistry Reg;
+    EJitOptimizer Opt(Reg);
+    SpecializationContext SC;
+    SC.fnName = EntryName.str();
+    SC.optLevel = llvm::ejit::OptimizationLevel::L2;
+    Opt.runPipeline(*M, SC);
+
+    Function *ResultFn = M->getFunction(EntryName);
+    if (!ResultFn || ResultFn->empty())
+      return int64_t{-3};
+    auto *Ret = dyn_cast<ReturnInst>(ResultFn->getEntryBlock().getTerminator());
+    auto *Value =
+        Ret ? dyn_cast_or_null<ConstantInt>(Ret->getReturnValue()) : nullptr;
+    if (!Value) {
+      ResultFn = M->getFunction("shared_helper");
+      if (!ResultFn || ResultFn->empty())
+        return int64_t{-3};
+      Ret = dyn_cast<ReturnInst>(ResultFn->getEntryBlock().getTerminator());
+      Value =
+          Ret ? dyn_cast_or_null<ConstantInt>(Ret->getReturnValue()) : nullptr;
+    }
+    return Value ? Value->getSExtValue() : int64_t{-4};
+  };
+
+  EXPECT_EQ(specialize("entry_one"), 10);
+  EXPECT_EQ(specialize("entry_two"), 20);
+}
+
+TEST(EJitRepository, LegacyPerEntryModuleIsUnchanged) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    define i32 @entry() {
+      ret i32 1
+    }
+    define i32 @unrelated() {
+      ret i32 2
+    }
+  )",
+                               Err, Ctx);
+  ASSERT_NE(M, nullptr);
+
+  Error E = prepareRepositoryForEntry(*M, "entry");
+  if (E)
+    FAIL() << toString(std::move(E));
+  EXPECT_NE(M->getFunction("entry"), nullptr);
+  EXPECT_NE(M->getFunction("unrelated"), nullptr);
+}
+
+TEST(EJitRepository, RejectsUnknownSCC) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    define i32 @entry() {
+      ret i32 1
+    }
+    !ejit.repository.version = !{!0}
+    !ejit.repository.sccs = !{!1}
+    !ejit.repository.entries = !{!2}
+    !0 = !{i32 1}
+    !1 = !{i32 0, !"entry"}
+    !2 = !{!"entry", i32 7}
+  )",
+                               Err, Ctx);
+  ASSERT_NE(M, nullptr);
+
+  Error E = prepareRepositoryForEntry(*M, "entry");
+  if (!E)
+    FAIL() << "unknown repository SCC was accepted";
+  EXPECT_NE(toString(std::move(E)).find("unknown SCC 7"), std::string::npos);
 }
 
 //===----------------------------------------------------------------------===//

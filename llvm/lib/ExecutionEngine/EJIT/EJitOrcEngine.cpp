@@ -763,6 +763,12 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     return ModuleOrErr.takeError();
   }
 
+  if (Error E = prepareRepositoryForEntry(**ModuleOrErr, origFnName)) {
+    EJIT_DIAG("loadBitcode FAIL key=0x%016lx func=%s: repository select error",
+              cacheKey, origFnName.c_str());
+    return E;
+  }
+
   Triple TT((*ModuleOrErr)->getTargetTriple());
   if (TT.isAArch64() && TT.isOSBinFormatELF()) {
     // External-symbol access from JIT specializations. The JIT slab is

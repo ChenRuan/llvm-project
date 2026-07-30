@@ -219,7 +219,7 @@ struct Config {
   // EJIT: opt-in cross-TU inline processing at link time. Set by clang for
   // -fejit-cross-inline links that use ld.lld; ld.lld is the single owner.
   bool ejitCrossInline = false;
-  // Preserve ordinary helper definitions in each per-entry JIT module.
+  // Preserve ordinary helpers in one shared repository bitcode template.
   bool ejitCrossJitHelpers = false;
   uint32_t andFeatures = 0;
   llvm::CachePruningPolicy thinLTOCachePolicy;

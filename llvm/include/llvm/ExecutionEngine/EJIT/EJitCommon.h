@@ -54,6 +54,10 @@ namespace ejit {
 //===----------------------------------------------------------------------===//
 constexpr const char *MD_EJIT_METADATA = "ejit.metadata";
 constexpr const char *MD_EJIT_MAY_CONST = "ejit.may_const";
+constexpr const char *MD_EJIT_REPOSITORY_VERSION = "ejit.repository.version";
+constexpr const char *MD_EJIT_REPOSITORY_SCCS = "ejit.repository.sccs";
+constexpr const char *MD_EJIT_REPOSITORY_ENTRIES = "ejit.repository.entries";
+constexpr uint32_t EJIT_REPOSITORY_VERSION = 1;
 
 //===----------------------------------------------------------------------===//
 // Metadata entry tags (first operand of sub-nodes in !ejit.metadata)

@@ -60,41 +60,44 @@
 # RUN: llvm-dis %t/out.so.ejit-cross.ejit_entry_two.bc -o - | \
 # RUN:   FileCheck %s --check-prefix=SECOND
 # SECOND-LABEL: define{{.*}} i32 @ejit_entry_two()
-# SECOND: call i32 @some_extern_fn(i32 5)
+# SECOND-NOT: call i32 @helper
+# SECOND: call i32 @some_extern_fn
 # SECOND: load i32, ptr @extern_global
 
-## JIT-local helper mode consumes the same cross sections but expands only
-## mandatory always_inline calls. The ordinary A -> B -> C chain remains in
-## the per-entry bitcode so runtime specialization can optimize every body and
-## codegen can place all three functions in one JIT allocation.
+## JIT-local helper mode consumes the same cross sections but stores one
+## repository payload shared by every entry. The repository contains each
+## helper definition once plus an entry-to-SCC manifest; runtime selection
+## trims it back to one entry closure before specialization.
 # RUN: ld.lld --ejit-cross-jit-helpers --save-temps -shared \
 # RUN:   --unresolved-symbols=ignore-all \
 # RUN:   %t/entry.o %t/helper.o -o %t/helpers.so
 # RUN: llvm-readelf -S %t/helpers.so | FileCheck %s --check-prefix=LINKED
-# RUN: llvm-dis %t/helpers.so.ejit-cross.ejit_entry_fn.bc -o - | \
+# RUN: llvm-nm %t/helpers.so | FileCheck %s --check-prefix=REPOSITORY-SYMBOL
+# REPOSITORY-SYMBOL-COUNT-1: __ejit_bitcode_repository
+# RUN: llvm-dis %t/helpers.so.ejit-cross.repository.bc -o - | \
 # RUN:   FileCheck %s --check-prefix=JITHELPERS
 # JITHELPERS-LABEL: define{{.*}} i32 @ejit_entry_fn()
 # JITHELPERS-NOT: call i32 @mandatory_helper()
 # JITHELPERS-COUNT-2: call i32 @helper()
+# JITHELPERS-LABEL: define{{.*}} i32 @ejit_entry_two()
+# JITHELPERS: call i32 @helper()
 # JITHELPERS-LABEL: define{{.*}} i32 @helper()
 # JITHELPERS: call i32 @helper_leaf()
 # JITHELPERS-LABEL: define{{.*}} i32 @helper_leaf()
 # JITHELPERS-NOT: define{{.*}} i32 @unused_helper()
-
-## The second entry does not reach the helper chain, so per-entry closure
-## trimming must not copy those definitions into its bitcode.
-# RUN: llvm-dis %t/helpers.so.ejit-cross.ejit_entry_two.bc -o - | \
-# RUN:   FileCheck %s --check-prefix=JITHELPERS-SECOND
-# JITHELPERS-SECOND-LABEL: define{{.*}} i32 @ejit_entry_two()
-# JITHELPERS-SECOND-NOT: define{{.*}} i32 @helper
+# JITHELPERS: !ejit.repository.version = !{![[VERSION:[0-9]+]]}
+# JITHELPERS: !ejit.repository.sccs = !{
+# JITHELPERS: !ejit.repository.entries = !{
+# JITHELPERS-DAG: !{!"ejit_entry_fn", i32
+# JITHELPERS-DAG: !{!"ejit_entry_two", i32
 
 ## AArch64 codegen sees definitions, not declarations, and therefore emits
 ## direct intra-module branches rather than an external GOT/PLT call.
 # RUN: llc -mtriple=aarch64-unknown-linux-gnu -O2 \
-# RUN:   %t/helpers.so.ejit-cross.ejit_entry_fn.bc -o - | \
+# RUN:   %t/helpers.so.ejit-cross.repository.bc -o - | \
 # RUN:   FileCheck %s --check-prefix=AARCH64
 # AARCH64-LABEL: ejit_entry_fn:
-# AARCH64-COUNT-2: bl helper
+# AARCH64-COUNT-3: bl helper
 # AARCH64-LABEL: helper:
 # AARCH64: bl helper_leaf
 
@@ -160,7 +163,8 @@ define i32 @ejit_entry_fn() !ejit.metadata !0 {
 }
 
 define i32 @ejit_entry_two() !ejit.metadata !0 {
-  %e = call i32 @some_extern_fn(i32 5)
+  %h = call i32 @helper()
+  %e = call i32 @some_extern_fn(i32 %h)
   %g = load i32, ptr @extern_global
   %r = add i32 %e, %g
   ret i32 %r

@@ -22,6 +22,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "EJitCrossLink.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -219,6 +221,143 @@ computeTransitiveClosure(ArrayRef<Function *> EntryFuncs,
     drainGlobals();
   }
   drainGlobals();
+}
+
+static void
+collectDirectFunctionReferences(Function &F,
+                                SmallVectorImpl<Function *> &References) {
+  SmallPtrSet<const Constant *, 32> Visited;
+  SetVector<GlobalVariable *> Globals;
+  collectReferences(F, References, Globals, Visited);
+  for (unsigned I = 0; I < Globals.size(); ++I) {
+    GlobalVariable *GV = Globals[I];
+    if (GV->hasInitializer())
+      collectFromConstant(GV->getInitializer(), References, Globals, Visited);
+  }
+}
+
+struct RepositoryManifest {
+  SmallVector<SmallVector<Function *, 4>, 16> SCCs;
+  DenseMap<Function *, uint32_t> FunctionSCC;
+  SmallVector<SmallVector<uint32_t, 4>, 8> EntrySCCs;
+};
+
+class RepositorySCCBuilder {
+public:
+  RepositorySCCBuilder(Module &M, ArrayRef<Function *> Entries)
+      : Entries(Entries) {
+    for (Function &F : M)
+      if (!F.isDeclaration())
+        Nodes.push_back(&F);
+    for (Function *F : Nodes) {
+      SmallVector<Function *, 8> Refs;
+      collectDirectFunctionReferences(*F, Refs);
+      SmallPtrSet<Function *, 8> Seen;
+      for (Function *Ref : Refs)
+        if (!Ref->isDeclaration() && Seen.insert(Ref).second)
+          Edges[F].push_back(Ref);
+    }
+  }
+
+  RepositoryManifest build() {
+    for (Function *F : Nodes)
+      if (!Index.count(F))
+        visit(F);
+
+    RepositoryManifest Result;
+    Result.SCCs = std::move(SCCs);
+    for (uint32_t I = 0; I < Result.SCCs.size(); ++I)
+      for (Function *F : Result.SCCs[I])
+        Result.FunctionSCC[F] = I;
+
+    for (Function *Entry : Entries) {
+      SetVector<Function *> Funcs;
+      SetVector<GlobalVariable *> Globals;
+      SmallVector<Function *, 1> Roots{Entry};
+      computeTransitiveClosure(Roots, Funcs, Globals);
+      SmallDenseSet<uint32_t, 8> Seen;
+      SmallVector<uint32_t, 4> IDs;
+      for (Function *F : Funcs) {
+        auto It = Result.FunctionSCC.find(F);
+        if (It != Result.FunctionSCC.end() && Seen.insert(It->second).second)
+          IDs.push_back(It->second);
+      }
+      llvm::sort(IDs);
+      Result.EntrySCCs.push_back(std::move(IDs));
+    }
+    return Result;
+  }
+
+private:
+  void visit(Function *F) {
+    uint32_t I = NextIndex++;
+    Index[F] = I;
+    LowLink[F] = I;
+    Stack.push_back(F);
+    OnStack.insert(F);
+
+    for (Function *To : Edges[F]) {
+      if (!Index.count(To)) {
+        visit(To);
+        LowLink[F] = std::min(LowLink[F], LowLink[To]);
+      } else if (OnStack.contains(To)) {
+        LowLink[F] = std::min(LowLink[F], Index[To]);
+      }
+    }
+
+    if (LowLink[F] != Index[F])
+      return;
+    SmallVector<Function *, 4> Component;
+    while (true) {
+      Function *Top = Stack.pop_back_val();
+      OnStack.erase(Top);
+      Component.push_back(Top);
+      if (Top == F)
+        break;
+    }
+    llvm::sort(Component, [](const Function *L, const Function *R) {
+      return L->getName() < R->getName();
+    });
+    SCCs.push_back(std::move(Component));
+  }
+
+  ArrayRef<Function *> Entries;
+  SmallVector<Function *, 32> Nodes;
+  DenseMap<Function *, SmallVector<Function *, 4>> Edges;
+  DenseMap<Function *, uint32_t> Index;
+  DenseMap<Function *, uint32_t> LowLink;
+  SmallVector<Function *, 32> Stack;
+  SmallPtrSet<Function *, 32> OnStack;
+  SmallVector<SmallVector<Function *, 4>, 16> SCCs;
+  uint32_t NextIndex = 0;
+};
+
+static void addRepositoryManifest(Module &M, ArrayRef<Function *> Entries,
+                                  const RepositoryManifest &Manifest) {
+  LLVMContext &Ctx = M.getContext();
+  auto mdInt = [&](uint32_t V) -> Metadata * {
+    return ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(Ctx), V));
+  };
+
+  M.getOrInsertNamedMetadata(MD_EJIT_REPOSITORY_VERSION)
+      ->addOperand(MDNode::get(Ctx, mdInt(EJIT_REPOSITORY_VERSION)));
+
+  NamedMDNode *SCCs = M.getOrInsertNamedMetadata(MD_EJIT_REPOSITORY_SCCS);
+  for (uint32_t I = 0; I < Manifest.SCCs.size(); ++I) {
+    SmallVector<Metadata *, 8> Ops{mdInt(I)};
+    for (Function *F : Manifest.SCCs[I])
+      Ops.push_back(MDString::get(Ctx, F->getName()));
+    SCCs->addOperand(MDNode::get(Ctx, Ops));
+  }
+
+  NamedMDNode *EntryMap =
+      M.getOrInsertNamedMetadata(MD_EJIT_REPOSITORY_ENTRIES);
+  for (size_t I = 0; I < Entries.size(); ++I) {
+    SmallVector<Metadata *, 8> Ops{MDString::get(Ctx, Entries[I]->getName())};
+    for (uint32_t ID : Manifest.EntrySCCs[I])
+      Ops.push_back(mdInt(ID));
+    EntryMap->addOperand(MDNode::get(Ctx, Ops));
+  }
 }
 
 /// Delete every defined function/global not in the closure, without leaving a
@@ -562,8 +701,8 @@ Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
   SmallVector<std::string, 4> ConsumedFiles;
 
   // Helper to process a single bitcode buffer into the composite.
-  auto mergeBitcodeIntoComposite =
-      [&](MemoryBufferRef BCBuf, StringRef DisplayName) -> Error {
+  auto mergeBitcodeIntoComposite = [&](MemoryBufferRef BCBuf,
+                                       StringRef DisplayName) -> Error {
     auto M = parseBitcodeFile(BCBuf, *Ctx);
     if (!M)
       return crossError("parse bitcode", DisplayName, M.takeError());
@@ -687,47 +826,96 @@ Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
   SetVector<Function *> ExternalFuncs;
   SetVector<GlobalVariable *> ExternalGlobals;
 
-  for (Function *F : EntryFuncs) {
-    auto PerFunc = CloneModule(*Composite);
-    Function *ClonedF = PerFunc->getFunction(F->getName());
-    if (!ClonedF)
-      return crossError("clone", F->getName(),
-                        "entry function vanished after cloning the composite");
+  if (PreserveJitHelpers) {
+    // Store one template repository for every entry. At runtime the selected
+    // entry is the sole externally-visible root, GlobalDCE reconstructs its
+    // closure, and the SCC manifest verifies that the result matches the
+    // link-time dependency graph. Helper bodies therefore occupy the final
+    // image once while each specialization still receives an independent
+    // transient copy for IPSCCP.
+    RepositoryManifest Manifest =
+        RepositorySCCBuilder(*Composite, EntryFuncs).build();
+    addRepositoryManifest(*Composite, EntryFuncs, Manifest);
 
-    SetVector<Function *> PerFuncs;
-    SetVector<GlobalVariable *> PerGlobals;
-    SmallVector<Function *, 1> Single{ClonedF};
-    computeTransitiveClosure(Single, PerFuncs, PerGlobals);
-    trimToClosure(*PerFunc, PerFuncs, PerGlobals);
+    SetVector<Function *> RepositoryFuncs;
+    SetVector<GlobalVariable *> RepositoryGlobals;
+    computeTransitiveClosure(EntryFuncs, RepositoryFuncs, RepositoryGlobals);
 
-    // Externalise non-const global definitions so JITLink resolves them from
-    // the host image, mirroring the single-TU extractor.
-    for (GlobalVariable &GV : PerFunc->globals())
+    for (GlobalVariable &GV : Composite->globals())
       if (!GV.isDeclaration() && !GV.isConstant()) {
         GV.setInitializer(nullptr);
         GV.setLinkage(GlobalValue::ExternalLinkage);
       }
 
-    if (Error E = collectExternalSymbols(PerFuncs, PerGlobals, *TmpM,
-                                         ExternalFuncs, ExternalGlobals))
-      return crossError("collect external symbols", F->getName(), std::move(E));
+    if (Error E = collectExternalSymbols(RepositoryFuncs, RepositoryGlobals,
+                                         *TmpM, ExternalFuncs, ExternalGlobals))
+      return crossError("collect repository external symbols", "<repository>",
+                        std::move(E));
 
-    if (verifyModule(*PerFunc, &errs()))
-      return crossError("verify per-entry module", F->getName(),
-                        "cloned/trimmed module failed verification");
+    if (verifyModule(*Composite, &errs()))
+      return crossError("verify repository module", "<repository>",
+                        "repository module failed verification");
 
     if (!SaveTempsPrefix.empty()) {
-      std::string Path = saveTempEntryPath(SaveTempsPrefix, F->getName());
-      if (Error E = writeModuleBitcode(*PerFunc, Path))
-        return crossError("save per-entry bitcode", Path, std::move(E));
+      std::string Path = saveTempEntryPath(SaveTempsPrefix, "repository");
+      if (Error E = writeModuleBitcode(*Composite, Path))
+        return crossError("save repository bitcode", Path, std::move(E));
     }
 
     std::string BC;
     raw_string_ostream OS(BC);
-    WriteBitcodeToFile(*PerFunc, OS);
+    WriteBitcodeToFile(*Composite, OS);
     OS.flush();
-    BitcodeGVs.push_back(embedBitcode(*TmpM, BC, F->getName()));
-    ValidEntryFuncs.push_back(F);
+    GlobalVariable *RepositoryGV = embedBitcode(*TmpM, BC, "repository");
+    for (Function *Entry : EntryFuncs) {
+      ValidEntryFuncs.push_back(Entry);
+      BitcodeGVs.push_back(RepositoryGV);
+    }
+  } else {
+    for (Function *F : EntryFuncs) {
+      auto PerFunc = CloneModule(*Composite);
+      Function *ClonedF = PerFunc->getFunction(F->getName());
+      if (!ClonedF)
+        return crossError(
+            "clone", F->getName(),
+            "entry function vanished after cloning the composite");
+
+      SetVector<Function *> PerFuncs;
+      SetVector<GlobalVariable *> PerGlobals;
+      SmallVector<Function *, 1> Single{ClonedF};
+      computeTransitiveClosure(Single, PerFuncs, PerGlobals);
+      trimToClosure(*PerFunc, PerFuncs, PerGlobals);
+
+      // Externalise non-const global definitions so JITLink resolves them from
+      // the host image, mirroring the single-TU extractor.
+      for (GlobalVariable &GV : PerFunc->globals())
+        if (!GV.isDeclaration() && !GV.isConstant()) {
+          GV.setInitializer(nullptr);
+          GV.setLinkage(GlobalValue::ExternalLinkage);
+        }
+
+      if (Error E = collectExternalSymbols(PerFuncs, PerGlobals, *TmpM,
+                                           ExternalFuncs, ExternalGlobals))
+        return crossError("collect external symbols", F->getName(),
+                          std::move(E));
+
+      if (verifyModule(*PerFunc, &errs()))
+        return crossError("verify per-entry module", F->getName(),
+                          "cloned/trimmed module failed verification");
+
+      if (!SaveTempsPrefix.empty()) {
+        std::string Path = saveTempEntryPath(SaveTempsPrefix, F->getName());
+        if (Error E = writeModuleBitcode(*PerFunc, Path))
+          return crossError("save per-entry bitcode", Path, std::move(E));
+      }
+
+      std::string BC;
+      raw_string_ostream OS(BC);
+      WriteBitcodeToFile(*PerFunc, OS);
+      OS.flush();
+      BitcodeGVs.push_back(embedBitcode(*TmpM, BC, F->getName()));
+      ValidEntryFuncs.push_back(F);
+    }
   }
 
   generateRegistryTable(*TmpM, ValidEntryFuncs, BitcodeGVs, ExternalFuncs,

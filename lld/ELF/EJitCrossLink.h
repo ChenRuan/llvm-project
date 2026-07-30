@@ -21,7 +21,8 @@ struct EJitCrossLinkResult {
 /// helper policy to each ejit_entry, and write a single registry bitcode module
 /// to a temporary file whose path is returned.
 /// With \p PreserveJitHelpers, only mandatory always_inline calls are expanded;
-/// ordinary transitive helper definitions remain in each per-entry module.
+/// ordinary helpers remain in one repository bitcode template shared by all
+/// registry entries. An SCC manifest identifies each entry's runtime closure.
 ///
 /// Three-state result:
 ///   * an Error         - a .ejit_cross section was found but processing failed
