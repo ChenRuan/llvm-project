@@ -34,6 +34,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h" // EJitCompileMode, status enum
+#include <atomic>
 #include <cstdint>
 
 namespace llvm {
@@ -139,23 +140,24 @@ void ejitIcacheClearAll();
 // No-op for an out-of-range funcIndex or null base.
 void ejitIcacheRegisterSlot(uint32_t funcIndex, void *base, uint32_t numDims);
 
+/// One L0 slot, sized to a cache line. The identity is stored in full and
+/// re-checked on every hit, because the index hash is not injective: it selects
+/// a slot and nothing more, so a collision must evict, never answer.
 struct EJitL0Entry {
-  uint32_t key;   ///< packed identity; 0 = empty
-  uint32_t epoch; ///< dispatchEpoch this entry was filled at
-  uint32_t core;  ///< core that filled it
-  void *fn;
+  uint32_t seq; ///< even = stable, odd = mid-write
+  uint32_t epoch;
+  uint32_t core;
+  uint32_t funcIndex;
+  uint32_t numDims;
+  EJitDimPair dims[kEJitSharedMaxDims];
+  void *fn; ///< null = empty
 };
-constexpr uint32_t kEJitL0Slots = 64; // 1.5KB/core
+constexpr uint32_t kEJitL0Slots = 64; // 4KB/core
 
-// The three globals below are core-private: deliberately NOT in
+// The two globals below are core-private: deliberately NOT in
 // EJIT_SHARED_SECTION_ATTR, so each core's image holds its own copy and
 // probing generates no coherence traffic.
 extern EJitL0Entry gEJitL0[kEJitL0Slots];
-
-/// L0 hits on THIS core. Non-atomic: routing it through the shared cacheHits
-/// counter costs an atomic RMW measured at ~7ns, more than the probe it counts.
-/// getStats() folds it in.
-extern uint64_t gEJitL0Hits;
 
 /// The shared state this core's table was armed against, null if it has not
 /// passed the L0 gates. Not a member of EJitSharedTaskPool: that object lives
@@ -165,16 +167,21 @@ extern uint64_t gEJitL0Hits;
 /// fresh blob starts from a low epoch a stale entry can match by coincidence.
 extern const void *gEJitL0State;
 
-/// Never returns 0, so 0 stays "empty".
-inline uint32_t ejitL0Key(uint32_t funcIndex, const EJitDimPair *dims,
-                          uint32_t numDims) {
+inline bool dimsEqual(const EJitDimPair *a, const EJitDimPair *b,
+                      uint32_t numDims) {
+  for (uint32_t i = 0; i < numDims; ++i)
+    if (a[i].dimType != b[i].dimType || a[i].instanceId != b[i].instanceId)
+      return false;
+  return true;
+}
+
+/// Slot selection only; correctness never depends on this being injective.
+inline uint32_t ejitL0Index(uint32_t funcIndex, const EJitDimPair *dims,
+                            uint32_t numDims) {
   uint32_t k = funcIndex * 2654435761u;
   for (uint32_t i = 0; i < numDims; ++i)
-    k = (k ^ (dims[i].dimType * 31u + dims[i].instanceId)) * 2654435761u;
-  return k | 1u;
-}
-inline uint32_t ejitL0Index(uint32_t key) {
-  return (key >> 26) & (kEJitL0Slots - 1);
+    k = (k ^ (dims[i].dimType * 2654435761u) ^ dims[i].instanceId) * 2654435761u;
+  return (k >> 26) & (kEJitL0Slots - 1);
 }
 
 class EJitSharedTaskPool {
@@ -318,6 +325,12 @@ public:
     // UAF. Auto-disable the cache while a releaser is wired. Production wires
     // no releaser, so the gate stays open and the cache is unconditionally safe.
     icacheReclamationSafe_ = (fn == nullptr);
+    if (fn) {
+      // The gate is evaluated at fill, so blocking new fills is not enough:
+      // entries armed earlier would keep serving code the releaser may free.
+      gEJitL0State = nullptr;
+      retireDispatchCache();
+    }
   }
   void setPrepareCodeCallback(PrepareCodeCallback fn, void *ctx) {
     prepareCodeFn_ = fn;
@@ -498,24 +511,34 @@ public:
   bool l0Try(uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
              void **outFn) {
     // Inline: an out-of-line call costs more than the probe it performs.
-    if (!state_ || gEJitL0State != state_)
+    if (!state_ || gEJitL0State != state_ || numDims > kEJitSharedMaxDims)
       return false;
-    const uint32_t key = ejitL0Key(funcIndex, dims, numDims);
-    const EJitL0Entry &e = gEJitL0[ejitL0Index(key)];
-    // The core stamp is a constant compare on hardware, where the table is
-    // core-private. It matters where cores are SIMULATED in one process: there
-    // the table is shared, and a peer taking the owner's entry would skip
-    // peerPrepareSlot() and run code it has no execute permission for.
-    if (e.key != key || e.core != EJitCoreId::current() ||
-        e.epoch != state_->dispatchEpoch.loadRelaxed())
-      return false;
-    if (e.fn == nullptr)
-      return false;
-    ++gEJitL0Hits; // core-private, non-atomic: see the declaration
+    EJitL0Entry &e = gEJitL0[ejitL0Index(funcIndex, dims, numDims)];
 
-    *outFn = e.fn;
+    // Seqlock: core-private storage excludes other CORES, not preemption or
+    // interrupts on this one, which could otherwise leave a stale identity
+    // beside a new fnPtr. Signal fences suffice -- same-core ordering, not
+    // cross-core visibility.
+    const uint32_t s0 = e.seq;
+    if (s0 & 1u)
+      return false;
+    std::atomic_signal_fence(std::memory_order_acquire);
+
+    void *fn = e.fn;
+    const bool match = fn != nullptr && e.epoch == state_->dispatchEpoch.loadRelaxed() &&
+                       e.core == EJitCoreId::current() &&
+                       e.funcIndex == funcIndex && e.numDims == numDims &&
+                       dimsEqual(e.dims, dims, numDims);
+
+    std::atomic_signal_fence(std::memory_order_acquire);
+    if (e.seq != s0 || !match)
+      return false;
+
+    EJIT_STAT_INC(state_->counters.cacheHits);
+    *outFn = fn;
     return true;
   }
+
   void l0Fill(uint32_t funcIndex, void *fnPtr, const EJitDimPair *dims,
               uint32_t numDims);
 

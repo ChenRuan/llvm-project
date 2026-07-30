@@ -2774,11 +2774,10 @@ void resetL0ForTest() {
   for (uint32_t i = 0; i < kEJitL0Slots; ++i)
     gEJitL0[i] = EJitL0Entry{};
   gEJitL0State = nullptr;
-  gEJitL0Hits = 0;
 }
 } // namespace
 
-TEST_F(SharedTaskPoolTest, L0ServesARepeatDispatchAndCountsIt) {
+TEST_F(SharedTaskPoolTest, L0ServesARepeatDispatch) {
   resetL0ForTest();
   EJitSharedTaskPool pool;
   bringUpOwner(pool);
@@ -2791,7 +2790,6 @@ TEST_F(SharedTaskPoolTest, L0ServesARepeatDispatchAndCountsIt) {
   pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
   EXPECT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
   EXPECT_EQ(out, codeFor(kFunc));
-  EXPECT_EQ(gEJitL0Hits, 1u);
 
   // A different identity must miss, not return the wrong pointer.
   const EJitDimPair other[1] = {{0, 2}};
@@ -2925,7 +2923,24 @@ TEST_F(SharedTaskPoolTest, L0RefusesToArmWhileAReleaserIsWired) {
   pool.setReleaser([](void *, void *) {}, nullptr);
   pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
   EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out));
-  EXPECT_EQ(gEJitL0Hits, 0u);
+}
+
+// The gate is evaluated at fill, so wiring a releaser AFTER entries are armed
+// must retire them.
+TEST_F(SharedTaskPoolTest, L0EntriesAreRetiredWhenAReleaserIsWiredLater) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 12;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+
+  pool.setReleaser([](void *, void *) {}, nullptr);
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out))
+      << "an armed entry must not survive a releaser being wired";
 }
 
 TEST_F(SharedTaskPoolTest, ReleaseReadIgnoresTheNoBucketSentinel) {
@@ -2938,6 +2953,89 @@ TEST_F(SharedTaskPoolTest, ReleaseReadIgnoresTheNoBucketSentinel) {
   for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
     EXPECT_EQ(state_->buckets[b].readers.loadRelaxed(), 0u)
         << "bucket " << b << " reader count disturbed";
+}
+
+// A fill interrupted between its payload stores must not leave an old identity
+// paired with the new fnPtr. Core-private storage excludes other CORES, not
+// preemption on this one, so the seqlock is what makes the entry atomic.
+TEST_F(SharedTaskPoolTest, L0PartiallyWrittenEntryIsNotServed) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const EJitDimPair a[1] = {{0, 1}};
+  void *out = nullptr;
+
+  pool.l0Fill(20, codeFor(20), a, 1);
+  ASSERT_TRUE(pool.l0Try(20, a, 1, &out));
+  ASSERT_EQ(out, codeFor(20));
+
+  // The interleaving a preempted fill leaves: odd sequence, fnPtr replaced,
+  // identity not yet updated.
+  EJitL0Entry &e = gEJitL0[ejitL0Index(20, a, 1)];
+  e.seq = e.seq + 1u;
+  e.fn = codeFor(21);
+
+  EXPECT_FALSE(pool.l0Try(20, a, 1, &out))
+      << "a half-written entry must not be served";
+
+  e.seq = e.seq + 1u; // writer completes
+  EXPECT_TRUE(pool.l0Try(20, a, 1, &out));
+}
+
+// Two identities landing in the same slot must evict each other, never
+// cross-serve. The colliding pair is SEARCHED FOR rather than hard-coded, so
+// the test keeps its meaning if the hash changes.
+TEST_F(SharedTaskPoolTest, L0CollidingIdentitiesNeverCrossServe) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  void *out = nullptr;
+
+  const EJitDimPair a[1] = {{0, 1}};
+  const uint32_t slot = ejitL0Index(30, a, 1);
+  EJitDimPair b[1] = {{0, 0}};
+  bool found = false;
+  for (uint32_t inst = 2; inst < kEJitSharedInstances && !found; ++inst) {
+    b[0].instanceId = inst;
+    found = ejitL0Index(30, b, 1) == slot;
+  }
+  ASSERT_TRUE(found) << "no colliding identity found in the instance space";
+
+  pool.l0Fill(30, codeFor(30), a, 1);
+  pool.l0Fill(30, codeFor(31), b, 1); // evicts a from the shared slot
+
+  EXPECT_FALSE(pool.l0Try(30, a, 1, &out))
+      << "the evicted identity must miss, not receive the evictor's pointer";
+  ASSERT_TRUE(pool.l0Try(30, b, 1, &out));
+  EXPECT_EQ(out, codeFor(31));
+
+  // The pair the old packed key aliased via dimType*31 + instanceId.
+  resetL0ForTest();
+  const EJitDimPair c[1] = {{0, 31}};
+  const EJitDimPair d[1] = {{1, 0}};
+  pool.l0Fill(30, codeFor(32), c, 1);
+  pool.l0Fill(30, codeFor(33), d, 1);
+  if (pool.l0Try(30, c, 1, &out))
+    EXPECT_EQ(out, codeFor(32)) << "(0,31) served (1,0)'s specialization";
+  if (pool.l0Try(30, d, 1, &out))
+    EXPECT_EQ(out, codeFor(33)) << "(1,0) served (0,31)'s specialization";
+
+  // Same funcIndex, differing arity must not alias.
+  resetL0ForTest();
+  const EJitDimPair two[2] = {{0, 31}, {0, 0}};
+  pool.l0Fill(30, codeFor(34), c, 1);
+  pool.l0Fill(30, codeFor(35), two, 2);
+  if (pool.l0Try(30, c, 1, &out))
+    EXPECT_EQ(out, codeFor(34)) << "1D identity served a 2D entry";
+  if (pool.l0Try(30, two, 2, &out))
+    EXPECT_EQ(out, codeFor(35));
+
+  // Different funcIndex, identical dims must not alias.
+  resetL0ForTest();
+  pool.l0Fill(30, codeFor(36), c, 1);
+  pool.l0Fill(31, codeFor(37), c, 1);
+  if (pool.l0Try(30, c, 1, &out))
+    EXPECT_NE(out, codeFor(37)) << "funcIndex 30 served funcIndex 31's entry";
 }
 
 } // namespace

@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#include <atomic>
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
@@ -276,7 +277,6 @@ bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
 // stable in steady state and entries only miss while warming.
 //===----------------------------------------------------------------------===//
 EJitL0Entry llvm::ejit::gEJitL0[kEJitL0Slots];
-uint64_t llvm::ejit::gEJitL0Hits = 0;
 const void *llvm::ejit::gEJitL0State = nullptr;
 
 void EJitSharedTaskPool::retireDispatchCache() {
@@ -288,6 +288,8 @@ void EJitSharedTaskPool::l0Fill(uint32_t funcIndex, void *fnPtr,
                                 const EJitDimPair *dims, uint32_t numDims) {
   if (!icacheReclamationSafe_ || !state_ || !fnPtr)
     return;
+  if (numDims > kEJitSharedMaxDims)
+    return;
   if (state_->initState.loadAcquire() != kReady)
     return;
 #if !defined(EJIT_SRE_SHARED_CODE_POINTERS)
@@ -295,16 +297,26 @@ void EJitSharedTaskPool::l0Fill(uint32_t funcIndex, void *fnPtr,
     return;
 #endif
   gEJitL0State = state_;
-  const uint32_t key = ejitL0Key(funcIndex, dims, numDims);
-  EJitL0Entry &e = gEJitL0[ejitL0Index(key)];
-  // Read the epoch BEFORE publishing the entry, so a bump racing the fill
-  // leaves a stale epoch (a miss), never a fresh epoch on a stale pointer.
-  // Plain stores: the table is core-private, ordered by program order.
+  EJitL0Entry &e = gEJitL0[ejitL0Index(funcIndex, dims, numDims)];
+
+  // Read the epoch BEFORE publishing, so a bump racing the fill leaves a stale
+  // epoch (a miss), never a fresh epoch on a stale pointer.
   const uint32_t epoch = state_->dispatchEpoch.loadAcquire();
+
+  // Seqlock writer: odd while the payload is inconsistent.
+  e.seq = e.seq + 1u;
+  std::atomic_signal_fence(std::memory_order_release);
+
   e.fn = fnPtr;
   e.core = EJitCoreId::current();
-  e.key = key;
+  e.funcIndex = funcIndex;
+  e.numDims = numDims;
+  for (uint32_t i = 0; i < numDims; ++i)
+    e.dims[i] = dims[i];
   e.epoch = epoch;
+
+  std::atomic_signal_fence(std::memory_order_release);
+  e.seq = e.seq + 1u;
 }
 
 void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
@@ -2240,8 +2252,7 @@ void EJitSharedTaskPool::getDiagnostics(EJitSharedDiagnostics &out) const {
           static_cast<uint32_t>(EJitSharedSlotState::Ready))
         ++ready;
   out.cacheReadyCount = ready;
-  // L0 hits are cache hits that never touched the shared counter.
-  out.cacheHits = state_->counters.cacheHits.loadRelaxed() + gEJitL0Hits;
+  out.cacheHits = state_->counters.cacheHits.loadRelaxed();
   out.asyncEnqueues = state_->counters.asyncEnqueues.loadRelaxed();
   out.asyncCompiles = state_->counters.asyncCompiles.loadRelaxed();
   out.alreadyPending = state_->counters.alreadyPending.loadRelaxed();
