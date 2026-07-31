@@ -32,9 +32,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
-#include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h" // EJitCompileMode, status enum
-#include <atomic>
 #include <cstdint>
 
 namespace llvm {
@@ -139,50 +137,6 @@ void ejitIcacheClearAll();
 // (name->funcIndex resolution) at ejit_auto_register / .ejit_period time.
 // No-op for an out-of-range funcIndex or null base.
 void ejitIcacheRegisterSlot(uint32_t funcIndex, void *base, uint32_t numDims);
-
-/// One L0 slot, sized to a cache line. The identity is stored in full and
-/// re-checked on every hit, because the index hash is not injective: it selects
-/// a slot and nothing more, so a collision must evict, never answer.
-struct EJitL0Entry {
-  uint32_t seq; ///< even = stable, odd = mid-write
-  uint32_t epoch;
-  uint32_t core;
-  uint32_t funcIndex;
-  uint32_t numDims;
-  EJitDimPair dims[kEJitSharedMaxDims];
-  void *fn; ///< null = empty
-};
-constexpr uint32_t kEJitL0Slots = 64; // 4KB/core
-
-// The two globals below are core-private: deliberately NOT in
-// EJIT_SHARED_SECTION_ATTR, so each core's image holds its own copy and
-// probing generates no coherence traffic.
-extern EJitL0Entry gEJitL0[kEJitL0Slots];
-
-/// The shared state this core's table was armed against, null if it has not
-/// passed the L0 gates. Not a member of EJitSharedTaskPool: that object lives
-/// in the compile driver and is SHARED, so one core would arm the probe for
-/// cores that never qualified. Holding the pointer rather than a bool also
-/// rejects entries armed against a DIFFERENT blob, which the epoch cannot: a
-/// fresh blob starts from a low epoch a stale entry can match by coincidence.
-extern const void *gEJitL0State;
-
-inline bool dimsEqual(const EJitDimPair *a, const EJitDimPair *b,
-                      uint32_t numDims) {
-  for (uint32_t i = 0; i < numDims; ++i)
-    if (a[i].dimType != b[i].dimType || a[i].instanceId != b[i].instanceId)
-      return false;
-  return true;
-}
-
-/// Slot selection only; correctness never depends on this being injective.
-inline uint32_t ejitL0Index(uint32_t funcIndex, const EJitDimPair *dims,
-                            uint32_t numDims) {
-  uint32_t k = funcIndex * 2654435761u;
-  for (uint32_t i = 0; i < numDims; ++i)
-    k = (k ^ (dims[i].dimType * 2654435761u) ^ dims[i].instanceId) * 2654435761u;
-  return (k >> 26) & (kEJitL0Slots - 1);
-}
 
 class EJitSharedTaskPool {
 public:
@@ -325,12 +279,6 @@ public:
     // UAF. Auto-disable the cache while a releaser is wired. Production wires
     // no releaser, so the gate stays open and the cache is unconditionally safe.
     icacheReclamationSafe_ = (fn == nullptr);
-    if (fn) {
-      // The gate is evaluated at fill, so blocking new fills is not enough:
-      // entries armed earlier would keep serving code the releaser may free.
-      gEJitL0State = nullptr;
-      retireDispatchCache();
-    }
   }
   void setPrepareCodeCallback(PrepareCodeCallback fn, void *ctx) {
     prepareCodeFn_ = fn;
@@ -501,53 +449,6 @@ public:
   // a different identity fills a different cell. No-op when reclamation is not
   // safe, the function is unregistered (no base wired) or numDims mismatches,
   // funcIndex is out of range, or fnPtr is null.
-  /// Per-core L0 dispatch cache: serves the (funcIndex, dims) identity the
-  /// bucket lookup would resolve, skipping the rwlock and the 16-slot scan.
-  ///
-  /// A hit hands back a raw fnPtr with NO read token, so it runs under the
-  /// same gate as the inline cache (icacheReclamationSafe_): with a releaser
-  /// wired, code can be freed under the caller and the cache auto-disables.
-  /// Callers receive kEJitNoBucket, which releaseRead() ignores.
-  bool l0Try(uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
-             void **outFn) {
-    // Inline: an out-of-line call costs more than the probe it performs.
-    if (!state_ || gEJitL0State != state_ || numDims > kEJitSharedMaxDims)
-      return false;
-    EJitL0Entry &e = gEJitL0[ejitL0Index(funcIndex, dims, numDims)];
-
-    // Seqlock: core-private storage excludes other CORES, not preemption or
-    // interrupts on this one, which could otherwise leave a stale identity
-    // beside a new fnPtr. Signal fences suffice -- same-core ordering, not
-    // cross-core visibility.
-    const uint32_t s0 = e.seq;
-    if (s0 & 1u)
-      return false;
-    std::atomic_signal_fence(std::memory_order_acquire);
-
-    void *fn = e.fn;
-    const bool match = fn != nullptr && e.epoch == state_->dispatchEpoch.loadRelaxed() &&
-                       e.core == EJitCoreId::current() &&
-                       e.funcIndex == funcIndex && e.numDims == numDims &&
-                       dimsEqual(e.dims, dims, numDims);
-
-    std::atomic_signal_fence(std::memory_order_acquire);
-    if (e.seq != s0 || !match)
-      return false;
-
-    EJIT_STAT_INC(state_->counters.cacheHits);
-    *outFn = fn;
-    return true;
-  }
-
-  void l0Fill(uint32_t funcIndex, void *fnPtr, const EJitDimPair *dims,
-              uint32_t numDims);
-
-  /// Retire every core's L0. Must be called from every path that can
-  /// invalidate an (identity -> fnPtr) mapping from OUTSIDE the taskpool --
-  /// ejit_clear_cache(), ejit_invalidate(), a compile-mode change -- since
-  /// those bypass cachePublish() and setInstanceEnabled().
-  void retireDispatchCache();
-
   void icacheFill(uint32_t funcIndex, void *fnPtr, const EJitDimPair *dims,
                   uint32_t numDims);
 
