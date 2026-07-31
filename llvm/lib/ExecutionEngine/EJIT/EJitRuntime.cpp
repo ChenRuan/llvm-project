@@ -35,6 +35,11 @@ using namespace llvm::ejit;
 
 static EJit *gEJIT = nullptr;
 
+// Returned only by the shared-taskpool L0 path, which takes no bucket read
+// token. Keep the C-ABI sentinel independent of the shared-state header so a
+// private-taskpool build does not acquire a shared-only dependency.
+constexpr uint32_t kEJitRuntimeNoBucket = UINT32_MAX;
+
 #ifdef EJIT_FREESTANDING
 extern "C" uint64_t SRE_CycleCountGet64(void);
 #endif
@@ -381,7 +386,11 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
               funcName);
     return;
   }
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejitIcacheRegisterSlot(idx, slot, numDims);
+#else
+  (void)numDims;
+#endif
   EJIT_DIAG_VERBOSE("register_icache_slot OK name=%s idx=%u numDims=%u",
                     funcName, idx, numDims);
 }
@@ -578,6 +587,35 @@ inline void ejitIcacheFillOnSuccess(uint32_t funcIndex, void *fnPtr,
   (void)numDims;
 #endif
 }
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+inline bool ejitL0Try(EJitSharedTaskPool *tp, uint32_t funcIndex,
+                      const EJitDimPair *dims, uint32_t numDims, void **outFn) {
+  return tp->l0Try(funcIndex, dims, numDims, outFn);
+}
+
+inline uint32_t ejitL0Epoch(EJitSharedTaskPool *tp) {
+  return tp->dispatchEpoch();
+}
+
+inline void ejitL0Fill(EJitSharedTaskPool *tp, uint32_t funcIndex, void *fnPtr,
+                       const EJitDimPair *dims, uint32_t numDims,
+                       uint32_t expectedEpoch) {
+  tp->l0Fill(funcIndex, fnPtr, dims, numDims, expectedEpoch);
+}
+#else
+// L0 is a shared-taskpool optimization. Keep the private taskpool ABI on its
+// established bucket path without requiring methods it does not implement.
+inline bool ejitL0Try(EJitTaskPool *, uint32_t, const EJitDimPair *, uint32_t,
+                      void **) {
+  return false;
+}
+
+inline uint32_t ejitL0Epoch(EJitTaskPool *) { return 0; }
+
+inline void ejitL0Fill(EJitTaskPool *, uint32_t, void *, const EJitDimPair *,
+                       uint32_t, uint32_t) {}
+#endif
 } // namespace
 
 ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
@@ -637,11 +675,13 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
   // disabled instance never returns stale code. A true miss falls through to
   // compileOrGet unchanged (enqueue/dedup/compile).
   void *l0Fn = nullptr;
-  if (tp->l0Try(funcIndex, dimsCast, numDims, &l0Fn)) {
+  if (ejitL0Try(tp, funcIndex, dimsCast, numDims, &l0Fn)) {
     if (outFn) *outFn = l0Fn;
-    if (outBucket) *outBucket = kEJitNoBucket;
+    if (outBucket)
+      *outBucket = kEJitRuntimeNoBucket;
     return EJIT_OK;
   }
+  const uint32_t l0Epoch = ejitL0Epoch(tp);
   auto fast = tp->tryCacheHit(funcIndex, dimsCast, numDims);
   if (fast.fastPathTerminal) {
     if (outFn)
@@ -653,7 +693,7 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
                       fast.fnPtr);
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dimsCast, numDims);
     if (fast.fnPtr)
-      tp->l0Fill(funcIndex, fast.fnPtr, dimsCast, numDims);
+      ejitL0Fill(tp, funcIndex, fast.fnPtr, dimsCast, numDims, l0Epoch);
     return taskpoolStatus(fast.status);
   }
 
@@ -667,7 +707,7 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
                     funcIndex, static_cast<unsigned>(r.status), r.fnPtr);
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dimsCast, numDims);
   if (r.fnPtr)
-    tp->l0Fill(funcIndex, r.fnPtr, dimsCast, numDims);
+    ejitL0Fill(tp, funcIndex, r.fnPtr, dimsCast, numDims, l0Epoch);
   return taskpoolStatus(r.status);
 }
 
@@ -705,11 +745,13 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
     return EJIT_ERR_NOT_ACTIVE;
 
   void *l0Fn = nullptr;
-  if (tp->l0Try(funcIndex, nullptr, 0, &l0Fn)) {
+  if (ejitL0Try(tp, funcIndex, nullptr, 0, &l0Fn)) {
     if (outFn) *outFn = l0Fn;
-    if (outBucket) *outBucket = kEJitNoBucket;
+    if (outBucket)
+      *outBucket = kEJitRuntimeNoBucket;
     return EJIT_OK;
   }
+  const uint32_t l0Epoch = ejitL0Epoch(tp);
   auto fast = tp->tryCacheHit0D(funcIndex);
   if (fast.fastPathTerminal) {
     if (outFn)
@@ -717,6 +759,8 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
     if (outBucket)
       *outBucket = fast.bucketIndex;
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, nullptr, 0);
+    if (fast.fnPtr)
+      ejitL0Fill(tp, funcIndex, fast.fnPtr, nullptr, 0, l0Epoch);
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, nullptr, 0, /*fallback=*/nullptr);
@@ -726,7 +770,7 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, nullptr, 0);
   if (r.fnPtr)
-    tp->l0Fill(funcIndex, r.fnPtr, nullptr, 0);
+    ejitL0Fill(tp, funcIndex, r.fnPtr, nullptr, 0, l0Epoch);
   return taskpoolStatus(r.status);
 }
 
@@ -747,15 +791,16 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
 
   const EJitDimPair dims[1] = {{dim0, inst0}};
   // Per-core L0: steady-state hit with no rwlock, scan, or read token.
-  // kEJitNoBucket tells the caller no token was taken.
+  // kEJitRuntimeNoBucket tells the caller no token was taken.
   void *l0Fn = nullptr;
-  if (tp->l0Try(funcIndex, dims, 1, &l0Fn)) {
+  if (ejitL0Try(tp, funcIndex, dims, 1, &l0Fn)) {
     if (outFn)
       *outFn = l0Fn;
     if (outBucket)
-      *outBucket = kEJitNoBucket;
+      *outBucket = kEJitRuntimeNoBucket;
     return EJIT_OK;
   }
+  const uint32_t l0Epoch = ejitL0Epoch(tp);
   auto fast = tp->tryCacheHit1D(funcIndex, dim0, inst0);
   if (fast.fastPathTerminal) {
     if (outFn)
@@ -764,7 +809,7 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
       *outBucket = fast.bucketIndex;
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 1);
     if (fast.fnPtr)
-      tp->l0Fill(funcIndex, fast.fnPtr, dims, 1);
+      ejitL0Fill(tp, funcIndex, fast.fnPtr, dims, 1, l0Epoch);
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, dims, 1, /*fallback=*/nullptr);
@@ -774,7 +819,7 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 1);
   if (r.fnPtr)
-    tp->l0Fill(funcIndex, r.fnPtr, dims, 1);
+    ejitL0Fill(tp, funcIndex, r.fnPtr, dims, 1, l0Epoch);
   return taskpoolStatus(r.status);
 }
 
@@ -797,11 +842,13 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
 
   const EJitDimPair dims[2] = {{dim0, inst0}, {dim1, inst1}};
   void *l0Fn = nullptr;
-  if (tp->l0Try(funcIndex, dims, 2, &l0Fn)) {
+  if (ejitL0Try(tp, funcIndex, dims, 2, &l0Fn)) {
     if (outFn) *outFn = l0Fn;
-    if (outBucket) *outBucket = kEJitNoBucket;
+    if (outBucket)
+      *outBucket = kEJitRuntimeNoBucket;
     return EJIT_OK;
   }
+  const uint32_t l0Epoch = ejitL0Epoch(tp);
   auto fast = tp->tryCacheHit2D(funcIndex, dim0, inst0, dim1, inst1);
   if (fast.fastPathTerminal) {
     if (outFn)
@@ -810,7 +857,7 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
       *outBucket = fast.bucketIndex;
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 2);
     if (fast.fnPtr)
-      tp->l0Fill(funcIndex, fast.fnPtr, dims, 2);
+      ejitL0Fill(tp, funcIndex, fast.fnPtr, dims, 2, l0Epoch);
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, dims, 2, /*fallback=*/nullptr);
@@ -820,7 +867,7 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 2);
   if (r.fnPtr)
-    tp->l0Fill(funcIndex, r.fnPtr, dims, 2);
+    ejitL0Fill(tp, funcIndex, r.fnPtr, dims, 2, l0Epoch);
   return taskpoolStatus(r.status);
 }
 
@@ -845,11 +892,13 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
 
   const EJitDimPair dims[3] = {{dim0, inst0}, {dim1, inst1}, {dim2, inst2}};
   void *l0Fn = nullptr;
-  if (tp->l0Try(funcIndex, dims, 3, &l0Fn)) {
+  if (ejitL0Try(tp, funcIndex, dims, 3, &l0Fn)) {
     if (outFn) *outFn = l0Fn;
-    if (outBucket) *outBucket = kEJitNoBucket;
+    if (outBucket)
+      *outBucket = kEJitRuntimeNoBucket;
     return EJIT_OK;
   }
+  const uint32_t l0Epoch = ejitL0Epoch(tp);
   auto fast =
       tp->tryCacheHit3D(funcIndex, dim0, inst0, dim1, inst1, dim2, inst2);
   if (fast.fastPathTerminal) {
@@ -859,7 +908,7 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
       *outBucket = fast.bucketIndex;
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 3);
     if (fast.fnPtr)
-      tp->l0Fill(funcIndex, fast.fnPtr, dims, 3);
+      ejitL0Fill(tp, funcIndex, fast.fnPtr, dims, 3, l0Epoch);
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, dims, 3, /*fallback=*/nullptr);
@@ -869,7 +918,7 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 3);
   if (r.fnPtr)
-    tp->l0Fill(funcIndex, r.fnPtr, dims, 3);
+    ejitL0Fill(tp, funcIndex, r.fnPtr, dims, 3, l0Epoch);
   return taskpoolStatus(r.status);
 }
 
@@ -897,11 +946,13 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
   const EJitDimPair dims[4] = {
       {dim0, inst0}, {dim1, inst1}, {dim2, inst2}, {dim3, inst3}};
   void *l0Fn = nullptr;
-  if (tp->l0Try(funcIndex, dims, 4, &l0Fn)) {
+  if (ejitL0Try(tp, funcIndex, dims, 4, &l0Fn)) {
     if (outFn) *outFn = l0Fn;
-    if (outBucket) *outBucket = kEJitNoBucket;
+    if (outBucket)
+      *outBucket = kEJitRuntimeNoBucket;
     return EJIT_OK;
   }
+  const uint32_t l0Epoch = ejitL0Epoch(tp);
   auto fast = tp->tryCacheHit4D(funcIndex, dim0, inst0, dim1, inst1, dim2,
                                 inst2, dim3, inst3);
   if (fast.fastPathTerminal) {
@@ -911,7 +962,7 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
       *outBucket = fast.bucketIndex;
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 4);
     if (fast.fnPtr)
-      tp->l0Fill(funcIndex, fast.fnPtr, dims, 4);
+      ejitL0Fill(tp, funcIndex, fast.fnPtr, dims, 4, l0Epoch);
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, dims, 4, /*fallback=*/nullptr);
@@ -921,7 +972,7 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 4);
   if (r.fnPtr)
-    tp->l0Fill(funcIndex, r.fnPtr, dims, 4);
+    ejitL0Fill(tp, funcIndex, r.fnPtr, dims, 4, l0Epoch);
   return taskpoolStatus(r.status);
 }
 

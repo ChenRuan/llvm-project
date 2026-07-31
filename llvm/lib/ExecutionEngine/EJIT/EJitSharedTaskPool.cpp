@@ -17,10 +17,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
-#include <atomic>
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
-#include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
+#include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -269,15 +268,41 @@ bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
 // Per-core L0 dispatch cache
 //
 // A direct-mapped table in core-private memory, in front of the bucket lookup.
-// A hit is a key compare plus one read of the shared dispatchEpoch: no atomics,
-// no scan, no cache-line ownership transfer.
+// A hit is a full identity compare plus one read of the shared dispatchEpoch:
+// only atomic loads, no RMW, no scan, and no cache-line ownership transfer.
 //
 // Invalidation is coarse on purpose -- any epoch bump retires every core's
 // whole table. Publishes cluster in warm-up and then stop, so the epoch is
 // stable in steady state and entries only miss while warming.
 //===----------------------------------------------------------------------===//
 EJitL0Entry llvm::ejit::gEJitL0[kEJitL0Slots];
-const void *llvm::ejit::gEJitL0State = nullptr;
+EJitAtomicUPtr llvm::ejit::gEJitL0State;
+EJitAtomicU32 llvm::ejit::gEJitL0Writer;
+
+namespace {
+void clearL0Entry(EJitL0Entry &entry) {
+  const uint32_t seq = entry.seq.loadRelaxed();
+  entry.seq.storeRelease(seq | 1u);
+  entry.epoch.storeRelaxed(0);
+  entry.core.storeRelaxed(kEJitInvalidCoreId);
+  entry.funcIndex.storeRelaxed(0);
+  entry.numDims.storeRelaxed(0);
+  for (uint32_t i = 0; i < kEJitSharedMaxDims; ++i)
+    entry.dims[i].storeRelaxed(0);
+  entry.fn.storeRelaxed(0);
+  entry.seq.storeRelease((seq | 1u) + 1u);
+}
+} // namespace
+
+void llvm::ejit::ejitL0ClearLocal() {
+  uint32_t unlocked = 0;
+  if (!gEJitL0Writer.compareExchange(unlocked, 1))
+    return;
+  gEJitL0State.storeRelease(0);
+  for (uint32_t i = 0; i < kEJitL0Slots; ++i)
+    clearL0Entry(gEJitL0[i]);
+  gEJitL0Writer.storeRelease(0);
+}
 
 void EJitSharedTaskPool::retireDispatchCache() {
   if (state_)
@@ -285,7 +310,8 @@ void EJitSharedTaskPool::retireDispatchCache() {
 }
 
 void EJitSharedTaskPool::l0Fill(uint32_t funcIndex, void *fnPtr,
-                                const EJitDimPair *dims, uint32_t numDims) {
+                                const EJitDimPair *dims, uint32_t numDims,
+                                uint32_t expectedEpoch) {
   if (!icacheReclamationSafe_ || !state_ || !fnPtr)
     return;
   if (numDims > kEJitSharedMaxDims)
@@ -296,27 +322,50 @@ void EJitSharedTaskPool::l0Fill(uint32_t funcIndex, void *fnPtr,
   if (EJitCoreId::current() != state_->ownerCoreId.loadRelaxed())
     return;
 #endif
-  gEJitL0State = state_;
+
+  // Same-core task preemption can nest a fill. Never spin here: skipping one
+  // population only sends the next dispatch through the authoritative shared
+  // cache. The successful writer owns all entry mutation until release.
+  uint32_t unlocked = 0;
+  if (!gEJitL0Writer.compareExchange(unlocked, 1))
+    return;
+
+  const uintptr_t stateTag = reinterpret_cast<uintptr_t>(state_);
+  if (gEJitL0State.loadAcquire() != stateTag) {
+    // Disarm before clearing so a preempting reader cannot consume an entry
+    // from the previous shared blob under the new blob's epoch.
+    gEJitL0State.storeRelease(0);
+    for (uint32_t i = 0; i < kEJitL0Slots; ++i)
+      clearL0Entry(gEJitL0[i]);
+    gEJitL0State.storeRelease(stateTag);
+  }
+
   EJitL0Entry &e = gEJitL0[ejitL0Index(funcIndex, dims, numDims)];
 
-  // Read the epoch BEFORE publishing, so a bump racing the fill leaves a stale
-  // epoch (a miss), never a fresh epoch on a stale pointer.
-  const uint32_t epoch = state_->dispatchEpoch.loadAcquire();
+  // The token was captured before the authoritative bucket lookup. If any
+  // publish/version/invalidation raced that lookup, never re-arm an old result
+  // under the new epoch. The next call simply uses the shared cache again.
+  if (expectedEpoch == 0 ||
+      state_->dispatchEpoch.loadAcquire() != expectedEpoch) {
+    gEJitL0Writer.storeRelease(0);
+    return;
+  }
 
-  // Seqlock writer: odd while the payload is inconsistent.
-  e.seq = e.seq + 1u;
-  std::atomic_signal_fence(std::memory_order_release);
-
-  e.fn = fnPtr;
-  e.core = EJitCoreId::current();
-  e.funcIndex = funcIndex;
-  e.numDims = numDims;
+  // Atomic seqlock writer: odd while the payload is inconsistent. Payload
+  // fields are atomic as well, so a preempting reader has no C++ data race.
+  const uint32_t seq = e.seq.loadRelaxed();
+  e.seq.storeRelease(seq | 1u);
+  e.fn.storeRelaxed(reinterpret_cast<uintptr_t>(fnPtr));
+  e.core.storeRelaxed(EJitCoreId::current());
+  e.funcIndex.storeRelaxed(funcIndex);
+  e.numDims.storeRelaxed(numDims);
   for (uint32_t i = 0; i < numDims; ++i)
-    e.dims[i] = dims[i];
-  e.epoch = epoch;
-
-  std::atomic_signal_fence(std::memory_order_release);
-  e.seq = e.seq + 1u;
+    e.dims[i].storeRelaxed(ejitL0PackDim(dims[i]));
+  for (uint32_t i = numDims; i < kEJitSharedMaxDims; ++i)
+    e.dims[i].storeRelaxed(0);
+  e.epoch.storeRelaxed(expectedEpoch);
+  e.seq.storeRelease((seq | 1u) + 1u);
+  gEJitL0Writer.storeRelease(0);
 }
 
 void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
@@ -1437,7 +1486,8 @@ namespace {
 // activated via ejit_activate before the JIT will compile it. This matches
 // the non-shared EJitRuntimeState::isActive default (no entry => inactive).
 // setInstanceEnabled(true) flips 0->1 and bumps version on first activate.
-void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
+void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
+                       uint32_t nextDispatchEpoch) {
   for (uint32_t d = 0; d < kEJitSharedDimTypes; ++d)
     for (uint32_t i = 0; i < kEJitSharedInstances; ++i) {
       st->enabled[d][i].storeRelaxed(0);
@@ -1445,14 +1495,10 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
     }
   st->mode.storeRelaxed(mode);
   st->anyInstanceActivated.storeRelaxed(0);
-  // dispatchEpoch is BUMPED, never reset. A per-core L0 entry filled under a
-  // previous pool instance must not validate under this one, and the entries
-  // outlive the shared blob (they live in core-private memory). Monotonic
-  // bumping guarantees the mismatch; resetting to a fixed value would let a
-  // stale entry match again after a re-init. On a genuinely fresh blob the
-  // starting value is arbitrary, which is harmless: the L0 tables are zeroed
-  // BSS and l0Key() never returns 0, so no entry can match anyway.
-  st->dispatchEpoch.fetchAdd(1);
+  // Preserve monotonic invalidation across re-initialization. The caller reads
+  // the old value before this field-by-field reset; fresh shared storage must
+  // be zero-filled, just like initState and generation.
+  st->dispatchEpoch.storeRelaxed(nextDispatchEpoch);
   for (uint32_t i = 0; i < kEJitSharedMaxFuncIndex; ++i)
     st->inFlight[i].storeRelaxed(0);
   for (uint32_t i = 0; i < kEJitSharedQueueSlots; ++i) {
@@ -1564,7 +1610,11 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       // We are the owner. Build the whole blob, then publish Ready LAST.
       uint32_t self = EJitCoreId::current();
       uint32_t nextGen = state_->generation.loadRelaxed() + 1;
-      initSharedStorage(state_, static_cast<uint32_t>(configuredMode_));
+      uint32_t nextDispatchEpoch = state_->dispatchEpoch.loadRelaxed() + 1;
+      if (nextDispatchEpoch == 0)
+        nextDispatchEpoch = 1;
+      initSharedStorage(state_, static_cast<uint32_t>(configuredMode_),
+                        nextDispatchEpoch);
       state_->generation.storeRelease(nextGen);
       state_->ownerCoreId.storeRelease(self);
       state_->codeSharingEnabled.storeRelease(codeSharingEnabled_ ? 1u : 0u);
@@ -1653,7 +1703,7 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
 void EJitSharedTaskPool::ownerShutdown() {
   // Disarm this core's L0: its entries hold code pointers about to become
   // invalid. Peers stay armed but cannot match after the epoch bump below.
-  gEJitL0State = nullptr;
+  gEJitL0State.storeRelease(0);
   if (state_)
     state_->dispatchEpoch.fetchAdd(1);
   if (!state_ || !isOwner_)

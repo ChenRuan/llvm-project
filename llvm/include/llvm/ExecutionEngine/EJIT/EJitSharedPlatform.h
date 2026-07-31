@@ -71,7 +71,10 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// the optional EJIT_SRE_TASKPOOL_NO_RECLAIM seqlock reader.
 /// v7: full IR/ASM payloads are worker-local again; shared dump state contains
 /// only a bounded filter and latest-capture metadata. publishSeq is unchanged.
-constexpr uint32_t kEJitSharedAbiVersion = 7u;
+/// v8: shared state gains dispatchEpoch for the hardened per-core L0 dispatch
+/// cache. Older owners do not maintain this invalidation protocol, so peers
+/// must reject a mixed-version blob even though the field fits old padding.
+constexpr uint32_t kEJitSharedAbiVersion = 8u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

@@ -34,7 +34,6 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h" // EJitCompileMode, status enum
-#include <atomic>
 #include <cstdint>
 
 namespace llvm {
@@ -143,16 +142,20 @@ void ejitIcacheRegisterSlot(uint32_t funcIndex, void *base, uint32_t numDims);
 /// One L0 slot, sized to a cache line. The identity is stored in full and
 /// re-checked on every hit, because the index hash is not injective: it selects
 /// a slot and nothing more, so a collision must evict, never answer.
-struct EJitL0Entry {
-  uint32_t seq; ///< even = stable, odd = mid-write
-  uint32_t epoch;
-  uint32_t core;
-  uint32_t funcIndex;
-  uint32_t numDims;
-  EJitDimPair dims[kEJitSharedMaxDims];
-  void *fn; ///< null = empty
+struct alignas(kEJitSharedCacheLine) EJitL0Entry {
+  EJitAtomicU32 seq; ///< even = stable, odd = mid-write
+  EJitAtomicU32 epoch;
+  EJitAtomicU32 core;
+  EJitAtomicU32 funcIndex;
+  EJitAtomicU32 numDims;
+  /// Each element preserves the full (dimType, instanceId) identity while
+  /// keeping one L0 entry exactly one cache line.
+  EJitAtomicU64 dims[kEJitSharedMaxDims];
+  EJitAtomicUPtr fn; ///< zero = empty
 };
 constexpr uint32_t kEJitL0Slots = 64; // 4KB/core
+static_assert(sizeof(EJitL0Entry) == kEJitSharedCacheLine,
+              "one L0 entry must occupy exactly one cache line");
 
 // The two globals below are core-private: deliberately NOT in
 // EJIT_SHARED_SECTION_ATTR, so each core's image holds its own copy and
@@ -165,12 +168,24 @@ extern EJitL0Entry gEJitL0[kEJitL0Slots];
 /// cores that never qualified. Holding the pointer rather than a bool also
 /// rejects entries armed against a DIFFERENT blob, which the epoch cannot: a
 /// fresh blob starts from a low epoch a stale entry can match by coincidence.
-extern const void *gEJitL0State;
+extern EJitAtomicUPtr gEJitL0State;
 
-inline bool dimsEqual(const EJitDimPair *a, const EJitDimPair *b,
-                      uint32_t numDims) {
+/// Serializes fills and table re-arming against same-core task preemption.
+/// A contending fill simply skips L0 population; the shared cache remains the
+/// authoritative fallback, so this lock is never spun on the dispatch path.
+extern EJitAtomicU32 gEJitL0Writer;
+
+/// Clear this core's L0 table and disarm it from any shared-state blob.
+void ejitL0ClearLocal();
+
+inline uint64_t ejitL0PackDim(const EJitDimPair &dim) {
+  return (static_cast<uint64_t>(dim.dimType) << 32) | dim.instanceId;
+}
+
+inline bool l0DimsEqual(const EJitL0Entry &entry, const EJitDimPair *dims,
+                        uint32_t numDims) {
   for (uint32_t i = 0; i < numDims; ++i)
-    if (a[i].dimType != b[i].dimType || a[i].instanceId != b[i].instanceId)
+    if (entry.dims[i].loadRelaxed() != ejitL0PackDim(dims[i]))
       return false;
   return true;
 }
@@ -328,7 +343,7 @@ public:
     if (fn) {
       // The gate is evaluated at fill, so blocking new fills is not enough:
       // entries armed earlier would keep serving code the releaser may free.
-      gEJitL0State = nullptr;
+      gEJitL0State.storeRelease(0);
       retireDispatchCache();
     }
   }
@@ -511,36 +526,42 @@ public:
   bool l0Try(uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
              void **outFn) {
     // Inline: an out-of-line call costs more than the probe it performs.
-    if (!state_ || gEJitL0State != state_ || numDims > kEJitSharedMaxDims)
+    if (!state_ || numDims > kEJitSharedMaxDims || !outFn ||
+        gEJitL0State.loadAcquire() != reinterpret_cast<uintptr_t>(state_))
       return false;
     EJitL0Entry &e = gEJitL0[ejitL0Index(funcIndex, dims, numDims)];
 
-    // Seqlock: core-private storage excludes other CORES, not preemption or
-    // interrupts on this one, which could otherwise leave a stale identity
-    // beside a new fnPtr. Signal fences suffice -- same-core ordering, not
-    // cross-core visibility.
-    const uint32_t s0 = e.seq;
+    // Every payload field is atomic: the sequence check rejects a torn
+    // snapshot, while the atomic payload accesses keep the protocol defined
+    // even when a same-core task/interrupt preempts the reader with a fill.
+    const uint32_t s0 = e.seq.loadAcquire();
     if (s0 & 1u)
       return false;
-    std::atomic_signal_fence(std::memory_order_acquire);
 
-    void *fn = e.fn;
-    const bool match = fn != nullptr && e.epoch == state_->dispatchEpoch.loadRelaxed() &&
-                       e.core == EJitCoreId::current() &&
-                       e.funcIndex == funcIndex && e.numDims == numDims &&
-                       dimsEqual(e.dims, dims, numDims);
+    const uintptr_t fn = e.fn.loadRelaxed();
+    const bool match =
+        fn != 0 &&
+        e.epoch.loadRelaxed() == state_->dispatchEpoch.loadAcquire() &&
+        e.core.loadRelaxed() == EJitCoreId::current() &&
+        e.funcIndex.loadRelaxed() == funcIndex &&
+        e.numDims.loadRelaxed() == numDims && l0DimsEqual(e, dims, numDims);
 
-    std::atomic_signal_fence(std::memory_order_acquire);
-    if (e.seq != s0 || !match)
+    if (e.seq.loadAcquire() != s0 || !match)
       return false;
 
     EJIT_STAT_INC(state_->counters.cacheHits);
-    *outFn = fn;
+    *outFn = reinterpret_cast<void *>(fn);
     return true;
   }
 
   void l0Fill(uint32_t funcIndex, void *fnPtr, const EJitDimPair *dims,
-              uint32_t numDims);
+              uint32_t numDims, uint32_t expectedEpoch);
+
+  /// Snapshot taken immediately before the authoritative shared-cache lookup.
+  /// l0Fill accepts the result only while this epoch is still current.
+  uint32_t dispatchEpoch() const {
+    return state_ ? state_->dispatchEpoch.loadAcquire() : 0;
+  }
 
   /// Retire every core's L0. Must be called from every path that can
   /// invalidate an (identity -> fnPtr) mapping from OUTSIDE the taskpool --

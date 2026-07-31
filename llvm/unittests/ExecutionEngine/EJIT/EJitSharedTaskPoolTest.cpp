@@ -1594,12 +1594,12 @@ TEST_F(SharedTaskPoolTest, FourKGenerationChangeDuringPrepareNotReturned) {
   EXPECT_TRUE(r.readyButNotShareable);
 }
 
-// 16/17 ABI v7 layout: the slot carries the executable range as fixed-width,
+// 16/17 ABI v8 layout: the slot carries the executable range as fixed-width,
 // naturally-aligned scalars (read back by value — endian-safe), the pool-split
 // table is POD, dump state contains metadata only, and each bucket carries the
 // NO_RECLAIM seqlock publishSeq word.
 TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
-  EXPECT_EQ(kEJitSharedAbiVersion, 7u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 8u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -2770,11 +2770,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheMultiVersion) {
 namespace {
 /// Process-globals standing in for core-private storage: no test may inherit
 /// them from the one before it.
-void resetL0ForTest() {
-  for (uint32_t i = 0; i < kEJitL0Slots; ++i)
-    gEJitL0[i] = EJitL0Entry{};
-  gEJitL0State = nullptr;
-}
+void resetL0ForTest() { ejitL0ClearLocal(); }
 } // namespace
 
 TEST_F(SharedTaskPoolTest, L0ServesARepeatDispatch) {
@@ -2787,7 +2783,7 @@ TEST_F(SharedTaskPoolTest, L0ServesARepeatDispatch) {
   void *out = nullptr;
   EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out)) << "cold table must miss";
 
-  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1, pool.dispatchEpoch());
   EXPECT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
   EXPECT_EQ(out, codeFor(kFunc));
 
@@ -2804,13 +2800,13 @@ TEST_F(SharedTaskPoolTest, L0RetiredByPublishAndByVersionChange) {
   const EJitDimPair dims[1] = {{0, 1}};
   void *out = nullptr;
 
-  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1, pool.dispatchEpoch());
   ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
 
   publish(pool, 9);
   EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out)) << "publish must retire the L0";
 
-  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1, pool.dispatchEpoch());
   ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
 
   // L0 entries carry no version of their own.
@@ -2827,13 +2823,50 @@ TEST_F(SharedTaskPoolTest, L0RetiredByExplicitFlush) {
   const EJitDimPair dims[1] = {{0, 1}};
   void *out = nullptr;
 
-  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1, pool.dispatchEpoch());
   ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
 
   // ejit_clear_cache() / ejit_invalidate() / a compile-mode change reach the
   // L0 only through this hook.
   pool.retireDispatchCache();
   EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out));
+}
+
+TEST_F(SharedTaskPoolTest, L0RejectsResultResolvedBeforeEpochChange) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 5;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  // Model the C-ABI race: an authoritative cache lookup resolves fnPtr, then
+  // activation/invalidation changes the epoch before the L0 fill executes.
+  const uint32_t lookupEpoch = pool.dispatchEpoch();
+  pool.retireDispatchCache();
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1, lookupEpoch);
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out))
+      << "an old lookup result must not be tagged with the new epoch";
+}
+
+TEST_F(SharedTaskPoolTest, L0NestedWriterSkipsFillWithoutCorruptingEntry) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 5;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  // Model a same-core task/interrupt entering l0Fill while another fill is
+  // preempted. The nested writer never spins and leaves the table untouched.
+  gEJitL0Writer.storeRelease(1);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1, pool.dispatchEpoch());
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out));
+  gEJitL0Writer.storeRelease(0);
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1, pool.dispatchEpoch());
+  EXPECT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+  EXPECT_EQ(out, codeFor(kFunc));
 }
 
 TEST_F(SharedTaskPoolTest, L0EntryIsNotServedToAnotherCore) {
@@ -2845,7 +2878,7 @@ TEST_F(SharedTaskPoolTest, L0EntryIsNotServedToAnotherCore) {
   void *out = nullptr;
 
   EJitCoreId::setCurrentForTest(0);
-  owner.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  owner.l0Fill(kFunc, codeFor(kFunc), dims, 1, owner.dispatchEpoch());
   ASSERT_TRUE(owner.l0Try(kFunc, dims, 1, &out));
 
   // Cannot arise on hardware (core-private table), but can where cores are
@@ -2866,9 +2899,9 @@ TEST_F(SharedTaskPoolTest, L0DoesNotSurviveANewSharedBlob) {
 
   EJitSharedTaskPool pool;
   bringUpOwner(pool);
-  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1, pool.dispatchEpoch());
   ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
-  ASSERT_NE(gEJitL0State, nullptr);
+  ASSERT_NE(gEJitL0State.loadAcquire(), 0u);
 
   // The table outlives the shared blob. A fresh blob starts from a low
   // dispatchEpoch, so the epoch alone cannot separate the two instances -- the
@@ -2893,7 +2926,7 @@ TEST_F(SharedTaskPoolTest, L0DoesNotSurviveAReInitialization) {
 
   EJitSharedTaskPool pool;
   bringUpOwner(pool);
-  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1, pool.dispatchEpoch());
   ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
 
   // Same blob, torn down and stood back up: entries still point into a code
@@ -2906,7 +2939,7 @@ TEST_F(SharedTaskPoolTest, L0DoesNotSurviveAReInitialization) {
       << "an entry from the previous pool instance must not validate";
 
   // ...and the cache re-arms normally afterwards.
-  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1, pool.dispatchEpoch());
   EXPECT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
 }
 
@@ -2921,7 +2954,7 @@ TEST_F(SharedTaskPoolTest, L0RefusesToArmWhileAReleaserIsWired) {
   // With a releaser wired, code can be freed under a caller, and an L0 hit
   // carries no read token. Same gate the inline cache uses.
   pool.setReleaser([](void *, void *) {}, nullptr);
-  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1, pool.dispatchEpoch());
   EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out));
 }
 
@@ -2935,7 +2968,7 @@ TEST_F(SharedTaskPoolTest, L0EntriesAreRetiredWhenAReleaserIsWiredLater) {
   const EJitDimPair dims[1] = {{0, 1}};
   void *out = nullptr;
 
-  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1, pool.dispatchEpoch());
   ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
 
   pool.setReleaser([](void *, void *) {}, nullptr);
@@ -2965,20 +2998,21 @@ TEST_F(SharedTaskPoolTest, L0PartiallyWrittenEntryIsNotServed) {
   const EJitDimPair a[1] = {{0, 1}};
   void *out = nullptr;
 
-  pool.l0Fill(20, codeFor(20), a, 1);
+  pool.l0Fill(20, codeFor(20), a, 1, pool.dispatchEpoch());
   ASSERT_TRUE(pool.l0Try(20, a, 1, &out));
   ASSERT_EQ(out, codeFor(20));
 
   // The interleaving a preempted fill leaves: odd sequence, fnPtr replaced,
   // identity not yet updated.
   EJitL0Entry &e = gEJitL0[ejitL0Index(20, a, 1)];
-  e.seq = e.seq + 1u;
-  e.fn = codeFor(21);
+  uint32_t seq = e.seq.loadRelaxed();
+  e.seq.storeRelease(seq | 1u);
+  e.fn.storeRelaxed(reinterpret_cast<uintptr_t>(codeFor(21)));
 
   EXPECT_FALSE(pool.l0Try(20, a, 1, &out))
       << "a half-written entry must not be served";
 
-  e.seq = e.seq + 1u; // writer completes
+  e.seq.storeRelease((seq | 1u) + 1u); // writer completes
   EXPECT_TRUE(pool.l0Try(20, a, 1, &out));
 }
 
@@ -3001,8 +3035,9 @@ TEST_F(SharedTaskPoolTest, L0CollidingIdentitiesNeverCrossServe) {
   }
   ASSERT_TRUE(found) << "no colliding identity found in the instance space";
 
-  pool.l0Fill(30, codeFor(30), a, 1);
-  pool.l0Fill(30, codeFor(31), b, 1); // evicts a from the shared slot
+  pool.l0Fill(30, codeFor(30), a, 1, pool.dispatchEpoch());
+  pool.l0Fill(30, codeFor(31), b, 1,
+              pool.dispatchEpoch()); // evicts a from the shared slot
 
   EXPECT_FALSE(pool.l0Try(30, a, 1, &out))
       << "the evicted identity must miss, not receive the evictor's pointer";
@@ -3013,8 +3048,8 @@ TEST_F(SharedTaskPoolTest, L0CollidingIdentitiesNeverCrossServe) {
   resetL0ForTest();
   const EJitDimPair c[1] = {{0, 31}};
   const EJitDimPair d[1] = {{1, 0}};
-  pool.l0Fill(30, codeFor(32), c, 1);
-  pool.l0Fill(30, codeFor(33), d, 1);
+  pool.l0Fill(30, codeFor(32), c, 1, pool.dispatchEpoch());
+  pool.l0Fill(30, codeFor(33), d, 1, pool.dispatchEpoch());
   if (pool.l0Try(30, c, 1, &out))
     EXPECT_EQ(out, codeFor(32)) << "(0,31) served (1,0)'s specialization";
   if (pool.l0Try(30, d, 1, &out))
@@ -3023,8 +3058,8 @@ TEST_F(SharedTaskPoolTest, L0CollidingIdentitiesNeverCrossServe) {
   // Same funcIndex, differing arity must not alias.
   resetL0ForTest();
   const EJitDimPair two[2] = {{0, 31}, {0, 0}};
-  pool.l0Fill(30, codeFor(34), c, 1);
-  pool.l0Fill(30, codeFor(35), two, 2);
+  pool.l0Fill(30, codeFor(34), c, 1, pool.dispatchEpoch());
+  pool.l0Fill(30, codeFor(35), two, 2, pool.dispatchEpoch());
   if (pool.l0Try(30, c, 1, &out))
     EXPECT_EQ(out, codeFor(34)) << "1D identity served a 2D entry";
   if (pool.l0Try(30, two, 2, &out))
@@ -3032,8 +3067,8 @@ TEST_F(SharedTaskPoolTest, L0CollidingIdentitiesNeverCrossServe) {
 
   // Different funcIndex, identical dims must not alias.
   resetL0ForTest();
-  pool.l0Fill(30, codeFor(36), c, 1);
-  pool.l0Fill(31, codeFor(37), c, 1);
+  pool.l0Fill(30, codeFor(36), c, 1, pool.dispatchEpoch());
+  pool.l0Fill(31, codeFor(37), c, 1, pool.dispatchEpoch());
   if (pool.l0Try(30, c, 1, &out))
     EXPECT_NE(out, codeFor(37)) << "funcIndex 30 served funcIndex 31's entry";
 }
