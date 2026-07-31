@@ -451,24 +451,14 @@ void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn) {
 
 void ejit_clear_cache(void) {
   EJIT_DIAG("clear_cache");
-  if (!gEJIT)
-    return;
-  gEJIT->clearCache();
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (auto *tp = gEJIT->sharedTaskPool())
-    tp->retireDispatchCache();
-#endif
+  if (gEJIT)
+    gEJIT->clearCache();
 }
 
 void ejit_invalidate(const char *periodName, uint8_t cellIdx) {
   EJIT_DIAG("invalidate(%s,%u)", periodName, cellIdx);
-  if (!gEJIT)
-    return;
-  gEJIT->invalidateByPeriod(periodName, cellIdx);
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (auto *tp = gEJIT->sharedTaskPool())
-    tp->retireDispatchCache();
-#endif
+  if (gEJIT)
+    gEJIT->invalidateByPeriod(periodName, cellIdx);
 }
 
 ejit_status_t ejit_get_stats(ejit_stats_t *stats) {
@@ -495,16 +485,11 @@ const ejit_error_t *ejit_get_last_error(void) {
 
 void ejit_set_compile_mode(ejit_compile_mode_t mode) {
   EJIT_DIAG("set_compile_mode mode=%u", static_cast<unsigned>(mode));
-  if (!gEJIT) {
+  if (gEJIT)
+    (void)gEJIT->setCompileMode(mode == EJIT_COMPILE_ASYNC ? CompileMode::Async
+                                                           : CompileMode::Sync);
+  else
     EJIT_DIAG("set_compile_mode reject: not initialized");
-    return;
-  }
-  (void)gEJIT->setCompileMode(mode == EJIT_COMPILE_ASYNC ? CompileMode::Async
-                                                        : CompileMode::Sync);
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (auto *tp = gEJIT->sharedTaskPool())
-    tp->retireDispatchCache();
-#endif
 }
 
 ejit_compile_mode_t ejit_get_compile_mode(void) {
@@ -636,12 +621,6 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
   // so a hit still hands back outBucket for ejit_taskpool_release_read and a
   // disabled instance never returns stale code. A true miss falls through to
   // compileOrGet unchanged (enqueue/dedup/compile).
-  void *l0Fn = nullptr;
-  if (tp->l0Try(funcIndex, dimsCast, numDims, &l0Fn)) {
-    if (outFn) *outFn = l0Fn;
-    if (outBucket) *outBucket = kEJitNoBucket;
-    return EJIT_OK;
-  }
   auto fast = tp->tryCacheHit(funcIndex, dimsCast, numDims);
   if (fast.fastPathTerminal) {
     if (outFn)
@@ -652,8 +631,6 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
                       funcIndex, static_cast<unsigned>(fast.status),
                       fast.fnPtr);
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dimsCast, numDims);
-    if (fast.fnPtr)
-      tp->l0Fill(funcIndex, fast.fnPtr, dimsCast, numDims);
     return taskpoolStatus(fast.status);
   }
 
@@ -666,8 +643,6 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
   EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u status=%u fn=%p",
                     funcIndex, static_cast<unsigned>(r.status), r.fnPtr);
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dimsCast, numDims);
-  if (r.fnPtr)
-    tp->l0Fill(funcIndex, r.fnPtr, dimsCast, numDims);
   return taskpoolStatus(r.status);
 }
 
@@ -704,12 +679,6 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
 
-  void *l0Fn = nullptr;
-  if (tp->l0Try(funcIndex, nullptr, 0, &l0Fn)) {
-    if (outFn) *outFn = l0Fn;
-    if (outBucket) *outBucket = kEJitNoBucket;
-    return EJIT_OK;
-  }
   auto fast = tp->tryCacheHit0D(funcIndex);
   if (fast.fastPathTerminal) {
     if (outFn)
@@ -725,8 +694,6 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
   if (outBucket)
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, nullptr, 0);
-  if (r.fnPtr)
-    tp->l0Fill(funcIndex, r.fnPtr, nullptr, 0);
   return taskpoolStatus(r.status);
 }
 
@@ -746,16 +713,6 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
     return EJIT_ERR_INVALID_PARAM;
 
   const EJitDimPair dims[1] = {{dim0, inst0}};
-  // Per-core L0: steady-state hit with no rwlock, scan, or read token.
-  // kEJitNoBucket tells the caller no token was taken.
-  void *l0Fn = nullptr;
-  if (tp->l0Try(funcIndex, dims, 1, &l0Fn)) {
-    if (outFn)
-      *outFn = l0Fn;
-    if (outBucket)
-      *outBucket = kEJitNoBucket;
-    return EJIT_OK;
-  }
   auto fast = tp->tryCacheHit1D(funcIndex, dim0, inst0);
   if (fast.fastPathTerminal) {
     if (outFn)
@@ -763,8 +720,6 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
     if (outBucket)
       *outBucket = fast.bucketIndex;
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 1);
-    if (fast.fnPtr)
-      tp->l0Fill(funcIndex, fast.fnPtr, dims, 1);
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, dims, 1, /*fallback=*/nullptr);
@@ -773,8 +728,6 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
   if (outBucket)
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 1);
-  if (r.fnPtr)
-    tp->l0Fill(funcIndex, r.fnPtr, dims, 1);
   return taskpoolStatus(r.status);
 }
 
@@ -796,12 +749,6 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
     return EJIT_ERR_INVALID_PARAM;
 
   const EJitDimPair dims[2] = {{dim0, inst0}, {dim1, inst1}};
-  void *l0Fn = nullptr;
-  if (tp->l0Try(funcIndex, dims, 2, &l0Fn)) {
-    if (outFn) *outFn = l0Fn;
-    if (outBucket) *outBucket = kEJitNoBucket;
-    return EJIT_OK;
-  }
   auto fast = tp->tryCacheHit2D(funcIndex, dim0, inst0, dim1, inst1);
   if (fast.fastPathTerminal) {
     if (outFn)
@@ -809,8 +756,6 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
     if (outBucket)
       *outBucket = fast.bucketIndex;
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 2);
-    if (fast.fnPtr)
-      tp->l0Fill(funcIndex, fast.fnPtr, dims, 2);
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, dims, 2, /*fallback=*/nullptr);
@@ -819,8 +764,6 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
   if (outBucket)
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 2);
-  if (r.fnPtr)
-    tp->l0Fill(funcIndex, r.fnPtr, dims, 2);
   return taskpoolStatus(r.status);
 }
 
@@ -844,12 +787,6 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
     return EJIT_ERR_INVALID_PARAM;
 
   const EJitDimPair dims[3] = {{dim0, inst0}, {dim1, inst1}, {dim2, inst2}};
-  void *l0Fn = nullptr;
-  if (tp->l0Try(funcIndex, dims, 3, &l0Fn)) {
-    if (outFn) *outFn = l0Fn;
-    if (outBucket) *outBucket = kEJitNoBucket;
-    return EJIT_OK;
-  }
   auto fast =
       tp->tryCacheHit3D(funcIndex, dim0, inst0, dim1, inst1, dim2, inst2);
   if (fast.fastPathTerminal) {
@@ -858,8 +795,6 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
     if (outBucket)
       *outBucket = fast.bucketIndex;
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 3);
-    if (fast.fnPtr)
-      tp->l0Fill(funcIndex, fast.fnPtr, dims, 3);
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, dims, 3, /*fallback=*/nullptr);
@@ -868,8 +803,6 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
   if (outBucket)
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 3);
-  if (r.fnPtr)
-    tp->l0Fill(funcIndex, r.fnPtr, dims, 3);
   return taskpoolStatus(r.status);
 }
 
@@ -896,12 +829,6 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
 
   const EJitDimPair dims[4] = {
       {dim0, inst0}, {dim1, inst1}, {dim2, inst2}, {dim3, inst3}};
-  void *l0Fn = nullptr;
-  if (tp->l0Try(funcIndex, dims, 4, &l0Fn)) {
-    if (outFn) *outFn = l0Fn;
-    if (outBucket) *outBucket = kEJitNoBucket;
-    return EJIT_OK;
-  }
   auto fast = tp->tryCacheHit4D(funcIndex, dim0, inst0, dim1, inst1, dim2,
                                 inst2, dim3, inst3);
   if (fast.fastPathTerminal) {
@@ -910,8 +837,6 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
     if (outBucket)
       *outBucket = fast.bucketIndex;
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 4);
-    if (fast.fnPtr)
-      tp->l0Fill(funcIndex, fast.fnPtr, dims, 4);
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, dims, 4, /*fallback=*/nullptr);
@@ -920,8 +845,6 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
   if (outBucket)
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 4);
-  if (r.fnPtr)
-    tp->l0Fill(funcIndex, r.fnPtr, dims, 4);
   return taskpoolStatus(r.status);
 }
 
