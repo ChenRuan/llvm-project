@@ -28,11 +28,12 @@
 // This is the post-link "assembly" view of the branch instructions, obtained
 // directly from inside JITLink - no separate dump-then-disassemble roundtrip,
 // and no MCDisassembler dependency (which is trimmed out of the embedded
-// build). Output goes through EJIT_DIAG_VERBOSE (SRE_printf on bare-metal).
+// build). Output goes through EJIT_DIAG/EJIT_DIAG_VERBOSE (SRE_printf on
+// bare-metal).
 //
-// The plugin is always attached but does nothing unless the EJIT log level is
-// VERBOSE or above (ejit_set_log_level(EJIT_LOG_LVL_VERBOSE)); zero-cost
-// otherwise.
+// The plugin is always attached. At INFO it prints only one summary per graph;
+// VERBOSE additionally prints every branch relocation. It does nothing when
+// diagnostics are OFF.
 //
 //===----------------------------------------------------------------------===//
 

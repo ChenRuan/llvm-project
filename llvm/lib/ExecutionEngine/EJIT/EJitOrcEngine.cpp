@@ -590,8 +590,8 @@ EJitOrcEngine::Create(const Config &config,
   // PostFixup pass that audits every AArch64 branch relocation and reports
   // which ones JITLink bridged through a $__STUBS PointerJumpStub + $__GOT
   // (because the direct BL target is external / out of +-128MB) instead of a
-  // direct BL. Zero-cost unless the log level is VERBOSE; output via
-  // EJIT_DIAG_VERBOSE (SRE_printf on bare-metal).
+  // direct BL. INFO emits one summary per graph; VERBOSE additionally emits
+  // each relocation. Output uses SRE_printf on bare-metal.
   if (auto *OLL = dyn_cast<orc::ObjectLinkingLayer>(
           &engine->P->J->getObjLinkingLayer()))
     OLL->addPlugin(std::make_shared<EJitLinkDiagPlugin>());
