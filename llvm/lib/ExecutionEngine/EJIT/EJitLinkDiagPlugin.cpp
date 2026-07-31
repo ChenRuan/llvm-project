@@ -106,8 +106,9 @@ static const Symbol *followStubToRealTarget(const Symbol &StubSym) {
 
 static int64_t absVal(int64_t V) { return V < 0 ? -V : V; }
 
-// PostFixup pass body. Runs only when verbose diagnostics are enabled (see
-// modifyPassConfig). Never fails the link: all output is advisory.
+// PostFixup pass body. INFO prints only the final summary; VERBOSE also prints
+// the header and every relocation. Never fails the link: all output is
+// advisory.
 static Error reportLinkGraph(LinkGraph &G) {
   unsigned stubbed = 0, direct = 0, outOfRange = 0;
   bool headerPrinted = false;
@@ -161,7 +162,7 @@ static Error reportLinkGraph(LinkGraph &G) {
   }
 
   if (headerPrinted)
-    EJIT_DIAG_VERBOSE(
+    EJIT_DIAG(
         "linkdiag: graph=%s summary: %u stubbed (%u exceed +-128MB), %u direct",
         G.getName().c_str(), stubbed, outOfRange, direct);
 
@@ -175,10 +176,9 @@ void EJitLinkDiagPlugin::modifyPassConfig(orc::MaterializationResponsibility &MR
                                           LinkGraph &G,
                                           PassConfiguration &Config) {
 #ifdef EJIT_DIAG_ENABLE
-  // Zero-cost unless verbose diagnostics are requested. The level is checked
-  // here (rather than inside the pass) so no pass object is constructed when
-  // the feature is off.
-  if (gEJitDiagLevel < EJIT_LOG_LVL_VERBOSE)
+  // Avoid constructing the pass when diagnostics are disabled. INFO emits one
+  // summary per graph; relocation-level detail remains VERBOSE-only.
+  if (gEJitDiagLevel < EJIT_LOG_LVL_INFO)
     return;
 
   // Branch-relocation classification is AArch64-specific.
