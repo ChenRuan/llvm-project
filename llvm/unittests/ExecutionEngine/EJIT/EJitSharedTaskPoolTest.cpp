@@ -2759,4 +2759,283 @@ TEST_F(SharedTaskPoolTest, InlineCacheMultiVersion) {
   ejitIcacheClearAll();
 }
 
+//===----------------------------------------------------------------------===//
+// Per-core L0 dispatch cache
+//
+// Nothing on the hit path re-checks what makes it safe, so each invariant is
+// pinned here. Getting one wrong yields a stale or dangling code pointer, which
+// no value assertion elsewhere would catch.
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// Process-globals standing in for core-private storage: no test may inherit
+/// them from the one before it.
+void resetL0ForTest() {
+  for (uint32_t i = 0; i < kEJitL0Slots; ++i)
+    gEJitL0[i] = EJitL0Entry{};
+  gEJitL0State = nullptr;
+}
+} // namespace
+
+TEST_F(SharedTaskPoolTest, L0ServesARepeatDispatch) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 3;
+  const EJitDimPair dims[1] = {{0, 1}};
+
+  void *out = nullptr;
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out)) << "cold table must miss";
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  EXPECT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+  EXPECT_EQ(out, codeFor(kFunc));
+
+  // A different identity must miss, not return the wrong pointer.
+  const EJitDimPair other[1] = {{0, 2}};
+  EXPECT_FALSE(pool.l0Try(kFunc, other, 1, &out));
+}
+
+TEST_F(SharedTaskPoolTest, L0RetiredByPublishAndByVersionChange) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 4;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+
+  publish(pool, 9);
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out)) << "publish must retire the L0";
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+
+  // L0 entries carry no version of their own.
+  pool.setInstanceEnabled(0, 1, true);
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out))
+      << "version change must retire the L0";
+}
+
+TEST_F(SharedTaskPoolTest, L0RetiredByExplicitFlush) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 5;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+
+  // ejit_clear_cache() / ejit_invalidate() / a compile-mode change reach the
+  // L0 only through this hook.
+  pool.retireDispatchCache();
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out));
+}
+
+TEST_F(SharedTaskPoolTest, L0EntryIsNotServedToAnotherCore) {
+  resetL0ForTest();
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  const uint32_t kFunc = 6;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  EJitCoreId::setCurrentForTest(0);
+  owner.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(owner.l0Try(kFunc, dims, 1, &out));
+
+  // Cannot arise on hardware (core-private table), but can where cores are
+  // simulated: a peer taking the owner's entry would skip peerPrepareSlot().
+  EJitCoreId::setCurrentForTest(1);
+  EXPECT_FALSE(owner.l0Try(kFunc, dims, 1, &out))
+      << "a peer must not be served the owner's entry";
+
+  EJitCoreId::setCurrentForTest(0);
+  EXPECT_TRUE(owner.l0Try(kFunc, dims, 1, &out)) << "owner still hits";
+}
+
+TEST_F(SharedTaskPoolTest, L0DoesNotSurviveANewSharedBlob) {
+  resetL0ForTest();
+  const uint32_t kFunc = 7;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+  ASSERT_NE(gEJitL0State, nullptr);
+
+  // The table outlives the shared blob. A fresh blob starts from a low
+  // dispatchEpoch, so the epoch alone cannot separate the two instances -- the
+  // entry must be rejected because it was armed against another state.
+  auto other = std::make_unique<EJitSharedTaskPoolState>();
+  EJitSharedTaskPool fresh;
+  EJitCoreId::setCurrentForTest(0);
+  fresh.bind(other.get());
+  fresh.setCompiler(&mockCompile, nullptr);
+  fresh.setMode(EJitCompileMode::Async);
+  ASSERT_EQ(fresh.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EXPECT_FALSE(fresh.l0Try(kFunc, dims, 1, &out))
+      << "an entry armed against a previous blob must not validate";
+}
+
+TEST_F(SharedTaskPoolTest, L0DoesNotSurviveAReInitialization) {
+  resetL0ForTest();
+  const uint32_t kFunc = 11;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+
+  // Same blob, torn down and stood back up: entries still point into a code
+  // pool that has been reset.
+  EJitCoreId::setCurrentForTest(0);
+  pool.ownerShutdown();
+  ASSERT_EQ(pool.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out))
+      << "an entry from the previous pool instance must not validate";
+
+  // ...and the cache re-arms normally afterwards.
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  EXPECT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+}
+
+TEST_F(SharedTaskPoolTest, L0RefusesToArmWhileAReleaserIsWired) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 8;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  // With a releaser wired, code can be freed under a caller, and an L0 hit
+  // carries no read token. Same gate the inline cache uses.
+  pool.setReleaser([](void *, void *) {}, nullptr);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out));
+}
+
+// The gate is evaluated at fill, so wiring a releaser AFTER entries are armed
+// must retire them.
+TEST_F(SharedTaskPoolTest, L0EntriesAreRetiredWhenAReleaserIsWiredLater) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 12;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+
+  pool.setReleaser([](void *, void *) {}, nullptr);
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out))
+      << "an armed entry must not survive a releaser being wired";
+}
+
+TEST_F(SharedTaskPoolTest, ReleaseReadIgnoresTheNoBucketSentinel) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  // The wrapper calls releaseRead() unconditionally, so kEJitNoBucket must be
+  // a no-op rather than a spurious decrement of a real bucket.
+  pool.releaseRead(kEJitNoBucket);
+  for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
+    EXPECT_EQ(state_->buckets[b].readers.loadRelaxed(), 0u)
+        << "bucket " << b << " reader count disturbed";
+}
+
+// A fill interrupted between its payload stores must not leave an old identity
+// paired with the new fnPtr. Core-private storage excludes other CORES, not
+// preemption on this one, so the seqlock is what makes the entry atomic.
+TEST_F(SharedTaskPoolTest, L0PartiallyWrittenEntryIsNotServed) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const EJitDimPair a[1] = {{0, 1}};
+  void *out = nullptr;
+
+  pool.l0Fill(20, codeFor(20), a, 1);
+  ASSERT_TRUE(pool.l0Try(20, a, 1, &out));
+  ASSERT_EQ(out, codeFor(20));
+
+  // The interleaving a preempted fill leaves: odd sequence, fnPtr replaced,
+  // identity not yet updated.
+  EJitL0Entry &e = gEJitL0[ejitL0Index(20, a, 1)];
+  e.seq = e.seq + 1u;
+  e.fn = codeFor(21);
+
+  EXPECT_FALSE(pool.l0Try(20, a, 1, &out))
+      << "a half-written entry must not be served";
+
+  e.seq = e.seq + 1u; // writer completes
+  EXPECT_TRUE(pool.l0Try(20, a, 1, &out));
+}
+
+// Two identities landing in the same slot must evict each other, never
+// cross-serve. The colliding pair is SEARCHED FOR rather than hard-coded, so
+// the test keeps its meaning if the hash changes.
+TEST_F(SharedTaskPoolTest, L0CollidingIdentitiesNeverCrossServe) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  void *out = nullptr;
+
+  const EJitDimPair a[1] = {{0, 1}};
+  const uint32_t slot = ejitL0Index(30, a, 1);
+  EJitDimPair b[1] = {{0, 0}};
+  bool found = false;
+  for (uint32_t inst = 2; inst < kEJitSharedInstances && !found; ++inst) {
+    b[0].instanceId = inst;
+    found = ejitL0Index(30, b, 1) == slot;
+  }
+  ASSERT_TRUE(found) << "no colliding identity found in the instance space";
+
+  pool.l0Fill(30, codeFor(30), a, 1);
+  pool.l0Fill(30, codeFor(31), b, 1); // evicts a from the shared slot
+
+  EXPECT_FALSE(pool.l0Try(30, a, 1, &out))
+      << "the evicted identity must miss, not receive the evictor's pointer";
+  ASSERT_TRUE(pool.l0Try(30, b, 1, &out));
+  EXPECT_EQ(out, codeFor(31));
+
+  // The pair the old packed key aliased via dimType*31 + instanceId.
+  resetL0ForTest();
+  const EJitDimPair c[1] = {{0, 31}};
+  const EJitDimPair d[1] = {{1, 0}};
+  pool.l0Fill(30, codeFor(32), c, 1);
+  pool.l0Fill(30, codeFor(33), d, 1);
+  if (pool.l0Try(30, c, 1, &out))
+    EXPECT_EQ(out, codeFor(32)) << "(0,31) served (1,0)'s specialization";
+  if (pool.l0Try(30, d, 1, &out))
+    EXPECT_EQ(out, codeFor(33)) << "(1,0) served (0,31)'s specialization";
+
+  // Same funcIndex, differing arity must not alias.
+  resetL0ForTest();
+  const EJitDimPair two[2] = {{0, 31}, {0, 0}};
+  pool.l0Fill(30, codeFor(34), c, 1);
+  pool.l0Fill(30, codeFor(35), two, 2);
+  if (pool.l0Try(30, c, 1, &out))
+    EXPECT_EQ(out, codeFor(34)) << "1D identity served a 2D entry";
+  if (pool.l0Try(30, two, 2, &out))
+    EXPECT_EQ(out, codeFor(35));
+
+  // Different funcIndex, identical dims must not alias.
+  resetL0ForTest();
+  pool.l0Fill(30, codeFor(36), c, 1);
+  pool.l0Fill(31, codeFor(37), c, 1);
+  if (pool.l0Try(30, c, 1, &out))
+    EXPECT_NE(out, codeFor(37)) << "funcIndex 30 served funcIndex 31's entry";
+}
+
 } // namespace

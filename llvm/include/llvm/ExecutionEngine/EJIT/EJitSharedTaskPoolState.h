@@ -79,10 +79,17 @@ namespace ejit {
 //===----------------------------------------------------------------------===//
 // Fixed capacities and the cache-line size used to avoid false sharing.
 //===----------------------------------------------------------------------===//
+/// Max dims in one identity; matches EJitSharedCacheSlot::dims.
+constexpr uint32_t kEJitSharedMaxDims = 4u;
 constexpr uint32_t kEJitSharedDimTypes = 8u;
 constexpr uint32_t kEJitSharedInstances = 256u;
 constexpr uint32_t kEJitSharedMaxFuncIndex = EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX;
 constexpr uint32_t kEJitSharedCacheBuckets = EJIT_SRE_TASKPOOL_BUCKETS;
+
+/// Out-bucket for a lookup served without a read token (the per-core L0).
+/// releaseRead() ignores it, so the caller shape -- call fn, then release --
+/// needs no wrapper change.
+constexpr uint32_t kEJitNoBucket = 0xFFFFFFFFu;
 constexpr uint32_t kEJitSharedCacheSlots = EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS;
 constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
 constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
@@ -318,6 +325,13 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU64 workerTaskId;       ///< platform worker task id (diagnostic)
   EJitAtomicU64 registrationFingerprint; ///< owner funcIndex/dimType mapping
                                          ///< digest; peers validate on attach
+  /// Bumps on any event that can invalidate a cached (identity -> fnPtr)
+  /// mapping: publish, eviction, version change, (re)initialization. Per-core
+  /// L0 entries record the epoch they were filled at and are discarded on a
+  /// mismatch. Read once per dispatch, written only on those rare events, so
+  /// the line stays Shared in every core's L1 rather than bouncing. Sits in
+  /// this cache line's padding, so sizeof() and later offsets are unchanged.
+  EJitAtomicU32 dispatchEpoch;
 
   //--- SwitchController state (own cache line)
   alignas(kEJitSharedCacheLine)
