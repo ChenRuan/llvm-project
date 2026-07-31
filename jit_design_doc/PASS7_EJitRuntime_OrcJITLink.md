@@ -158,6 +158,13 @@ EJitOrcEngine::Create(const EJitConfig& config) {
     }
     engine->J = std::move(*JOrErr);
 
+    // PreFixup: resolved AArch64 B/BL calls that JITLink initially routed
+    // through a standard stub+GOT chain are changed back to a direct branch
+    // when the final target is within the architectural ±128 MiB range.
+    if (auto *OLL = dyn_cast<orc::ObjectLinkingLayer>(
+            &engine->J->getObjLinkingLayer()))
+        OLL->addPlugin(std::make_shared<EJitLinkOptimizationPlugin>());
+
     // 步骤 3: 注册 IRTransformLayer 回调
     // 完整的 JIT Pipeline: 参数替换 → InstCombine → StructFieldPass → IPSCCP →
     //   InstCombine → StructFieldPass → 标准优化 (详见 §2.4)
@@ -202,6 +209,19 @@ EJitOrcEngine::Create(const EJitConfig& config) {
     return engine;
 }
 ```
+
+### 2.1.2 AArch64 近目标分支松弛
+
+JITLink 会先为外部 `B/BL` 目标建立
+`branch -> $__STUBS -> $__GOT -> destination` 链。代码池与 AOT 代码距离较近时，
+`EJitLinkOptimizationPlugin` 在 `PreFixup` 阶段读取已经解析的最终地址；若
+`Branch26PCRel` 的位移处于 `[-2^27, 2^27 - 4]` 字节且四字节对齐，则将边直接
+指向最终目标，由正常 fixup 编码单条 `B/BL`。远目标、未解析目标、非标准 stub
+链和非零 GOT addend 均保留原 stub 路径。
+
+该优化只发生在链接阶段，不增加运行时热路径状态，也不改变 code-pool/shared
+taskpool ABI。已经分配的 stub/GOT 不主动删除，因此本改动降低执行开销，但不以
+缩小本次 JITLink allocation 为目标。
 
 ---
 

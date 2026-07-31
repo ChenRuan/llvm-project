@@ -7,13 +7,15 @@
 //===----------------------------------------------------------------------===//
 //
 // A LinkGraphLinkingLayer plugin that proves JITLink's special handling of
-// branch relocations on AArch64: when a BL/B target is external (e.g. an AOT
-// function) or out of the ±128MB direct-branch range, JITLink does NOT emit a
-// direct BL. Instead it routes the call through a PointerJumpStub in $__STUBS
+// branch relocations on AArch64. JITLink initially routes external BL/B
+// targets through a PointerJumpStub in $__STUBS
 //
 //     ADRP x16, <got page> ; LDR x16, [x16, #<got off>] ; BR x16
 //
-// whose GOT entry (in $__GOT) holds the real target address.
+// whose GOT entry (in $__GOT) holds the real target address. EJIT's preceding
+// optimization pass may retarget this branch to the resolved destination when
+// it falls within the architectural direct-branch range. Out-of-range targets
+// retain the original stub chain.
 //
 // The plugin appends a PostFixup pass to every linked LinkGraph. After fixup
 // the graph carries the full chain JITLink built, so the pass can report each

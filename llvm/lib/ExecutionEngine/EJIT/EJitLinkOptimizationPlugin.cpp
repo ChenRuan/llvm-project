@@ -1,0 +1,132 @@
+//===-- EJitLinkOptimizationPlugin.cpp - EJIT JITLink optimizations -------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/ExecutionEngine/EJIT/EJitLinkOptimizationPlugin.h"
+
+#include "llvm/ExecutionEngine/JITLink/aarch64.h"
+#include "llvm/Support/MathExtras.h"
+#include "llvm/TargetParser/Triple.h"
+
+#include <limits>
+
+using namespace llvm;
+using namespace llvm::ejit;
+using namespace llvm::jitlink;
+
+namespace {
+
+static bool isStubSymbol(const Symbol &S) {
+  return S.isDefined() && S.getOffset() == 0 &&
+         S.getSize() == sizeof(aarch64::PointerJumpStubContent) &&
+         S.getBlock().getSize() == sizeof(aarch64::PointerJumpStubContent) &&
+         S.getBlock().getSection().getName() ==
+             aarch64::PLTTableManager::getSectionName();
+}
+
+// Match the standard JITLink AArch64 pointer-jump chain:
+//   branch -> stub --Page21/PageOffset12--> GOT --Pointer64--> destination.
+static Symbol *getPointerJumpStubDestination(Symbol &Stub) {
+  if (!isStubSymbol(Stub))
+    return nullptr;
+
+  Symbol *GOTEntry = nullptr;
+  bool SawPage21 = false;
+  bool SawPageOffset12 = false;
+  for (Edge &E : Stub.getBlock().edges()) {
+    if (E.getKind() == aarch64::Page21) {
+      if (SawPage21 || E.getOffset() != 0 || E.getAddend() != 0)
+        return nullptr;
+      SawPage21 = true;
+    } else if (E.getKind() == aarch64::PageOffset12) {
+      if (SawPageOffset12 || E.getOffset() != 4 || E.getAddend() != 0)
+        return nullptr;
+      SawPageOffset12 = true;
+    } else {
+      continue;
+    }
+    if (GOTEntry && GOTEntry != &E.getTarget())
+      return nullptr;
+    GOTEntry = &E.getTarget();
+  }
+  if (!SawPage21 || !SawPageOffset12 || !GOTEntry || !GOTEntry->isDefined() ||
+      GOTEntry->getOffset() != 0 || GOTEntry->getSize() != 8 ||
+      GOTEntry->getBlock().getSize() != 8 ||
+      GOTEntry->getBlock().getSection().getName() !=
+          aarch64::GOTTableManager::getSectionName())
+    return nullptr;
+
+  Symbol *Destination = nullptr;
+  for (Edge &E : GOTEntry->getBlock().edges()) {
+    if (E.getKind() != aarch64::Pointer64)
+      continue;
+    if (Destination || E.getOffset() != 0 || E.getAddend() != 0)
+      return nullptr;
+    Destination = &E.getTarget();
+  }
+  return Destination;
+}
+
+static bool isDirectBranchReachable(uint64_t FixupAddr, uint64_t TargetAddr,
+                                    int64_t Addend) {
+  constexpr uint64_t MaxInt64 =
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+  if (FixupAddr > MaxInt64 || TargetAddr > MaxInt64)
+    return false;
+
+  int64_t Delta = 0;
+  if (SubOverflow(static_cast<int64_t>(TargetAddr),
+                  static_cast<int64_t>(FixupAddr), Delta) ||
+      AddOverflow(Delta, Addend, Delta))
+    return false;
+
+  // Branch26PCRel stores a signed 26-bit count of four-byte instructions:
+  // [-2^27, 2^27 - 4] bytes, with four-byte alignment.
+  return (Delta & 3) == 0 && isInt<28>(Delta);
+}
+
+} // namespace
+
+Error llvm::ejit::relaxAArch64BranchStubs(LinkGraph &G) {
+  const Triple &TT = G.getTargetTriple();
+  if (TT.getArch() != Triple::aarch64 && TT.getArch() != Triple::aarch64_be)
+    return Error::success();
+
+  for (Section &Sec : G.sections()) {
+    for (Block *B : Sec.blocks()) {
+      for (Edge &E : B->edges()) {
+        if (E.getKind() != aarch64::Branch26PCRel)
+          continue;
+
+        Symbol *Destination = getPointerJumpStubDestination(E.getTarget());
+        if (!Destination || Destination->isExternal())
+          continue;
+
+        uint64_t FixupAddr = B->getFixupAddress(E).getValue();
+        uint64_t TargetAddr = Destination->getAddress().getValue();
+        if (isDirectBranchReachable(FixupAddr, TargetAddr, E.getAddend()))
+          E.setTarget(*Destination);
+      }
+    }
+  }
+  return Error::success();
+}
+
+void EJitLinkOptimizationPlugin::modifyPassConfig(
+    orc::MaterializationResponsibility &MR, LinkGraph &G,
+    PassConfiguration &Config) {
+  (void)MR;
+  const Triple &TT = G.getTargetTriple();
+  if (TT.getArch() != Triple::aarch64 && TT.getArch() != Triple::aarch64_be)
+    return;
+
+  // PreFixup runs after allocation and external-symbol lookup, so both the
+  // call site and final destination addresses are known. Retargeting here
+  // leaves the already-allocated stub/GOT layout intact while allowing the
+  // normal Branch26PCRel fixup to emit a direct B/BL displacement.
+  Config.PreFixupPasses.push_back(relaxAArch64BranchStubs);
+}
