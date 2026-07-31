@@ -158,12 +158,6 @@ static cl::opt<bool> EnableEJITAOT(
     cl::desc("Enable EmbeddedJIT AOT passes (period register, wrapper "
              "generation, lifecycle handlers)"));
 
-cl::opt<bool> EJitCrossInline(
-    "ejit-cross-inline", cl::init(false), cl::Hidden,
-    cl::desc("Defer bitcode extraction to link time for cross-TU inlining. "
-             "Only extract the full Module IR into a .ejit_cross ELF section; "
-             "the final @__ejit_bitcode is generated at link time."));
-
 static cl::opt<InliningAdvisorMode> UseInlineAdvisor(
     "enable-ml-inliner", cl::init(InliningAdvisorMode::Default), cl::Hidden,
     cl::desc("Enable ML policy for inliner. Currently trained for -Oz only"),
@@ -1674,7 +1668,7 @@ PassBuilder::buildPerModuleDefaultPipeline(OptimizationLevel Level,
   // functions are available.
   if (!isLTOPreLink(Phase))
     if (EnableEJITBitcode)
-      MPM.addPass(EJitRegisterBitcodePass(EJitCrossInline));
+      MPM.addPass(EJitRegisterBitcodePass());
 
   // EmbeddedJIT PASS2-4: Register periods, generate wrapper, handle
   // lifecycle callbacks. Must run before the optimization pipeline so
@@ -1746,7 +1740,7 @@ PassBuilder::buildFatLTODefaultPipeline(OptimizationLevel Level, bool ThinLTO,
         buildModuleOptimizationPipeline(Level, ThinOrFullLTOPhase::None));
     // EmbeddedJIT PASS1: Extract optimized bitcode.
     if (EnableEJITBitcode)
-      MPM.addPass(EJitRegisterBitcodePass(EJitCrossInline));
+      MPM.addPass(EJitRegisterBitcodePass());
     // EmbeddedJIT AOT module pass (PASS2-4).
     if (EnableEJITAOT)
       MPM.addPass(EJitAotModulePass());
@@ -1860,7 +1854,7 @@ ModulePassManager PassBuilder::buildThinLTODefaultPipeline(
     MPM.addPass(GlobalDCEPass());
     // EmbeddedJIT AOT module pass (PASS2-4).
     if (EnableEJITBitcode)
-      MPM.addPass(EJitRegisterBitcodePass(EJitCrossInline));
+      MPM.addPass(EJitRegisterBitcodePass());
     if (EnableEJITAOT)
       MPM.addPass(EJitAotModulePass());
     return MPM;
@@ -1878,7 +1872,7 @@ ModulePassManager PassBuilder::buildThinLTODefaultPipeline(
   // (from simplification pipeline) but before heavy optimization
   // to preserve !ejit.may_const metadata.
   if (EnableEJITBitcode)
-    MPM.addPass(EJitRegisterBitcodePass(EJitCrossInline));
+    MPM.addPass(EJitRegisterBitcodePass());
 
   // Now add the optimization pipeline.
   MPM.addPass(buildModuleOptimizationPipeline(
@@ -1926,7 +1920,7 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
 
     // EmbeddedJIT: FullLTO post-link (O0 path).
     if (EnableEJITBitcode)
-      MPM.addPass(EJitRegisterBitcodePass(EJitCrossInline));
+      MPM.addPass(EJitRegisterBitcodePass());
     if (EnableEJITAOT)
       MPM.addPass(EJitAotModulePass());
 
@@ -2018,7 +2012,7 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
 
     // EmbeddedJIT AOT module pass (PASS2-4).
     if (EnableEJITBitcode)
-      MPM.addPass(EJitRegisterBitcodePass(EJitCrossInline));
+      MPM.addPass(EJitRegisterBitcodePass());
     if (EnableEJITAOT)
       MPM.addPass(EJitAotModulePass());
 
@@ -2158,7 +2152,7 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
   // (ModuleInliner above) but before heavy optimization (LICM, GVN,
   // vectorizer) to preserve !ejit.may_const metadata.
   if (EnableEJITBitcode)
-    MPM.addPass(EJitRegisterBitcodePass(EJitCrossInline));
+    MPM.addPass(EJitRegisterBitcodePass());
 
   FunctionPassManager MainFPM;
   MainFPM.addPass(createFunctionToLoopPassAdaptor(
@@ -2306,7 +2300,7 @@ PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
 
   // EmbeddedJIT PASS1: Extract raw bitcode before AlwaysInliner.
   if (EnableEJITBitcode)
-    MPM.addPass(EJitRegisterBitcodePass(EJitCrossInline));
+    MPM.addPass(EJitRegisterBitcodePass());
 
   // EmbeddedJIT PASS2-4: Must run early (before AlwaysInliner) so PASS3
   // operates on clean IR without optimization-introduced PHI nodes.

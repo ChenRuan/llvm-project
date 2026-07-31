@@ -461,23 +461,6 @@ void tools::gnutools::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   bool NeedsSanitizerDeps = addSanitizerRuntimes(ToolChain, Args, CmdArgs);
   bool NeedsXRayDeps = addXRayRuntime(ToolChain, Args, CmdArgs);
   addLinkerCompressDebugSectionsOption(ToolChain, Args, CmdArgs);
-
-  // EJIT cross-TU inlining. ld.lld is the single owner of the merge; the clang
-  // driver never performs it. When -fejit-cross-inline is requested we require
-  // ld.lld and forward the request via --ejit-cross-inline. Any other linker
-  // cannot consume the .ejit_cross sections, so we emit a hard error rather
-  // than produce an output that still carries the (large) .ejit_cross data and
-  // no registry -- which would silently fall back to per-TU AOT bitcode.
-  if (Args.hasArg(options::OPT_fejit_cross_inline)) {
-    bool LinkerIsLLD = false;
-    (void)ToolChain.GetLinkerPath(&LinkerIsLLD);
-    if (!LinkerIsLLD)
-      ToolChain.getDriver().Diag(diag::err_drv_argument_only_allowed_with)
-          << "-fejit-cross-inline" << "-fuse-ld=lld";
-    else
-      CmdArgs.push_back("--ejit-cross-inline");
-  }
-
   AddLinkerInputs(ToolChain, Inputs, Args, CmdArgs, JA);
 
   addHIPRuntimeLibArgs(ToolChain, C, Args, CmdArgs);

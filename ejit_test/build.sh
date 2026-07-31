@@ -176,7 +176,6 @@ ALL_TESTS=(
   ejit_jit_verify_test
   ejit_inline_asm_test
   ejit_likely_test
-  ejit_cross_inline_test
   ejit_lto_inline_test
   ejit_lifecycle_test
   ejit_multidim_test
@@ -204,12 +203,10 @@ COMPILE_FLAGS[ejit_manual_register_test]="-mllvm -enable-ejit-global-ctors=false
 COMPILE_FLAGS[ejit_baremetal_link_test]="-mllvm -enable-ejit-global-ctors=false"
 COMPILE_FLAGS[ejit_fixed_dim_test]=""
 COMPILE_FLAGS[ejit_lto_inline_test]="-flto=thin"
-COMPILE_FLAGS[ejit_cross_inline_test]="-fejit-cross-inline"
 
 # Per-test link flags (e.g. -flto=thin for ThinLTO tests).
 declare -A LINK_FLAGS
 LINK_FLAGS[ejit_lto_inline_test]="-flto=thin"
-LINK_FLAGS[ejit_cross_inline_test]="-fejit-cross-inline"
 
 # Override the primary source file for a test (default: <name>.c). Lets a test
 # reuse existing sources under a different build/link recipe without copying.
@@ -234,7 +231,6 @@ declare -A EXTRA_SRCS
 EXTRA_SRCS[ejit_multi_tu_test]="ejit_multi_tu_test_b.c"
 EXTRA_SRCS[ejit_baremetal_link_test]="ejit_multi_tu_test_b.c"
 EXTRA_SRCS[ejit_lto_inline_test]="ejit_lto_inline_test_b.c"
-EXTRA_SRCS[ejit_cross_inline_test]="ejit_lto_inline_test_b.c"
 
 declare -A TEST_ARGS
 TEST_ARGS[ejit_complex_test]="0 1 2 3"
@@ -246,7 +242,6 @@ TEST_ARGS[ejit_jit_verify_test]="0 1 5"
 TEST_ARGS[ejit_inline_asm_test]=""
 TEST_ARGS[ejit_likely_test]="0 1 7"
 TEST_ARGS[ejit_lto_inline_test]="0"
-TEST_ARGS[ejit_cross_inline_test]="0"
 TEST_ARGS[ejit_external_idx_test]="3 1"
 TEST_ARGS[ejit_lifecycle_test]="3 7 2"
 TEST_ARGS[ejit_multidim_test]="0"
