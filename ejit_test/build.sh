@@ -209,7 +209,7 @@ COMPILE_FLAGS[ejit_cross_inline_test]="-fejit-cross-inline"
 # Per-test link flags (e.g. -flto=thin for ThinLTO tests).
 declare -A LINK_FLAGS
 LINK_FLAGS[ejit_lto_inline_test]="-flto=thin"
-LINK_FLAGS[ejit_cross_inline_test]="-fejit-cross-inline -fuse-ld=lld"
+LINK_FLAGS[ejit_cross_inline_test]="-fejit-cross-inline"
 
 # Override the primary source file for a test (default: <name>.c). Lets a test
 # reuse existing sources under a different build/link recipe without copying.

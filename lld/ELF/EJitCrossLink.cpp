@@ -494,9 +494,9 @@ Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
                                                StringRef SaveTempsPrefix) {
   // ---- Phase 1: detect .ejit_cross. Distinguish "no section" (normal skip)
   // from "corrupt input" (Area 5). Non-object inputs (scripts, shared libs)
-  // are skipped; archive members with .ejit_cross are collected for Phase 2.
+  // are skipped; an archive that *contains* a .ejit_cross member is an
+  // explicit, documented unsupported case rather than a silent miss.
   bool HasCross = false;
-  StringSet<> CrossArchives; // archive paths whose members carry .ejit_cross
   for (StringRef F : InputFiles) {
     auto Buf = MemoryBuffer::getFile(F);
     if (!Buf)
@@ -518,16 +518,15 @@ Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
         }
         for (const object::SectionRef &Sec : (*Obj)->sections()) {
           Expected<StringRef> N = Sec.getName();
-          if (N && *N == kCrossSection) {
-            HasCross = true;
-            CrossArchives.insert(F);
-            break;
-          }
+          if (N && *N == kCrossSection)
+            return crossError(
+                "scan archive", F,
+                "a .ejit_cross member is present in an archive; "
+                "-fejit-cross-inline does not process archive members, link "
+                "the object file directly");
           if (!N)
             consumeError(N.takeError());
         }
-        if (HasCross)
-          break;
       }
       if (Err)
         return crossError("iterate archive", F, std::move(Err));
@@ -550,6 +549,8 @@ Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
         break;
       }
     }
+    if (HasCross)
+      break;
   }
   if (!HasCross)
     return EJitCrossLinkResult{}; // nothing to do: normal AOT path is preserved
@@ -560,69 +561,11 @@ Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
   std::unique_ptr<Module> Composite;
   StringSet<> ConsumedFileSet;
   SmallVector<std::string, 4> ConsumedFiles;
-
-  // Helper to process a single bitcode buffer into the composite.
-  auto mergeBitcodeIntoComposite =
-      [&](MemoryBufferRef BCBuf, StringRef DisplayName) -> Error {
-    auto M = parseBitcodeFile(BCBuf, *Ctx);
-    if (!M)
-      return crossError("parse bitcode", DisplayName, M.takeError());
-    if (ConsumedFileSet.insert(DisplayName).second)
-      ConsumedFiles.push_back(DisplayName.str());
-    if (!Composite) {
-      Composite = std::move(*M);
-      return Error::success();
-    }
-    if (Linker(*Composite).linkInModule(std::move(*M), Linker::Flags::None))
-      return crossError("merge module", DisplayName,
-                        "Linker::linkInModule reported a conflict while "
-                        "merging modules");
-    return Error::success();
-  };
-
   for (StringRef F : InputFiles) {
     auto Buf = MemoryBuffer::getFile(F);
     if (!Buf)
       return crossError("read input", F, errorCodeToError(Buf.getError()));
     file_magic Magic = identify_magic(Buf->get()->getBuffer());
-
-    if (Magic == file_magic::archive && CrossArchives.contains(F)) {
-      auto ArOrErr = object::Archive::create(Buf->get()->getMemBufferRef());
-      if (!ArOrErr)
-        return crossError("read archive", F, ArOrErr.takeError());
-      Error Err = Error::success();
-      for (const auto &Child : (*ArOrErr)->children(Err)) {
-        auto ChildBuf = Child.getMemoryBufferRef();
-        if (!ChildBuf)
-          return crossError("read archive member", F, ChildBuf.takeError());
-        auto Obj = object::ObjectFile::createObjectFile(*ChildBuf);
-        if (!Obj) {
-          consumeError(Obj.takeError());
-          continue;
-        }
-        for (const object::SectionRef &Sec : (*Obj)->sections()) {
-          Expected<StringRef> N = Sec.getName();
-          if (!N)
-            return crossError("read section name", F, N.takeError());
-          if (*N != kCrossSection)
-            continue;
-          Expected<StringRef> C = Sec.getContents();
-          if (!C)
-            return crossError("read section", F, C.takeError());
-          // ChildBuf.getBufferIdentifier() returns the canonical
-          // "archive_path(member_name)" string that lld's InputFiles
-          // uses for ObjFile::getName(), so ConsumedFiles will match.
-          StringRef DisplayName = ChildBuf->getBufferIdentifier();
-          if (Error E = mergeBitcodeIntoComposite(
-                  MemoryBufferRef(*C, DisplayName), DisplayName))
-            return E;
-        }
-      }
-      if (Err)
-        return crossError("iterate archive", F, std::move(Err));
-      continue;
-    }
-
     if (Magic != file_magic::elf_relocatable &&
         Magic != file_magic::elf_shared_object &&
         Magic != file_magic::elf_executable)
@@ -640,8 +583,19 @@ Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
       Expected<StringRef> C = Sec.getContents();
       if (!C)
         return crossError("read section", F, C.takeError());
-      if (Error E = mergeBitcodeIntoComposite(MemoryBufferRef(*C, F), F))
-        return E;
+      auto M = parseBitcodeFile(MemoryBufferRef(*C, F), *Ctx);
+      if (!M)
+        return crossError("parse bitcode", F, M.takeError());
+      if (ConsumedFileSet.insert(F).second)
+        ConsumedFiles.push_back(F.str());
+      if (!Composite) {
+        Composite = std::move(*M);
+      } else if (Linker(*Composite)
+                     .linkInModule(std::move(*M), Linker::Flags::None)) {
+        return crossError("merge module", F,
+                          "Linker::linkInModule reported a conflict while "
+                          "merging modules");
+      }
     }
   }
   if (!Composite)
