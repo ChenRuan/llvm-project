@@ -16,10 +16,6 @@ namespace llvm {
 
 struct EJitRegisterBitcodePass
     : public PassInfoMixin<EJitRegisterBitcodePass> {
-  EJitRegisterBitcodePass() = default;
-  explicit EJitRegisterBitcodePass(bool CrossInline)
-      : CrossInline(CrossInline) {}
-  bool CrossInline = false;
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 };
 

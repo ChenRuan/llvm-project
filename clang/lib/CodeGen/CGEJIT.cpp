@@ -35,12 +35,6 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
   if (FD->hasAttr<EjitEntryAttr>()) {
     Entries.push_back(llvm::MDNode::get(Ctx,
         llvm::MDString::get(Ctx, TAG_EJIT_ENTRY)));
-    // Prevent the inliner from merging ejit_entry into its callers.
-    // In LTO pipelines the inliner runs before EJitWrapperGenPass can
-    // add this attribute; emitting it at CodeGen time ensures the
-    // function survives so PASS1 can extract its bitcode and PASS3
-    // can insert the JIT wrapper.
-    F->addFnAttr(llvm::Attribute::NoInline);
   }
 
   // ejit_period_lc
