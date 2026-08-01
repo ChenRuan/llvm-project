@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#include <atomic>
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
@@ -264,6 +265,60 @@ bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
   return true;
 }
 
+//===----------------------------------------------------------------------===//
+// Per-core L0 dispatch cache
+//
+// A direct-mapped table in core-private memory, in front of the bucket lookup.
+// A hit is a key compare plus one read of the shared dispatchEpoch: no atomics,
+// no scan, no cache-line ownership transfer.
+//
+// Invalidation is coarse on purpose -- any epoch bump retires every core's
+// whole table. Publishes cluster in warm-up and then stop, so the epoch is
+// stable in steady state and entries only miss while warming.
+//===----------------------------------------------------------------------===//
+EJitL0Entry llvm::ejit::gEJitL0[kEJitL0Slots];
+const void *llvm::ejit::gEJitL0State = nullptr;
+
+void EJitSharedTaskPool::retireDispatchCache() {
+  if (state_)
+    state_->dispatchEpoch.fetchAdd(1);
+}
+
+void EJitSharedTaskPool::l0Fill(uint32_t funcIndex, void *fnPtr,
+                                const EJitDimPair *dims, uint32_t numDims) {
+  if (!icacheReclamationSafe_ || !state_ || !fnPtr)
+    return;
+  if (numDims > kEJitSharedMaxDims)
+    return;
+  if (state_->initState.loadAcquire() != kReady)
+    return;
+#if !defined(EJIT_SRE_SHARED_CODE_POINTERS)
+  if (EJitCoreId::current() != state_->ownerCoreId.loadRelaxed())
+    return;
+#endif
+  gEJitL0State = state_;
+  EJitL0Entry &e = gEJitL0[ejitL0Index(funcIndex, dims, numDims)];
+
+  // Read the epoch BEFORE publishing, so a bump racing the fill leaves a stale
+  // epoch (a miss), never a fresh epoch on a stale pointer.
+  const uint32_t epoch = state_->dispatchEpoch.loadAcquire();
+
+  // Seqlock writer: odd while the payload is inconsistent.
+  e.seq = e.seq + 1u;
+  std::atomic_signal_fence(std::memory_order_release);
+
+  e.fn = fnPtr;
+  e.core = EJitCoreId::current();
+  e.funcIndex = funcIndex;
+  e.numDims = numDims;
+  for (uint32_t i = 0; i < numDims; ++i)
+    e.dims[i] = dims[i];
+  e.epoch = epoch;
+
+  std::atomic_signal_fence(std::memory_order_release);
+  e.seq = e.seq + 1u;
+}
+
 void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
                                     const EJitDimPair *dims, uint32_t numDims) {
   if (!icacheReclamationSafe_)
@@ -328,6 +383,8 @@ bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,
   uint8_t desired = enabled ? 1 : 0;
   if (state_->enabled[dimType][instanceId].compareExchange(expected, desired)) {
     state_->version[dimType][instanceId].fetchAdd(1);
+    // Cached L0 entries carry no version, so retire them all.
+    state_->dispatchEpoch.fetchAdd(1);
     // Latch on the first successful enable of ANY instance: this brackets the
     // init→activate window during which instanceDisabled hits are tallied
     // separately (instanceDisabledPreActivate) for diagnosing the pre-activate
@@ -1335,6 +1392,8 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   target->executableCoreMask.storeRelease(
       OwnerCore < 64 ? (uint64_t{1} << OwnerCore) : 0);
   target->state.storeRelease(static_cast<uint32_t>(EJitSharedSlotState::Ready));
+  // Published a new fnPtr, or evicted the slot that held one.
+  state_->dispatchEpoch.fetchAdd(1);
   bucketWriteRelease(B);
 
   // Release the slot's PREVIOUS code OUTSIDE the bucket lock (the callback may
@@ -1349,6 +1408,9 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
 }
 
 void EJitSharedTaskPool::releaseRead(uint32_t bucketIndex) {
+  // Served from the L0: no token was taken.
+  if (bucketIndex == kEJitNoBucket)
+    return;
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
   // A load-only seqlock hit takes no read token and deliberately returns the
   // one-past-the-end bucket as a sentinel. Wrappers still call releaseRead()
@@ -1383,6 +1445,14 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
     }
   st->mode.storeRelaxed(mode);
   st->anyInstanceActivated.storeRelaxed(0);
+  // dispatchEpoch is BUMPED, never reset. A per-core L0 entry filled under a
+  // previous pool instance must not validate under this one, and the entries
+  // outlive the shared blob (they live in core-private memory). Monotonic
+  // bumping guarantees the mismatch; resetting to a fixed value would let a
+  // stale entry match again after a re-init. On a genuinely fresh blob the
+  // starting value is arbitrary, which is harmless: the L0 tables are zeroed
+  // BSS and l0Key() never returns 0, so no entry can match anyway.
+  st->dispatchEpoch.fetchAdd(1);
   for (uint32_t i = 0; i < kEJitSharedMaxFuncIndex; ++i)
     st->inFlight[i].storeRelaxed(0);
   for (uint32_t i = 0; i < kEJitSharedQueueSlots; ++i) {
@@ -1581,6 +1651,11 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
 }
 
 void EJitSharedTaskPool::ownerShutdown() {
+  // Disarm this core's L0: its entries hold code pointers about to become
+  // invalid. Peers stay armed but cannot match after the epoch bump below.
+  gEJitL0State = nullptr;
+  if (state_)
+    state_->dispatchEpoch.fetchAdd(1);
   if (!state_ || !isOwner_)
     return;
   EJIT_DIAG("shared taskpool owner shutdown begin");
