@@ -99,6 +99,17 @@ touches `sp`. The slow path (funcidx guard + `compile_or_get` + dispatch + AOT
 fallback) is extracted into a per-function `noinline MissFn` (`<name>_miss`),
 which has its own frame. Miss is rare, so the tail-call overhead is irrelevant.
 
+The two tail calls are `musttail` (so they lower to `br` and the wrapper needs
+no frame) **only when `!EJitWrapperTiming`**; under `-ejit-wrapper-timing` the
+hit path inserts `trace_now`/`trace_wrapper` between the call and `ret`, which
+violates the musttail rule, so it becomes a framed plain call + trace + ret
+(the miss path stays musttail). MissFn must inherit F's target attributes
+(`target-cpu`/`target-features`/`tune-cpu`) via `setAttributes(F->getAttributes())`
+-- `Function::Create` only inherits module-default `uwtable`/`frame-pointer`,
+and a bare MissFn fails `TTI::areInlineCompatible`, so the CGSCC InlinerPass
+rejects all helper inlining into MissFn with "conflicting attributes" (zero
+inlining into the AOT fallback).
+
 An `llvm.expect(IHit, true)` hint marks the hit branch likely, so regalloc /
 shrink-wrapping keeps the hit path frame-less for all dims (including 0-dim
 where the arg is idle in the hit path).
@@ -119,7 +130,7 @@ jit_miss:                                      ; miss: tail-call MissFn
   ret
 }
 
-define internal noinline void @funcA_miss(args...) {  ; slow path (own frame)
+define internal noinline void @funcA_miss(args...) {  ; slow path (own frame; inherits F target-cpu/features + section)
   funcidx = load @__ejit_funcidx_funcA
   if funcidx valid: compile_or_get -> dispatch (call spec + release_read) / fallback
   else: fallback (AOT body)
@@ -267,7 +278,10 @@ product picks D + maxDims to fit the per-core BSS budget.
    dispatch + AOT fallback) is extracted into a per-function `noinline
    MissFn` (`<name>_miss`), which owns the frame and the original body.
    The `emitSlowPath` lambda is shared by icache-off (in F) and icache-on
-   (in MissFn).
+   (in MissFn). MissFn is created with `Function::Create` then
+   `setAttributes(F->getAttributes())` (copy `target-cpu`/`target-features`/
+   `tune-cpu` so `TTI::areInlineCompatible` passes and helpers can inline
+   into MissFn) + `addFnAttr(NoInline)` + `setSection(F->getSection())`.
 3. **Hit-path probe**: multi-dim `GEP` (NO bounds check), plain `load` (no
    atomic/acquire -- per-core-private slot), `expect(hit, true)` (hint hit
    likely), null-check -> `jit_miss` (tail-call MissFn). numDims=0 = scalar
@@ -280,7 +294,11 @@ product picks D + maxDims to fit the per-core BSS budget.
    in the entry block, in addition to `@__ejit_funcidx_`.
 7. **Wrapper timing** (`-ejit-wrapper-timing`): the hit path keeps its
    sentinel (`0xFE`) report; the slow path (in MissFn or F) keeps the
-   `trace_now` + `trace_wrapper` sequence.
+   `trace_now` + `trace_wrapper` sequence. Because trace calls are inserted
+   between the call and `ret`, the hit path can no longer be `musttail` and
+   demotes from frame-less to a framed plain call + trace + ret (the miss
+   path stays musttail). The frame-less cycle figures in §11 assume
+   `!EJitWrapperTiming`.
 
 ## 9. Runtime changes
 
@@ -344,6 +362,10 @@ product picks D + maxDims to fit the per-core BSS budget.
   多维索引加的还多）。4 维仅 +1~2 cycle。多版本的代价几乎为零。
 - **Cold**: O(1) per miss (Horner linearize + one `str`). No scan. Miss
   tail-calls `MissFn` (1 `b` instruction).
+
+> 注：本节 frame-less / cycle 数据前提是 `!EJitWrapperTiming`（见 §8 item 7）。
+> 开启 `-ejit-wrapper-timing` 时 hit 路径退化为带帧 plain call + trace + ret，
+> cycle 不适用。
 
 ### 逐维度命中路径汇编（`-Os`，入口 -> `br spec`）
 
