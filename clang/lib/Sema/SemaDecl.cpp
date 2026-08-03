@@ -76,6 +76,10 @@ using namespace sema;
 // Defined in SemaEJIT.cpp.
 void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD);
 
+// Forward declaration for EmbeddedJIT always_inline conflict check.
+// Defined in SemaEJIT.cpp.
+void checkEjitAlwaysInlineConflict(Sema &S, FunctionDecl *FD);
+
 // Forward declaration for EmbeddedJIT may_const write check.
 // Defined in SemaEJIT.cpp.
 void checkEjitMayConstWrites(Sema &S, const FunctionDecl *FD, Stmt *Body);
@@ -10513,6 +10517,10 @@ Sema::ActOnFunctionDeclarator(Scope *S, Declarator &D, DeclContext *DC,
 
   // Enforce at most 4 ejit_period_arr_ind parameters per function.
   checkEjitPeriodArrIndLimit(*this, NewFD);
+
+  // An ejit_entry / ejit_period_lc function must not carry always_inline
+  // (it conflicts with the noinline CodeGen/PASS3 add for LTO survival).
+  checkEjitAlwaysInlineConflict(*this, NewFD);
 
   const auto *NewTVA = NewFD->getAttr<TargetVersionAttr>();
   if (Context.getTargetInfo().getTriple().isAArch64() && NewTVA &&
