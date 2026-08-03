@@ -26,7 +26,8 @@ void expectSuccess(Error Err) {
 BranchStubGraph makeBranchStubGraph(uint64_t FixupAddr, uint64_t TargetAddr,
                                     int64_t Addend = 0,
                                     Triple::ArchType Arch = Triple::aarch64,
-                                    int64_t GOTAddend = 0) {
+                                    int64_t GOTAddend = 0,
+                                    bool ResolveViaSetAddress = false) {
   Triple TT;
   TT.setArch(Arch);
   auto G = std::make_unique<LinkGraph>(
@@ -39,9 +40,18 @@ BranchStubGraph makeBranchStubGraph(uint64_t FixupAddr, uint64_t TargetAddr,
   auto &BranchBlock = G->createContentBlock(Text, BranchContent,
                                             orc::ExecutorAddr(FixupAddr), 4, 0);
 
-  Symbol &Destination = G->addAbsoluteSymbol(
-      G->intern("destination"), orc::ExecutorAddr(TargetAddr), 0,
-      Linkage::Strong, Scope::Default, true);
+  Symbol &Destination =
+      ResolveViaSetAddress
+          ? G->addExternalSymbol("destination", 0, false)
+          : G->addAbsoluteSymbol(G->intern("destination"),
+                                 orc::ExecutorAddr(TargetAddr), 0,
+                                 Linkage::Strong, Scope::Default, true);
+  if (ResolveViaSetAddress)
+    // Mirror JITLink's applyLookupResult: resolve the external symbol's
+    // address via setAddress WITHOUT clearing isExternal() (makeAbsolute and
+    // addAbsoluteSymbol both clear it). The pass must gate on the address, not
+    // isExternal(), or it skips every resolved external stub.
+    Destination.getAddressable().setAddress(orc::ExecutorAddr(TargetAddr));
 
   Section &GOT = G->createSection(aarch64::GOTTableManager::getSectionName(),
                                   orc::MemProt::Read);
@@ -118,6 +128,27 @@ TEST(EJitLinkOptimizationPlugin, SupportsBigEndianTarget) {
 
 TEST(EJitLinkOptimizationPlugin, IgnoresOtherArchitectures) {
   auto T = makeBranchStubGraph(0x10000000, 0x10001000, 0, Triple::x86_64);
+  expectSuccess(relaxAArch64BranchStubs(*T.G));
+  EXPECT_EQ(&T.Branch->getTarget(), T.Stub);
+}
+
+// C3 regression: applyLookupResult resolves externals via setAddress, which
+// keeps isExternal()=true (makeAbsolute and addAbsoluteSymbol both clear it).
+// The pass must gate on the address, not isExternal(), or it skips every
+// resolved external stub. These mirror the real resolution flow.
+TEST(EJitLinkOptimizationPlugin, RelaxesSetAddressResolvedExternal) {
+  auto T = makeBranchStubGraph(0x10000000, 0x10001000, 0, Triple::aarch64, 0,
+                               /*ResolveViaSetAddress=*/true);
+  EXPECT_TRUE(T.Destination->isExternal()); // setAddress did not clear it
+  expectSuccess(relaxAArch64BranchStubs(*T.G));
+  EXPECT_EQ(&T.Branch->getTarget(), T.Destination);
+}
+
+TEST(EJitLinkOptimizationPlugin, KeepsUnresolvedExternalStubbed) {
+  // setAddress(0): genuinely unresolved (e.g. weak external with no defn).
+  auto T = makeBranchStubGraph(0x10000000, 0, 0, Triple::aarch64, 0,
+                               /*ResolveViaSetAddress=*/true);
+  EXPECT_TRUE(T.Destination->isExternal());
   expectSuccess(relaxAArch64BranchStubs(*T.G));
   EXPECT_EQ(&T.Branch->getTarget(), T.Stub);
 }
