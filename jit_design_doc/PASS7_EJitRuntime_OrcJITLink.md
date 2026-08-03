@@ -158,12 +158,22 @@ EJitOrcEngine::Create(const EJitConfig& config) {
     }
     engine->J = std::move(*JOrErr);
 
-    // PreFixup: resolved AArch64 B/BL calls that JITLink initially routed
-    // through a standard stub+GOT chain are changed back to a direct branch
-    // when the final target is within the architectural ±128 MiB range.
+    // PreFixup: retarget standard AArch64 pointer-jump stubs (branch ->
+    // $__STUBS -> $__GOT -> destination) to a direct B/BL when the resolved
+    // displacement fits the architectural ±128 MiB range. This plugin must
+    // run before the diagnostic plugin so PostFixup reporting sees the actual
+    // direct/stubbed result.
     if (auto *OLL = dyn_cast<orc::ObjectLinkingLayer>(
             &engine->J->getObjLinkingLayer()))
         OLL->addPlugin(std::make_shared<EJitLinkOptimizationPlugin>());
+
+    // PostFixup: EJitLinkDiagPlugin audits every AArch64 branch relocation
+    // and reports which remain bridged through a stub+GOT (out of ±128 MiB
+    // or unsafe chain) instead of a direct BL. INFO emits one summary per
+    // graph; VERBOSE additionally emits each relocation.
+    if (auto *OLL = dyn_cast<orc::ObjectLinkingLayer>(
+            &engine->J->getObjLinkingLayer()))
+        OLL->addPlugin(std::make_shared<EJitLinkDiagPlugin>());
 
     // 步骤 3: 注册 IRTransformLayer 回调
     // 完整的 JIT Pipeline: 参数替换 → InstCombine → StructFieldPass → IPSCCP →
@@ -216,8 +226,27 @@ JITLink 会先为外部 `B/BL` 目标建立
 `branch -> $__STUBS -> $__GOT -> destination` 链。代码池与 AOT 代码距离较近时，
 `EJitLinkOptimizationPlugin` 在 `PreFixup` 阶段读取已经解析的最终地址；若
 `Branch26PCRel` 的位移处于 `[-2^27, 2^27 - 4]` 字节且四字节对齐，则将边直接
-指向最终目标，由正常 fixup 编码单条 `B/BL`。远目标、未解析目标、非标准 stub
-链和非零 GOT addend 均保留原 stub 路径。
+指向最终目标，由正常 fixup 编码单条 `B/BL`。否则保留原 stub 路径。
+
+**门控用地址，不用 `isExternal()`**：JITLink 的 `applyLookupResult` 在 PreFixup
+之前用 `Sym->getAddressable().setAddress(addr)` 解析外部符号，但**不**把它转成
+`isAbsolute`，所以已解析的外部符号 `isExternal()` 仍为 `true`。若用
+`if (Destination->isExternal()) continue` 门控，会把每个已解析外部 stub 全部跳过
+-> 0 放松（这是曾出现的 bug）。pass 改为按地址门控
+`if (TargetAddr == 0) continue`，仅跳过真正未解析的（如弱引用无定义的外部）。
+
+**skip 分类与审计**：pass 在 `EJIT_DIAG` INFO 行按原因分类每个 stubbed
+`Branch26PCRel`，与三个 skip 计数器对齐：`chain-mismatch`（stub/GOT 链不匹配，
+含非零 GOT addend）、`unresolved`（`TargetAddr == 0`）、`out-of-range`（超
+±128 MiB 或未对齐），以及 `relaxed`（已放松计数）。格式：
+`relaxAArch64BranchStubs: graph=<name> Branch26PCRel: <total> total,
+<stubbed> stubbed (chain-mismatch=<cm> unresolved=<ur> out-of-range=<oor>),
+<relaxed> relaxed`。
+
+**PostFixup 审计**：`EJitLinkDiagPlugin`（紧跟 optimization plugin 之后注册）对
+每条 AArch64 分支重定位审计：INFO 汇总 "N stubbed (M exceed ±128MB)"，VERBOSE
+逐条打印 `[STUBBED] <reloc> -> <target> (<dist>, within/EXCEEDS ±128MB)`。顺序
+固定（optimization 先、diag 后），使 PostFixup 审计看到放松后的真实结果。
 
 该优化只发生在链接阶段，不增加运行时热路径状态，也不改变 code-pool/shared
 taskpool ABI。已经分配的 stub/GOT 不主动删除，因此本改动降低执行开销，但不以
@@ -1634,6 +1663,13 @@ llvm/include/llvm/ExecutionEngine/EJIT/
 
 // EJitCodePoolMemoryManagerTest.cpp, EJitCodePoolTest.cpp
 // - JITLink layout / executable ranges / 2M and 4K sealing / failures
+
+// EJitLinkOptimizationPluginTest.cpp
+// - relaxAArch64BranchStubs: forward/backward/in-range/boundary/out-of-range/
+//   misaligned/addend/GOT-addend/big-endian/other-arch
+// - setAddress 流程: RelaxesSetAddressResolvedExternal (in-range 外部符号经
+//   applyLookupResult 的 setAddress 解析后必须放松)、KeepsUnresolvedExternalStubbed
+//   (TargetAddr==0 不放松) -- 锁定 "门控用地址不用 isExternal()" 修复
 ```
 
 ### 8.2 集成测试
