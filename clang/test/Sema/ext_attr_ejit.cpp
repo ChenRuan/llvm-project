@@ -80,3 +80,21 @@ void good_writer(__attribute__((ejit_period_arr_ind("cell"))) int i, int v) {
   g_warn[i].cellType = v;  // no warning: ejit_period_lc sanctions the write
   g_warn[i].flags += v;    // no warning
 }
+
+// === Warning: always_inline conflicts with ejit_entry / ejit_period_lc ===
+// These functions must stay out-of-line: CodeGen/PASS3 mark them noinline so
+// they survive the LTO inliner for PASS1/PASS3/PASS4. always_inline is
+// incompatible ('noinline and alwaysinline' aborts the verifier), so it is
+// dropped after warning. The check is deferred to ActOnFunctionDeclarator
+// (after all attributes are processed), so both source orders are rejected.
+__attribute__((always_inline, ejit_entry))  // expected-warning {{'always_inline' is incompatible with ejit_entry}} expected-note {{conflicting attribute is here}}
+void ai_entry(__attribute__((ejit_period_arr_ind("cell"))) int idx) { g_warn[idx].plain = idx; }
+
+__attribute__((ejit_entry, always_inline))  // expected-warning {{'always_inline' is incompatible with ejit_entry}} expected-note {{conflicting attribute is here}}
+void ai_entry_rev(__attribute__((ejit_period_arr_ind("cell"))) int idx) { g_warn[idx].plain = idx; }
+
+__attribute__((always_inline, ejit_period_lc("cell")))  // expected-warning {{'always_inline' is incompatible with ejit_period_lc}} expected-note {{conflicting attribute is here}}
+void ai_lc(__attribute__((ejit_period_arr_ind("cell"))) int idx) { g_warn[idx].plain = idx; }
+
+// No ejit attribute -> always_inline is fine, no warning.
+__attribute__((always_inline)) inline void plain_ai(int x) { (void)x; }

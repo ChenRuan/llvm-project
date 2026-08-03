@@ -35,6 +35,15 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
   if (FD->hasAttr<EjitEntryAttr>()) {
     Entries.push_back(llvm::MDNode::get(Ctx,
         llvm::MDString::get(Ctx, TAG_EJIT_ENTRY)));
+    // Prevent the inliner from merging ejit_entry into its callers.
+    // In LTO pipelines the inliner runs before EJitWrapperGenPass can
+    // add this attribute; emitting it at CodeGen time ensures the
+    // function survives so PASS1 can extract its bitcode and PASS3
+    // can insert the JIT wrapper. Sema rejects always_inline on
+    // ejit_entry; the AlwaysInline guard is a backstop for hand-written
+    // IR (noinline + alwaysinline is illegal and aborts the verifier).
+    if (!F->hasFnAttribute(llvm::Attribute::AlwaysInline))
+      F->addFnAttr(llvm::Attribute::NoInline);
   }
 
   // ejit_period_lc
@@ -44,6 +53,17 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
         llvm::MDString::get(Ctx, LCA->getPeriodName())
     }));
   }
+  // Same LTO-inliner hazard as ejit_entry: in FullLTO the inliner runs
+  // before EJitAotModulePass, so PASS4 (EJitPeriodHandler) would see an
+  // inlined-away function and fail to emit ejit_deactivate/ejit_activate
+  // at its entry/returns. Unlike ejit_entry, PASS4 does not self-defend
+  // with NoInline, so the CodeGen-time attribute is the only guard.
+  // Lifecycle guards are entered/left rarely, so NoInline has no real
+  // perf cost. Sema rejects always_inline here too; the guard backstops
+  // hand-written IR.
+  if (FD->hasAttr<EjitPeriodLcAttr>() &&
+      !F->hasFnAttribute(llvm::Attribute::AlwaysInline))
+    F->addFnAttr(llvm::Attribute::NoInline);
 
   // ejit_period_arr_ind (on parameters)
   for (unsigned I = 0; I < FD->getNumParams(); ++I) {

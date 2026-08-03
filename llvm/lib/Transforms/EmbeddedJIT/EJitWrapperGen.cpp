@@ -39,11 +39,6 @@ using namespace llvm::ejit;
 
 extern cl::opt<bool> EnableEJitGlobalCtors;
 
-static cl::opt<bool> EJitNoInlineEntry(
-    "ejit-noinline-entry", cl::init(true), cl::Hidden,
-    cl::desc("Add noinline attribute to ejit_entry functions to prevent the "
-             "CGSCC inliner from duplicating the JIT wrapper into callers"));
-
 // Emit fixed-dimension taskpool fast-path C ABI calls
 // (ejit_taskpool_compile_or_get_Nd, N = dim count) for entries with <= 2 dims
 // (0-2 dims fit in 8 integer arg registers, no stack spill). Entries with > 2
@@ -564,9 +559,12 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     // Prevent the CGSCC inliner from inlining the wrapped function into
     // callers. Each call site would duplicate the JIT dispatch logic
     // (cacheKey computation, ejit_compile_or_get call, indirect call) and
-    // the inliner may produce
-    // inconsistent AOT fallback code depending on call-site context.
-    if (EJitNoInlineEntry)
+    // the inliner may produce inconsistent AOT fallback code depending on
+    // call-site context. This is unconditional: the entry must stay
+    // out-of-line for LTO correctness. Sema rejects always_inline on
+    // ejit_entry; the guard backstops hand-written IR (noinline +
+    // alwaysinline is illegal and aborts the verifier).
+    if (!F->hasFnAttribute(Attribute::AlwaysInline))
       F->addFnAttr(Attribute::NoInline);
 
     auto PeriodInds = getPeriodArrIndInfo(*F);

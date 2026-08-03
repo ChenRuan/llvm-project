@@ -303,6 +303,31 @@ void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD) {
   }
 }
 
+/// checkEjitAlwaysInlineConflict - An ejit_entry / ejit_period_lc function
+/// must stay out-of-line: CodeGen and PASS3 mark it noinline so it survives
+/// the LTO inliner for PASS1 (bitcode extraction), PASS3 (wrapper), and
+/// PASS4 (lifecycle). A user-written always_inline would produce illegal IR
+/// ("'noinline and alwaysinline' are incompatible"), which the verifier
+/// aborts on. Warn and drop the always_inline so ejit semantics win.
+/// Called from ActOnFunctionDeclarator after ProcessDeclAttributes, so the
+/// check is independent of the source order of the two attributes.
+void checkEjitAlwaysInlineConflict(Sema &S, FunctionDecl *FD) {
+  if (!FD)
+    return;
+  bool IsEntry = FD->hasAttr<EjitEntryAttr>();
+  bool IsLc = FD->hasAttr<EjitPeriodLcAttr>();
+  if (!IsEntry && !IsLc)
+    return;
+  if (AlwaysInlineAttr *AI = FD->getAttr<AlwaysInlineAttr>()) {
+    S.Diag(AI->getLocation(), diag::warn_ejit_always_inline_conflict)
+        << (IsEntry ? "ejit_entry" : "ejit_period_lc");
+    S.Diag(IsEntry ? FD->getAttr<EjitEntryAttr>()->getLocation()
+                   : FD->getAttr<EjitPeriodLcAttr>()->getLocation(),
+           diag::note_conflicting_attribute);
+    FD->dropAttr<AlwaysInlineAttr>();
+  }
+}
+
 /// If \p E is an lvalue that writes an ejit_may_const field, return that field
 /// and set \p BaseVar to the underlying variable (if any). Strips parentheses
 /// and implicit casts, and walks through array-subscript / member chains to
