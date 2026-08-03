@@ -6,6 +6,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLinkDiagPlugin.h"
+#include "llvm/ExecutionEngine/EJIT/EJitLinkOptimizationPlugin.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLibcallStubs.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
@@ -586,12 +587,20 @@ EJitOrcEngine::Create(const Config &config,
 
   engine->P->J = std::move(*J);
 
+  // Retarget standard AArch64 pointer-jump stubs to their final destination
+  // when the resolved B/BL displacement fits the architectural range. This
+  // plugin must run before the diagnostic plugin so PostFixup reporting sees
+  // the actual direct/stubbed result.
+  if (auto *OLL = dyn_cast<orc::ObjectLinkingLayer>(
+          &engine->P->J->getObjLinkingLayer()))
+    OLL->addPlugin(std::make_shared<EJitLinkOptimizationPlugin>());
+
   // Attach the JITLink branch-relocation diagnostic plugin. It appends a
   // PostFixup pass that audits every AArch64 branch relocation and reports
-  // which ones JITLink bridged through a $__STUBS PointerJumpStub + $__GOT
-  // (because the direct BL target is external / out of +-128MB) instead of a
-  // direct BL. INFO emits one summary per graph; VERBOSE additionally emits
-  // each relocation. Output uses SRE_printf on bare-metal.
+  // which ones remain bridged through a $__STUBS PointerJumpStub + $__GOT
+  // (because the resolved target is out of +-128MB or the chain is not safe to
+  // relax) instead of a direct BL. INFO emits one summary per graph; VERBOSE
+  // additionally emits each relocation. Output uses SRE_printf on bare-metal.
   if (auto *OLL = dyn_cast<orc::ObjectLinkingLayer>(
           &engine->P->J->getObjLinkingLayer()))
     OLL->addPlugin(std::make_shared<EJitLinkDiagPlugin>());

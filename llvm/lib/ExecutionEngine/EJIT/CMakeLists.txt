@@ -60,6 +60,7 @@ set(EJIT_SOURCES
   EJitRegistryTable.c
   EJitOrcEngine.cpp
   EJitLinkDiagPlugin.cpp
+  EJitLinkOptimizationPlugin.cpp
   EJitLibcallStubs.cpp
   EJitCompileDriver.cpp
   EJitRuntimeState.cpp
