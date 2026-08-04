@@ -33,3 +33,14 @@ cl::opt<bool> EJitWarnUnusedDim(
     cl::desc("Warn when an ejit_entry declares ejit_period_arr_ind(P) but its "
              "specialization closure never indexes an ejit_period_arr(P) "
              "(unused specialization dimension)."));
+
+// Optional info-level report (not a warning): per ejit_entry, count the
+// ejit_may_const reads in its specialization closure and how many sit inside
+// loops. A raw count is a poor specialization-value metric on its own (a
+// single read in a hot loop or feeding a branch is high value), so this only
+// reports the numbers for the user to judge - it does not gate or warn.
+cl::opt<bool> EJitReportMayConst(
+    "ejit-report-mayconst", cl::init(false), cl::Hidden,
+    cl::desc("Report per-ejit_entry ejit_may_const read counts (total and "
+             "in-loop) in the specialization closure, for manual "
+             "specialization-value assessment."));

@@ -10,6 +10,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
@@ -43,6 +44,7 @@ extern cl::opt<bool> EnableEJitGlobalCtors;
 extern cl::opt<std::string> EJitDumpBitcodeDir;
 extern cl::opt<bool> EJitWarnNoSpecialization;
 extern cl::opt<bool> EJitWarnUnusedDim;
+extern cl::opt<bool> EJitReportMayConst;
 
 #define DEBUG_TYPE "ejit-register-bitcode"
 
@@ -327,6 +329,8 @@ namespace {
 /// Per-function direct info used by the specialization diagnostic.
 struct EjitFuncDiagInfo {
   bool HasMayConstLoad = false;
+  unsigned MayConstCount = 0;        // # of !ejit.may_const loads (direct)
+  unsigned MayConstInLoopCount = 0;  // subset sitting inside a loop
   SmallVector<std::string, 4> RefsPeriodArr; // deduped period names referenced
   SmallVector<const Function *, 4> Callees;  // direct, defined, non-intrinsic
 };
@@ -365,14 +369,50 @@ static void collectReferencedPeriodArrs(Function &F,
   }
 }
 
-/// Compute direct (pre-propagation) diagnostic info for \p F.
+/// Return true if \p BB lies on a CFG cycle (reachable from itself via a
+/// non-empty path), i.e. it may execute more than once. This is a lightweight
+/// loop-membership test that avoids pulling LoopInfo / PassBuilder (and their
+/// shared-library link dependencies) into LLVMEmbeddedJIT. For natural loops
+/// it agrees with LoopInfo; it also accepts irreducible cycles, which is fine
+/// for an informational "may execute repeatedly" signal.
+static bool isOnCfgCycle(const BasicBlock *BB) {
+  SmallPtrSet<const BasicBlock *, 16> Visited;
+  SmallVector<const BasicBlock *, 16> WL(successors(BB).begin(),
+                                         successors(BB).end());
+  while (!WL.empty()) {
+    const BasicBlock *N = WL.pop_back_val();
+    if (N == BB)
+      return true;
+    if (!Visited.insert(N).second)
+      continue;
+    append_range(WL, successors(N));
+  }
+  return false;
+}
+
+/// Collect all basic blocks of \p F that lie on a CFG cycle.
+static void computeLoopBBs(Function &F,
+                           SmallPtrSetImpl<const BasicBlock *> &LoopBBs) {
+  for (const BasicBlock &BB : F)
+    if (isOnCfgCycle(&BB))
+      LoopBBs.insert(&BB);
+}
+
+/// Compute direct (pre-propagation) diagnostic info for \p F. \p LoopBBs is
+/// optional (non-null only when the may_const count report is enabled).
 static void
-computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKind) {
+computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKind,
+                        const SmallPtrSetImpl<const BasicBlock *> *LoopBBs) {
   for (BasicBlock &BB : F) {
+    const bool InLoop = LoopBBs && LoopBBs->count(&BB);
     for (Instruction &I : BB) {
       if (auto *Ld = dyn_cast<LoadInst>(&I))
-        if (Ld->hasMetadata(MayConstKind))
+        if (Ld->hasMetadata(MayConstKind)) {
           Info.HasMayConstLoad = true;
+          ++Info.MayConstCount;
+          if (InLoop)
+            ++Info.MayConstInLoopCount;
+        }
       if (auto *CB = dyn_cast<CallBase>(&I))
         if (Function *Callee = CB->getCalledFunction())
           if (!Callee->isDeclaration() && !Callee->isIntrinsic())
@@ -394,7 +434,7 @@ computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKi
 static void
 runSpecializationDiagnostic(Module &Extracted,
                             const SmallVectorImpl<Function *> &EntryFuncs) {
-  if (!EJitWarnNoSpecialization && !EJitWarnUnusedDim)
+  if (!EJitWarnNoSpecialization && !EJitWarnUnusedDim && !EJitReportMayConst)
     return;
 
   SmallVector<EjitEntryDiag, 4> Entries;
@@ -417,12 +457,18 @@ runSpecializationDiagnostic(Module &Extracted,
 
   unsigned MayConstKind = Extracted.getContext().getMDKindID(MD_EJIT_MAY_CONST);
 
-  // Direct info per defined function in the extracted module.
+  // Direct info per defined function in the extracted module. Loop membership
+  // (for the may_const count report) uses a lightweight CFG-cycle test so the
+  // report does not pull LoopInfo / PassBuilder into LLVMEmbeddedJIT.
   DenseMap<const Function *, EjitFuncDiagInfo> Info;
   for (Function &F : Extracted) {
     if (F.isDeclaration())
       continue;
-    computeEjitFuncDiagInfo(F, Info[&F], MayConstKind);
+    SmallPtrSet<const BasicBlock *, 16> LoopBBs;
+    if (EJitReportMayConst)
+      computeLoopBBs(F, LoopBBs);
+    computeEjitFuncDiagInfo(F, Info[&F], MayConstKind,
+                            EJitReportMayConst ? &LoopBBs : nullptr);
   }
 
   // Fixpoint: propagate HasMayConstLoad and RefsPeriodArr up the call graph.
@@ -482,6 +528,35 @@ runSpecializationDiagnostic(Module &Extracted,
                     "ejit_period_arr('"
                  << P << "'); unused specialization dimension, consider "
                         "removing it\n";
+  }
+
+  // Optional info report: per-entry ejit_may_const read counts (total /
+  // in-loop) over the specialization closure. Report-only; it does not gate.
+  if (EJitReportMayConst) {
+    for (const EjitEntryDiag &ED : Entries) {
+      const Function *EF = Extracted.getFunction(ED.Name);
+      if (!EF || EF->isDeclaration())
+        continue;
+      // BFS the entry's direct-call closure within the extracted module.
+      DenseSet<const Function *> Seen;
+      SmallVector<const Function *, 8> WL{EF};
+      unsigned K = 0, J = 0;
+      while (!WL.empty()) {
+        const Function *F = WL.pop_back_val();
+        if (!Seen.insert(F).second)
+          continue;
+        auto It = Info.find(F);
+        if (It == Info.end())
+          continue;
+        K += It->second.MayConstCount;
+        J += It->second.MayConstInLoopCount;
+        for (const Function *Callee : It->second.Callees)
+          WL.push_back(Callee);
+      }
+      errs() << "EJit info: ejit_entry function '" << EF->getName() << "': "
+             << K << " ejit_may_const read" << (K == 1 ? "" : "s") << " ("
+             << J << " in loops)\n";
+    }
   }
 }
 
