@@ -41,6 +41,7 @@ using namespace llvm::ejit;
 
 extern cl::opt<bool> EnableEJitGlobalCtors;
 extern cl::opt<std::string> EJitDumpBitcodeDir;
+extern cl::opt<bool> EJitWarnNoSpecialization;
 
 #define DEBUG_TYPE "ejit-register-bitcode"
 
@@ -320,9 +321,109 @@ static void logEJitGlobalMeta(const char *label, const Module &M) {
          << "\n";
 }
 
+namespace {
+
+/// Per-function direct info used by the specialization diagnostic.
+struct EjitFuncDiagInfo {
+  bool HasMayConstLoad = false;
+  SmallVector<const Function *, 4> Callees;  // direct, defined, non-intrinsic
+};
+
+/// One ejit_entry's name, located in the extracted module for diagnostics.
+struct EjitEntryDiag {
+  std::string Name;
+};
+
+} // namespace
+
+/// Compute direct (pre-propagation) diagnostic info for \p F.
+static void
+computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKind) {
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (auto *Ld = dyn_cast<LoadInst>(&I))
+        if (Ld->hasMetadata(MayConstKind))
+          Info.HasMayConstLoad = true;
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (Function *Callee = CB->getCalledFunction())
+          if (!Callee->isDeclaration() && !Callee->isIntrinsic())
+            Info.Callees.push_back(Callee);
+    }
+  }
+}
+
+/// AOT specialization diagnostic on the extracted bitcode (post-preOptimize),
+/// which is exactly what the JIT will specialize.
+///   #1: ejit_entry whose specialization closure reads no ejit_may_const field.
+/// The closure is the direct-call reachability within the extracted module.
+/// External calls (declarations) and indirect calls (function pointers) do NOT
+/// count: the JIT cannot inline them, so their may_const reads never enter this
+/// entry's specialization. This keeps #1 sound (no false positives).
+static void
+runSpecializationDiagnostic(Module &Extracted,
+                            const SmallVectorImpl<Function *> &EntryFuncs) {
+  if (!EJitWarnNoSpecialization)
+    return;
+
+  SmallVector<EjitEntryDiag, 4> Entries;
+  for (const Function *F : EntryFuncs) {
+    EjitEntryDiag ED;
+    ED.Name = F->getName().str();
+    Entries.push_back(std::move(ED));
+  }
+
+  unsigned MayConstKind = Extracted.getContext().getMDKindID(MD_EJIT_MAY_CONST);
+
+  // Direct info per defined function in the extracted module.
+  DenseMap<const Function *, EjitFuncDiagInfo> Info;
+  for (Function &F : Extracted) {
+    if (F.isDeclaration())
+      continue;
+    computeEjitFuncDiagInfo(F, Info[&F], MayConstKind);
+  }
+
+  // Fixpoint: propagate HasMayConstLoad up the call graph. The extracted
+  // module holds only the closure, so every function is reachable from some
+  // entry; the monotonic fixpoint converges quickly.
+  DenseMap<const Function *, bool> ClosureMC;
+  for (auto &KV : Info)
+    ClosureMC[KV.first] = KV.second.HasMayConstLoad;
+  bool Changed = true;
+  while (Changed) {
+    Changed = false;
+    for (auto &KV : Info) {
+      const Function *F = KV.first;
+      for (const Function *Callee : KV.second.Callees) {
+        if (!Info.count(Callee))
+          continue;
+        if (ClosureMC[Callee] && !ClosureMC[F]) {
+          ClosureMC[F] = true;
+          Changed = true;
+        }
+      }
+    }
+  }
+
+  // #1: no ejit_may_const read in the specialization closure.
+  for (const EjitEntryDiag &ED : Entries) {
+    const Function *EF = Extracted.getFunction(ED.Name);
+    if (!EF || EF->isDeclaration())
+      continue;
+    auto MCIt = ClosureMC.find(EF);
+    if (MCIt == ClosureMC.end())
+      continue;
+    if (!MCIt->second)
+      errs() << "EJit warning: ejit_entry function '" << EF->getName()
+             << "' reads no ejit_may_const field in its specialization "
+                "closure; no JIT specialization value, consider removing "
+                "ejit_entry\n";
+  }
+}
+
 static std::string extractAndSerialize(Module &M,
     const SetVector<Function *> &Funcs,
-    const SetVector<GlobalVariable *> &Globals) {
+    const SetVector<GlobalVariable *> &Globals,
+    const SmallVectorImpl<Function *> &EntryFuncs) {
 
   auto Extracted = CloneModule(M);
   DenseSet<StringRef> FuncNames;
@@ -362,6 +463,11 @@ static std::string extractAndSerialize(Module &M,
   logEJitGlobalMeta("extract-after-clone", *Extracted);
   preOptimizeBitcode(*Extracted);
   logEJitGlobalMeta("extract-after-preOpt", *Extracted);
+
+  // Specialization diagnostics on the post-preOptimize extracted module (the
+  // exact bitcode the JIT will specialize). Must run before the extern
+  // conversion below so GV definitions (and their !ejit.metadata) are intact.
+  runSpecializationDiagnostic(*Extracted, EntryFuncs);
 
   // Convert kept non-constant global definitions to external declarations
   // so the JIT linker resolves them from the host process. Constants (e.g.
@@ -665,7 +771,8 @@ EJitRegisterBitcodePass::run(Module &M, ModuleAnalysisManager &) {
   if (ClosureFuncs.empty())
     return PreservedAnalyses::all();
 
-  std::string Bitcode = extractAndSerialize(M, ClosureFuncs, ClosureGlobals);
+  std::string Bitcode =
+      extractAndSerialize(M, ClosureFuncs, ClosureGlobals, EntryFuncs);
   GlobalVariable *BitcodeGV = embedBitcode(M, Bitcode);
   generateRegisterCall(M, BitcodeGV, EntryFuncs, ClosureFuncs);
 

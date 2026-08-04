@@ -20,3 +20,10 @@ cl::opt<std::string> EJitDumpBitcodeDir(
              "at AOT compile time, for debugging symbol extraction. Each TU "
              "writes a PID + module-named file so parallel -j builds do not "
              "collide or serialize."));
+
+// AOT specialization diagnostic (PASS1). Defaults on; guards its own warning
+// so users can silence it independently via -mllvm.
+cl::opt<bool> EJitWarnNoSpecialization(
+    "ejit-warn-no-specialization", cl::init(true), cl::Hidden,
+    cl::desc("Warn when an ejit_entry function reads no ejit_may_const field "
+             "in its specialization closure (no JIT specialization value)."));
