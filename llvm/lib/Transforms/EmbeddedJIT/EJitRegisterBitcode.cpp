@@ -42,6 +42,7 @@ using namespace llvm::ejit;
 extern cl::opt<bool> EnableEJitGlobalCtors;
 extern cl::opt<std::string> EJitDumpBitcodeDir;
 extern cl::opt<bool> EJitWarnNoSpecialization;
+extern cl::opt<bool> EJitWarnUnusedDim;
 
 #define DEBUG_TYPE "ejit-register-bitcode"
 
@@ -326,15 +327,43 @@ namespace {
 /// Per-function direct info used by the specialization diagnostic.
 struct EjitFuncDiagInfo {
   bool HasMayConstLoad = false;
+  SmallVector<std::string, 4> RefsPeriodArr; // deduped period names referenced
   SmallVector<const Function *, 4> Callees;  // direct, defined, non-intrinsic
 };
 
-/// One ejit_entry's name, located in the extracted module for diagnostics.
+/// One ejit_entry's declared dimensions, parsed from the original module's
+/// function metadata (robust to whether the extracted module's function
+/// metadata survived clone + preOptimize).
 struct EjitEntryDiag {
   std::string Name;
+  SmallVector<std::string, 4> DeclaredDims;
 };
 
 } // namespace
+
+/// Collect the period names of ejit_period_arr globals that \p F references
+/// (walking GEP chains via the shared rootGlobal helper).
+static void collectReferencedPeriodArrs(Function &F,
+                                        SmallVectorImpl<std::string> &Out) {
+  SetVector<GlobalVariable *> GVs;
+  collectReferencedGlobals(F, GVs);
+  for (GlobalVariable *GV : GVs) {
+    MDNode *GMD = GV->getMetadata(MD_EJIT_METADATA);
+    if (!GMD)
+      continue;
+    for (const MDOperand &Op : GMD->operands()) {
+      auto *Sub = dyn_cast<MDNode>(Op.get());
+      if (!Sub || Sub->getNumOperands() < 2)
+        continue;
+      auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+      if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR)
+        continue;
+      if (auto *PN = dyn_cast<MDString>(Sub->getOperand(1)))
+        if (!is_contained(Out, PN->getString()))
+          Out.push_back(PN->getString().str());
+    }
+  }
+}
 
 /// Compute direct (pre-propagation) diagnostic info for \p F.
 static void
@@ -350,11 +379,14 @@ computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKi
             Info.Callees.push_back(Callee);
     }
   }
+  collectReferencedPeriodArrs(F, Info.RefsPeriodArr);
 }
 
-/// AOT specialization diagnostic on the extracted bitcode (post-preOptimize),
+/// AOT specialization diagnostics on the extracted bitcode (post-preOptimize),
 /// which is exactly what the JIT will specialize.
 ///   #1: ejit_entry whose specialization closure reads no ejit_may_const field.
+///   #2: ejit_entry that declares ejit_period_arr_ind(P) but its closure never
+///       indexes an ejit_period_arr(P).
 /// The closure is the direct-call reachability within the extracted module.
 /// External calls (declarations) and indirect calls (function pointers) do NOT
 /// count: the JIT cannot inline them, so their may_const reads never enter this
@@ -362,13 +394,24 @@ computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKi
 static void
 runSpecializationDiagnostic(Module &Extracted,
                             const SmallVectorImpl<Function *> &EntryFuncs) {
-  if (!EJitWarnNoSpecialization)
+  if (!EJitWarnNoSpecialization && !EJitWarnUnusedDim)
     return;
 
   SmallVector<EjitEntryDiag, 4> Entries;
   for (const Function *F : EntryFuncs) {
     EjitEntryDiag ED;
     ED.Name = F->getName().str();
+    if (MDNode *MD = F->getMetadata(MD_EJIT_METADATA))
+      for (const MDOperand &Op : MD->operands()) {
+        auto *Sub = dyn_cast<MDNode>(Op.get());
+        if (!Sub || Sub->getNumOperands() < 2)
+          continue;
+        auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+        if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
+          continue;
+        if (auto *PN = dyn_cast<MDString>(Sub->getOperand(1)))
+          ED.DeclaredDims.push_back(PN->getString().str());
+      }
     Entries.push_back(std::move(ED));
   }
 
@@ -382,12 +425,15 @@ runSpecializationDiagnostic(Module &Extracted,
     computeEjitFuncDiagInfo(F, Info[&F], MayConstKind);
   }
 
-  // Fixpoint: propagate HasMayConstLoad up the call graph. The extracted
-  // module holds only the closure, so every function is reachable from some
-  // entry; the monotonic fixpoint converges quickly.
+  // Fixpoint: propagate HasMayConstLoad and RefsPeriodArr up the call graph.
+  // The extracted module holds only the closure, so every function is reachable
+  // from some entry; the monotonic fixpoint converges quickly.
   DenseMap<const Function *, bool> ClosureMC;
-  for (auto &KV : Info)
+  DenseMap<const Function *, SmallVector<std::string, 4>> ClosureRefs;
+  for (auto &KV : Info) {
     ClosureMC[KV.first] = KV.second.HasMayConstLoad;
+    ClosureRefs[KV.first] = KV.second.RefsPeriodArr;
+  }
   bool Changed = true;
   while (Changed) {
     Changed = false;
@@ -400,23 +446,42 @@ runSpecializationDiagnostic(Module &Extracted,
           ClosureMC[F] = true;
           Changed = true;
         }
+        for (const std::string &P : ClosureRefs[Callee])
+          if (!is_contained(ClosureRefs[F], P)) {
+            ClosureRefs[F].push_back(P);
+            Changed = true;
+          }
       }
     }
   }
 
-  // #1: no ejit_may_const read in the specialization closure.
+  // Emit diagnostics per entry (locate in the extracted module by name).
   for (const EjitEntryDiag &ED : Entries) {
     const Function *EF = Extracted.getFunction(ED.Name);
     if (!EF || EF->isDeclaration())
       continue;
     auto MCIt = ClosureMC.find(EF);
-    if (MCIt == ClosureMC.end())
+    auto RefIt = ClosureRefs.find(EF);
+    if (MCIt == ClosureMC.end() || RefIt == ClosureRefs.end())
       continue;
-    if (!MCIt->second)
+
+    // #1: no ejit_may_const read in the specialization closure.
+    if (EJitWarnNoSpecialization && !MCIt->second)
       errs() << "EJit warning: ejit_entry function '" << EF->getName()
              << "' reads no ejit_may_const field in its specialization "
                 "closure; no JIT specialization value, consider removing "
                 "ejit_entry\n";
+
+    // #2: declared dimension never referenced by the closure.
+    if (EJitWarnUnusedDim)
+      for (const std::string &P : ED.DeclaredDims)
+        if (!is_contained(RefIt->second, P))
+          errs() << "EJit warning: ejit_entry function '" << EF->getName()
+                 << "' declares ejit_period_arr_ind('" << P
+                 << "') but its specialization closure never indexes an "
+                    "ejit_period_arr('"
+                 << P << "'); unused specialization dimension, consider "
+                        "removing it\n";
   }
 }
 
