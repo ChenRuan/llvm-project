@@ -20,22 +20,22 @@ define void @entry_plain(i32 %c) !ejit.metadata !30 {
 }
 
 ; Direct ejit_may_const read -> no warning.
-define void @entry_direct(i32 %c) !ejit.metadata !20 {
+define i32 @entry_direct(i32 %c) !ejit.metadata !20 {
   %p = getelementptr [16 x i32], ptr @cell_data, i32 0, i32 %c
   %v = load i32, ptr %p, !ejit.may_const !{}
-  ret void
+  ret i32 %v
 }
 
 ; ejit_may_const read hidden in an internal helper. The closure covers it, so
 ; the entry still has specialization value -> no warning.
-define void @entry_via_helper(i32 %c) !ejit.metadata !20 {
-  call void @helper_reads_mc(i32 %c)
-  ret void
+define i32 @entry_via_helper(i32 %c) !ejit.metadata !20 {
+  %r = call i32 @helper_reads_mc(i32 %c)
+  ret i32 %r
 }
-define internal void @helper_reads_mc(i32 %c) {
+define internal i32 @helper_reads_mc(i32 %c) {
   %p = getelementptr [16 x i32], ptr @cell_data, i32 0, i32 %c
   %v = load i32, ptr %p, !ejit.may_const !{}
-  ret void
+  ret i32 %v
 }
 
 ; Only calls an external function. The JIT cannot inline external calls, so

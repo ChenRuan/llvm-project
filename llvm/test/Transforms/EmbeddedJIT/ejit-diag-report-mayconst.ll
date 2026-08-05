@@ -17,7 +17,7 @@
 
 @cell_data = global [16 x i32] zeroinitializer, !ejit.metadata !10
 
-define void @entry_loop(i32 %c) !ejit.metadata !20 {
+define i32 @entry_loop(i32 %c) !ejit.metadata !20 {
 entry:
   br label %loop
 loop:
@@ -28,13 +28,14 @@ loop:
   %cond = icmp slt i32 %i.next, 10
   br i1 %cond, label %loop, label %exit
 exit:
-  ret void
+  %v.out = phi i32 [%v, %loop]
+  ret i32 %v.out
 }
 
-define void @entry_noloop(i32 %c) !ejit.metadata !20 {
+define i32 @entry_noloop(i32 %c) !ejit.metadata !20 {
   %p = getelementptr [16 x i32], ptr @cell_data, i32 0, i32 %c
   %v = load i32, ptr %p, !ejit.may_const !{}
-  ret void
+  ret i32 %v
 }
 
 define void @entry_plain(i32 %c) !ejit.metadata !30 {

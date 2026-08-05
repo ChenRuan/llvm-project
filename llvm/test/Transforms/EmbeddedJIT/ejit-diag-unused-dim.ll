@@ -19,17 +19,17 @@
 
 ; Declares cell + trp, but only indexes trp_data -> the cell dim is unused.
 ; (Still has specialization value via trp, so #1 does not fire either.)
-define void @entry_unused_cell(i32 %c, i32 %t) !ejit.metadata !21 {
+define i32 @entry_unused_cell(i32 %c, i32 %t) !ejit.metadata !21 {
   %p = getelementptr [8 x i32], ptr @trp_data, i32 0, i32 %t
   %v = load i32, ptr %p, !ejit.may_const !{}
-  ret void
+  ret i32 %v
 }
 
 ; Declares cell and indexes cell_data -> dim used, no warning.
-define void @entry_used(i32 %c) !ejit.metadata !20 {
+define i32 @entry_used(i32 %c) !ejit.metadata !20 {
   %p = getelementptr [16 x i32], ptr @cell_data, i32 0, i32 %c
   %v = load i32, ptr %p, !ejit.may_const !{}
-  ret void
+  ret i32 %v
 }
 
 !10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}, !{!"ejit_may_const_field", i32 0}}

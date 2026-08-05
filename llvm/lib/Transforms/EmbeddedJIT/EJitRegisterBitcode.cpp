@@ -96,8 +96,8 @@ static void computeTransitiveClosure(
     collectReferencedGlobals(*F, ClosureGlobals);
     for (BasicBlock &BB : *F)
       for (Instruction &I : BB)
-        if (auto *CI = dyn_cast<CallInst>(&I))
-          if (Function *Callee = CI->getCalledFunction())
+        if (auto *CB = dyn_cast<CallBase>(&I))
+          if (Function *Callee = CB->getCalledFunction())
             if (!Callee->isDeclaration() && !Callee->isIntrinsic())
               Worklist.push_back(Callee);
   }
@@ -331,7 +331,7 @@ struct EjitFuncDiagInfo {
   bool HasMayConstLoad = false;
   unsigned MayConstCount = 0;        // # of !ejit.may_const loads (direct)
   unsigned MayConstInLoopCount = 0;  // subset sitting inside a loop
-  SmallVector<std::string, 4> RefsPeriodArr; // deduped period names referenced
+  SetVector<std::string> RefsPeriodArr; // deduped period names referenced
   SmallVector<const Function *, 4> Callees;  // direct, defined, non-intrinsic
 };
 
@@ -344,30 +344,6 @@ struct EjitEntryDiag {
 };
 
 } // namespace
-
-/// Collect the period names of ejit_period_arr globals that \p F references
-/// (walking GEP chains via the shared rootGlobal helper).
-static void collectReferencedPeriodArrs(Function &F,
-                                        SmallVectorImpl<std::string> &Out) {
-  SetVector<GlobalVariable *> GVs;
-  collectReferencedGlobals(F, GVs);
-  for (GlobalVariable *GV : GVs) {
-    MDNode *GMD = GV->getMetadata(MD_EJIT_METADATA);
-    if (!GMD)
-      continue;
-    for (const MDOperand &Op : GMD->operands()) {
-      auto *Sub = dyn_cast<MDNode>(Op.get());
-      if (!Sub || Sub->getNumOperands() < 2)
-        continue;
-      auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-      if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR)
-        continue;
-      if (auto *PN = dyn_cast<MDString>(Sub->getOperand(1)))
-        if (!is_contained(Out, PN->getString()))
-          Out.push_back(PN->getString().str());
-    }
-  }
-}
 
 /// Return true if \p BB lies on a CFG cycle (reachable from itself via a
 /// non-empty path), i.e. it may execute more than once. This is a lightweight
@@ -403,6 +379,8 @@ static void computeLoopBBs(Function &F,
 static void
 computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKind,
                         const SmallPtrSetImpl<const BasicBlock *> *LoopBBs) {
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  SetVector<GlobalVariable *> GVs;
   for (BasicBlock &BB : F) {
     const bool InLoop = LoopBBs && LoopBBs->count(&BB);
     for (Instruction &I : BB) {
@@ -417,9 +395,28 @@ computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKi
         if (Function *Callee = CB->getCalledFunction())
           if (!Callee->isDeclaration() && !Callee->isIntrinsic())
             Info.Callees.push_back(Callee);
+      // Collect referenced GVs for period-arr lookup in the same traversal.
+      for (Value *Op : I.operands())
+        if (auto *GV = rootGlobal(Op, DL))
+          GVs.insert(GV);
     }
   }
-  collectReferencedPeriodArrs(F, Info.RefsPeriodArr);
+  // Derive period-arr names from collected GVs.
+  for (GlobalVariable *GV : GVs) {
+    MDNode *GMD = GV->getMetadata(MD_EJIT_METADATA);
+    if (!GMD)
+      continue;
+    for (const MDOperand &Op : GMD->operands()) {
+      auto *Sub = dyn_cast<MDNode>(Op.get());
+      if (!Sub || Sub->getNumOperands() < 2)
+        continue;
+      auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+      if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR)
+        continue;
+      if (auto *PN = dyn_cast<MDString>(Sub->getOperand(1)))
+        Info.RefsPeriodArr.insert(PN->getString().str());
+    }
+  }
 }
 
 /// AOT specialization diagnostics on the extracted bitcode (post-preOptimize),
@@ -475,7 +472,7 @@ runSpecializationDiagnostic(Module &Extracted,
   // The extracted module holds only the closure, so every function is reachable
   // from some entry; the monotonic fixpoint converges quickly.
   DenseMap<const Function *, bool> ClosureMC;
-  DenseMap<const Function *, SmallVector<std::string, 4>> ClosureRefs;
+  DenseMap<const Function *, SetVector<std::string>> ClosureRefs;
   for (auto &KV : Info) {
     ClosureMC[KV.first] = KV.second.HasMayConstLoad;
     ClosureRefs[KV.first] = KV.second.RefsPeriodArr;
@@ -493,10 +490,8 @@ runSpecializationDiagnostic(Module &Extracted,
           Changed = true;
         }
         for (const std::string &P : ClosureRefs[Callee])
-          if (!is_contained(ClosureRefs[F], P)) {
-            ClosureRefs[F].push_back(P);
+          if (ClosureRefs[F].insert(P))
             Changed = true;
-          }
       }
     }
   }
@@ -521,7 +516,7 @@ runSpecializationDiagnostic(Module &Extracted,
     // #2: declared dimension never referenced by the closure.
     if (EJitWarnUnusedDim)
       for (const std::string &P : ED.DeclaredDims)
-        if (!is_contained(RefIt->second, P))
+        if (RefIt->second.count(P) == 0)
           errs() << "EJit warning: ejit_entry function '" << EF->getName()
                  << "' declares ejit_period_arr_ind('" << P
                  << "') but its specialization closure never indexes an "
