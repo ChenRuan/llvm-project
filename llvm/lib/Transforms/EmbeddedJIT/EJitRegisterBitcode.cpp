@@ -10,6 +10,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
@@ -41,6 +42,9 @@ using namespace llvm::ejit;
 
 extern cl::opt<bool> EnableEJitGlobalCtors;
 extern cl::opt<std::string> EJitDumpBitcodeDir;
+extern cl::opt<bool> EJitWarnNoSpecialization;
+extern cl::opt<bool> EJitWarnUnusedDim;
+extern cl::opt<bool> EJitReportMayConst;
 
 #define DEBUG_TYPE "ejit-register-bitcode"
 
@@ -92,8 +96,8 @@ static void computeTransitiveClosure(
     collectReferencedGlobals(*F, ClosureGlobals);
     for (BasicBlock &BB : *F)
       for (Instruction &I : BB)
-        if (auto *CI = dyn_cast<CallInst>(&I))
-          if (Function *Callee = CI->getCalledFunction())
+        if (auto *CB = dyn_cast<CallBase>(&I))
+          if (Function *Callee = CB->getCalledFunction())
             if (!Callee->isDeclaration() && !Callee->isIntrinsic())
               Worklist.push_back(Callee);
   }
@@ -320,9 +324,241 @@ static void logEJitGlobalMeta(const char *label, const Module &M) {
          << "\n";
 }
 
+namespace {
+
+/// Per-function direct info used by the specialization diagnostic.
+struct EjitFuncDiagInfo {
+  bool HasMayConstLoad = false;
+  unsigned MayConstCount = 0;        // # of !ejit.may_const loads (direct)
+  unsigned MayConstInLoopCount = 0;  // subset sitting inside a loop
+  SetVector<std::string> RefsPeriodArr; // deduped period names referenced
+  SmallVector<const Function *, 4> Callees;  // direct, defined, non-intrinsic
+};
+
+/// One ejit_entry's declared dimensions, parsed from the original module's
+/// function metadata (robust to whether the extracted module's function
+/// metadata survived clone + preOptimize).
+struct EjitEntryDiag {
+  std::string Name;
+  SmallVector<std::string, 4> DeclaredDims;
+};
+
+} // namespace
+
+/// Return true if \p BB lies on a CFG cycle (reachable from itself via a
+/// non-empty path), i.e. it may execute more than once. This is a lightweight
+/// loop-membership test that avoids pulling LoopInfo / PassBuilder (and their
+/// shared-library link dependencies) into LLVMEmbeddedJIT. For natural loops
+/// it agrees with LoopInfo; it also accepts irreducible cycles, which is fine
+/// for an informational "may execute repeatedly" signal.
+static bool isOnCfgCycle(const BasicBlock *BB) {
+  SmallPtrSet<const BasicBlock *, 16> Visited;
+  SmallVector<const BasicBlock *, 16> WL(successors(BB).begin(),
+                                         successors(BB).end());
+  while (!WL.empty()) {
+    const BasicBlock *N = WL.pop_back_val();
+    if (N == BB)
+      return true;
+    if (!Visited.insert(N).second)
+      continue;
+    append_range(WL, successors(N));
+  }
+  return false;
+}
+
+/// Collect all basic blocks of \p F that lie on a CFG cycle.
+static void computeLoopBBs(Function &F,
+                           SmallPtrSetImpl<const BasicBlock *> &LoopBBs) {
+  for (const BasicBlock &BB : F)
+    if (isOnCfgCycle(&BB))
+      LoopBBs.insert(&BB);
+}
+
+/// Compute direct (pre-propagation) diagnostic info for \p F. \p LoopBBs is
+/// optional (non-null only when the may_const count report is enabled).
+static void
+computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKind,
+                        const SmallPtrSetImpl<const BasicBlock *> *LoopBBs) {
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  SetVector<GlobalVariable *> GVs;
+  for (BasicBlock &BB : F) {
+    const bool InLoop = LoopBBs && LoopBBs->count(&BB);
+    for (Instruction &I : BB) {
+      if (auto *Ld = dyn_cast<LoadInst>(&I))
+        if (Ld->hasMetadata(MayConstKind)) {
+          Info.HasMayConstLoad = true;
+          ++Info.MayConstCount;
+          if (InLoop)
+            ++Info.MayConstInLoopCount;
+        }
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (Function *Callee = CB->getCalledFunction())
+          if (!Callee->isDeclaration() && !Callee->isIntrinsic())
+            Info.Callees.push_back(Callee);
+      // Collect referenced GVs for period-arr lookup in the same traversal.
+      for (Value *Op : I.operands())
+        if (auto *GV = rootGlobal(Op, DL))
+          GVs.insert(GV);
+    }
+  }
+  // Derive period-arr names from collected GVs.
+  for (GlobalVariable *GV : GVs) {
+    MDNode *GMD = GV->getMetadata(MD_EJIT_METADATA);
+    if (!GMD)
+      continue;
+    for (const MDOperand &Op : GMD->operands()) {
+      auto *Sub = dyn_cast<MDNode>(Op.get());
+      if (!Sub || Sub->getNumOperands() < 2)
+        continue;
+      auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+      if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR)
+        continue;
+      if (auto *PN = dyn_cast<MDString>(Sub->getOperand(1)))
+        Info.RefsPeriodArr.insert(PN->getString().str());
+    }
+  }
+}
+
+/// AOT specialization diagnostics on the extracted bitcode (post-preOptimize),
+/// which is exactly what the JIT will specialize.
+///   #1: ejit_entry whose specialization closure reads no ejit_may_const field.
+///   #2: ejit_entry that declares ejit_period_arr_ind(P) but its closure never
+///       indexes an ejit_period_arr(P).
+/// The closure is the direct-call reachability within the extracted module.
+/// External calls (declarations) and indirect calls (function pointers) do NOT
+/// count: the JIT cannot inline them, so their may_const reads never enter this
+/// entry's specialization. This keeps #1 sound (no false positives).
+static void
+runSpecializationDiagnostic(Module &Extracted,
+                            const SmallVectorImpl<Function *> &EntryFuncs) {
+  if (!EJitWarnNoSpecialization && !EJitWarnUnusedDim && !EJitReportMayConst)
+    return;
+
+  SmallVector<EjitEntryDiag, 4> Entries;
+  for (const Function *F : EntryFuncs) {
+    EjitEntryDiag ED;
+    ED.Name = F->getName().str();
+    if (MDNode *MD = F->getMetadata(MD_EJIT_METADATA))
+      for (const MDOperand &Op : MD->operands()) {
+        auto *Sub = dyn_cast<MDNode>(Op.get());
+        if (!Sub || Sub->getNumOperands() < 2)
+          continue;
+        auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+        if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
+          continue;
+        if (auto *PN = dyn_cast<MDString>(Sub->getOperand(1)))
+          ED.DeclaredDims.push_back(PN->getString().str());
+      }
+    Entries.push_back(std::move(ED));
+  }
+
+  unsigned MayConstKind = Extracted.getContext().getMDKindID(MD_EJIT_MAY_CONST);
+
+  // Direct info per defined function in the extracted module. Loop membership
+  // (for the may_const count report) uses a lightweight CFG-cycle test so the
+  // report does not pull LoopInfo / PassBuilder into LLVMEmbeddedJIT.
+  DenseMap<const Function *, EjitFuncDiagInfo> Info;
+  for (Function &F : Extracted) {
+    if (F.isDeclaration())
+      continue;
+    SmallPtrSet<const BasicBlock *, 16> LoopBBs;
+    if (EJitReportMayConst)
+      computeLoopBBs(F, LoopBBs);
+    computeEjitFuncDiagInfo(F, Info[&F], MayConstKind,
+                            EJitReportMayConst ? &LoopBBs : nullptr);
+  }
+
+  // Fixpoint: propagate HasMayConstLoad and RefsPeriodArr up the call graph.
+  // The extracted module holds only the closure, so every function is reachable
+  // from some entry; the monotonic fixpoint converges quickly.
+  DenseMap<const Function *, bool> ClosureMC;
+  DenseMap<const Function *, SetVector<std::string>> ClosureRefs;
+  for (auto &KV : Info) {
+    ClosureMC[KV.first] = KV.second.HasMayConstLoad;
+    ClosureRefs[KV.first] = KV.second.RefsPeriodArr;
+  }
+  bool Changed = true;
+  while (Changed) {
+    Changed = false;
+    for (auto &KV : Info) {
+      const Function *F = KV.first;
+      for (const Function *Callee : KV.second.Callees) {
+        if (!Info.count(Callee))
+          continue;
+        if (ClosureMC[Callee] && !ClosureMC[F]) {
+          ClosureMC[F] = true;
+          Changed = true;
+        }
+        for (const std::string &P : ClosureRefs[Callee])
+          if (ClosureRefs[F].insert(P))
+            Changed = true;
+      }
+    }
+  }
+
+  // Emit diagnostics per entry (locate in the extracted module by name).
+  for (const EjitEntryDiag &ED : Entries) {
+    const Function *EF = Extracted.getFunction(ED.Name);
+    if (!EF || EF->isDeclaration())
+      continue;
+    auto MCIt = ClosureMC.find(EF);
+    auto RefIt = ClosureRefs.find(EF);
+    if (MCIt == ClosureMC.end() || RefIt == ClosureRefs.end())
+      continue;
+
+    // #1: no ejit_may_const read in the specialization closure.
+    if (EJitWarnNoSpecialization && !MCIt->second)
+      errs() << "EJit warning: ejit_entry function '" << EF->getName()
+             << "' reads no ejit_may_const field in its specialization "
+                "closure; no JIT specialization value, consider removing "
+                "ejit_entry\n";
+
+    // #2: declared dimension never referenced by the closure.
+    if (EJitWarnUnusedDim)
+      for (const std::string &P : ED.DeclaredDims)
+        if (RefIt->second.count(P) == 0)
+          errs() << "EJit warning: ejit_entry function '" << EF->getName()
+                 << "' declares ejit_period_arr_ind('" << P
+                 << "') but its specialization closure never indexes an "
+                    "ejit_period_arr('"
+                 << P << "'); unused specialization dimension, consider "
+                        "removing it\n";
+  }
+
+  // Optional info report: per-entry ejit_may_const read counts (total /
+  // in-loop) over the specialization closure. Report-only; it does not gate.
+  if (EJitReportMayConst) {
+    for (const EjitEntryDiag &ED : Entries) {
+      const Function *EF = Extracted.getFunction(ED.Name);
+      if (!EF || EF->isDeclaration())
+        continue;
+      // BFS the entry's direct-call closure within the extracted module.
+      DenseSet<const Function *> Seen;
+      SmallVector<const Function *, 8> WL{EF};
+      unsigned K = 0, J = 0;
+      while (!WL.empty()) {
+        const Function *F = WL.pop_back_val();
+        if (!Seen.insert(F).second)
+          continue;
+        auto It = Info.find(F);
+        if (It == Info.end())
+          continue;
+        K += It->second.MayConstCount;
+        J += It->second.MayConstInLoopCount;
+        for (const Function *Callee : It->second.Callees)
+          WL.push_back(Callee);
+      }
+      errs() << "EJit info: ejit_entry function '" << EF->getName() << "': "
+             << K << " ejit_may_const read" << (K == 1 ? "" : "s") << " ("
+             << J << " in loops)\n";
+    }
+  }
+}
+
 static std::string extractAndSerialize(Module &M,
     const SetVector<Function *> &Funcs,
-    const SetVector<GlobalVariable *> &Globals) {
+    const SetVector<GlobalVariable *> &Globals,
+    const SmallVectorImpl<Function *> &EntryFuncs) {
 
   auto Extracted = CloneModule(M);
   DenseSet<StringRef> FuncNames;
@@ -362,6 +598,11 @@ static std::string extractAndSerialize(Module &M,
   logEJitGlobalMeta("extract-after-clone", *Extracted);
   preOptimizeBitcode(*Extracted);
   logEJitGlobalMeta("extract-after-preOpt", *Extracted);
+
+  // Specialization diagnostics on the post-preOptimize extracted module (the
+  // exact bitcode the JIT will specialize). Must run before the extern
+  // conversion below so GV definitions (and their !ejit.metadata) are intact.
+  runSpecializationDiagnostic(*Extracted, EntryFuncs);
 
   // Convert kept non-constant global definitions to external declarations
   // so the JIT linker resolves them from the host process. Constants (e.g.
@@ -665,7 +906,8 @@ EJitRegisterBitcodePass::run(Module &M, ModuleAnalysisManager &) {
   if (ClosureFuncs.empty())
     return PreservedAnalyses::all();
 
-  std::string Bitcode = extractAndSerialize(M, ClosureFuncs, ClosureGlobals);
+  std::string Bitcode =
+      extractAndSerialize(M, ClosureFuncs, ClosureGlobals, EntryFuncs);
   GlobalVariable *BitcodeGV = embedBitcode(M, Bitcode);
   generateRegisterCall(M, BitcodeGV, EntryFuncs, ClosureFuncs);
 
