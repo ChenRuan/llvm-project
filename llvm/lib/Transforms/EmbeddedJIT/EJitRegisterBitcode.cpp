@@ -331,7 +331,7 @@ struct EjitFuncDiagInfo {
   bool HasMayConstLoad = false;
   unsigned MayConstCount = 0;        // # of !ejit.may_const loads (direct)
   unsigned MayConstInLoopCount = 0;  // subset sitting inside a loop
-  SetVector<std::string> RefsPeriodArr; // deduped period names referenced
+  SetVector<StringRef> RefsPeriodArr; // deduped period names referenced
   SmallVector<const Function *, 4> Callees;  // direct, defined, non-intrinsic
 };
 
@@ -414,7 +414,7 @@ computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKi
       if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR)
         continue;
       if (auto *PN = dyn_cast<MDString>(Sub->getOperand(1)))
-        Info.RefsPeriodArr.insert(PN->getString().str());
+        Info.RefsPeriodArr.insert(PN->getString());
     }
   }
 }
@@ -472,7 +472,7 @@ runSpecializationDiagnostic(Module &Extracted,
   // The extracted module holds only the closure, so every function is reachable
   // from some entry; the monotonic fixpoint converges quickly.
   DenseMap<const Function *, bool> ClosureMC;
-  DenseMap<const Function *, SetVector<std::string>> ClosureRefs;
+  DenseMap<const Function *, SetVector<StringRef>> ClosureRefs;
   for (auto &KV : Info) {
     ClosureMC[KV.first] = KV.second.HasMayConstLoad;
     ClosureRefs[KV.first] = KV.second.RefsPeriodArr;
@@ -489,7 +489,7 @@ runSpecializationDiagnostic(Module &Extracted,
           ClosureMC[F] = true;
           Changed = true;
         }
-        for (const std::string &P : ClosureRefs[Callee])
+        for (StringRef P : ClosureRefs[Callee])
           if (ClosureRefs[F].insert(P))
             Changed = true;
       }
