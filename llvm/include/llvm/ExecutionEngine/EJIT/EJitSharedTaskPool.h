@@ -241,6 +241,9 @@ public:
   /// never busy-spins and starves the core trying to publish Ready. MUST NOT be
   /// called while holding a bucket lock / queue slot / dedup critical state.
   using WorkerIdleFn = void (*)(void *ctx);
+  /// Owner-only setup hook (see setOwnerElectedCallback). Return false to fail
+  /// init. Runs on the elected owner, inside init(), before the worker starts.
+  using OwnerElectedFn = bool (*)(void *ctx);
 
   enum class InitResult : uint32_t {
     BecameOwner =
@@ -369,6 +372,25 @@ public:
     workerStart_ = start;
     workerStop_ = stop;
     workerCtx_ = ctx;
+  }
+  /// Owner-only setup, run inside init() by the core that WINS the election,
+  /// after the blob is built but before the worker is started and before Ready
+  /// is published. Returning false is a clean init failure (Failed +
+  /// OwnerSetupFailed), exactly like a failed worker start.
+  ///
+  /// This exists so the JIT engine is built only on the core that will actually
+  /// compile. Only the owner's worker ever invokes the compile callback, so
+  /// constructing an LLJIT on every core wastes one per non-owner. Ownership is
+  /// won by CAS and is not permanent (see ownerShutdown), so the engine cannot
+  /// be assigned to a fixed core -- it has to follow whoever wins, which is
+  /// what this hook expresses.
+  ///
+  /// Placement is load-bearing: the worker may compile the instant it starts,
+  /// and peers may enqueue the instant Ready is published, so the engine must
+  /// exist before both.
+  void setOwnerElectedCallback(OwnerElectedFn fn, void *ctx) {
+    ownerElected_ = fn;
+    ownerElectedCtx_ = ctx;
   }
   /// Inject the worker idle/yield hook (see WorkerIdleFn). When unset the loop
   /// falls back to a compiler reordering barrier only (used by step tests).
@@ -751,6 +773,8 @@ private:
   void *workerCtx_ = nullptr;
   WorkerIdleFn workerIdle_ = nullptr;
   void *workerIdleCtx_ = nullptr;
+  OwnerElectedFn ownerElected_ = nullptr;
+  void *ownerElectedCtx_ = nullptr;
   uint64_t regFingerprint_ = 0;
   EJitCompileMode configuredMode_ = EJitCompileMode::Async;
   bool codeSharingEnabled_ = false;

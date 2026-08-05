@@ -260,30 +260,50 @@ EJit::EJit(const Config &config) : config_(config) {
       "registered: bitcodes=%zu periodArrays=%zu staticVars=%zu symbols=%zu",
       data.bitcodes.size(), data.periodArrays.size(), data.staticVars.size(),
       data.userSymbols.size());
-  auto engine = EJitOrcEngine::Create(config, runtimeState_->getRegistry(),
-                                      *runtimeState_);
+  // Build the ORC engine. On the shared-taskpool async path this is DEFERRED to
+  // the core that wins the owner election: only the owner's worker ever invokes
+  // the compile callback, so every other core would construct an LLJIT
+  // (ExecutionSession, object/IR layers, LLVMContext, memory manager) and never
+  // use it. Ownership is decided by a CAS inside init() and is not permanent
+  // (see ownerShutdown), so the engine has to follow whoever wins rather than
+  // being assigned to a fixed core.
   bool engineReady = false;
-  if (engine) {
+  auto createJitEngine = [&]() -> bool {
+    auto engine = EJitOrcEngine::Create(config, runtimeState_->getRegistry(),
+                                        *runtimeState_);
+    if (!engine) {
+      EJIT_DIAG("FAILED to create OrcJIT engine");
+#ifndef EJIT_FREESTANDING
+      std::string errStr;
+      llvm::handleAllErrors(
+          engine.takeError(),
+          [&](const llvm::ErrorInfoBase &E) { errStr = E.message(); });
+      if (logger_)
+        logger_->log(EJIT_ERR_COMPILE_FAILED,
+                     "Failed to create OrcJIT engine: " + errStr, "", "");
+#else
+      consumeError(engine.takeError());
+#endif
+      return false;
+    }
     // Forward auto-registered user symbols to the engine.
     for (auto &sym : data.userSymbols)
       (*engine)->addUserSymbol(sym.name, sym.addr);
     compileDriver_->setJitEngine(std::move(*engine));
     engineReady = true;
     EJIT_DIAG("OrcJIT engine created successfully");
-  } else {
-    EJIT_DIAG("FAILED to create OrcJIT engine");
-#ifndef EJIT_FREESTANDING
-    std::string errStr;
-    llvm::handleAllErrors(
-        engine.takeError(),
-        [&](const llvm::ErrorInfoBase &E) { errStr = E.message(); });
-    if (logger_)
-      logger_->log(EJIT_ERR_COMPILE_FAILED,
-                   "Failed to create OrcJIT engine: " + errStr, "", "");
-#else
-    consumeError(engine.takeError());
+    return true;
+  };
+
+  // Sync mode compiles on the CALLING core, so there every core genuinely needs
+  // its own engine; only the async shared path funnels all compiles through the
+  // elected owner. Anything else builds it eagerly, exactly as before.
+  bool deferEngineToOwner = false;
+#if defined(EJIT_SRE_TASKPOOL) && defined(EJIT_SRE_SHARED_TASKPOOL)
+  deferEngineToOwner = (config_.compileMode == CompileMode::Async);
 #endif
-  }
+  if (!deferEngineToOwner)
+    createJitEngine();
 
 #ifdef EJIT_SRE_TASKPOOL
   // Deferred worker start (spec §3.4 single async worker): the taskpool worker
@@ -297,19 +317,52 @@ EJit::EJit(const Config &config) : config_(config) {
   if (!initFailed_) {
     regPhase_ = RegistrationPhase::Frozen;
     if (config_.compileMode == CompileMode::Async) {
-      EJIT_DIAG_VERBOSE("taskpool async init: engineReady=%u",
-                        static_cast<unsigned>(engineReady));
+      EJIT_DIAG_VERBOSE("taskpool async init: engineReady=%u deferred=%u",
+                        static_cast<unsigned>(engineReady),
+                        static_cast<unsigned>(deferEngineToOwner));
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+      // Cross-core shared taskpool: run owner election and (if elected) build
+      // the engine and start the ONE shared worker. engineReady is still false
+      // on EVERY core here -- the engine is created inside init() by the
+      // callback below, and only on the winner. A clean failure (engine build /
+      // worker start / ABI mismatch) fails init rather than accepting requests
+      // no worker consumes.
+      // The unary + forces the captureless thunk to a plain function pointer;
+      // the captured lambda travels as the ctx argument.
+      compileDriver_->sharedTaskPool()->setOwnerElectedCallback(
+          +[](void *ctx) -> bool {
+            return (*static_cast<decltype(createJitEngine) *>(ctx))();
+          },
+          &createJitEngine);
+      bool poolOk = compileDriver_->startSharedTaskPool();
+      // The callback closes over this constructor's stack; drop it before those
+      // locals die so a later init() can never call through a dangling pointer.
+      compileDriver_->sharedTaskPool()->setOwnerElectedCallback(nullptr,
+                                                                nullptr);
+      if (!poolOk) {
+        // Distinguish "the engine failed to build on the winner" from a genuine
+        // election/ABI failure -- the pool records which in lastInitError, and
+        // reporting "election failed" for an engine failure sends the next
+        // person debugging this to the wrong place.
+        EJitSharedDiagnostics d{};
+        compileDriver_->sharedTaskPool()->getDiagnostics(d);
+        recordInitError(EJIT_ERR_COMPILE_FAILED,
+                        d.lastInitError ==
+                                static_cast<uint32_t>(
+                                    EJitSharedInitError::OwnerSetupFailed)
+                            ? "owner elected but ORC engine creation failed"
+                            : "shared taskpool init/election failed",
+                        "");
+      } else if (!engineReady) {
+        // Attached as a peer: no engine here by design. Stated explicitly so
+        // the absence of "OrcJIT engine created" in a log is a recorded fact
+        // rather than something to infer.
+        EJIT_DIAG("ORC engine skipped: not the compile owner");
+      }
+#else
       if (!engineReady)
         recordInitError(EJIT_ERR_COMPILE_FAILED,
                         "Async mode requires a ready ORC engine", "");
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-      // Cross-core shared taskpool: run owner election and (if elected) start
-      // the ONE shared worker. A clean failure (owner worker-start failed / ABI
-      // mismatch) fails init rather than accepting requests no worker consumes.
-      else if (!compileDriver_->startSharedTaskPool())
-        recordInitError(EJIT_ERR_COMPILE_FAILED,
-                        "shared taskpool init/election failed", "");
-#else
       else if (!compileDriver_->startTaskPoolWorker())
         recordInitError(EJIT_ERR_COMPILE_FAILED,
                         "taskpool worker failed to start", "");

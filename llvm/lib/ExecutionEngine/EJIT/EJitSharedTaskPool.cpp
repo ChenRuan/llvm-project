@@ -1578,6 +1578,20 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       state_->structSize =
           static_cast<uint32_t>(sizeof(EJitSharedTaskPoolState));
 
+      // Owner-only setup (building the JIT engine) runs HERE: after the blob is
+      // built, before the worker exists, and before Ready is published. Both
+      // orderings matter -- the worker can compile the instant it starts, and a
+      // peer can enqueue the instant it observes Ready. A failure is a clean
+      // init failure, exactly like a failed worker start.
+      if (ownerElected_ && !ownerElected_(ownerElectedCtx_)) {
+        state_->lastInitError.storeRelease(
+            static_cast<uint32_t>(EJitSharedInitError::OwnerSetupFailed));
+        state_->initState.storeRelease(
+            static_cast<uint32_t>(EJitSharedInitState::Failed));
+        EJIT_DIAG("shared taskpool owner=%u setup FAILED (engine)", self);
+        return InitResult::OwnerFailed;
+      }
+
       // Start the ONE worker (if a starter was injected). A failure here is a
       // clean init failure: record it, publish Failed, and DO NOT pretend JIT
       // is up.
