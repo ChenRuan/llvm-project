@@ -4,12 +4,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build Configuration
 
+### Host Environment Check (run before any build)
+
+Before invoking `build.sh`, verify the host environment to avoid misconfiguration:
+
+```bash
+# 1. Host architecture — determines native vs cross-compile
+uname -m
+#   x86_64  → native for "x86" arch; "aarch64" requires cross-compiler
+#   aarch64 → native for "aarch64" arch; "x86" requires cross-compiler
+
+# 2. CPU cores — this machine is limited (8 cores); don't pass -j higher than $(nproc)
+nproc
+
+# 3. Memory — avoid -j > 8 or multiple concurrent builds
+free -h
+```
+
 Use the top-level `build.sh` script for all builds:
 
 ```bash
 ./build.sh debug x86              # → build_debug_x86/ (dev daily driver)
 ./build.sh release x86            # → build_release_x86/ (for EJIT tests)
-./build.sh release x86 minimal    # → build_release_x86_minimal/
 ./build.sh debug aarch64          # → build_debug_aarch64/
 ./build.sh release aarch64        # → build_release_aarch64/
 ```
@@ -43,29 +59,24 @@ ninja -C build_release_x86 LLVMEJIT
 
 ## Running Tests
 
-This project uses **lit** (LLVM Integrated Tester) with FileCheck.
+EJIT tests are spread across four directories. Commands use `$BUILD` as a placeholder for the build directory (e.g. `build_release_x86`, `build_release_aarch64`).
 
-- **All LLVM tests**: `cd build && ninja check-llvm`
-- **Single lit test file**: `cd build && ./bin/llvm-lit -v ../llvm/test/Transforms/InstCombine/some-test.ll`
-- **Directory of lit tests**: `cd build && ./bin/llvm-lit -v ../llvm/test/Transforms/InstCombine/`
-- **Specific test subdirectory**: `cd build && ninja check-llvm-transforms-instcombine`
-- **Clang lit tests**: `cd build && ninja check-clang`
-- **Single clang test**: `cd build && ./bin/llvm-lit -v ../clang/test/CodeGen/some-test.c`
-- **LLVM unit tests (gtest)**: `cd build && ninja check-llvm-unit`
+| Test Suite | Directory | Type | How to Run |
+|------------|-----------|------|-------------|
+| AOT Pass lit | `llvm/test/Transforms/EmbeddedJIT/` | lit (opt + FileCheck) | `cd $BUILD && ./bin/llvm-lit -v ../llvm/test/Transforms/EmbeddedJIT/` |
+| Clang lit | `clang/test/CodeGen/ejit_*.c` `clang/test/Sema/ejit_*.cpp` `clang/test/Sema/ext_attr_ejit.cpp` | lit (%clang_cc1 + FileCheck) | `cd $BUILD && ./bin/llvm-lit -v ../clang/test/CodeGen/ejit_* ../clang/test/Sema/ejit_*` |
+| Runtime gtest | `llvm/unittests/ExecutionEngine/EJIT/` | gtest (C++ unit tests) | `ninja -C $BUILD EJITTests EJITCodePoolTests EJITTaskPoolTests EJITSharedTaskPoolTests` |
+| Integration | `ejit_test/` | C programs + runtime | `EJIT_CLANG=$BUILD/bin/clang cd ejit_test && ./build.sh` |
 
-### Lit Test Format for LLVM Passes
+**Build prerequisites**:
 
-```llvm
-; RUN: opt -passes=<pass-name> -S %s | FileCheck %s
-; CHECK: <expected output>
+```bash
+ninja -C $BUILD opt clang                  # lit
+ninja -C $BUILD EJITTests ...              # gtest
+ninja -C $BUILD clang LLVMEJIT lld         # integration
 ```
 
-### Lit Test Format for Clang (CodeGen / Sema)
-
-```c
-// RUN: %clang_cc1 -emit-llvm -o - %s | FileCheck %s       // CodeGen
-// RUN: %clang_cc1 -fsyntax-only -verify %s                  // Sema diagnostics
-```
+> **Note**: Prefer release builds for running EJIT lit tests — debug builds may skip optimizations that affect test behavior.
 
 ## Repository Architecture
 
@@ -90,8 +101,8 @@ This is the **LLVM monorepo**. Key top-level directories:
 ### LLVM Execution Engine / OrcJIT
 
 - `llvm/lib/ExecutionEngine/` — JIT infrastructure: OrcJIT, JITLink, Interpreter, MCJIT
-- A new EmbeddedJIT runtime library is planned at `llvm/lib/ExecutionEngine/EJIT/` (not yet created on this branch)
-- Corresponding headers go in `llvm/include/llvm/ExecutionEngine/EJIT/`
+- `llvm/lib/ExecutionEngine/EJIT/` — EmbeddedJIT runtime library (core engine, cache, compiler, optimizer)
+- `llvm/include/llvm/ExecutionEngine/EJIT/` — Runtime headers
 
 ### Clang Architecture
 
@@ -100,18 +111,11 @@ This is the **LLVM monorepo**. Key top-level directories:
 - **CodeGen (AST → LLVM IR)**: `clang/lib/CodeGen/`
 - **Backend integration** (adding LLVM passes to Clang pipeline): `clang/lib/CodeGen/BackendUtil.cpp`
 
-### Testing
-
-- **Lit tests** (LLVM IR / opt / llc): `llvm/test/<category>/<test>.ll`
-- **Unit tests** (C++ / gtest): `llvm/unittests/<category>/<test>.cpp`
-- **Clang lit tests**: `clang/test/<category>/<test>.c` or `.cpp`
-- **Execution Engine integration tests**: `llvm/test/ExecutionEngine/`
-
-## This Branch: `ejit_dev`
+## This Branch: `ejit_dev_spec4`
 
 This branch is developing **EmbeddedJIT** — an embedded-scenario JIT compilation system based on time-window constants with runtime specialization. Design documents are in `/workspaces/jit_design_doc/`.
 
-### Planned file locations (to be created):
+### File locations:
 
 - **AOT Passes**: `llvm/lib/Transforms/EmbeddedJIT/` — 5 passes (EJitRegisterBitcode, EJitRegisterPeriod, EJitWrapperGen, EJitPeriodHandler, EJitAotModulePass)
 - **Runtime library**: `llvm/lib/ExecutionEngine/EJIT/` — core engine, cache, compiler, optimizer, PASS6
@@ -128,6 +132,17 @@ This branch is developing **EmbeddedJIT** — an embedded-scenario JIT compilati
 - **OrcJIT + JITLink**: runtime uses LLJIT with custom embedded memory manager (slab allocator, 512KB default)
 - **JIT pipeline order**: param substitution → InstCombine → Inline → EJitStructFieldPass → standard LLVM opts (L1/L2/L3)
 
-## Code Review Considerations
+## Code Review
 
-When reviewing changes that modify function control flow, pay close attention to whether the change could corrupt performance profile data or invalidate debug information, particularly for branches and calls. (From `.github/copilot-instructions.md`)
+After completing a non-trivial change, spawn a sub-agent to review the diff before committing:
+
+```
+Agent("code-review", prompt: "Review the current git diff for correctness, simplification, and test coverage.")
+```
+
+Review focus areas:
+
+- **Correctness**: metadata round-trips, pass ordering, memory/ownership, thread safety, error handling.
+- **Simplicity**: reuse existing helpers, avoid duplication, prefer LLVM idioms.
+- **Tests**: cover new paths with lit tests (passes) or gtest (runtime); integration tests for end-to-end behavior.
+- **Control flow**: changes to branches/calls must not corrupt profile data or debug info. (From `.github/copilot-instructions.md`)
