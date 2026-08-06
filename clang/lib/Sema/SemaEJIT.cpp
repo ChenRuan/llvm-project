@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/ParentMapContext.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/RecursiveASTVisitor.h"
@@ -363,6 +364,18 @@ static const FieldDecl *findMayConstWriteTarget(Expr *E,
     if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
       BaseVar = VD;
 
+  // The EjitMayConstAttr lives on the FieldDecl and applies to every struct
+  // instance.  Suppress the warning when the base is a local struct copy
+  // (value type, not pointer/reference), which does not alias period data.
+  // Pointers and references are kept because they may point to period data
+  // even though the variable itself lacks a period annotation.
+  if (BaseVar &&
+      !BaseVar->hasAttr<EjitPeriodArrAttr>() &&
+      !BaseVar->hasAttr<EjitPeriodAttr>() &&
+      !BaseVar->getType()->isPointerType() &&
+      !BaseVar->getType()->isReferenceType())
+    return nullptr;
+
   return FD;
 }
 
@@ -385,10 +398,61 @@ public:
   bool VisitUnaryOperator(UnaryOperator *UO) {
     if (UO->isIncrementDecrementOp())
       checkWrite(UO->getSubExpr(), UO->getOperatorLoc());
+    else if (UO->getOpcode() == UO_AddrOf)
+      checkAddrOf(UO);
     return true;
   }
 
 private:
+  /// If taking the address of an ejit_may_const field without const on the
+  /// pointee type, warn: a non-const pointer can escape and write the field
+  /// outside ejit_period_lc.
+  void checkAddrOf(UnaryOperator *UO) {
+    const VarDecl *BaseVar = nullptr;
+    const FieldDecl *FD =
+        findMayConstWriteTarget(UO->getSubExpr(), BaseVar);
+    if (!FD)
+      return;
+
+    // Walk up the parent chain skipping transparent nodes (ParenExpr) to
+    // check whether the address-of result lands in a const-qualified pointer
+    // context.  The & operator always yields T*; const is added by an
+    // implicit or explicit cast.
+    DynTypedNode CurNode = DynTypedNode::create(*UO);
+    for (;;) {
+      auto Parents = S.getASTContext().getParents(CurNode);
+      if (Parents.empty())
+        break;
+      const DynTypedNode &Parent = Parents[0];
+
+      if (Parent.get<ParenExpr>()) {
+        CurNode = Parent;
+        continue;
+      }
+      if (const auto *UOInner = Parent.get<UnaryOperator>())
+        if (UOInner->getOpcode() == UO_Deref)
+          return; // *&field — no persistent writable pointer escapes
+      if (const auto *CE = Parent.get<CastExpr>()) {
+        QualType QT = CE->getType();
+        if (!QT->isPointerType())
+          return; // converted to non-pointer (e.g. bool, intptr_t) — no
+                  // writable pointer escapes
+        if (QT->getPointeeType().isConstQualified())
+          return; // cast to const T* — safe, cannot write through this pointer
+      }
+      break; // stop at first non-transparent parent
+    }
+
+    if (BaseVar)
+      S.Diag(UO->getOperatorLoc(),
+             diag::warn_ejit_may_const_addr_without_const)
+          << FD << BaseVar;
+    else
+      S.Diag(UO->getOperatorLoc(),
+             diag::warn_ejit_may_const_addr_without_const)
+          << FD << FD->getParent();
+  }
+
   /// If \p Target designates an ejit_may_const field, emit the warning.
   void checkWrite(Expr *Target, SourceLocation Loc) {
     const VarDecl *BaseVar = nullptr;
@@ -422,10 +486,13 @@ void checkEjitMayConstWrites(Sema &S, const FunctionDecl *FD, Stmt *Body) {
   if (FD->hasAttr<EjitPeriodLcAttr>())
     return;
 
-  // Skip the traversal entirely when the warning is disabled
+  // Skip the traversal entirely when BOTH diagnostics are disabled
   // (e.g. -Wno-embedded-jit), matching the AnalysisBasedWarnings pattern.
+  // If either warning is enabled the visitor must run — it emits both.
   if (S.getDiagnostics().isIgnored(
-          diag::warn_ejit_may_const_modified_without_lc, FD->getLocation()))
+          diag::warn_ejit_may_const_modified_without_lc, FD->getLocation()) &&
+      S.getDiagnostics().isIgnored(
+          diag::warn_ejit_may_const_addr_without_const, FD->getLocation()))
     return;
 
   EjitMayConstWriteVisitor Visitor(S);

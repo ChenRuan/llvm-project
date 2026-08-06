@@ -18,6 +18,8 @@ __attribute__((ejit_period_arr("cell"))) struct S g_s[2];
 void write_without_lc(int i) {
   g_s[i].a = 1; // on-warning {{modifying ejit_may_const field 'a' of 'g_s' without ejit_period_lc attribute}} explicit-warning {{modifying ejit_may_const field 'a' of 'g_s' without ejit_period_lc attribute}}
   g_s[i].b = 1; // no warning: 'b' is not ejit_may_const
+  int *p1 = &g_s[i].a;        // on-warning {{taking address of ejit_may_const field 'a' of 'g_s' without const qualifier}} explicit-warning {{taking address of ejit_may_const field 'a' of 'g_s' without const qualifier}}
+  const int *p2 = &g_s[i].a;  // no warning: const qualified
 }
 
 // ejit_period_lc sanctions the write -> never warns, under any toggle.
