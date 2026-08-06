@@ -115,7 +115,7 @@ JIT 特化对 D-cache 的影响更值得关注：
 
 ### Tier 1：几乎零成本
 
-- **代码池分配 padding**：在 `EJitCodePool` bump allocator 中对热点函数末尾填充 1-2 个 cache line（64-128 字节），避免两个热点函数落在同一 cache set
+- ~~**代码池分配 padding**~~（已评估，不实施）：4K seal 模式下每次分配已对齐到 4 KiB 页，远超 cache line 粒度，额外 padding 无效果
 - **链接脚本偏移验证**：检查 `FIXED_CODE_POOL` 基址与 `.text` 热点函数地址之间的 offset，确保不是 2 的幂次倍数
 
 ### Tier 2：低实现成本
@@ -227,4 +227,5 @@ jit_entry:
 1. [ ] **PMU 测量**：在 aarch64_be 实板上测量 I-cache refill 率和 D-cache refill 率
 2. [ ] **热点路径 size 测量**：用 `objdump -d` 统计特化后的实际代码量
 3. [ ] **Set 冲突验证**：计算 `.text.ejit` 与 `.text` 中热点函数的物理地址 offset，检查是否命中同一 cache set
-4. [ ] **Dispatcher 聚类实验**：若 PMU 数据显示 I-cache miss 率 > 2%，实施聚类方案
+4. [x] **Dispatcher 聚类实验**：已实施（PR #124），待上板验证
+5. [x] **Cold MissFn 隔离**：已实施（PR #124），`Attribute::Cold` → `.text.unlikely`，待上板验证
