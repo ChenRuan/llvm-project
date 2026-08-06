@@ -172,6 +172,12 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   // Ready or on an empty queue (spec §11): a high-priority worker that spun
   // could starve the owner core trying to publish Ready / a producer enqueuing.
   sharedPool_.setWorkerIdleHook(&EJitCompileDriver::sharedWorkerIdle, this);
+  // Owner-only setup, armed for the pool's WHOLE lifetime with a stable ctx.
+  // It must stay armed after the first election: ownerShutdown() returns the
+  // blob to Uninitialized, so a later init() can elect a DIFFERENT peer, and a
+  // peer that won with no hook would publish Ready with no engine.
+  sharedPool_.setOwnerElectedCallback(&EJitCompileDriver::sharedOwnerElected,
+                                      this);
   sharedPool_.setMode(config_.compileMode == CompileMode::Async   ? EJitCompileMode::Async
                           : config_.compileMode == CompileMode::Sync ? EJitCompileMode::Sync
                                                                      : EJitCompileMode::Off);
@@ -243,6 +249,10 @@ void EJitCompileDriver::sharedWorkerIdle(void * /*ctx*/) {
   EJitSreTask::yield();
 }
 
+bool EJitCompileDriver::sharedOwnerElected(void *ctx) {
+  return static_cast<EJitCompileDriver *>(ctx)->ensureJitEngine();
+}
+
 bool EJitCompileDriver::startSharedTaskPool() {
   // Publish this core's funcIndex/dimType registration digest so a peer with a
   // divergent mapping is cleanly rejected at attach (spec §11), never silently
@@ -284,7 +294,40 @@ void EJitCompileDriver::setJitEngine(std::unique_ptr<EJitOrcEngine> engine) {
   jitEngine_ = std::move(engine);
 }
 
+bool EJitCompileDriver::ensureJitEngine() {
+  // Ownership can be won more than once by the same core, and a live engine is
+  // how already-published code is reached, so never rebuild.
+  if (jitEngine_)
+    return true;
+
+  auto engine =
+      EJitOrcEngine::Create(config_, runtimeState_.getRegistry(), runtimeState_);
+  if (!engine) {
+    EJIT_DIAG("FAILED to create OrcJIT engine");
+#ifndef EJIT_FREESTANDING
+    std::string errStr;
+    llvm::handleAllErrors(
+        engine.takeError(),
+        [&](const llvm::ErrorInfoBase &E) { errStr = E.message(); });
+    if (logger_)
+      logger_->log(EJIT_ERR_COMPILE_FAILED,
+                   "Failed to create OrcJIT engine: " + errStr, "", "");
+#else
+    consumeError(engine.takeError());
+#endif
+    return false;
+  }
+  jitEngine_ = std::move(*engine);
+  // Replay the staged symbols: on a re-elected owner this engine is built long
+  // after registration ran, so the list is the only record of them left.
+  for (auto &sym : userSymbols_)
+    jitEngine_->addUserSymbol(sym.first, sym.second);
+  EJIT_DIAG("OrcJIT engine created successfully");
+  return true;
+}
+
 void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
+  userSymbols_.emplace_back(name, addr);
   if (jitEngine_)
     jitEngine_->addUserSymbol(name, addr);
 }

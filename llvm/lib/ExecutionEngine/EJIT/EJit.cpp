@@ -260,41 +260,19 @@ EJit::EJit(const Config &config) : config_(config) {
       "registered: bitcodes=%zu periodArrays=%zu staticVars=%zu symbols=%zu",
       data.bitcodes.size(), data.periodArrays.size(), data.staticVars.size(),
       data.userSymbols.size());
+  // Stage the auto-registered user symbols on the DRIVER, not on an engine.
+  // Whichever core ends up building one replays this list, including a peer
+  // elected owner long after this constructor (and `data`) is gone.
+  for (auto &sym : data.userSymbols)
+    compileDriver_->registerSymbol(sym.name, sym.addr);
+
   // Build the ORC engine. On the shared-taskpool async path this is DEFERRED to
   // the core that wins the owner election: only the owner's worker ever invokes
   // the compile callback, so every other core would construct an LLJIT
   // (ExecutionSession, object/IR layers, LLVMContext, memory manager) and never
-  // use it. Ownership is decided by a CAS inside init() and is not permanent
-  // (see ownerShutdown), so the engine has to follow whoever wins rather than
-  // being assigned to a fixed core.
-  bool engineReady = false;
-  auto createJitEngine = [&]() -> bool {
-    auto engine = EJitOrcEngine::Create(config, runtimeState_->getRegistry(),
-                                        *runtimeState_);
-    if (!engine) {
-      EJIT_DIAG("FAILED to create OrcJIT engine");
-#ifndef EJIT_FREESTANDING
-      std::string errStr;
-      llvm::handleAllErrors(
-          engine.takeError(),
-          [&](const llvm::ErrorInfoBase &E) { errStr = E.message(); });
-      if (logger_)
-        logger_->log(EJIT_ERR_COMPILE_FAILED,
-                     "Failed to create OrcJIT engine: " + errStr, "", "");
-#else
-      consumeError(engine.takeError());
-#endif
-      return false;
-    }
-    // Forward auto-registered user symbols to the engine.
-    for (auto &sym : data.userSymbols)
-      (*engine)->addUserSymbol(sym.name, sym.addr);
-    compileDriver_->setJitEngine(std::move(*engine));
-    engineReady = true;
-    EJIT_DIAG("OrcJIT engine created successfully");
-    return true;
-  };
-
+  // use it. The driver's owner-elected hook, armed for the pool's lifetime, is
+  // what lets the engine follow whoever wins, whenever they win.
+  //
   // Sync mode compiles on the CALLING core, so there every core genuinely needs
   // its own engine; only the async shared path funnels all compiles through the
   // elected owner. Anything else builds it eagerly, exactly as before.
@@ -302,8 +280,8 @@ EJit::EJit(const Config &config) : config_(config) {
 #if defined(EJIT_SRE_TASKPOOL) && defined(EJIT_SRE_SHARED_TASKPOOL)
   deferEngineToOwner = (config_.compileMode == CompileMode::Async);
 #endif
-  if (!deferEngineToOwner)
-    createJitEngine();
+  bool engineReady =
+      deferEngineToOwner ? false : compileDriver_->ensureJitEngine();
 
 #ifdef EJIT_SRE_TASKPOOL
   // Deferred worker start (spec §3.4 single async worker): the taskpool worker
@@ -324,21 +302,11 @@ EJit::EJit(const Config &config) : config_(config) {
       // Cross-core shared taskpool: run owner election and (if elected) build
       // the engine and start the ONE shared worker. engineReady is still false
       // on EVERY core here -- the engine is created inside init() by the
-      // callback below, and only on the winner. A clean failure (engine build /
-      // worker start / ABI mismatch) fails init rather than accepting requests
-      // no worker consumes.
-      // The unary + forces the captureless thunk to a plain function pointer;
-      // the captured lambda travels as the ctx argument.
-      compileDriver_->sharedTaskPool()->setOwnerElectedCallback(
-          +[](void *ctx) -> bool {
-            return (*static_cast<decltype(createJitEngine) *>(ctx))();
-          },
-          &createJitEngine);
+      // driver's owner-elected hook, and only on the winner. A clean failure
+      // (engine build / worker start / ABI mismatch) fails init rather than
+      // accepting requests no worker consumes.
       bool poolOk = compileDriver_->startSharedTaskPool();
-      // The callback closes over this constructor's stack; drop it before those
-      // locals die so a later init() can never call through a dangling pointer.
-      compileDriver_->sharedTaskPool()->setOwnerElectedCallback(nullptr,
-                                                                nullptr);
+      engineReady = compileDriver_->hasJitEngine();
       if (!poolOk) {
         // Distinguish "the engine failed to build on the winner" from a genuine
         // election/ABI failure -- the pool records which in lastInitError, and
@@ -631,14 +599,26 @@ bool EJit::setCompileMode(CompileMode mode) {
     return false;
 
   if (mode == CompileMode::Async) {
-    // Do not expose Async until both the compiler engine and consumer exist.
-    // Failure preserves the old mode, so callers cannot enqueue permanent
-    // pending work into a worker-less taskpool.
+    // Do not expose Async until a compiler and a consumer exist. Failure
+    // preserves the old mode, so callers cannot enqueue permanent pending work
+    // into a taskpool nothing drains.
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+    // A peer has NO local engine by design -- the elected owner compiles for
+    // every core -- so gating on the private engine would make Async
+    // unreachable on every non-owner core, including an idempotent
+    // setCompileMode(Async) and any switch back after a flip to Sync. A Ready
+    // blob with an elected owner running the single worker is exactly the
+    // condition under which a request enqueued from here gets compiled.
+    if (!compileDriver_->sharedTaskPool()->asyncServiceAvailable()) {
+      EJIT_DIAG("compile mode switch rejected: shared pool cannot service "
+                "async (not Ready / no owner / no worker)");
+      return false;
+    }
+#else
     if (!compileDriver_->hasJitEngine()) {
       EJIT_DIAG("compile mode switch rejected: async without engine");
       return false;
     }
-#ifndef EJIT_SRE_SHARED_TASKPOOL
     // Private taskpool: the worker is local to this instance, so a runtime
     // switch to Async must start it here. In a shared build the single worker
     // is cross-core and owner-controlled (started by owner election during

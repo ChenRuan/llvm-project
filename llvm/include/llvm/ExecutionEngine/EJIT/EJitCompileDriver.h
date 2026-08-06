@@ -20,6 +20,8 @@
 #endif
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace llvm {
 namespace ejit {
@@ -103,6 +105,18 @@ public:
 #endif
 
   void setJitEngine(std::unique_ptr<EJitOrcEngine> engine);
+
+  /// Build the ORC engine on THIS core if one is not already installed.
+  /// Idempotent, and never replaces a live engine (published code is reached
+  /// through it). Under the shared taskpool this is the owner-elected hook:
+  /// ownership is won by CAS and released by ownerShutdown, so the engine must
+  /// follow whoever wins, whenever they win. Hence a member of a lifetime-
+  /// stable object rather than a lambda over a caller's stack.
+  bool ensureJitEngine();
+
+  /// Stage a user symbol for the engine. The list is durable because the engine
+  /// may not exist yet: a peer elected owner after a re-election builds its
+  /// engine long after registration is over and must still see every symbol.
   void registerSymbol(const std::string &name, void *addr);
 
 private:
@@ -114,6 +128,9 @@ private:
 #endif
 
   std::unique_ptr<EJitOrcEngine> jitEngine_;
+  /// Durable record of every user symbol, replayed into whichever engine this
+  /// driver ends up building (see ensureJitEngine).
+  std::vector<std::pair<std::string, void *>> userSymbols_;
 #ifdef EJIT_SRE_TASKPOOL
   std::unique_ptr<EJitTaskPool> taskPool_;
 #endif
@@ -130,6 +147,9 @@ private:
   /// Worker idle/yield hook: defers to the platform task abstraction
   /// (EJitSreTask::yield) so the shared worker never busy-spins.
   static void sharedWorkerIdle(void *ctx);
+  /// Owner-elected hook: builds the engine on whichever core wins the election.
+  /// ctx is the driver, which owns sharedPool_ and so always outlives it.
+  static bool sharedOwnerElected(void *ctx);
 #endif
   // Async compiler will be added in EJitAsyncCompiler phase
 

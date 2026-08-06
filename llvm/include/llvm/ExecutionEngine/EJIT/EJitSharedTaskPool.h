@@ -388,6 +388,13 @@ public:
   /// Placement is load-bearing: the worker may compile the instant it starts,
   /// and peers may enqueue the instant Ready is published, so the engine must
   /// exist before both.
+  ///
+  /// LIFETIME: \p fn and \p ctx MUST stay valid for the pool's whole lifetime,
+  /// and \p fn MUST be idempotent. An election is not a one-shot event:
+  /// ownerShutdown() returns the blob to Uninitialized precisely so a later
+  /// init() can elect a different existing peer, which runs this hook on ITS
+  /// pool object. So ctx must be a lifetime-stable object, never a caller's
+  /// stack, and the hook must not be cleared after the first election.
   void setOwnerElectedCallback(OwnerElectedFn fn, void *ctx) {
     ownerElected_ = fn;
     ownerElectedCtx_ = ctx;
@@ -446,6 +453,24 @@ public:
   /// Run owner election + bind. Idempotent: re-observes the same outcome.
   InitResult init();
   bool isOwner() const { return isOwner_; }
+
+  /// Can an async request submitted from THIS core actually be compiled? True
+  /// when the blob is Ready, an owner is elected, and that owner's single
+  /// worker started. Says nothing about a LOCAL engine: peers have none by
+  /// design and the owner compiles for every core (see EJit::setCompileMode).
+  bool asyncServiceAvailable() const {
+    if (!state_)
+      return false;
+    if (state_->initState.loadAcquire() !=
+        static_cast<uint32_t>(EJitSharedInitState::Ready))
+      return false;
+    if (state_->ownerCoreId.loadAcquire() == kEJitInvalidCoreId)
+      return false;
+    // Published only after a successful worker start, cleared by
+    // ownerShutdown: the one field separating "a worker is running" from "the
+    // blob merely looks Ready".
+    return state_->workerTaskId.loadAcquire() != 0;
+  }
 
   /// Owner-only orderly shutdown: stop+join the worker, then return the state
   /// to Uninitialized so a later init() can re-elect. No-op for a non-owner.
