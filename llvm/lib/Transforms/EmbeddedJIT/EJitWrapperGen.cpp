@@ -74,6 +74,25 @@ static cl::opt<bool> EJitInlineCache(
              "cached specialization pointer) before the taskpool "
              "compile_or_get call in ejit_entry wrappers"));
 
+// When the inline-cache probe is enabled, put the frame-less dispatcher
+// (probe + two tail calls, ~16-48 bytes) into a dedicated
+// .text.ejit_dispatch section so all dispatchers share cache lines for
+// spatial locality and reduced iTLB pressure.  No effect without
+// -ejit-inline-cache (the non-icache wrapper is too large to benefit).
+static cl::opt<bool> EJitDispatcherCluster(
+    "ejit-dispatcher-cluster", cl::init(false), cl::Hidden,
+    cl::desc("Cluster frame-less icache dispatchers into .text.ejit_dispatch "
+             "section for I-cache spatial locality"));
+
+// Mark the per-function MissFn (which contains the full AOT fallback body)
+// as cold so the backend places it in .text.unlikely, keeping KBs of cold
+// code out of hot I-cache lines.  Miss is rare, so the cold attribute also
+// enables OptSize-level optimization on the fallback body.
+static cl::opt<bool> EJitMissFnCold(
+    "ejit-missfn-cold", cl::init(false), cl::Hidden,
+    cl::desc("Mark the icache MissFn as cold to isolate the AOT fallback "
+             "body from hot I-cache"));
+
 // Wrapper generation now unconditionally uses the unified taskpool API
 // (ejit_taskpool_compile_or_get + ejit_taskpool_release_read). Both Sync
 // and Async modes are runtime-configurable — the AOT wrapper code is
@@ -790,7 +809,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // Copy F's attributes so MissFn matches F's subtarget; re-affirm NoInline.
       MissFn->setAttributes(F->getAttributes());
       MissFn->addFnAttr(Attribute::NoInline);
-      MissFn->addFnAttr(Attribute::Cold);
+      if (EJitMissFnCold)
+        MissFn->addFnAttr(Attribute::Cold);
       MissFn->setSection(F->getSection());
 
       // Move ALL of F's original blocks to MissFn (not just the entry block --
@@ -919,7 +939,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // multiple ejit_entry functions) and reduce iTLB pressure.  MissFn
       // already copied F's original section above; only the tiny dispatcher
       // (probe + two tail calls) moves here.
-      F->setSection(".text.ejit_dispatch");
+      if (EJitDispatcherCluster)
+        F->setSection(".text.ejit_dispatch");
     } else {
       //=== icache OFF: single-function wrapper (funcidx guard -> slow path) ==
       auto *JitEntry = BasicBlock::Create(Ctx, "jit_entry", F, &OrigEntry);
