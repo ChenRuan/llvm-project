@@ -44,3 +44,15 @@ cl::opt<bool> EJitReportMayConst(
     cl::desc("Report per-ejit_entry ejit_may_const read counts (total and "
              "in-loop) in the specialization closure, for manual "
              "specialization-value assessment."));
+
+// Optional warning (off by default): warn when an ejit_entry's specialization
+// closure has fewer than N ejit_may_const reads. N=0 disables the check,
+// N>0 enables it with that threshold. A low load count means the JIT has
+// little to specialize against, but the significance depends on whether those
+// few loads gate branches or sit in hot loops — this warning flags low counts
+// for manual review rather than asserting a defect.
+cl::opt<unsigned> EJitWarnFewMayConst(
+    "ejit-warn-few-mayconst", cl::init(0), cl::Hidden,
+    cl::desc("Warn when an ejit_entry's specialization closure has fewer than "
+             "N ejit_may_const reads (0 = off). Example: "
+             "-ejit-warn-few-mayconst=4 warns on 0..3 may-const reads."));
