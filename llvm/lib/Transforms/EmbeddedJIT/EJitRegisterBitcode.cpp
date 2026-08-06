@@ -45,6 +45,7 @@ extern cl::opt<std::string> EJitDumpBitcodeDir;
 extern cl::opt<bool> EJitWarnNoSpecialization;
 extern cl::opt<bool> EJitWarnUnusedDim;
 extern cl::opt<bool> EJitReportMayConst;
+extern cl::opt<unsigned> EJitWarnFewMayConst;
 
 #define DEBUG_TYPE "ejit-register-bitcode"
 
@@ -431,7 +432,8 @@ computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKi
 static void
 runSpecializationDiagnostic(Module &Extracted,
                             const SmallVectorImpl<Function *> &EntryFuncs) {
-  if (!EJitWarnNoSpecialization && !EJitWarnUnusedDim && !EJitReportMayConst)
+  if (!EJitWarnNoSpecialization && !EJitWarnUnusedDim && !EJitReportMayConst &&
+      !EJitWarnFewMayConst)
     return;
 
   SmallVector<EjitEntryDiag, 4> Entries;
@@ -525,9 +527,10 @@ runSpecializationDiagnostic(Module &Extracted,
                         "removing it\n";
   }
 
-  // Optional info report: per-entry ejit_may_const read counts (total /
-  // in-loop) over the specialization closure. Report-only; it does not gate.
-  if (EJitReportMayConst) {
+  // Per-entry may_const read counts over the specialization closure (BFS).
+  // Used by the info report and the few-may-const warning; both share the
+  // same closure walk so they share one gated loop.
+  if (EJitReportMayConst || EJitWarnFewMayConst > 0) {
     for (const EjitEntryDiag &ED : Entries) {
       const Function *EF = Extracted.getFunction(ED.Name);
       if (!EF || EF->isDeclaration())
@@ -548,9 +551,24 @@ runSpecializationDiagnostic(Module &Extracted,
         for (const Function *Callee : It->second.Callees)
           WL.push_back(Callee);
       }
-      errs() << "EJit info: ejit_entry function '" << EF->getName() << "': "
-             << K << " ejit_may_const read" << (K == 1 ? "" : "s") << " ("
-             << J << " in loops)\n";
+
+      // Info report (not a warning): summary of all may-const reads.
+      if (EJitReportMayConst)
+        errs() << "EJit info: ejit_entry function '" << EF->getName() << "': "
+               << K << " ejit_may_const read" << (K == 1 ? "" : "s") << " ("
+               << J << " in loops)\n";
+
+      // Warning #3: too few may-const reads for meaningful specialization.
+      // A low count means the JIT has little to fold, but doesn't mean the
+      // entry is misconfigured — the significance depends on what those loads
+      // gate.  This only flags the count for manual review.
+      if (EJitWarnFewMayConst > 0 && K < EJitWarnFewMayConst)
+        errs() << "EJit warning: ejit_entry function '" << EF->getName()
+               << "' has only " << K << " ejit_may_const read"
+               << (K == 1 ? "" : "s") << " in its specialization closure"
+               << " (threshold: " << EJitWarnFewMayConst
+               << "); low specialization surface, consider adding more"
+                  " may-const fields\n";
     }
   }
 }
