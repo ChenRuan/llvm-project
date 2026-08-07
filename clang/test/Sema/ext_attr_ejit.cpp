@@ -74,6 +74,19 @@ void bad_writer(int i, int v) {
   (void)r;
   int *p1 = &g_warn[i].cellType;        // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}}
   const int *p2 = &g_warn[i].cellType;  // no warning: const qualifier on pointee
+  *&g_warn[i].cellType = v;             // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}}
+  (*&g_warn[i].cellType)++;             // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}}
+  (void)(*&g_warn[i].cellType);         // no warning: deref consumed pointer, no writable pointer escapes
+}
+
+// Pointer-based access: p may alias period data -> warn.
+void via_pointer(struct WarnCfg *p) {
+  p->cellType = 5;  // expected-warning {{modifying ejit_may_const field 'cellType' of 'p' without ejit_period_lc attribute}}
+}
+
+// Nested cast: outer (int*) strips const added by inner (const int*) -> warn.
+void nested_const_cast(int i) {
+  int *p = (int *)(const int *)&g_warn[i].cellType;  // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}}
 }
 
 // An ejit_period_lc function is sanctioned to modify may_const fields -> no warning.
