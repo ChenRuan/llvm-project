@@ -72,6 +72,21 @@ void bad_writer(int i, int v) {
   g_warn[i].plain = v;     // no warning: 'plain' is not ejit_may_const
   int r = g_warn[i].cellType; // no warning: read, not a write
   (void)r;
+  int *p1 = &g_warn[i].cellType;        // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}}
+  const int *p2 = &g_warn[i].cellType;  // no warning: const qualifier on pointee
+  *&g_warn[i].cellType = v;             // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}}
+  (*&g_warn[i].cellType)++;             // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}}
+  (void)(*&g_warn[i].cellType);         // no warning: deref consumed pointer, no writable pointer escapes
+}
+
+// Pointer-based access: p may alias period data -> warn.
+void via_pointer(struct WarnCfg *p) {
+  p->cellType = 5;  // expected-warning {{modifying ejit_may_const field 'cellType' of 'p' without ejit_period_lc attribute}}
+}
+
+// Nested cast: outer (int*) strips const added by inner (const int*) -> warn.
+void nested_const_cast(int i) {
+  int *p = (int *)(const int *)&g_warn[i].cellType;  // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}}
 }
 
 // An ejit_period_lc function is sanctioned to modify may_const fields -> no warning.
@@ -79,6 +94,7 @@ __attribute__((ejit_period_lc("cell")))
 void good_writer(__attribute__((ejit_period_arr_ind("cell"))) int i, int v) {
   g_warn[i].cellType = v;  // no warning: ejit_period_lc sanctions the write
   g_warn[i].flags += v;    // no warning
+  int *p1 = &g_warn[i].cellType;        // no warning: lc is exempt
 }
 
 // === Warning: always_inline conflicts with ejit_entry / ejit_period_lc ===

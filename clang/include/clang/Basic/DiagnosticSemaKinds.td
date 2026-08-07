@@ -13506,6 +13506,11 @@ def err_ejit_period_lc_no_index : Error<
 def warn_ejit_may_const_modified_without_lc : Warning<
   "modifying ejit_may_const field %0 of %1 without ejit_period_lc attribute">,
   InGroup<EmbeddedJIT>;
+def warn_ejit_may_const_addr_without_const : Warning<
+  "taking address of ejit_may_const field %0 of %1 without const qualifier; "
+  "a non-const pointer allows the field to be written outside "
+  "ejit_period_lc, breaking the JIT's time-window constancy assumption">,
+  InGroup<EmbeddedJIT>;
 def warn_ejit_undeclared_period_dep : Warning<
   "function %0 references ejit_period_arr '%1' but does not declare "
   "a dependency on it via ejit_period_arr_ind">,
