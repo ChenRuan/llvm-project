@@ -36,6 +36,7 @@
 #include "llvm/Support/Process.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -809,7 +810,7 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
     auto *NameGV = new GlobalVariable(M, NameStr->getType(), true,
         GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
     Entries.push_back(ConstantStruct::get(EntryTy, {
-        ConstantInt::get(I32Ty, 0),                          // EJIT_REG_BITCODE
+        ConstantInt::get(I32Ty, EJIT_REG_BITCODE),           // EJIT_REG_BITCODE
         ConstantExpr::getBitCast(NameGV, PtrTy),             // name1 string
         ConstantPointerNull::get(PtrTy),                     // name2 = NULL
         ConstantExpr::getBitCast(BitcodeGV, PtrTy),          // bitcode data ptr
@@ -827,7 +828,7 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
         auto *NameGV = new GlobalVariable(M, NameStr->getType(), true,
             GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
         Entries.push_back(ConstantStruct::get(EntryTy, {
-            ConstantInt::get(I32Ty, 3),                      // EJIT_REG_SYMBOL
+            ConstantInt::get(I32Ty, EJIT_REG_SYMBOL),                      // EJIT_REG_SYMBOL
             ConstantExpr::getBitCast(NameGV, PtrTy),         // name1 string
             ConstantPointerNull::get(PtrTy),
             ConstantExpr::getBitCast(const_cast<Function *>(F), PtrTy),
@@ -869,7 +870,7 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
           auto *NameGV = new GlobalVariable(M, NameStr->getType(), true,
               GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
           Entries.push_back(ConstantStruct::get(EntryTy, {
-              ConstantInt::get(I32Ty, 3),                // EJIT_REG_SYMBOL
+              ConstantInt::get(I32Ty, EJIT_REG_SYMBOL),                // EJIT_REG_SYMBOL
               ConstantExpr::getBitCast(NameGV, PtrTy),   // name1 string
               ConstantPointerNull::get(PtrTy),
               ConstantExpr::getBitCast(

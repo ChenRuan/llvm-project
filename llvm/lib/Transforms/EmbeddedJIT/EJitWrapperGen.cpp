@@ -31,6 +31,7 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <map>
 #include <string>
+#include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -206,7 +207,7 @@ emitLifecycleRegistration(Module &M,
   SmallVector<Constant *, 16> Entries;
   for (auto &KV : LCs) {
     Entries.push_back(ConstantStruct::get(
-        EntryTy, {ConstantInt::get(I32Ty, 5), // EJIT_REG_LIFECYCLE
+        EntryTy, {ConstantInt::get(I32Ty, EJIT_REG_LIFECYCLE),
                   makeStrGV(KV.first), ConstantPointerNull::get(PtrTy),
                   ConstantExpr::getBitCast(KV.second, PtrTy),
                   ConstantInt::get(I64Ty, 0)}));
@@ -341,7 +342,7 @@ emitFuncIndexRegistration(Module &M,
   SmallVector<Constant *, 16> Entries;
   for (auto &KV : Fns) {
     Entries.push_back(ConstantStruct::get(
-        EntryTy, {ConstantInt::get(I32Ty, 6), // EJIT_REG_FUNCINDEX
+        EntryTy, {ConstantInt::get(I32Ty, EJIT_REG_FUNCINDEX),
                   makeStrGV(KV.first), ConstantPointerNull::get(PtrTy),
                   ConstantExpr::getBitCast(KV.second, PtrTy),
                   ConstantInt::get(I64Ty, 0)}));
@@ -418,7 +419,7 @@ emitIcacheSlotRegistration(Module &M,
   SmallVector<Constant *, 16> Entries;
   for (auto &KV : Fns) {
     Entries.push_back(ConstantStruct::get(
-        EntryTy, {ConstantInt::get(I32Ty, 7), // EJIT_REG_ICACHE_SLOT
+        EntryTy, {ConstantInt::get(I32Ty, EJIT_REG_ICACHE_SLOT),
                   makeStrGV(KV.first), ConstantPointerNull::get(PtrTy),
                   ConstantExpr::getBitCast(KV.second.GV, PtrTy),
                   ConstantInt::get(I64Ty, KV.second.NumDims)}));
