@@ -1578,6 +1578,20 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       state_->structSize =
           static_cast<uint32_t>(sizeof(EJitSharedTaskPoolState));
 
+      // Owner-only setup (building the JIT engine) runs HERE: after the blob is
+      // built, before the worker exists, and before Ready is published. Both
+      // orderings matter -- the worker can compile the instant it starts, and a
+      // peer can enqueue the instant it observes Ready. A failure is a clean
+      // init failure, exactly like a failed worker start.
+      if (ownerElected_ && !ownerElected_(ownerElectedCtx_)) {
+        state_->lastInitError.storeRelease(
+            static_cast<uint32_t>(EJitSharedInitError::OwnerSetupFailed));
+        state_->initState.storeRelease(
+            static_cast<uint32_t>(EJitSharedInitState::Failed));
+        EJIT_DIAG("shared taskpool owner=%u setup FAILED (engine)", self);
+        return InitResult::OwnerFailed;
+      }
+
       // Start the ONE worker (if a starter was injected). A failure here is a
       // clean init failure: record it, publish Failed, and DO NOT pretend JIT
       // is up.
@@ -1665,6 +1679,12 @@ void EJitSharedTaskPool::ownerShutdown() {
       static_cast<uint32_t>(EJitSharedInitState::Stopping));
   if (workerStop_)
     workerStop_(workerCtx_); // soft-stop + JOIN (no use-after-free).
+  // Release what the election built, between the join and Uninitialized: no
+  // compile can be in flight, and no peer can be elected yet. Without this the
+  // former owner keeps its engine while a new owner builds another, so the
+  // system accumulates one per handoff.
+  if (ownerReleased_)
+    ownerReleased_(ownerReleasedCtx_);
   state_->ownerCoreId.storeRelease(kEJitInvalidCoreId);
   state_->workerTaskId.storeRelease(0);
   state_->generation.storeRelease(state_->generation.loadRelaxed() + 1);

@@ -241,6 +241,12 @@ public:
   /// never busy-spins and starves the core trying to publish Ready. MUST NOT be
   /// called while holding a bucket lock / queue slot / dedup critical state.
   using WorkerIdleFn = void (*)(void *ctx);
+  /// Owner-only setup hook (see setOwnerElectedCallback). Return false to fail
+  /// init. Runs on the elected owner, inside init(), before the worker starts.
+  using OwnerElectedFn = bool (*)(void *ctx);
+  /// Owner-only teardown hook (see setOwnerReleasedCallback). Runs on the core
+  /// giving up ownership, inside ownerShutdown().
+  using OwnerReleasedFn = void (*)(void *ctx);
 
   enum class InitResult : uint32_t {
     BecameOwner =
@@ -370,6 +376,46 @@ public:
     workerStop_ = stop;
     workerCtx_ = ctx;
   }
+  /// Owner-only setup, run inside init() by the core that WINS the election,
+  /// after the blob is built but before the worker is started and before Ready
+  /// is published. Returning false is a clean init failure (Failed +
+  /// OwnerSetupFailed), exactly like a failed worker start.
+  ///
+  /// This exists so the JIT engine is built only on the core that will actually
+  /// compile. Only the owner's worker ever invokes the compile callback, so
+  /// constructing an LLJIT on every core wastes one per non-owner. Ownership is
+  /// won by CAS and is not permanent (see ownerShutdown), so the engine cannot
+  /// be assigned to a fixed core -- it has to follow whoever wins, which is
+  /// what this hook expresses.
+  ///
+  /// Placement is load-bearing: the worker may compile the instant it starts,
+  /// and peers may enqueue the instant Ready is published, so the engine must
+  /// exist before both.
+  ///
+  /// LIFETIME: \p fn and \p ctx MUST stay valid for the pool's whole lifetime,
+  /// and \p fn MUST be idempotent. An election is not a one-shot event:
+  /// ownerShutdown() returns the blob to Uninitialized precisely so a later
+  /// init() can elect a different existing peer, which runs this hook on ITS
+  /// pool object. So ctx must be a lifetime-stable object, never a caller's
+  /// stack, and the hook must not be cleared after the first election.
+  void setOwnerElectedCallback(OwnerElectedFn fn, void *ctx) {
+    ownerElected_ = fn;
+    ownerElectedCtx_ = ctx;
+  }
+  /// The counterpart of setOwnerElectedCallback: release whatever that hook
+  /// built. Runs inside ownerShutdown() AFTER the worker is joined and BEFORE
+  /// the blob returns to Uninitialized, so no compile can be in flight and no
+  /// peer can have been elected yet.
+  ///
+  /// Quiescence: what this releases is the COMPILER, not the code. Code-pool
+  /// memory is never recycled (sealed RX pages are not reused), so
+  /// specializations already published stay executable for peers still running
+  /// them after the engine is gone. Same lifetime rules as the elected hook:
+  /// stable ctx, armed for the pool's lifetime.
+  void setOwnerReleasedCallback(OwnerReleasedFn fn, void *ctx) {
+    ownerReleased_ = fn;
+    ownerReleasedCtx_ = ctx;
+  }
   /// Inject the worker idle/yield hook (see WorkerIdleFn). When unset the loop
   /// falls back to a compiler reordering barrier only (used by step tests).
   void setWorkerIdleHook(WorkerIdleFn fn, void *ctx) {
@@ -411,6 +457,27 @@ public:
             static_cast<uint32_t>(EJitSharedInitState::Ready))
       state_->mode.storeRelease(static_cast<uint32_t>(mode));
   }
+  /// Publish \p mode only if the blob is still Ready at generation \p gen --
+  /// the one asyncServiceAvailable() validated. An ownerShutdown that lands in
+  /// between bumps the generation, so the stale mode is never committed and the
+  /// caller learns the switch did not take. Returns false without writing then.
+  bool publishSharedMode(EJitCompileMode mode, uint32_t gen) {
+    if (!state_)
+      return false;
+    if (state_->initState.loadAcquire() !=
+            static_cast<uint32_t>(EJitSharedInitState::Ready) ||
+        state_->generation.loadAcquire() != gen)
+      return false;
+    configuredMode_ = mode;
+    state_->mode.storeRelease(static_cast<uint32_t>(mode));
+    // Re-check: if the owner went Stopping between the gate and the store, the
+    // write is stale. Producers gate on Ready before enqueuing so nothing can
+    // act on it, but report the failure rather than claim the switch took.
+    return state_->initState.loadAcquire() ==
+               static_cast<uint32_t>(EJitSharedInitState::Ready) &&
+           state_->generation.loadAcquire() == gen;
+  }
+
   /// The current cross-core compile mode: the shared state's mode (acquire
   /// load) once the blob is Ready, otherwise the staged configuredMode_.
   EJitCompileMode getSharedMode() const {
@@ -424,6 +491,41 @@ public:
   /// Run owner election + bind. Idempotent: re-observes the same outcome.
   InitResult init();
   bool isOwner() const { return isOwner_; }
+
+  /// Can an async request submitted from THIS core actually be compiled? True
+  /// when the blob is Ready, an owner is elected, and that owner's single
+  /// worker started. Says nothing about a LOCAL engine: peers have none by
+  /// design and the owner compiles for every core (see EJit::setCompileMode).
+  ///
+  /// The fields are re-read after the check and the whole thing is rejected if
+  /// the generation or state moved, so the answer describes ONE generation
+  /// rather than a mix of before- and after-shutdown reads. \p outGeneration
+  /// receives that generation; pass it to publishSharedMode() so the mode can
+  /// only commit against the same one.
+  bool asyncServiceAvailable(uint32_t *outGeneration = nullptr) const {
+    if (!state_)
+      return false;
+    const uint32_t gen = state_->generation.loadAcquire();
+    if (state_->initState.loadAcquire() !=
+        static_cast<uint32_t>(EJitSharedInitState::Ready))
+      return false;
+    if (state_->ownerCoreId.loadAcquire() == kEJitInvalidCoreId)
+      return false;
+    // Published only after a successful worker start, cleared by
+    // ownerShutdown: the one field separating "a worker is running" from "the
+    // blob merely looks Ready".
+    if (state_->workerTaskId.loadAcquire() == 0)
+      return false;
+    // Re-validate: an ownerShutdown concurrent with the reads above moves the
+    // state to Stopping and bumps the generation.
+    if (state_->initState.loadAcquire() !=
+            static_cast<uint32_t>(EJitSharedInitState::Ready) ||
+        state_->generation.loadAcquire() != gen)
+      return false;
+    if (outGeneration)
+      *outGeneration = gen;
+    return true;
+  }
 
   /// Owner-only orderly shutdown: stop+join the worker, then return the state
   /// to Uninitialized so a later init() can re-elect. No-op for a non-owner.
@@ -751,6 +853,10 @@ private:
   void *workerCtx_ = nullptr;
   WorkerIdleFn workerIdle_ = nullptr;
   void *workerIdleCtx_ = nullptr;
+  OwnerElectedFn ownerElected_ = nullptr;
+  void *ownerElectedCtx_ = nullptr;
+  OwnerReleasedFn ownerReleased_ = nullptr;
+  void *ownerReleasedCtx_ = nullptr;
   uint64_t regFingerprint_ = 0;
   EJitCompileMode configuredMode_ = EJitCompileMode::Async;
   bool codeSharingEnabled_ = false;

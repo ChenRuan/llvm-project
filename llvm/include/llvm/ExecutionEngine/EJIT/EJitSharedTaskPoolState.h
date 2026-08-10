@@ -124,6 +124,11 @@ enum class EJitSharedInitState : uint32_t {
 enum class EJitSharedInitError : uint32_t {
   None = 0,
   WorkerStartFailed = 1,
+  /// Owner-only setup (building the JIT engine) failed after the election was
+  /// won. Only the owner compiles, so the engine is built inside init() once
+  /// the CAS succeeds; a failure there is an init failure exactly like a failed
+  /// worker start, not a silently degraded pool.
+  OwnerSetupFailed = 2,
 };
 
 //===----------------------------------------------------------------------===//
