@@ -218,12 +218,21 @@ EJit::EJit(const Config &config) : config_(config) {
           }
           uint32_t numDims = static_cast<uint32_t>(e->size);
           uint32_t idx = EJitFuncRegistry::instance().resolveAssign(e->name1);
-          if (idx != kEJitInvalidFuncIndex)
-            ejitIcacheRegisterSlot(idx, const_cast<void *>(e->ptr), numDims);
-          else
+          if (idx == kEJitInvalidFuncIndex) {
             recordInitError(EJIT_ERR_CACHE_FULL,
                             "funcIndex capacity exhausted for icache slot",
                             e->name1);
+            break;
+          }
+          if (!ejitIcacheRegisterSlot(idx, const_cast<void *>(e->ptr),
+                                      numDims)) {
+            // Declined (numDims above the cap): the cell stays null and every
+            // call to this function resolves through the taskpool. Correct,
+            // just without the fast path.
+            recordInitError(EJIT_ERR_INVALID_PARAM,
+                            "icache slot declined: numDims above the cap",
+                            e->name1);
+          }
           break;
         }
         default:

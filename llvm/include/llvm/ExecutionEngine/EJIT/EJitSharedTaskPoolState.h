@@ -343,6 +343,20 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
       EJitAtomicU8 enabled[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 version[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 mode; ///< EJitCompileMode (Off=0, Async=1)
+  /// Counts inline-cache drains. Bumped by icacheDrainAll() AFTER it zeroes the
+  /// shared cell table, so a resolve that started before the drain can tell its
+  /// fnPtr may be specialized for period values that have since changed, and
+  /// drop the fill rather than re-populate a cell the drain just cleared. The
+  /// hit path never reads it: the cells are shared, so the drain reaches every
+  /// core directly. Bumped, never reset.
+  EJitAtomicU32 icacheDrainSeq;
+  /// Drains currently zeroing the table. Raised before the first cell store and
+  /// lowered after the sequence bump, so the pair brackets the whole drain: a
+  /// fill that sees 0 at both ends of its resolve and an unchanged sequence
+  /// provably did not overlap one. Needed because a drain that has passed a cell
+  /// but not yet bumped the sequence would otherwise let a fill slip in behind
+  /// it, and because several cores can drain at once.
+  EJitAtomicU32 icacheDrainsInFlight;
   EJitAtomicU32 anyInstanceActivated; ///< 1 once any instance first
                                       ///< setInstanceEnabled(true); gates the
                                       ///< instanceDisabledPreActivate counter.

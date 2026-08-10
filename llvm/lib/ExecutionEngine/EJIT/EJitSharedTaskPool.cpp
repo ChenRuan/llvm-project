@@ -150,24 +150,46 @@ constexpr uint64_t kHashMul = 0x9e3779b97f4a7c15ULL;
 // Per-function inline-cache slot registry (multi-version direct-indexed). Each
 // entry records the wrapper's per-function @__ejit_icache_fn_<name> global base
 // (a uintptr_t cell, or a [D]^numDims array of them for a multi-version entry)
-// plus its dimensionality, registered by name at ejit_auto_register / .ejit_period
-// time via ejit_register_icache_slot (which calls ejitIcacheRegisterSlot). The
-// wrapper reads its OWN global directly (a GEP by the ejit_dim arg values + one
-// plain load + null-check + indirect call) with NO ejit_icache_try call and NO
-// per-call guards. icacheFill writes the specialization pointer through the cell
-// at [i0][i1]... (linearized from dims) on a successful resolve; icacheTry
-// (test/diagnostic only) reads it. The slot is PER-CORE PRIVATE (default BSS),
-// so the fill and the read are same-core, ordered by program order; the
-// indirect call's data dependency on the loaded pointer orders the load before
-// the br. So NO atomic/acquire/CAS is needed -- plain load (ldr) / store (str)
-// is correct. Process-static, zero-filled by the loader (base starts null =
-// unregistered = probe misses = taskpool fallback). See the header for the
-// safety model.
+// plus its dimensionality, registered by name at ejit_auto_register /
+// .ejit_period time via ejit_register_icache_slot (which calls
+// ejitIcacheRegisterSlot). The wrapper reads the cell directly (a GEP by the
+// ejit_dim arg values + one load + null-check + indirect call) with NO
+// ejit_icache_try call and NO per-call guards. icacheFill writes the
+// specialization pointer through the cell at [i0][i1]... (linearized from dims)
+// on a successful resolve; icacheDrainAll zeroes them on a period toggle;
+// icacheTry (test/diagnostic only) reads them.
+//
+// The REGISTRY is core-private (default BSS); the CELLS it points at are not.
+// With EJIT_ICACHE_SECTION set @__ejit_icache_fn_<name> is one shared object,
+// so every core registers the same base and a drain on any core reaches every
+// core's partition. These bookkeeping words are rebuilt identically at each
+// core's own registration and never read cross-core.
+//
+// Cell accesses therefore go through the atomic wrapper -- a fill on one core
+// can race a drain on another. Relaxed is the right order (single-location
+// coherence on one naturally-aligned word) and lowers to the same ldr/str on
+// AArch64. The AOT probe's load is likewise relaxed, so the cache is race-free
+// in the C++ model at zero code-size cost.
 struct EJitIcacheSlotReg {
   uintptr_t *base;
   uint32_t numDims;
 };
 EJitIcacheSlotReg gIcacheSlots[EJIT_ICACHE_FUNC_SLOTS];
+
+// A cell viewed as the atomic it is: EJitAtomic<uintptr_t> is a standard-layout
+// wrapper over exactly one pointer-sized word, so this overlay on the AOT array
+// is layout-identical and only changes which builtin performs the access.
+inline EJitAtomicUPtr &icacheCell(uintptr_t *base, uintptr_t idx) {
+  return reinterpret_cast<EJitAtomicUPtr *>(base)[idx];
+}
+
+// Cells in a [D]^numDims array. numDims is capped at registration.
+inline uintptr_t icacheCellCount(uint32_t numDims) {
+  uintptr_t n = 1;
+  for (uint32_t i = 0; i < numDims; ++i)
+    n *= EJIT_ICACHE_DIM_SIZE;
+  return n;
+}
 
 // Linearize the dim identity to a flat cell index, row-major, dim0 = leftmost
 // ejit_dim param (MUST match the AOT [D]^numDims array declaration order). D is
@@ -182,12 +204,18 @@ static uintptr_t icacheLinearize(const EJitDimPair *dims, uint32_t numDims) {
 
 } // namespace
 
-void llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
+bool llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
                                         uint32_t numDims) {
   if (funcIndex >= EJIT_ICACHE_FUNC_SLOTS || !base)
-    return;
+    return false;
+  // numDims sizes the array the drain walks, so an out-of-cap value writes far
+  // past the wrapper's global. The AOT pass never emits one, but numDims also
+  // arrives from a uint64 registry field and the public C ABI -- don't trust it.
+  if (numDims > EJIT_ICACHE_MAX_DIMS)
+    return false;
   gIcacheSlots[funcIndex].base = reinterpret_cast<uintptr_t *>(base);
   gIcacheSlots[funcIndex].numDims = numDims;
+  return true;
 }
 
 void llvm::ejit::ejitIcacheClearAll() {
@@ -196,7 +224,8 @@ void llvm::ejit::ejitIcacheClearAll() {
   // base pointers here: in tests the slots are stack locals that may already be
   // destroyed by the time a later test clears (e.g. if an ASSERT returned early
   // and skipped the prior test's end-clear), so dereferencing would be a
-  // use-after-free. Production never calls this.
+  // use-after-free -- which is why this stays distinct from icacheDrainAll(),
+  // which DOES write through every base. Production never calls this.
   for (uint32_t f = 0; f < EJIT_ICACHE_FUNC_SLOTS; ++f) {
     gIcacheSlots[f].base = nullptr;
     gIcacheSlots[f].numDims = 0;
@@ -216,15 +245,94 @@ void llvm::ejit::ejitDumpIcacheSlots() {
     // For multi-dim arrays, cell[0] is the [0]...[0] element; for 0-dim,
     // it is the scalar cell. Either way it tells us whether the first
     // identity has been resolved yet.
-    bool cell0 = (reg.base[0] != 0);
-    if (cell0)
+    const uintptr_t c0 = icacheCell(reg.base, 0).loadRelaxed();
+    if (c0)
       filled++;
     EJIT_DIAG("  [%2u] base=%p numDims=%u cell[0]=%p %s",
-              f, (void *)reg.base, reg.numDims,
-              (void *)reg.base[0], cell0 ? "(filled)" : "(empty)");
+              f, (void *)reg.base, reg.numDims, (void *)c0,
+              c0 ? "(filled)" : "(empty)");
   }
   EJIT_DIAG("=== icache slots: %u registered, %u with cell[0] filled ===",
             registered, filled);
+}
+
+void EJitSharedTaskPool::icacheDrainAll(const char *reason) {
+  if (!state_) {
+    EJIT_DIAG("icacheDrain SKIP (%s): no shared state bound",
+              reason ? reason : "unspecified");
+    return;
+  }
+  // Announce the drain BEFORE touching a cell and retire the sequence AFTER the
+  // last one. Together these bracket the whole window: a fill can only be
+  // accepted if it saw drainsInFlight == 0 at both ends AND an unchanged
+  // sequence, which is possible only when no drain overlapped its resolve.
+  // Announcing first is what stops a fill from slipping into a cell this drain
+  // has already passed but has not yet accounted for.
+  state_->icacheDrainsInFlight.fetchAdd(1);
+  // Counted only under EJIT_DIAG_ENABLE: reading every cell back to see whether
+  // it held anything doubles the drain's memory traffic, and with diagnostics
+  // off EJIT_DIAG discards its arguments unevaluated, so these would be dead.
+#ifdef EJIT_DIAG_ENABLE
+  uint32_t walkedSlots = 0;
+  uint64_t clearedCells = 0;
+#endif
+  for (uint32_t f = 0; f < EJIT_ICACHE_FUNC_SLOTS; ++f) {
+    const EJitIcacheSlotReg &reg = gIcacheSlots[f];
+    if (!reg.base)
+      continue;
+    if (reg.numDims > EJIT_ICACHE_MAX_DIMS)
+      continue; // defence in depth: never walk past a mis-sized array
+    const uintptr_t cells = icacheCellCount(reg.numDims);
+#ifdef EJIT_DIAG_ENABLE
+    ++walkedSlots;
+#endif
+    for (uintptr_t c = 0; c < cells; ++c) {
+#ifdef EJIT_DIAG_ENABLE
+      if (icacheCell(reg.base, c).loadRelaxed() != 0)
+        ++clearedCells;
+#endif
+      icacheCell(reg.base, c).storeRelaxed(0);
+    }
+  }
+  const uint32_t seq = state_->icacheDrainSeq.fetchAdd(1) + 1u;
+  state_->icacheDrainsInFlight.fetchSub(1);
+  // A drain that actually emptied a cell is the event worth seeing on a board:
+  // it is what explains a hot core suddenly missing. A drain that cleared
+  // NOTHING invalidated nothing, and at bring-up those dominate -- N cores each
+  // calling ejit_activate per instance, every one walking a table that is still
+  // cold. Logging those at INFO buries the run in lines reporting a non-event,
+  // so they go to VERBOSE; the sequence still moves, so a fill retraction can
+  // still be traced by raising the level.
+#ifdef EJIT_DIAG_ENABLE
+  if (clearedCells != 0) {
+    EJIT_DIAG("icacheDrain OK (%s): core=%u slots=%u cellsCleared=%llu seq=%u",
+              reason ? reason : "unspecified", EJitCoreId::current(),
+              walkedSlots, static_cast<unsigned long long>(clearedCells), seq);
+  } else {
+    EJIT_DIAG_VERBOSE("icacheDrain OK (%s): core=%u slots=%u cellsCleared=0 "
+                      "seq=%u (nothing was cached)",
+                      reason ? reason : "unspecified", EJitCoreId::current(),
+                      walkedSlots, seq);
+  }
+#else
+  (void)reason;
+  (void)seq;
+#endif
+}
+
+uint32_t EJitSharedTaskPool::icacheDrainSeq() const {
+  return state_ ? state_->icacheDrainSeq.loadAcquire() : 0;
+}
+
+uint64_t EJitSharedTaskPool::icacheBeginResolve() {
+  if (!state_)
+    return kEJitIcacheNoResolve;
+  const uint32_t seq = state_->icacheDrainSeq.loadAcquire();
+  // A drain already running has an unknown reach: it may have passed this
+  // identity's cell or not. Refuse the token rather than guess.
+  if (state_->icacheDrainsInFlight.loadAcquire() != 0)
+    return kEJitIcacheNoResolve;
+  return kEJitIcacheResolveValid | seq;
 }
 
 //===----------------------------------------------------------------------===//
@@ -257,18 +365,18 @@ uint32_t EJitSharedTaskPool::instanceVersion(uint32_t dimType,
 // Per-function inline cache (multi-version direct-indexed).
 //
 // The production hit path does NOT call icacheTry: the ejit_entry wrapper reads
-// its own @__ejit_icache_fn_<name> global directly (GEP into the [D]^numDims
-// array by the ejit_dim arg values + acquire load + null check + indirect call,
-// no call, no per-call guards). icacheTry is retained for unit tests and
+// the shared @__ejit_icache_fn_<name> table directly (GEP into the [D]^numDims
+// array by the ejit_dim arg values + one load + null check + indirect call, no
+// call, no per-call guards). icacheTry is retained for unit tests and
 // diagnostics. icacheFill writes the specialization pointer through the cell at
-// [i0][i1]... (linearized from dims) on a successful resolve; it is a frozen,
-// one-shot fill PER CELL - each identity's cell is written once and never
-// refilled, so a cell's pointer is always the correct (invariant) specialization
-// for that identity. Lifetime is safe because JIT code is never freed in
-// production; the safety gate auto-disables the cache if a releaser is wired
-// (no HP-scan retire). The code-sharing gate retains the cross-core pointer
-// discipline of resolveMatchedSlot (relevant to icacheTry in non-shared test
-// builds; the wrapper's inline probe is only enabled under
+// [i0][i1]... (linearized from dims) on a successful resolve, and
+// icacheDrainAll zeroes every cell on a period toggle - so a cell holds the
+// specialization for its identity under the CURRENT period values, and stops
+// answering the moment those change. Lifetime is safe because JIT code is never
+// freed in production; the safety gate auto-disables the cache if a releaser is
+// wired (no HP-scan retire). The code-sharing gate retains the cross-core
+// pointer discipline of resolveMatchedSlot (relevant to icacheTry in non-shared
+// test builds; the wrapper's inline probe is only enabled under
 // EJIT_SRE_SHARED_CODE_POINTERS, where the gate is compile-time true).
 //===----------------------------------------------------------------------===//
 bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
@@ -303,12 +411,12 @@ bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
 #endif
   if (!mayReadPtr)
     return false;
-  // Read this identity's cell. The slot is per-core private: the fill (same
-  // core) is ordered before this read by program order, and the caller's
-  // indirect call depends on the loaded pointer (data dependency). So a plain
-  // load is correct -- no acquire needed.
+  // Read this identity's cell. Relaxed is enough, and is what the AOT probe
+  // emits: the cell holds a self-contained pointer, the caller's indirect call
+  // depends on the value loaded (data dependency), and the only cross-core
+  // write is a drain storing 0 -- which yields a miss, never a bad pointer.
   uintptr_t idx = icacheLinearize(dims, numDims);
-  uintptr_t p = reg.base[idx];
+  uintptr_t p = icacheCell(reg.base, idx).loadRelaxed();
   if (p == 0)
     return false;
   *outFn = reinterpret_cast<void *>(p);
@@ -330,8 +438,12 @@ EJitL0Entry llvm::ejit::gEJitL0[kEJitL0Slots];
 const void *llvm::ejit::gEJitL0State = nullptr;
 
 void EJitSharedTaskPool::retireDispatchCache() {
-  if (state_)
-    state_->dispatchEpoch.fetchAdd(1);
+  if (!state_)
+    return;
+  state_->dispatchEpoch.fetchAdd(1);
+  // The inline cache answers the same (identity -> fnPtr) question with no
+  // epoch of its own, so the events that retire the L0 must empty it outright.
+  icacheDrainAll("retire-dispatch-cache");
 }
 
 void EJitSharedTaskPool::l0Fill(uint32_t funcIndex, void *fnPtr,
@@ -369,34 +481,99 @@ void EJitSharedTaskPool::l0Fill(uint32_t funcIndex, void *fnPtr,
   e.seq = e.seq + 1u;
 }
 
+// One-shot diagnostics for icacheFill's decline paths. The fill runs on every
+// successful resolve, so an unconditional log would emit millions of lines under
+// load; each reason is reported once per core instead, which is all it takes to
+// answer "why is no cell being filled" from a board log. Core-private .bss, and
+// compiled out entirely when EJIT_DIAG_ENABLE is off.
+namespace {
+enum EJitIcacheFillReject {
+  kFillRejectReclaim = 0,
+  kFillRejectArgs,
+  kFillRejectUnregistered,
+  kFillRejectRacedDrain,
+  kFillRejectCount
+};
+bool gIcacheFillRejectLogged[kFillRejectCount];
+bool gIcacheFillOkLogged;
+} // namespace
+
 void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
-                                    const EJitDimPair *dims, uint32_t numDims) {
+                                    const EJitDimPair *dims, uint32_t numDims,
+                                    uint64_t token) {
   if (!icacheReclamationSafe_) {
-    EJIT_DIAG("icacheFill SKIP func=%u: reclamation not safe", funcIndex);
+    if (!gIcacheFillRejectLogged[kFillRejectReclaim]) {
+      gIcacheFillRejectLogged[kFillRejectReclaim] = true;
+      EJIT_DIAG("icacheFill DECLINE func=%u: a releaser is wired, so the cache "
+                "is disabled to avoid handing out freed code",
+                funcIndex);
+    }
     return;
   }
+  // Cross-core executability gate: this store publishes fnPtr to every core at
+  // once, including cores that have not prepared it. Where the platform needs
+  // per-core execute preparation a peer would jump to an address it has not
+  // sealed, so decline and let the taskpool -- which prepares -- serve every
+  // call. See icacheCrossCoreExecutable().
+  if (!icacheCrossCoreExecutable())
+    return;
   if (!state_ || !fnPtr || funcIndex >= EJIT_ICACHE_FUNC_SLOTS) {
-    EJIT_DIAG("icacheFill SKIP func=%u: state=%p fn=%p OOB=%u", funcIndex,
-              (void *)state_, fnPtr,
-              (unsigned)(funcIndex >= EJIT_ICACHE_FUNC_SLOTS));
+    if (!gIcacheFillRejectLogged[kFillRejectArgs]) {
+      gIcacheFillRejectLogged[kFillRejectArgs] = true;
+      EJIT_DIAG("icacheFill DECLINE func=%u: state=%p fn=%p slots=%u",
+                funcIndex, (const void *)state_, fnPtr,
+                EJIT_ICACHE_FUNC_SLOTS);
+    }
     return;
   }
   EJitIcacheSlotReg &reg = gIcacheSlots[funcIndex];
   if (!reg.base || numDims != reg.numDims) {
-    EJIT_DIAG("icacheFill SKIP func=%u: base=%p regDims=%u callDims=%u",
-              funcIndex, (void *)reg.base, reg.numDims, numDims);
-    return; // unregistered, or shape mismatch: nowhere to write.
+    // Unregistered, or shape mismatch: nowhere to write. A null base means this
+    // core never ran ejit_register_icache_slot for this function -- the AOT
+    // .ejit_period entry is missing, or the name did not resolve to funcIndex.
+    if (!gIcacheFillRejectLogged[kFillRejectUnregistered]) {
+      gIcacheFillRejectLogged[kFillRejectUnregistered] = true;
+      EJIT_DIAG("icacheFill DECLINE func=%u: base=%p registeredDims=%u "
+                "callerDims=%u (null base = never registered on this core)",
+                funcIndex, (const void *)reg.base, reg.numDims, numDims);
+    }
+    return;
   }
-  // Plain store: the slot is per-core private, so this write (on the calling
-  // core) is ordered before the wrapper's read (same core) by program order.
-  // The specialization is invariant per identity under the contract + NO_RECLAIM,
-  // so overwriting on a later resolve (same pointer) is harmless -- no one-shot
-  // CAS is needed. No atomic/release: same-core, and the read's data dependency
-  // on the pointer orders this store-before-use.
+  // Drop the fill if any drain overlapped this resolve: fnPtr may be specialized
+  // for the period values the toggle just replaced, and restoring a cell the
+  // drain cleared is something nothing later would notice. The token pins the
+  // start of the window, these two loads the end.
+  if (!(token & kEJitIcacheResolveValid) ||
+      state_->icacheDrainsInFlight.loadAcquire() != 0 ||
+      static_cast<uint32_t>(token) != state_->icacheDrainSeq.loadAcquire()) {
+    // Expected occasionally: a period toggle overlapped this resolve. Reported
+    // once because a PERMANENT stream of these means something is draining
+    // continuously, which would keep the cache empty forever.
+    if (!gIcacheFillRejectLogged[kFillRejectRacedDrain]) {
+      gIcacheFillRejectLogged[kFillRejectRacedDrain] = true;
+      EJIT_DIAG("icacheFill DECLINE func=%u: resolve raced a drain "
+                "(token=0x%llx valid=%u seqAtResolve=%u seqNow=%u inFlight=%u)",
+                funcIndex, static_cast<unsigned long long>(token),
+                static_cast<unsigned>((token & kEJitIcacheResolveValid) != 0),
+                static_cast<unsigned>(token),
+                state_->icacheDrainSeq.loadAcquire(),
+                state_->icacheDrainsInFlight.loadAcquire());
+    }
+    return;
+  }
+  // Relaxed store into the SHARED cell. Cores write disjoint identities, so the
+  // only colliding writer is a drain storing 0 (and the guard above rules out
+  // the one unsafe order). The reader's indirect call carries a data dependency
+  // on the value, so no release is needed.
   uintptr_t idx = icacheLinearize(dims, numDims);
-  reg.base[idx] = reinterpret_cast<uintptr_t>(fnPtr);
-  EJIT_DIAG("icacheFill OK func=%u dims=%u idx=%zu fn=%p cell[0]=%p",
-            funcIndex, numDims, (size_t)idx, fnPtr, (void *)reg.base[0]);
+  icacheCell(reg.base, idx).storeRelaxed(reinterpret_cast<uintptr_t>(fnPtr));
+  if (!gIcacheFillOkLogged) {
+    gIcacheFillOkLogged = true;
+    EJIT_DIAG("icacheFill OK func=%u cell=%p[%llu] fn=%p -- the inline cache is "
+              "live on this core",
+              funcIndex, (const void *)reg.base,
+              static_cast<unsigned long long>(idx), fnPtr);
+  }
 }
 
 void EJitSharedTaskPool::forEachCompiled(CompiledFuncCallback cb,
@@ -442,19 +619,29 @@ bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,
   }
   uint8_t expected = enabled ? 0 : 1;
   uint8_t desired = enabled ? 1 : 0;
-  if (state_->enabled[dimType][instanceId].compareExchange(expected, desired)) {
+  const bool flipped =
+      state_->enabled[dimType][instanceId].compareExchange(expected, desired);
+
+  // The INVALIDATIONS run unconditionally: neither cache stores a version, and
+  // a caller that LOST the CAS may still have rewritten its own core-private
+  // period values. Draining the shared cell table here is what reaches a peer
+  // core that is permanently hot and would never call in on its own.
+  state_->dispatchEpoch.fetchAdd(1);
+  icacheDrainAll("period-toggle");
+
+  // version[] moves only on a real transition: its consumer is runCompile's
+  // checkpoints, which DISCARD a finished compile when it moves, and nothing
+  // re-enqueues a dropped compile. An unconditional bump would let N cores
+  // activating the same instance at startup stall the JIT permanently.
+  if (flipped)
     state_->version[dimType][instanceId].fetchAdd(1);
-    // Cached L0 entries carry no version, so retire them all.
-    state_->dispatchEpoch.fetchAdd(1);
-    // Latch on the first successful enable of ANY instance: this brackets the
-    // init→activate window during which instanceDisabled hits are tallied
-    // separately (instanceDisabledPreActivate) for diagnosing the pre-activate
-    // fallback storm. Once latched it stays 1 until the next (re)initialization.
-    if (enabled)
-      state_->anyInstanceActivated.storeRelease(1);
-    return true;
-  }
-  return false;
+  // Latch on the first enable of ANY instance: this brackets the init→activate
+  // window during which instanceDisabled hits are tallied separately
+  // (instanceDisabledPreActivate) for diagnosing the pre-activate fallback
+  // storm. Once latched it stays 1 until the next (re)initialization.
+  if (enabled)
+    state_->anyInstanceActivated.storeRelease(1);
+  return flipped;
 }
 
 bool EJitSharedTaskPool::versionsCurrent(const EJitCompileRequest &req) const {
@@ -1514,6 +1701,11 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
   // starting value is arbitrary, which is harmless: the L0 tables are zeroed
   // BSS and l0Key() never returns 0, so no entry can match anyway.
   st->dispatchEpoch.fetchAdd(1);
+  // icacheDrainSeq is likewise BUMPED, never reset: a core that snapshotted it
+  // before this (re)initialization must not find its snapshot still current
+  // afterwards and fill a cell with a pointer from the previous generation.
+  st->icacheDrainSeq.fetchAdd(1);
+  st->icacheDrainsInFlight.storeRelaxed(0);
   for (uint32_t i = 0; i < kEJitSharedMaxFuncIndex; ++i)
     st->inFlight[i].storeRelaxed(0);
   for (uint32_t i = 0; i < kEJitSharedQueueSlots; ++i) {
@@ -1626,6 +1818,10 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       uint32_t self = EJitCoreId::current();
       uint32_t nextGen = state_->generation.loadRelaxed() + 1;
       initSharedStorage(state_, static_cast<uint32_t>(configuredMode_));
+      // Empty the shared cell table for the new generation: after a re-init that
+      // skipped ownerShutdown the cells hold pointers into the previous
+      // generation's code, and a cell carries no epoch to invalidate against.
+      icacheDrainAll("owner-init");
       state_->generation.storeRelease(nextGen);
       state_->ownerCoreId.storeRelease(self);
       state_->codeSharingEnabled.storeRelease(codeSharingEnabled_ ? 1u : 0u);
@@ -1729,8 +1925,13 @@ void EJitSharedTaskPool::ownerShutdown() {
   // Disarm this core's L0: its entries hold code pointers about to become
   // invalid. Peers stay armed but cannot match after the epoch bump below.
   gEJitL0State = nullptr;
-  if (state_)
+  if (state_) {
     state_->dispatchEpoch.fetchAdd(1);
+    // Empty every core's inline cache: its cells point at the generation being
+    // torn down and carry no epoch to invalidate against. The cells are shared,
+    // so zeroing them here retires them everywhere.
+    icacheDrainAll("owner-shutdown");
+  }
   if (!state_ || !isOwner_)
     return;
   EJIT_DIAG("shared taskpool owner shutdown begin");

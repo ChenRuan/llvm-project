@@ -82,29 +82,61 @@ enum class EJitWorkerStep : uint32_t {
 };
 
 //===----------------------------------------------------------------------===//
-// Per-function inline cache (v2: sticky monomorphic).
+// Per-function inline cache: SHARED PARTITIONED CELL TABLE.
 //
-// A single global slot per funcIndex holding a FROZEN specialization pointer:
-// written once (first resolution, one-shot CAS) and read forever. No version /
-// dims / generation re-validation, no refill, and no release_read on the hit
-// path - the probe is a single acquire load + null check.
+// One cell per (funcIndex, dim identity) holding a specialization pointer, read
+// with no version / dims / generation re-validation and no release_read: the
+// probe is one load + null check + indirect call.
 //
-// Correctness rests on a hard precondition: every ejit_entry's specialization
-// is invariant for process lifetime (period toggles do not change the baked
-// code; each entry is monomorphic - always called with one dim identity). If
-// that ever fails the cache silently runs a stale specialization; the safety
-// gate below does NOT cover that, only UAF.
+// Where the cells LIVE is the design. The wrapper's @__ejit_icache_fn_<name>
+// array is emitted into the inter-core shared section (EJIT_ICACHE_SECTION,
+// .mc_shared) rather than per-core .bss, so ONE table backs every core:
+//
+//  * PARTITIONED, so no locking. A cell's index is icacheLinearize(dims), the
+//    ejit_dim argument values (the ejit_period_lc instance indices). Cores drive
+//    disjoint instance ranges, so they write disjoint cells and the hit path is
+//    what it was when the table was private: no gate, no contention, one load.
+//
+//  * DRAINABLE ACROSS CORES, which a private table is not. activate/deactivate
+//    zeroes every registered cell in place (icacheDrainAll), reaching a peer's
+//    partition directly. A permanently-hot core -- one that never misses and
+//    never calls the runtime again -- stops running the stale specialization on
+//    its next call, with no invalidation epoch on the probe, no per-core drain
+//    rendezvous, and no sync entry point for the application to call.
+//
+// PREREQUISITE 1: the partitioning must be real -- each core drives its OWN
+// ejit_period_lc instance indices. Two cores calling one ejit_entry with the
+// SAME identity share a cell; the pointer they race to store is the same
+// specialization, so the write is benign, but "disjoint by construction"
+// weakens to "identical by construction".
+//
+// PREREQUISITE 2, enforced rather than assumed: a resolved fnPtr must be
+// callable on EVERY core with no per-core work. A shared cell publishes the
+// pointer to all cores at once, so where the platform needs per-core execute
+// preparation (4K-seal mode, or a wired prepareCodeFn_) a peer could jump to an
+// address it has not sealed. The private table ruled that out for free -- a
+// non-null cell meant THIS core had resolved, hence prepared. See
+// icacheCrossCoreExecutable(), which disables the fill in those builds.
+//
+// THE RACE, and why it is bounded: core A's drain stores 0 while core B's probe
+// loads the cell. Both are naturally-aligned word accesses, so B reads the old
+// pointer (calls the previous specialization once more, misses next call) or 0
+// (misses now) -- never a torn value.
+//
+// The one race that is NOT benign is a fill landing AFTER a drain: the pointer
+// was resolved pre-toggle, so the cell would come back holding a specialization
+// baked from the old period values and nothing would clear it. icacheDrainSeq
+// closes exactly that -- icacheBeginResolve() snapshots it at the taskpool entry
+// point and icacheFill drops the fill if it moved.
 //
 // Lifetime safety: JIT code is never physically freed in production (NO_RECLAIM
-// + no releaseFn_ wired), so a cached pointer can never dangle. v2 does NO
-// hazard-pointer retire and never will: if a releaser IS wired (code may be
-// freed) the safety gate (icacheReclamationSafe_) auto-disables the cache
-// (icacheTry always misses, icacheFill no-ops) to avoid UAF.
+// + no releaser wired), so a cached pointer can never dangle -- including one a
+// probe loaded an instruction before the drain zeroed its cell. There is no
+// hazard-pointer retire: if a releaser IS wired the safety gate
+// (icacheReclamationSafe_) disables the cache outright to avoid UAF.
 //
 // The code-sharing gate is retained: a non-owner core may only read a cached
-// pointer when EJIT_SRE_SHARED_CODE_POINTERS is platform-validated; otherwise it
-// misses and falls back to ejit_taskpool_compile_or_get. Under sharing=OFF only
-// the owner core uses the cache, so one global slot suffices.
+// pointer when EJIT_SRE_SHARED_CODE_POINTERS is platform-validated.
 //===----------------------------------------------------------------------===//
 #ifndef EJIT_ICACHE_FUNC_SLOTS
 // Fallback ONLY for a non-CMake compile. The default must cover the full
@@ -134,20 +166,38 @@ enum class EJitWorkerStep : uint32_t {
 #define EJIT_ICACHE_MAX_DIMS 4u
 #endif
 
-// Test/diagnostic: clear every icache slot. The slot-pointer table is
-// process-static storage shared across pool instances, so tests clear it
-// between cases to avoid stale cross-test leakage.
+/// Resolve token (see EJitSharedTaskPool::icacheBeginResolve): bit 32 marks a
+/// usable token, the low 32 bits carry the drain sequence it was taken at. A
+/// plain integer so the taskpool C ABI can hold one in a local without dragging
+/// this header into non-shared builds.
+constexpr uint64_t kEJitIcacheNoResolve = 0;
+constexpr uint64_t kEJitIcacheResolveValid = uint64_t{1} << 32;
+
+// Test/diagnostic: UNREGISTER every icache slot, WITHOUT touching the cells the
+// bases point at (a test-local base may already be gone). The slot table is
+// process-static, so tests clear it between cases. To empty the cells of slots
+// that stay registered, use EJitSharedTaskPool::icacheDrainAll().
 void ejitIcacheClearAll();
 
 // Register a per-function icache slot: \p base is the address of the wrapper's
-// @__ejit_icache_fn_<name> global (an EJitAtomicUPtr, or a [D]^numDims array of
+// @__ejit_icache_fn_<name> global (a uintptr_t cell, or a [D]^numDims array of
 // them for a multi-version entry), and \p numDims is its dimensionality. The
-// runtime writes the frozen specialization pointer through the cell at
-// [i0][i1]... (linearized from dims) on a successful resolve (icacheFill); the
-// wrapper reads the cell directly. Called from ejit_register_icache_slot
-// (name->funcIndex resolution) at ejit_auto_register / .ejit_period time.
-// No-op for an out-of-range funcIndex or null base.
-void ejitIcacheRegisterSlot(uint32_t funcIndex, void *base, uint32_t numDims);
+// runtime writes the specialization pointer through the cell at [i0][i1]...
+// (linearized from dims) on a successful resolve (icacheFill), and zeroes the
+// whole array on a period toggle (icacheDrainAll); the wrapper reads the cell
+// directly. Called from ejit_register_icache_slot (name->funcIndex resolution)
+// at ejit_auto_register / .ejit_period time.
+//
+// Every core registers the SAME base: with EJIT_ICACHE_SECTION set the array is
+// one shared object, which is what lets a drain on any core clear the cells
+// every other core reads.
+//
+// Returns false, registering nothing, for an out-of-range funcIndex, a null
+// base, or numDims above EJIT_ICACHE_MAX_DIMS (numDims sizes the array the
+// drain walks, so an over-cap value would write past the wrapper's global).
+// Declining is the safe degradation: the cell stays null, the taskpool serves
+// every call.
+bool ejitIcacheRegisterSlot(uint32_t funcIndex, void *base, uint32_t numDims);
 
 /// Diagnostic: dump every registered icache slot to the diagnostic log.
 /// Shows funcIndex, base pointer, numDims, and cell[0] (the scalar or
@@ -362,6 +412,20 @@ public:
   void setPrepareCodeCallback(PrepareCodeCallback fn, void *ctx) {
     prepareCodeFn_ = fn;
     prepareCodeCtx_ = ctx;
+  }
+  /// Whether a resolved fnPtr is callable on EVERY core the instant it exists,
+  /// with no per-core work. False when the platform wires per-core execute
+  /// preparation (legacy 2M `prepareCodeFn_`, or 4K-seal mode, where a core must
+  /// split its pool and seal the code's pages before executing a peer's code).
+  ///
+  /// This is the precondition of a SHARED cell table, and what the per-core
+  /// table gave for free: a non-null cell there implied THIS core had resolved,
+  /// hence prepared. A shared fill publishes to every core at once, and the
+  /// probe has no per-core gate to restore the implication -- so when per-core
+  /// preparation is required icacheFill declines and the taskpool, which
+  /// prepares, serves every call.
+  bool icacheCrossCoreExecutable() const {
+    return !fourKSeal_ && prepareCodeFn_ == nullptr;
   }
   /// Owner: provide the finalized code-range resolver (see CodeRangeCallback).
   void setCodeRangeProvider(CodeRangeCallback fn, void *ctx) {
@@ -597,6 +661,23 @@ public:
                                    uint32_t inst2, uint32_t dim3,
                                    uint32_t inst3);
   void releaseRead(uint32_t bucketIndex);
+  /// Drive one end of a period-value mutation window for a lifecycle instance.
+  ///
+  /// The shared `enabled` bit is the JIT compile gate and is CAS'd, so only the
+  /// first caller in each direction moves it.
+  ///
+  /// The INVALIDATIONS (icache drain + L0 dispatchEpoch bump) run on EVERY call.
+  /// Period data is core-private while the specialization is SHARED, so N cores
+  /// each bracket their own writes over one shared bit: a caller that LOST the
+  /// CAS may still have rewritten its own copy, and neither cache stores a
+  /// version.
+  ///
+  /// version[] moves ONLY on a real transition. Its consumer is runCompile's
+  /// checkpoints, which DISCARD a finished compile when it changes, and nothing
+  /// re-enqueues a dropped compile -- so an unconditional bump would let N cores
+  /// activating the same instance at startup stall the JIT permanently.
+  ///
+  /// \returns whether the enabled BIT flipped. The invalidations run either way.
   bool setInstanceEnabled(uint32_t dimType, uint32_t instanceId, bool enabled);
   /// Query the shared activation bit for a lifecycle instance — the read
   /// counterpart of setInstanceEnabled, and the single cross-core source of
@@ -608,9 +689,9 @@ public:
   // NOTE: the production hit path does NOT use icacheTry. With -ejit-inline-cache
   // the ejit_entry wrapper reads its per-function @__ejit_icache_fn_<name> slot
   // directly - a GEP into the [D]^numDims array by the ejit_dim arg values, one
-  // acquire load + null-check + indirect call, NO ejit_icache_try call, NO
+  // load + null-check + indirect call, NO ejit_icache_try call, NO
   // per-call guards. icacheTry is retained for unit tests / diagnostics: on a
-  // hit it sets *outFn to the frozen specialization for the given dims (call
+  // hit it sets *outFn to the cached specialization for the given dims (call
   // with NO releaseRead) and returns true; on a miss returns false. It keeps
   // the reclamation-safety, pool-Ready, range, and cross-core code-sharing gates
   // (the latter matters in non-shared test builds; the wrapper's inline probe is
@@ -667,14 +748,53 @@ public:
   void l0Fill(uint32_t funcIndex, void *fnPtr, const EJitDimPair *dims,
               uint32_t numDims);
 
-  /// Retire every core's L0. Must be called from every path that can
-  /// invalidate an (identity -> fnPtr) mapping from OUTSIDE the taskpool --
-  /// ejit_clear_cache(), ejit_invalidate(), a compile-mode change -- since
-  /// those bypass cachePublish() and setInstanceEnabled().
+  /// Retire every core's L0 AND drain the shared inline cache. Must be called
+  /// from every path that can invalidate an (identity -> fnPtr) mapping from
+  /// OUTSIDE the taskpool -- ejit_clear_cache(), ejit_invalidate(), a
+  /// compile-mode change -- since those bypass cachePublish() and
+  /// setInstanceEnabled(). Both caches answer the same question and neither
+  /// re-validates on read, so they are retired together or not at all.
   void retireDispatchCache();
 
+  /// Open a resolve window: returns a token pinning the shared drain state, to
+  /// be handed back to icacheFill(). Called at every taskpool entry point that
+  /// can end in a fill, BEFORE the resolve and before any bucket read token.
+  /// kEJitIcacheNoResolve when a drain is already in flight (its reach is
+  /// unknown, so no fill from this resolve may be trusted).
+  ///
+  /// The token is a VALUE the caller keeps on its stack, not runtime state: on
+  /// an RTOS a higher-priority task can preempt this core mid-resolve and run
+  /// its own resolve, which would clobber any core-private snapshot.
+  uint64_t icacheBeginResolve();
+
+  /// Publish \p fnPtr into the cell for \p dims. Dropped unless \p token, from
+  /// the icacheBeginResolve() that opened this resolve, shows no drain
+  /// overlapped it.
   void icacheFill(uint32_t funcIndex, void *fnPtr, const EJitDimPair *dims,
-                  uint32_t numDims);
+                  uint32_t numDims, uint64_t token);
+
+  /// Zero every cell of every registered icache slot, bracketed by
+  /// icacheDrainsInFlight and closed by an icacheDrainSeq bump, so any resolve
+  /// this overlaps drops its fill. This is THE cross-core
+  /// invalidation: the cells are shared, so clearing them here clears them for
+  /// every core, including one that is permanently hot and would never reach a
+  /// runtime entry point of its own.
+  ///
+  /// Cost is O(cells registered) -- proportional to the table the build chose to
+  /// allocate. Toggles are rare; paying the refill once per toggle is what buys
+  /// a probe with no freshness check.
+  ///
+  /// Safe against a concurrent probe on any core: it reads the old pointer (and
+  /// calls it once more; the code is never freed under the gate this cache
+  /// requires) or 0 (and misses).
+  /// Zero every registered cell. \p reason names the event that triggered it
+  /// and appears in the EJIT_DIAG line, which is what makes a drain visible on
+  /// an SRE board -- the probe never enters the runtime on a hit, so a sudden
+  /// burst of misses is otherwise unexplained.
+  void icacheDrainAll(const char *reason = "unspecified");
+
+  /// Number of drains this shared state has performed. Diagnostic / test hook.
+  uint32_t icacheDrainSeq() const;
 
   //--- consumer path (worker / test) -----------------------------------------
   bool pollOne();

@@ -161,15 +161,18 @@ void ejit_register_lifecycle(const char *lifecycleName, uint32_t *slotOut);
 // funcIndex global; a capacity failure is recorded so ejit_init can fail.
 void ejit_register_funcindex(const char *funcName, uint32_t *slotOut);
 
-// Register the wrapper's per-function inline-cache slot (@__ejit_icache_fn_<name>
-// global address) by name, with its dimensionality (number of ejit_dim params).
-// The runtime writes the frozen specialization pointer through the [D]^numDims
-// cell at [i0][i1]... on a successful resolve (icacheFill); the wrapper reads
-// the cell directly on the hit path (GEP + one atomic load + null-check +
-// indirect call, no ejit_icache_try call). Keys the slot by the SAME registry
-// funcIndex assigned by ejit_register_funcindex. Called by AOT auto-registration.
-// A null slot or capacity exhaustion is recorded; the base stays null and the
-// probe misses.
+// Register the wrapper's per-function inline-cache cell table
+// (@__ejit_icache_fn_<name> global address) by name, with its dimensionality
+// (number of ejit_dim params). The runtime writes the specialization pointer
+// through the [D]^numDims cell at [i0][i1]... on a successful resolve
+// (icacheFill) and zeroes every cell on a period toggle (icacheDrainAll); the
+// wrapper reads the cell directly on the hit path (GEP + one load + null-check
+// + indirect call, no ejit_icache_try call). Keys the slot by the SAME registry
+// funcIndex assigned by ejit_register_funcindex. Called by AOT auto-registration
+// on EVERY core: the table is one shared object, so each core records the same
+// base and a drain on any of them clears the cells all of them read. A null
+// slot, capacity exhaustion, or a numDims above the cap is recorded; the base
+// stays null and the probe misses.
 void ejit_register_icache_slot(const char *funcName, void *slot,
                                uint32_t numDims);
 

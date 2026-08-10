@@ -1,4 +1,9 @@
-# EJIT Multi-Version Inline Cache (Direct-Indexed, Per-Core Private)
+# EJIT Multi-Version Inline Cache (Direct-Indexed)
+
+> **Storage update:** the cell table is no longer per-core private. It now lives
+> in the inter-core shared section and is invalidated by zeroing the cells
+> cross-core. See `EJIT_ICACHE_SHARED_TABLE.md`; the sections below marked
+> *(superseded)* describe the earlier per-core layout.
 
 > Extends the v2 sticky-monomorphic inline cache (`ejit_icache_design.md`) to
 > **polymorphic** specialization: one cached slot per `(instanceId…)` identity,
@@ -45,7 +50,7 @@ hit-path compare becomes mandatory (future work, out of scope here).
 
 ## 3. Data structure
 
-### Per-function AOT global (per-core private)
+### Per-function AOT global *(placement superseded — see EJIT_ICACHE_SHARED_TABLE.md)*
 ```c
 // numDims = 0  -> ptr  g_funcA_cache;                 // scalar (= v2)
 // numDims = 1  -> ptr  g_funcA_cache[D];
@@ -60,14 +65,13 @@ instanceId/version/generation: direct indexing has no collision within bounds,
 so no validation fields are needed (this is the key hit-overhead saving vs a
 hash+validate cache).
 
-Emitted by `EJitWrapperGen` as an InternalLinkage global in **default section**
-(`.bss`). Under the SRE memory model (per-core private by default; only
-`EJIT_SHARED_SECTION_ATTR`/`.mc_shared` is cross-core shared), this global is
-**per-core private** - exactly like the v2 `@__ejit_icache_fn_<name>`. Each core
-owns its own cache array; this is what lets the hit path have no cross-core gate
-(see `ejit-runtime-environment-facts` C3, `ejit-icache-slots-per-core-private`).
+Emitted by `EJitWrapperGen` as an InternalLinkage global in
+`EJIT_ICACHE_SECTION`, which defaults to `.mc_shared` — **cross-core shared**, so
+one table backs every core and a period toggle can zero a peer's cells directly.
+Set the variable to `""` to restore the earlier per-core `.bss` placement (on a
+multi-core target the default section is per-image private).
 
-### Runtime registration table (per-core private)
+### Runtime registration table (per-core private; the CELLS it points at are shared)
 ```c
 struct EJitIcacheSlotReg {
   uintptr_t *base;    // &g_funcA_cache (this core's private global)
@@ -217,7 +221,12 @@ cell = UAF. The gate disables `icacheFill` (no-op) when a releaser is wired.
 no runtime gate, so under a releaser it would still fire and UAF - production
 wires no releaser, so the gate stays open. Same contract as v2.
 
-### Per-core seal (carries over per-cell)
+### Per-core seal *(superseded)*
+This argument held while the array was per-core private, and is exactly what a
+shared table gives up: see precondition P1 in `EJIT_ICACHE_SHARED_TABLE.md`,
+where `icacheCrossCoreExecutable()` disables the fill in builds that need
+per-core preparation. Original text:
+
 The icache array is per-core private. A core fills cell `(i0,…)` only on its own
 `compile_or_get` slow path, which for a non-owner runs `peerPrepareSlot` ->
 `prepareExecForCurrentCore` -> `sealAndSyncCache` (seal + DC CVAU/IC IVAU on THIS
@@ -228,9 +237,10 @@ path safe (see `ejit-icache-slots-per-core-private`). Each cell is sealed-then-
 filled independently per core.
 
 ### Version (no check)
-By precondition (§2.1), same instanceId = stable specialization; under NO_RECLAIM
-the cached fnPtr never dangles and never goes wrong. No version field, no
-hit-path compare.
+No version field and no hit-path compare — but *(superseded)* the reasoning is no
+longer precondition §2.1. A period toggle now **zeroes** the cells
+(`icacheDrainAll`), so a cell only ever holds a specialization current under the
+present period values. Under NO_RECLAIM the cached fnPtr never dangles.
 
 ## 7. Configuration
 
@@ -240,6 +250,7 @@ hit-path compare.
 | `EJIT_ICACHE_DIM_SIZE` (CMake -> `#define` on both LLVMEmbeddedJIT + LLVMEJIT) | 16 (power-of-2) | uniform per-dim bound D |
 | `EJIT_ICACHE_MAX_DIMS` (header `#define`) | 4 | max cached dims; >N -> compile error |
 | `EJIT_ICACHE_FUNC_SLOTS` | 64 | registration table size (unchanged) |
+| `EJIT_ICACHE_SECTION` (CMake -> `#define` on LLVMEmbeddedJIT) | `.mc_shared` | section for the cell table; `""` = per-core `.bss` |
 
 **Wiring (one CMake var drives both AOT and runtime so D agrees):**
 ```cmake
@@ -252,8 +263,8 @@ Both use the `#ifndef EJIT_ICACHE_DIM_SIZE` default (16) from `EJitCommon.h` if
 CMake doesn't override. The preset sets `EJIT_ICACHE_DIM_SIZE=16`. **Power-of-2 D
 is required**; a non-power-of-2 value is **rejected at CMake configure**.
 
-### Memory budget (per function, per core)
-`D^numDims * 8` bytes, zero-filled (`.bss`, no ctor).
+### Memory budget (per function; ONCE, not per core — see EJIT_ICACHE_SHARED_TABLE.md)
+`D^numDims * 8` bytes, zero-filled.
 
 | D \ numDims | 0 | 1 | 2 | 3 | 4 |
 |---|---|---|---|---|---|
@@ -261,9 +272,9 @@ is required**; a non-power-of-2 value is **rejected at CMake configure**.
 | 8 | 8B | 64B | 512B | 4KB | 32KB |
 | 16 | 8B | 128B | 2KB | 32KB | 512KB |
 
-×32 cores × N `ejit_entry` functions. D=16 + maxDims=4 is a safe default
-(≤32KB/func/core at 4 dims); D=16 + maxDims=2 keeps every function ≤2KB. The
-product picks D + maxDims to fit the per-core BSS budget.
+× N `ejit_entry` functions (no longer × cores — the table is shared). D=16 +
+maxDims=4 is a safe default (≤32KB/func at 4 dims); D=16 + maxDims=2 keeps every
+function ≤2KB. The product picks D + maxDims to fit the shared-region budget.
 
 ## 8. AOT changes - `EJitWrapperGen`
 

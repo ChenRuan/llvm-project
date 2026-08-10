@@ -68,14 +68,15 @@ static cl::opt<bool> EJitWrapperTiming(
              "JIT call, and read-token release in ejit_entry wrappers"));
 
 // Emit a per-function inline-cache probe DIRECTLY in the ejit_entry wrapper
-// (not a call). On a hit the wrapper loads its per-function @__ejit_icache_fn_
-// <name> slot (one atomic acquire load), null-checks it, and tail-calls the
+// (not a call). On a hit the wrapper loads its cell out of the per-function
+// @__ejit_icache_fn_<name> table (one load), null-checks it, and tail-calls the
 // cached specialization - NO ejit_icache_try call, NO read-token, NO per-call
 // guards, NO funcIndex/IdxValid on the hit path. Just "pointer non-null? jump".
 // On a miss it falls through to jit_slow -> ejit_taskpool_compile_or_get, which
-// fills the slot on success (icacheFill). v2: sticky monomorphic - the slot is
-// filled once (first resolution) and read forever, so the probe needs no
-// version/dims re-validation. Default off. Requires the runtime to be built
+// fills the cell on success (icacheFill). The probe carries NO freshness check:
+// the table is SHARED across cores (EJitIcacheSection), so an activate or
+// deactivate zeroes the cells directly and the next probe on any core misses.
+// Default off. Requires the runtime to be built
 // with EJIT_SRE_SHARED_CODE_POINTERS (production preset): the inline probe has
 // no per-call cross-core gate, so it is only safe when a cached pointer is
 // callable on any core. When combined with -ejit-wrapper-timing the icache hit
@@ -86,6 +87,25 @@ static cl::opt<bool> EJitInlineCache(
     cl::desc("Emit a per-function inline-cache probe (a direct load of the "
              "cached specialization pointer) before the taskpool "
              "compile_or_get call in ejit_entry wrappers"));
+
+// Section for the per-function @__ejit_icache_fn_<name> cell table. In the
+// inter-core SHARED section (.mc_shared, where the taskpool state blob also
+// lives) the table is ONE object every core reads, so a deactivate zeroes a
+// peer's cells directly. Left empty it lands in .bss, which on a multi-core
+// target is per-core private.
+//
+// Placement is a link-time contract with no runtime check behind it: the symbol
+// resolves to the same virtual address either way, so a per-core table under a
+// cross-core runtime is undetectable. Default comes from the CMake
+// EJIT_ICACHE_SECTION var; the flag lets tests pin a value.
+#ifndef EJIT_ICACHE_SECTION
+#define EJIT_ICACHE_SECTION ""
+#endif
+static cl::opt<std::string> EJitIcacheSection(
+    "ejit-icache-section", cl::init(EJIT_ICACHE_SECTION), cl::Hidden,
+    cl::desc("Section for the @__ejit_icache_fn_<name> inline-cache cell "
+             "table. Must name the inter-core SHARED section on a multi-core "
+             "target; empty leaves the table in per-core .bss"));
 
 // When the inline-cache probe is enabled, put the frame-less dispatcher
 // (probe + two tail calls, ~16-48 bytes) into a dedicated
@@ -259,17 +279,20 @@ struct IcacheSlotInfo {
   unsigned NumDims = 0;
 };
 
-// Per-function pointer-typed global holding the frozen inline-cache slot: the
-// specialization pointer once resolved, null until then. Internal linkage (each
+// Per-function pointer-typed global holding the inline-cache cell table: the
+// specialization pointer for each dim identity once resolved, null until then
+// and null again after a period toggle drains it. Internal linkage (each
 // module's copy is wired into the runtime slot-pointer table by name at
-// registration). 8-byte aligned so the atomic acquire load / one-shot CAS the
-// runtime pairs against it are lock-free on aarch64. The wrapper reads it
-// DIRECTLY (load atomic acquire + null-check + indirect call) - no
-// ejit_icache_try call, no per-call guards - so the hit path is one load.
+// registration). 8-byte aligned so each cell is one naturally-aligned,
+// tear-free access: a drain on another core zeroing a cell under a reading
+// probe yields the old pointer or 0, never a torn value.
+//
+// Placed in EJitIcacheSection when set - SHARED across cores, partitioned by
+// dim identity so writers never collide.
 //
 // Multi-version: the global is a [D]^NumDims array (D = EJIT_ICACHE_DIM_SIZE,
 // power-of-2) indexed by the ejit_dim argument values, so each dim identity
-// gets its own frozen fnPtr cell. NumDims=0 is a scalar ptr (= v2 monomorphic).
+// gets its own cell. NumDims=0 is a scalar ptr (one cell).
 static GlobalVariable *getOrCreateIcacheFnGlobal(Module &M,
                                                  StringRef FuncName,
                                                  unsigned NumDims) {
@@ -291,6 +314,8 @@ static GlobalVariable *getOrCreateIcacheFnGlobal(Module &M,
   auto *GV = new GlobalVariable(M, SlotTy, /*isConstant=*/false,
                                 GlobalValue::InternalLinkage, Init, GVName);
   GV->setAlignment(Align(8));
+  if (!EJitIcacheSection.empty())
+    GV->setSection(EJitIcacheSection);
   return GV;
 }
 
@@ -892,6 +917,12 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       }
       LoadInst *ICSlotLoad = B.CreateLoad(PtrTy, SlotPtr, "ejit_ic_fn");
       ICSlotLoad->setAlignment(Align(8));
+      // Monotonic, nothing stronger: the cell is shared, so a peer's drain can
+      // store 0 concurrently and the atomic makes that a defined race (old
+      // pointer or 0) instead of UB. The value is self-contained and the call
+      // below carries a data dependency on it, so acquire would buy nothing and
+      // cost an LDAR per hit. Lowers to the same LDR on AArch64.
+      ICSlotLoad->setAtomic(AtomicOrdering::Monotonic);
       Value *TAfterIcache = nullptr;
       if (EJitWrapperTiming)
         TAfterIcache = B.CreateCall(TraceNow, {}, "ejit_t_after_icache");

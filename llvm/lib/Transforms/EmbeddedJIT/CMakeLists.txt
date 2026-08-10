@@ -18,5 +18,12 @@ add_llvm_component_library(LLVMEmbeddedJIT
 # @__ejit_icache_fn_<name> as a [D]^numDims array; the runtime (LLVMEJIT)
 # linearizes with the same D on fill. Both targets get the identical value from
 # the top-level CMake var so array layout and linearization never disagree.
+#
+# EJIT_ICACHE_SECTION: the section that array is placed in — the inter-core
+# SHARED section on a multi-core target, so one partitioned table backs every
+# core and a period toggle can zero a peer's cells directly. Only this pass
+# needs it (the runtime reaches the table through the registered base address,
+# whatever section it came from), so it is defined here alone.
 target_compile_definitions(LLVMEmbeddedJIT PRIVATE
-  EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE})
+  EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}
+  EJIT_ICACHE_SECTION="${EJIT_ICACHE_SECTION}")
