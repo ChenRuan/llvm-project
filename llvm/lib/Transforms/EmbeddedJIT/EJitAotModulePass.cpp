@@ -18,13 +18,21 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstdlib>
 
 using namespace llvm;
 using namespace llvm::ejit;
 
 #define DEBUG_TYPE "ejit-aot-module"
+
+static cl::opt<bool> PrintIcacheDimSize(
+    "print-ejit-icache-dim-size", cl::init(false), cl::Hidden,
+    cl::desc("Print the EJIT_ICACHE_DIM_SIZE value this clang was built with "
+             "and exit.  Used by the build system to verify the AOT pass and "
+             "runtime agree on D."));
 
 namespace {
 
@@ -94,6 +102,13 @@ static void runDiagnosticCheck(Module &M) {
 
 PreservedAnalyses
 EJitAotModulePass::run(Module &M, ModuleAnalysisManager &AM) {
+  // Build-system consistency check: print the D value this clang was built with
+  // and exit immediately so CMake can compare against the runtime's value.
+  if (PrintIcacheDimSize) {
+    outs() << EJIT_ICACHE_DIM_SIZE << '\n';
+    std::exit(0);
+  }
+
   if (!hasAnyEjitMetadata(M)) {
     LLVM_DEBUG(dbgs() << "ejit-aot-module: no EJIT metadata, skip\n");
     return PreservedAnalyses::all();
