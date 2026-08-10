@@ -703,6 +703,39 @@ endif()
 unset(_ejit_icache_dim_pow2)
 message(STATUS "EmbeddedJIT: inline-cache per-dim bound D=${EJIT_ICACHE_DIM_SIZE}")
 
+# Verify that the compiler's AOT pass uses the same D.  The check compiles a
+# trivial C file with -mllvm -print-ejit-icache-dim-size, which causes the
+# EJitAotModulePass to print the D value it was built with and exit.  If the
+# printed value differs from CMake's EJIT_ICACHE_DIM_SIZE, the AOT-generated
+# [D]^numDims array layout will not match the runtime icacheLinearize stride
+# and the inline-cache fast path silently breaks.
+set(_ejit_dim_check_src "${CMAKE_CURRENT_BINARY_DIR}/ejit-dim-check.c")
+file(WRITE "${_ejit_dim_check_src}" "int main(void){return 0;}\n")
+execute_process(
+    COMMAND ${CMAKE_C_COMPILER} -O2 -mllvm -print-ejit-icache-dim-size
+            -x c "${_ejit_dim_check_src}" -c -o /dev/null
+    OUTPUT_VARIABLE _clang_dim
+    ERROR_VARIABLE _clang_dim_err
+    RESULT_VARIABLE _clang_dim_rc)
+file(REMOVE "${_ejit_dim_check_src}")
+if(_clang_dim_rc EQUAL 0)
+    string(STRIP "${_clang_dim}" _clang_dim)
+    if(NOT _clang_dim EQUAL "${EJIT_ICACHE_DIM_SIZE}")
+        message(FATAL_ERROR
+            "EJIT_ICACHE_DIM_SIZE mismatch: "
+            "CMake sets ${EJIT_ICACHE_DIM_SIZE}, "
+            "but the compiler (${CMAKE_C_COMPILER}) was built with ${_clang_dim}. "
+            "Rebuild the compiler with -DEJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}, "
+            "or adjust the CMake variable to match the compiler's value.")
+    endif()
+    message(STATUS "EmbeddedJIT: verified compiler D=${_clang_dim} matches CMake")
+else()
+    message(WARNING
+        "EmbeddedJIT: could not query compiler icache dim size (rc=${_clang_dim_rc}). "
+        "Skipping D-value consistency check. "
+        "Ensure the compiler was built with EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}.")
+endif()
+
 #===-- EmbeddedJIT SRE taskpool compile scheduler -------------------------===#
 # Route ejit_compile_or_get through a unified taskpool (cache + dedup + queue)
 # instead of calling the synchronous compile driver directly. Sync and async
