@@ -158,6 +158,43 @@ bool mockWorkerStart(void *ctx, EJitSharedTaskPool::WorkerEntryFn /*entry*/,
 }
 void mockWorkerStop(void *ctx) { ++static_cast<WorkerHooks *>(ctx)->stops; }
 
+// Stands in for building/releasing the owner's ORC engine, and records what the
+// blob looked like WHILE it ran -- the ordering against the worker start and the
+// Ready publish is the contract, not just that it ran.
+struct OwnerEngineLog {
+  int built = 0;
+  int released = 0;
+  bool failBuild = false;
+  uint32_t coreAtBuild = kEJitInvalidCoreId;
+  uint32_t stateAtBuild = 0xFFFFFFFFu;
+  uint64_t taskIdAtBuild = ~0ull;
+  int workerStartsAtBuild = -1;
+  uint32_t stateAtRelease = 0xFFFFFFFFu;
+  int workerStopsAtRelease = -1;
+  EJitSharedTaskPoolState *state = nullptr;
+  const WorkerHooks *hooks = nullptr;
+};
+bool mockOwnerElected(void *ctx) {
+  auto *l = static_cast<OwnerEngineLog *>(ctx);
+  ++l->built;
+  l->coreAtBuild = EJitCoreId::current();
+  if (l->state) {
+    l->stateAtBuild = l->state->initState.loadAcquire();
+    l->taskIdAtBuild = l->state->workerTaskId.loadAcquire();
+  }
+  if (l->hooks)
+    l->workerStartsAtBuild = l->hooks->starts;
+  return !l->failBuild;
+}
+void mockOwnerReleased(void *ctx) {
+  auto *l = static_cast<OwnerEngineLog *>(ctx);
+  ++l->released;
+  if (l->state)
+    l->stateAtRelease = l->state->initState.loadAcquire();
+  if (l->hooks)
+    l->workerStopsAtRelease = l->hooks->stops;
+}
+
 // A worker start hook that ignores its ctx (returns success), so a test can
 // share a non-WorkerHooks ctx between start and stop hooks.
 bool startOkIgnoreCtx(void * /*ctx*/,
@@ -3036,6 +3073,196 @@ TEST_F(SharedTaskPoolTest, L0CollidingIdentitiesNeverCrossServe) {
   pool.l0Fill(31, codeFor(37), c, 1);
   if (pool.l0Try(30, c, 1, &out))
     EXPECT_NE(out, codeFor(37)) << "funcIndex 30 served funcIndex 31's entry";
+}
+
+//===----------------------------------------------------------------------===//
+// Owner-only engine lifecycle. Only the elected owner builds an ORC engine, and
+// it releases it when it gives ownership up, so a handoff never leaves two.
+//===----------------------------------------------------------------------===//
+
+// Winner-only, and BEFORE the worker exists and before Ready is published: the
+// worker can compile the instant it starts and a peer can enqueue the instant
+// it sees Ready, so an engine built after either would be too late.
+TEST_F(SharedTaskPoolTest, OwnerSetupRunsOnTheWinnerBeforeWorkerAndReady) {
+  WorkerHooks hooks;
+  OwnerEngineLog winner, loser;
+  winner.state = state_.get();
+  winner.hooks = &hooks;
+  loser.state = state_.get();
+
+  EJitSharedTaskPool c0, c1;
+  for (auto *pool : {&c0, &c1}) {
+    pool->bind(state_.get());
+    pool->setCompiler(&mockCompile, nullptr);
+    pool->setMode(EJitCompileMode::Async);
+  }
+  c0.setWorkerHooks(&mockWorkerStart, &mockWorkerStop, &hooks);
+  c0.setOwnerElectedCallback(&mockOwnerElected, &winner);
+  c1.setOwnerElectedCallback(&mockOwnerElected, &loser);
+
+  EJitCoreId::setCurrentForTest(3);
+  ASSERT_EQ(c0.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  EJitCoreId::setCurrentForTest(4);
+  ASSERT_EQ(c1.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+
+  EXPECT_EQ(winner.built, 1);
+  EXPECT_EQ(winner.coreAtBuild, 3u);
+  EXPECT_EQ(loser.built, 0) << "a peer built an LLJIT it can never use";
+
+  EXPECT_EQ(winner.stateAtBuild,
+            static_cast<uint32_t>(EJitSharedInitState::Initializing));
+  EXPECT_EQ(winner.workerStartsAtBuild, 0);
+  EXPECT_EQ(winner.taskIdAtBuild, 0ull);
+  EXPECT_EQ(hooks.starts, 1);
+  EXPECT_EQ(state_->initState.loadAcquire(),
+            static_cast<uint32_t>(EJitSharedInitState::Ready));
+}
+
+// A failed engine build is a clean init failure: OwnerSetupFailed, no worker.
+TEST_F(SharedTaskPoolTest, OwnerSetupFailureStartsNoWorker) {
+  WorkerHooks hooks;
+  OwnerEngineLog log;
+  log.failBuild = true;
+
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setWorkerHooks(&mockWorkerStart, &mockWorkerStop, &hooks);
+  owner.setOwnerElectedCallback(&mockOwnerElected, &log);
+  owner.setMode(EJitCompileMode::Async);
+
+  EXPECT_EQ(owner.init(), EJitSharedTaskPool::InitResult::OwnerFailed);
+  EXPECT_EQ(log.built, 1);
+  EXPECT_EQ(hooks.starts, 0) << "a worker with no compiler behind it";
+  EXPECT_EQ(state_->lastInitError.loadAcquire(),
+            static_cast<uint32_t>(EJitSharedInitError::OwnerSetupFailed));
+  EXPECT_FALSE(owner.isOwner());
+  EXPECT_FALSE(owner.asyncServiceAvailable());
+}
+
+// The handoff: the old owner releases its engine and the new one builds its
+// own, so the system never holds two. Release lands after the worker join and
+// before the blob is up for election again.
+TEST_F(SharedTaskPoolTest, ReElectionReleasesTheOldEngineAndBuildsTheNew) {
+  WorkerHooks ownerHooks, peerHooks;
+  OwnerEngineLog ownerLog, peerLog;
+  ownerLog.state = peerLog.state = state_.get();
+  ownerLog.hooks = &ownerHooks;
+  peerLog.hooks = &peerHooks;
+
+  EJitSharedTaskPool owner, peer;
+  for (auto *pool : {&owner, &peer}) {
+    pool->bind(state_.get());
+    pool->setCompiler(&mockCompile, nullptr);
+    pool->setMode(EJitCompileMode::Async);
+  }
+  owner.setWorkerHooks(&mockWorkerStart, &mockWorkerStop, &ownerHooks);
+  owner.setOwnerElectedCallback(&mockOwnerElected, &ownerLog);
+  owner.setOwnerReleasedCallback(&mockOwnerReleased, &ownerLog);
+  peer.setWorkerHooks(&mockWorkerStart, &mockWorkerStop, &peerHooks);
+  peer.setOwnerElectedCallback(&mockOwnerElected, &peerLog);
+  peer.setOwnerReleasedCallback(&mockOwnerReleased, &peerLog);
+
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+  ASSERT_EQ(ownerLog.built, 1);
+  ASSERT_EQ(peerLog.built, 0) << "the peer built an engine while attaching";
+
+  EJitCoreId::setCurrentForTest(0);
+  owner.ownerShutdown();
+  EXPECT_EQ(ownerLog.released, 1) << "the former owner kept its engine";
+  EXPECT_EQ(ownerLog.workerStopsAtRelease, 1)
+      << "released before the worker was joined";
+  EXPECT_EQ(ownerLog.stateAtRelease,
+            static_cast<uint32_t>(EJitSharedInitState::Stopping))
+      << "released after the blob was already up for re-election";
+
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_EQ(peer.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  EXPECT_EQ(peerLog.built, 1) << "the new owner must build its own engine";
+  EXPECT_EQ(ownerLog.built, 1) << "the old owner was rebuilt";
+  EXPECT_EQ(ownerLog.released, 1);
+  EXPECT_TRUE(peer.asyncServiceAvailable());
+}
+
+// A peer with no engine of its own can still flip the shared mode in both
+// directions, because the elected owner compiles for every core.
+TEST_F(SharedTaskPoolTest, PeerSwitchesSharedModeBothWays) {
+  WorkerHooks hooks;
+  EJitSharedTaskPool owner, peer;
+  for (auto *pool : {&owner, &peer}) {
+    pool->bind(state_.get());
+    pool->setCompiler(&mockCompile, nullptr);
+    pool->setMode(EJitCompileMode::Async);
+  }
+  owner.setWorkerHooks(&mockWorkerStart, &mockWorkerStop, &hooks);
+
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+
+  uint32_t gen = 0;
+  ASSERT_TRUE(peer.asyncServiceAvailable(&gen));
+  peer.setSharedMode(EJitCompileMode::Sync);
+  EXPECT_EQ(owner.getSharedMode(), EJitCompileMode::Sync)
+      << "the owner never saw the peer's flip";
+
+  ASSERT_TRUE(peer.asyncServiceAvailable(&gen));
+  EXPECT_TRUE(peer.publishSharedMode(EJitCompileMode::Async, gen))
+      << "Sync -> Async is unreachable for a peer";
+  EXPECT_EQ(owner.getSharedMode(), EJitCompileMode::Async);
+}
+
+// The shutdown race: a peer that validated the pool, then had the owner shut
+// down underneath it, must NOT commit Async against a stopped worker.
+TEST_F(SharedTaskPoolTest, ShutdownDuringModeSwitchRejectsTheAsyncPublish) {
+  WorkerHooks hooks;
+  EJitSharedTaskPool owner, peer;
+  for (auto *pool : {&owner, &peer}) {
+    pool->bind(state_.get());
+    pool->setCompiler(&mockCompile, nullptr);
+    pool->setMode(EJitCompileMode::Sync);
+  }
+  owner.setWorkerHooks(&mockWorkerStart, &mockWorkerStop, &hooks);
+
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+
+  // The peer checks and is told yes.
+  uint32_t gen = 0;
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_TRUE(peer.asyncServiceAvailable(&gen));
+
+  // The owner shuts down before the peer gets to publish.
+  EJitCoreId::setCurrentForTest(0);
+  owner.ownerShutdown();
+  ASSERT_EQ(hooks.stops, 1);
+
+  EJitCoreId::setCurrentForTest(1);
+  EXPECT_FALSE(peer.publishSharedMode(EJitCompileMode::Async, gen))
+      << "published Async over a stopped worker";
+  EXPECT_FALSE(peer.asyncServiceAvailable())
+      << "still claims the pool can service async";
+  // And nothing can be enqueued anyway: every producer path gates on Ready.
+  const EJitDimPair d[1] = {{0, 0}};
+  EXPECT_EQ(peer.compileOrGet(1, d, 1, codeFor(1)).status,
+            EJitCompileOrGetStatus::OffMode);
+}
+
+// A Ready blob whose worker never started is not serviceable: a request
+// enqueued there would sit pending forever.
+TEST_F(SharedTaskPoolTest, AsyncServiceUnavailableWithoutAWorker) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner); // no worker hooks injected: tests drive pollOne()
+  ASSERT_EQ(state_->initState.loadAcquire(),
+            static_cast<uint32_t>(EJitSharedInitState::Ready));
+  EXPECT_FALSE(owner.asyncServiceAvailable());
 }
 
 } // namespace

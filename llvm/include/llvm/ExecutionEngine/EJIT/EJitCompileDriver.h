@@ -114,6 +114,12 @@ public:
   /// stable object rather than a lambda over a caller's stack.
   bool ensureJitEngine();
 
+  /// Drop this core's ORC engine. Called when ownership is given up, so a
+  /// handoff does not leave one engine per former owner. Safe for already
+  /// published code: the code pool never recycles memory, so specializations
+  /// peers are still running outlive the compiler that produced them.
+  void releaseJitEngine();
+
   /// Stage a user symbol for the engine. The list is durable because the engine
   /// may not exist yet: a peer elected owner after a re-election builds its
   /// engine long after registration is over and must still see every symbol.
@@ -150,6 +156,8 @@ private:
   /// Owner-elected hook: builds the engine on whichever core wins the election.
   /// ctx is the driver, which owns sharedPool_ and so always outlives it.
   static bool sharedOwnerElected(void *ctx);
+  /// Owner-release hook: the counterpart of sharedOwnerElected.
+  static void sharedOwnerReleased(void *ctx);
 #endif
   // Async compiler will be added in EJitAsyncCompiler phase
 

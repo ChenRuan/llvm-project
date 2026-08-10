@@ -597,6 +597,11 @@ bool EJit::setCompileMode(CompileMode mode) {
   EJitTaskPool *tp = taskPool();
   if (!tp)
     return false;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  // The generation asyncServiceAvailable() validated, so the publish below can
+  // only commit against the same one.
+  uint32_t serviceGen = 0;
+#endif
 
   if (mode == CompileMode::Async) {
     // Do not expose Async until a compiler and a consumer exist. Failure
@@ -609,7 +614,7 @@ bool EJit::setCompileMode(CompileMode mode) {
     // setCompileMode(Async) and any switch back after a flip to Sync. A Ready
     // blob with an elected owner running the single worker is exactly the
     // condition under which a request enqueued from here gets compiled.
-    if (!compileDriver_->sharedTaskPool()->asyncServiceAvailable()) {
+    if (!compileDriver_->sharedTaskPool()->asyncServiceAvailable(&serviceGen)) {
       EJIT_DIAG("compile mode switch rejected: shared pool cannot service "
                 "async (not Ready / no owner / no worker)");
       return false;
@@ -650,10 +655,31 @@ bool EJit::setCompileMode(CompileMode mode) {
   // blob with release semantics so every core's compileOrGet() observes the new
   // mode; engine/worker ownership stays owner-controlled (a mode flip never
   // starts/stops the shared worker or re-runs owner election).
-  if (EJitSharedTaskPool *sp = sharedTaskPool())
-    sp->setSharedMode(mode == CompileMode::Async   ? EJitCompileMode::Async
-                     : mode == CompileMode::Sync   ? EJitCompileMode::Sync
-                                                   : EJitCompileMode::Off);
+  //
+  // Async commits only against the generation the availability check ran on: an
+  // ownerShutdown landing in between bumps it, and the switch reports failure
+  // rather than leaving Async live over a stopped worker. Sync/Off need no
+  // gate -- neither asks the worker for anything.
+  if (EJitSharedTaskPool *sp = sharedTaskPool()) {
+    const EJitCompileMode shared =
+        mode == CompileMode::Async  ? EJitCompileMode::Async
+        : mode == CompileMode::Sync ? EJitCompileMode::Sync
+                                    : EJitCompileMode::Off;
+    if (mode == CompileMode::Async) {
+      if (!sp->publishSharedMode(shared, serviceGen)) {
+        EJIT_DIAG("compile mode switch rejected: owner shut down during the "
+                  "switch (generation moved)");
+        tp->switchController().setMode(
+            config_.compileMode == CompileMode::Async ? EJitCompileMode::Async
+            : config_.compileMode == CompileMode::Sync
+                ? EJitCompileMode::Sync
+                : EJitCompileMode::Off);
+        return false;
+      }
+    } else {
+      sp->setSharedMode(shared);
+    }
+  }
 #endif
   config_.compileMode = mode;
   return true;

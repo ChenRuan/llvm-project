@@ -1679,6 +1679,12 @@ void EJitSharedTaskPool::ownerShutdown() {
       static_cast<uint32_t>(EJitSharedInitState::Stopping));
   if (workerStop_)
     workerStop_(workerCtx_); // soft-stop + JOIN (no use-after-free).
+  // Release what the election built, between the join and Uninitialized: no
+  // compile can be in flight, and no peer can be elected yet. Without this the
+  // former owner keeps its engine while a new owner builds another, so the
+  // system accumulates one per handoff.
+  if (ownerReleased_)
+    ownerReleased_(ownerReleasedCtx_);
   state_->ownerCoreId.storeRelease(kEJitInvalidCoreId);
   state_->workerTaskId.storeRelease(0);
   state_->generation.storeRelease(state_->generation.loadRelaxed() + 1);

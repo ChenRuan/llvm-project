@@ -57,9 +57,22 @@ public:
   void invalidateAllByPeriod(const std::string &periodName);
 
   // Configuration
-  /// Change compile mode. In a taskpool build, switching to Async requires a
-  /// ready ORC engine and a successfully started worker; on failure the current
-  /// mode is preserved and false is returned.
+  /// Change compile mode. On failure the current mode is preserved and false
+  /// is returned.
+  ///
+  /// Private taskpool: Async requires a ready ORC engine on this instance and a
+  /// successfully started worker.
+  ///
+  /// Shared taskpool: Async instead requires the SHARED pool to be serviceable
+  /// (Ready, owner elected, worker running) -- peers have no engine of their
+  /// own, the elected owner compiles for every core. The switch is rejected if
+  /// the owner shuts down while it is in flight.
+  ///
+  /// Shared SYNC compiles on the CALLING core, and only the owner has an
+  /// engine, so a non-owner core in Sync mode does not JIT: its calls resolve
+  /// to nullptr and the wrapper cleanly runs the AOT body. Sync is therefore a
+  /// single-core debugging mode under the shared taskpool, not a way for every
+  /// core to compile.
   bool setCompileMode(CompileMode mode);
   CompileMode getCompileMode() const;
   void setOptimizationLevel(OptimizationLevel level);

@@ -178,6 +178,8 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   // peer that won with no hook would publish Ready with no engine.
   sharedPool_.setOwnerElectedCallback(&EJitCompileDriver::sharedOwnerElected,
                                       this);
+  sharedPool_.setOwnerReleasedCallback(&EJitCompileDriver::sharedOwnerReleased,
+                                       this);
   sharedPool_.setMode(config_.compileMode == CompileMode::Async   ? EJitCompileMode::Async
                           : config_.compileMode == CompileMode::Sync ? EJitCompileMode::Sync
                                                                      : EJitCompileMode::Off);
@@ -253,6 +255,10 @@ bool EJitCompileDriver::sharedOwnerElected(void *ctx) {
   return static_cast<EJitCompileDriver *>(ctx)->ensureJitEngine();
 }
 
+void EJitCompileDriver::sharedOwnerReleased(void *ctx) {
+  static_cast<EJitCompileDriver *>(ctx)->releaseJitEngine();
+}
+
 bool EJitCompileDriver::startSharedTaskPool() {
   // Publish this core's funcIndex/dimType registration digest so a peer with a
   // divergent mapping is cleanly rejected at attach (spec §11), never silently
@@ -324,6 +330,13 @@ bool EJitCompileDriver::ensureJitEngine() {
     jitEngine_->addUserSymbol(sym.first, sym.second);
   EJIT_DIAG("OrcJIT engine created successfully");
   return true;
+}
+
+void EJitCompileDriver::releaseJitEngine() {
+  if (!jitEngine_)
+    return;
+  EJIT_DIAG("OrcJIT engine released: ownership given up");
+  jitEngine_.reset();
 }
 
 void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
