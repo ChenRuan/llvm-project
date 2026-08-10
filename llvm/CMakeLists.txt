@@ -687,7 +687,7 @@ endif()
 # so the hit path indexes with shifts (no multiply). The same value is applied
 # to the runtime (LLVMEJIT -DEJIT_ICACHE_DIM_SIZE) and to the AOT pass (clang
 # -mllvm -ejit-icache-dim-size) so the AOT array layout and the runtime
-# linearization agree. Default 8; the product overrides it via the preset.
+# linearization agree. Default 16; the product overrides it via the preset.
 set(EJIT_ICACHE_DIM_SIZE 16 CACHE STRING
   "EJIT inline-cache per-dim bound D (must be a power of 2)")
 if(EJIT_ICACHE_DIM_SIZE LESS 1)
