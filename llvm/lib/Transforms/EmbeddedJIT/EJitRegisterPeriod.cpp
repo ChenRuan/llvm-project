@@ -26,6 +26,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -156,7 +157,7 @@ generateRegistryTablePeriod(
   // Period array entries
   for (auto &[GV, PeriodName, VarName, Size] : PeriodArrays) {
     Entries.push_back(ConstantStruct::get(EntryTy, {
-        ConstantInt::get(I32Ty, 1),                  // EJIT_REG_PERIOD_ARRAY
+        ConstantInt::get(I32Ty, EJIT_REG_PERIOD_ARRAY),       // EJIT_REG_PERIOD_ARRAY
         makeStrGV(PeriodName),
         makeStrGV(VarName),
         ConstantExpr::getBitCast(GV, PtrTy),         // base address
@@ -167,7 +168,7 @@ generateRegistryTablePeriod(
   // Static var entries
   for (auto &[GV, VarName] : StaticVars) {
     Entries.push_back(ConstantStruct::get(EntryTy, {
-        ConstantInt::get(I32Ty, 2),                  // EJIT_REG_STATIC_VAR
+        ConstantInt::get(I32Ty, EJIT_REG_STATIC_VAR),           // EJIT_REG_STATIC_VAR
         makeStrGV(VarName),
         ConstantPointerNull::get(PtrTy),
         ConstantExpr::getBitCast(GV, PtrTy),
