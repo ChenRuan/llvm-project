@@ -640,6 +640,12 @@ static std::string extractAndSerialize(Module &M,
   // table; if preserved in the extracted bitcode, JITLink refuses to resolve
   // them against externally-supplied absolute symbols, causing spurious
   // "Symbols not found" errors.
+  //
+  // NOTE: Only Function and GlobalVariable declarations are traversed here.
+  // GlobalAlias and GlobalIFunc are not handled — they are unused in the
+  // bare-metal embedded scenarios that EJIT targets, and the closure
+  // collector (computeTransitiveClosure / collectReferencedGlobals) does
+  // not emit them.
   for (Function &F : Extracted->functions())
     if (F.isDeclaration() && !F.hasDefaultVisibility())
       F.setVisibility(GlobalValue::DefaultVisibility);
