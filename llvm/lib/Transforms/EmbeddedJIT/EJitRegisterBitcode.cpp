@@ -465,11 +465,10 @@ runSpecializationDiagnostic(Module &Extracted,
     if (F.isDeclaration())
       continue;
     SmallPtrSet<const BasicBlock *, 16> LoopBBs;
-    bool NeedLoops = EJitReportMayConst || EJitWarnFewMayConst > 0;
-    if (NeedLoops)
+    if (EJitReportMayConst)
       computeLoopBBs(F, LoopBBs);
     computeEjitFuncDiagInfo(F, Info[&F], MayConstKind,
-                            NeedLoops ? &LoopBBs : nullptr);
+                            EJitReportMayConst ? &LoopBBs : nullptr);
   }
 
   // Fixpoint: propagate HasMayConstLoad and RefsPeriodArr up the call graph.
@@ -564,10 +563,7 @@ runSpecializationDiagnostic(Module &Extracted,
       // A low count means the JIT has little to fold, but doesn't mean the
       // entry is misconfigured — the significance depends on what those loads
       // gate.  This only flags the count for manual review.
-      // A load inside a loop is high specialization value regardless of
-      // count — a single loop load executes thousands of times.  Only
-      // warn when there are no loop loads AND the total is below threshold.
-      if (EJitWarnFewMayConst > 0 && K < EJitWarnFewMayConst && J == 0)
+      if (EJitWarnFewMayConst > 0 && K < EJitWarnFewMayConst)
         errs() << "EJit warning: ejit_entry function '" << EF->getName()
                << "' has only " << K << " ejit_may_const read"
                << (K == 1 ? "" : "s") << " in its specialization closure"
