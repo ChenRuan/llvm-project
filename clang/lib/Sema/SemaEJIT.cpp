@@ -11,7 +11,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/AST/ASTContext.h"
-#include "clang/AST/ParentMapContext.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/RecursiveASTVisitor.h"
@@ -364,18 +363,6 @@ static const FieldDecl *findMayConstWriteTarget(Expr *E,
     if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
       BaseVar = VD;
 
-  // The EjitMayConstAttr lives on the FieldDecl and applies to every struct
-  // instance.  Suppress the warning when the base is a local struct copy
-  // (value type, not pointer/reference), which does not alias period data.
-  // Pointers and references are kept because they may point to period data
-  // even though the variable itself lacks a period annotation.
-  if (BaseVar &&
-      !BaseVar->hasAttr<EjitPeriodArrAttr>() &&
-      !BaseVar->hasAttr<EjitPeriodAttr>() &&
-      !BaseVar->getType()->isPointerType() &&
-      !BaseVar->getType()->isReferenceType())
-    return nullptr;
-
   return FD;
 }
 
@@ -398,148 +385,10 @@ public:
   bool VisitUnaryOperator(UnaryOperator *UO) {
     if (UO->isIncrementDecrementOp())
       checkWrite(UO->getSubExpr(), UO->getOperatorLoc());
-    else if (UO->getOpcode() == UO_AddrOf)
-      checkAddrOf(UO);
     return true;
   }
 
 private:
-  /// If taking the address of an ejit_may_const field without const on the
-  /// pointee type, warn: a non-const pointer can escape and write the field
-  /// outside ejit_period_lc.
-  ///
-  /// Walks up the parent chain through transparent/semi-transparent nodes
-  /// (ParenExpr, CastExpr, UnaryOperator*, ConditionalOperator) to reach
-  /// the context that determines whether the pointer is const-protected or
-  /// directly written through.  Stops at terminals: VarDecl, CallExpr,
-  /// ReturnStmt, BinaryOperator (assignment), UnaryOperator (inc/dec).
-  void checkAddrOf(UnaryOperator *UO) {
-    const VarDecl *BaseVar = nullptr;
-    const FieldDecl *FD =
-        findMayConstWriteTarget(UO->getSubExpr(), BaseVar);
-    if (!FD)
-      return;
-
-    // Track whether the pointer result is const-protected at any layer.
-    // A non-pointer cast (bool, intptr_t) terminates the walk: no writable
-    // pointer escapes.
-    bool ConstProtected = false;
-    DynTypedNode CurNode = DynTypedNode::create(*UO);
-
-    for (;;) {
-      auto Parents = S.getASTContext().getParents(CurNode);
-      if (Parents.empty())
-        break; // no parent → conservative: warn
-      const DynTypedNode &Parent = Parents[0];
-
-      // Transparent nodes: skip and continue.
-      if (isa<ParenExpr>(Parent.get<Stmt>())) {
-        CurNode = Parent;
-        continue;
-      }
-      if (isa<AbstractConditionalOperator>(Parent.get<Stmt>())) {
-        CurNode = Parent;
-        continue; // type flows through the branches
-      }
-
-      // Cast: track whether const qualification was added or stripped.
-      if (const auto *CE =
-              dyn_cast_or_null<CastExpr>(Parent.get<Stmt>())) {
-        QualType CastTy = CE->getType();
-        if (!CastTy->isPointerType())
-          return; // converted to non-pointer — no writable pointer escapes
-        const Expr *Sub = CE->getSubExpr();
-        if (Sub && Sub->getType()->isPointerType()) {
-          const auto *CastPT = dyn_cast<PointerType>(CastTy.getTypePtr());
-          const auto *SubPT =
-              dyn_cast<PointerType>(Sub->getType().getTypePtr());
-          bool CastConst = CastPT &&
-                           CastPT->getPointeeType().isConstQualified();
-          bool SubConst =
-              SubPT && SubPT->getPointeeType().isConstQualified();
-          if (CastConst && !SubConst)
-            ConstProtected = true;  // cast added const to pointee
-          else if (!CastConst && SubConst)
-            ConstProtected = false; // cast stripped const from pointee
-        }
-        CurNode = Parent;
-        continue;
-      }
-
-      // *&field: the pointer is consumed by the deref.  Walk past it — the
-      // deref result is the field's value (or an lvalue that may be written).
-      // Mark ConstProtected so non-write terminals (value copy, function arg)
-      // do not false-positive; write terminals will reset it below.
-      if (const auto *UOInner =
-              dyn_cast_or_null<UnaryOperator>(Parent.get<Stmt>()))
-        if (UOInner->getOpcode() == UO_Deref) {
-          ConstProtected = true; // pointer consumed — no writable pointer exists
-          CurNode = Parent;
-          continue;
-        }
-
-      // --- Terminal nodes: the walk ends, decide below ---
-
-      // Declaration: the declared type may add const protection.
-      // Check the pointee directly through PointerType to avoid
-      // QualType::getPointeeType's fast-qualifier merging.
-      if (const auto *VD =
-              dyn_cast_or_null<VarDecl>(Parent.get<Decl>())) {
-        if (!ConstProtected) {
-          if (const auto *PT =
-                  dyn_cast<PointerType>(VD->getType().getTypePtr()))
-            if (PT->getPointeeType().isConstQualified())
-              return; // const T* → safe
-        }
-        break;
-      }
-
-      // Call argument: the pointer escapes through a function parameter.
-      if (isa<CallExpr>(Parent.get<Stmt>())) {
-        break; // warn unless const-protected
-      }
-
-      // Return: the pointer escapes to the caller.
-      if (isa<ReturnStmt>(Parent.get<Stmt>())) {
-        break;
-      }
-
-      // Assignment or inc/dec on the dereferenced result: a write through
-      // the address — always warn, even if the pointer was const-cast.
-      if (const auto *BO =
-              dyn_cast_or_null<BinaryOperator>(Parent.get<Stmt>())) {
-        if (BO->isAssignmentOp() || BO->isCompoundAssignmentOp()) {
-          ConstProtected = false; // being written → warn
-          break;
-        }
-        break; // other binary op — check ConstProtected
-      }
-      if (const auto *UO2 =
-              dyn_cast_or_null<UnaryOperator>(Parent.get<Stmt>())) {
-        if (UO2->isIncrementDecrementOp()) {
-          ConstProtected = false; // being written → warn
-          break;
-        }
-        break;
-      }
-
-      // Any other parent we cannot classify: conservative, warn.
-      break;
-    }
-
-    if (ConstProtected)
-      return;
-
-    if (BaseVar)
-      S.Diag(UO->getOperatorLoc(),
-             diag::warn_ejit_may_const_addr_without_const)
-          << FD << BaseVar;
-    else
-      S.Diag(UO->getOperatorLoc(),
-             diag::warn_ejit_may_const_addr_without_const)
-          << FD << FD->getParent();
-  }
-
   /// If \p Target designates an ejit_may_const field, emit the warning.
   void checkWrite(Expr *Target, SourceLocation Loc) {
     const VarDecl *BaseVar = nullptr;
@@ -573,13 +422,10 @@ void checkEjitMayConstWrites(Sema &S, const FunctionDecl *FD, Stmt *Body) {
   if (FD->hasAttr<EjitPeriodLcAttr>())
     return;
 
-  // Skip the traversal entirely when BOTH diagnostics are disabled
+  // Skip the traversal entirely when the warning is disabled
   // (e.g. -Wno-embedded-jit), matching the AnalysisBasedWarnings pattern.
-  // If either warning is enabled the visitor must run — it emits both.
   if (S.getDiagnostics().isIgnored(
-          diag::warn_ejit_may_const_modified_without_lc, FD->getLocation()) &&
-      S.getDiagnostics().isIgnored(
-          diag::warn_ejit_may_const_addr_without_const, FD->getLocation()))
+          diag::warn_ejit_may_const_modified_without_lc, FD->getLocation()))
     return;
 
   EjitMayConstWriteVisitor Visitor(S);
