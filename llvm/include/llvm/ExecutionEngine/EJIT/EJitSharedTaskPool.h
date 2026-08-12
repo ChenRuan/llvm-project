@@ -104,19 +104,39 @@ enum class EJitWorkerStep : uint32_t {
 //    its next call, with no invalidation epoch on the probe, no per-core drain
 //    rendezvous, and no sync entry point for the application to call.
 //
-// PREREQUISITE 1: the partitioning must be real -- each core drives its OWN
-// ejit_period_lc instance indices. Two cores calling one ejit_entry with the
-// SAME identity share a cell; the pointer they race to store is the same
-// specialization, so the write is benign, but "disjoint by construction"
-// weakens to "identical by construction".
+// PREREQUISITE, and it is a CORRECTNESS one: the partitioning must be real --
+// each core drives its OWN ejit_period_lc instance indices, so no two cores
+// call one ejit_entry with the same ejit_dim values.
 //
-// PREREQUISITE 2, enforced rather than assumed: a resolved fnPtr must be
-// callable on EVERY core with no per-core work. A shared cell publishes the
-// pointer to all cores at once, so where the platform needs per-core execute
-// preparation (4K-seal mode, or a wired prepareCodeFn_) a peer could jump to an
-// address it has not sealed. The private table ruled that out for free -- a
-// non-null cell meant THIS core had resolved, hence prepared. See
-// icacheCrossCoreExecutable(), which disables the fill in those builds.
+// Disjointness is what makes a cell safe to jump to. A core only ever reads
+// cells it filled itself, and it filled them after resolving through the
+// taskpool, which is where per-core execute preparation happens (4K seal /
+// prepareCodeFn_). So the pointer it loads is always code it has already
+// prepared -- exactly the guarantee a per-core .bss table gave for free.
+//
+// If two cores DO share an identity they share a cell, and the second one loads
+// a pointer the first one prepared. The value is the same specialization, so
+// the result is right, but the translation is not: under per-core sealing that
+// core branches into a page it never sealed. So a collision is NOT benign here,
+// and this is the one thing about the design that cannot be checked from the
+// runtime side: the cell carries no record of which core wrote it, and adding
+// one would put a per-core gate back on a probe whose whole point is not having
+// any. It is a deployment contract, and it is on the application to hold it.
+//
+// (icacheCrossCoreExecutable() is NOT consulted for a DIMENSIONED entry. It
+// would decline every fill in every build the probe is allowed in, since
+// EJIT_SRE_SHARED_CODE_POINTERS always wires either fourKSeal_ or
+// prepareCodeFn_. The taskpool's own cross-core path still uses it.)
+//
+// THE 0-DIM EXCEPTION. An entry with no ejit_dim params has ONE cell and no
+// identity to partition it by, so everything above simply does not apply to it:
+// every core reads and writes that same scalar however well behaved the
+// deployment is. It is not a contract violation, it is the shape. So for
+// numDims == 0 icacheFill DOES consult icacheCrossCoreExecutable() and declines
+// unless a resolved pointer is callable on every core the instant it exists.
+// Where it declines the cell stays empty, the probe keeps missing, and the
+// taskpool -- which prepares -- serves every call. The AOT pass still emits the
+// 0D probe: the code is platform independent, only the fill is not.
 //
 // THE RACE, and why it is bounded: core A's drain stores 0 while core B's probe
 // loads the cell. Both are naturally-aligned word accesses, so B reads the old
@@ -192,12 +212,18 @@ void ejitIcacheClearAll();
 // one shared object, which is what lets a drain on any core clear the cells
 // every other core reads.
 //
-// Returns false, registering nothing, for an out-of-range funcIndex, a null
-// base, or numDims above EJIT_ICACHE_MAX_DIMS (numDims sizes the array the
-// drain walks, so an over-cap value would write past the wrapper's global).
-// Declining is the safe degradation: the cell stays null, the taskpool serves
-// every call.
-bool ejitIcacheRegisterSlot(uint32_t funcIndex, void *base, uint32_t numDims);
+// Outcome of a slot registration. The two failure kinds must NOT be conflated:
+//
+//   CapacityMiss  past EJIT_ICACHE_FUNC_SLOTS (4096) while the function registry
+//                 holds 4096. Normal in a large application: the cell stays
+//                 null and the taskpool serves the function. Callers must
+//                 degrade, never error, or the 65th ejit_entry stops ejit_init.
+//   Invalid       null base, or numDims above the cap (it sizes the array the
+//                 drain walks). A real defect, and reported.
+enum class EJitIcacheRegResult { Ok, CapacityMiss, Invalid };
+
+EJitIcacheRegResult ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
+                                           uint32_t numDims);
 
 /// Diagnostic: dump every registered icache slot to the diagnostic log.
 /// Shows funcIndex, base pointer, numDims, and cell[0] (the scalar or
@@ -206,6 +232,20 @@ bool ejitIcacheRegisterSlot(uint32_t funcIndex, void *base, uint32_t numDims);
 /// NOTE: dereferences base[0] of every registered slot — bases must be
 /// module-lifetime storage, never stack locals (see ejitIcacheClearAll).
 void ejitDumpIcacheSlots();
+
+/// Retire one in-flight drain that was announced under generation \p gen.
+///
+/// Split out of icacheDrainAll() because it is the half of the drain protocol
+/// that has to survive a (re)initialization landing in the middle of a walk,
+/// and that interleaving is only reachable deterministically by calling this
+/// directly. Two rules:
+///
+///  * If the blob's generation has moved on, do nothing. A re-init discards the
+///    whole in-flight count, so this drain's increment is already gone and
+///    subtracting again would wrap the counter.
+///  * Never go below zero regardless, so no ordering anywhere can leave
+///    icacheBeginResolve() permanently refusing tokens.
+void ejitIcacheRetireDrain(EJitSharedTaskPoolState *st, uint32_t gen);
 
 /// One L0 slot, sized to a cache line. The identity is stored in full and
 /// re-checked on every hit, because the index hash is not injective: it selects
@@ -372,7 +412,13 @@ public:
   EJitSharedTaskPool &operator=(const EJitSharedTaskPool &) = delete;
 
   /// Bind to the shared blob (not owned). Call before init().
-  void bind(EJitSharedTaskPoolState *state) { state_ = state; }
+  void bind(EJitSharedTaskPoolState *state) {
+    state_ = state;
+    // Seal mode / prepareCode may have been configured before the blob existed.
+    publishIcachePrepareMode();
+    // Likewise a releaser wired pre-bind must count against the shared table.
+    syncIcacheReleaserCount();
+  }
   EJitSharedTaskPoolState *state() const { return state_; }
 
   /// Callback type for forEachCompiled: receives the funcIndex, its dim
@@ -395,16 +441,28 @@ public:
     compileCtx_ = ctx;
   }
   void setReleaser(ReleaseCallback fn, void *ctx) {
+    const bool had = (releaseFn_ != nullptr);
     releaseFn_ = fn;
     releaseCtx_ = ctx;
     // v2 inline cache never reclaims (no HP-scan retire, ever). A wired
     // releaser means code may be freed while a cached fnPtr still pins it ->
     // UAF. Auto-disable the cache while a releaser is wired. Production wires
     // no releaser, so the gate stays open and the cache is unconditionally safe.
+    //
+    // The disable state is SHARED, not just this facade's: the cells are one
+    // table backing every core, so a peer facade with its own flag still clear
+    // would happily refill what this one just drained, and the probe consults
+    // no gate at all. Track the transition as a count in the blob so the cache
+    // re-arms only when the LAST releaser goes away.
+    (void)had;
     icacheReclamationSafe_ = (fn == nullptr);
+    syncIcacheReleaserCount();
     if (fn) {
       // The gate is evaluated at fill, so blocking new fills is not enough:
       // entries armed earlier would keep serving code the releaser may free.
+      // retireDispatchCache() drains the cell table as part of retiring the L0,
+      // so this needs no second icacheDrainAll(): that would walk the whole
+      // table twice and bump icacheDrainSeq twice for one event.
       gEJitL0State = nullptr;
       retireDispatchCache();
     }
@@ -412,6 +470,7 @@ public:
   void setPrepareCodeCallback(PrepareCodeCallback fn, void *ctx) {
     prepareCodeFn_ = fn;
     prepareCodeCtx_ = ctx;
+    publishIcachePrepareMode();
   }
   /// Whether a resolved fnPtr is callable on EVERY core the instant it exists,
   /// with no per-core work. False when the platform wires per-core execute
@@ -424,8 +483,39 @@ public:
   /// probe has no per-core gate to restore the implication -- so when per-core
   /// preparation is required icacheFill declines and the taskpool, which
   /// prepares, serves every call.
+  /// The reclamation gate as every core sees it: this facade's own releaser
+  /// AND any peer's. The cells are shared, so a peer wiring a releaser must
+  /// stop THIS core filling and serving them too.
+  bool icacheReclamationSafeShared() const {
+    return icacheReclamationSafe_ &&
+           (!state_ || state_->icacheReleasersWired.loadAcquire() == 0);
+  }
   bool icacheCrossCoreExecutable() const {
-    return !fourKSeal_ && prepareCodeFn_ == nullptr;
+    // The shared answer wins. A facade that was never handed the seal mode has
+    // fourKSeal_ == false and no prepareCodeFn_, and would otherwise conclude
+    // "callable everywhere" for a platform on which it is not -- see
+    // icachePerCorePrepare.
+    if (state_ && state_->icachePerCorePrepare.loadAcquire())
+      return false;
+    // 4K-seal mode is NOT counted as per-core preparation. On the target this
+    // runs on, the seal is an operation on an address space every core
+    // translates through, so a page sealed by one core is executable on all of
+    // them; the per-core split the taskpool still performs is bookkeeping, not
+    // a precondition for the jump. Counting it here left the 0-dim shared
+    // scalar permanently unfillable on the only platform the inline cache ships
+    // on, which costs every 0-dim entry the full taskpool path on every call.
+    //
+    // A wired prepareCodeFn_ (the legacy whole-2MiB path) IS per-core work and
+    // still closes the gate.
+    //
+    // NOTE, and it is the assumption to re-check if a 0-dim entry ever faults:
+    // EJitSharedPoolSplit tracks splitDoneMask per core, which is the runtime
+    // modelling the split as per-core state. That is consistent with the split
+    // being per-core bookkeeping over a shared mapping, but it is also what you
+    // would see if the mapping were NOT shared. Verified on the board by
+    // ejit_icache_multiverify_test's 0-dim entry (f_0) executing on cores that
+    // never resolved it themselves.
+    return prepareCodeFn_ == nullptr;
   }
   /// Owner: provide the finalized code-range resolver (see CodeRangeCallback).
   void setCodeRangeProvider(CodeRangeCallback fn, void *ctx) {
@@ -445,7 +535,10 @@ public:
   /// true = 4KiB page seal (split the pool once per core, then enable_ex every
   /// page the code covers), false = legacy whole-2MiB-pool seal. Must match the
   /// owner's code pool. Default false.
-  void setSealMode(bool fourKSeal) { fourKSeal_ = fourKSeal; }
+  void setSealMode(bool fourKSeal) {
+    fourKSeal_ = fourKSeal;
+    publishIcachePrepareMode();
+  }
   /// 4K mode: per-core split primitive (see SplitPoolCallback).
   void setSplitPoolCallback(SplitPoolCallback fn, void *ctx) {
     splitPoolFn_ = fn;
@@ -679,6 +772,16 @@ public:
   ///
   /// \returns whether the enabled BIT flipped. The invalidations run either way.
   bool setInstanceEnabled(uint32_t dimType, uint32_t instanceId, bool enabled);
+
+  /// Toggle EVERY instance of \p dimType, draining ONCE at the end.
+  ///
+  /// setInstanceEnabled drains the whole table per call, so looping it cost
+  /// MAX_INSTANCES full drains (256 x 256 cells per function for a 2-dim entry)
+  /// with the in-flight counter raised throughout, blocking concurrent fills.
+  /// The drain is global, not per instance, so one covers the batch.
+  ///
+  /// \returns the number of instances whose enabled bit actually flipped.
+  uint32_t setAllInstancesEnabled(uint32_t dimType, bool enabled);
   /// Query the shared activation bit for a lifecycle instance — the read
   /// counterpart of setInstanceEnabled, and the single cross-core source of
   /// truth the compile gate (compileCold) and ejit_is_active consult. Returns
@@ -1011,6 +1114,50 @@ private:
   // releaser (code may be freed) + the cache = UAF; the gate then auto-disables
   // the cache. See setReleaser().
   bool icacheReclamationSafe_ = true;
+  /// Whether THIS facade currently contributes 1 to icacheReleasersWired.
+  /// Without it, bind() and setReleaser() each add on their own and a facade
+  /// that is bound twice, or wired then re-bound, counts itself more than once
+  /// and the gate never re-opens.
+  bool icacheReleaserCounted_ = false;
+  /// Make the shared count agree with this facade's releaser, exactly once.
+  ///
+  /// LIMIT, and it is why production must keep to ONE facade per blob
+  /// (EJitCompileDriver::sharedPool_): a (re)initialization zeroes the count
+  /// while this flag stays set, so after a re-init this facade believes it is
+  /// counted when it is not. Only init() re-publishes, and only for the owner's
+  /// own releaseFn_ -- a peer facade that wired a releaser before the re-init
+  /// is not restored, and its later unwire would decrement a count it no longer
+  /// owns. The decrement saturates at zero so the worst case is re-opening the
+  /// gate early, never wrapping it shut forever; closing it properly would need
+  /// the same generation stamp the drain protocol uses.
+  void syncIcacheReleaserCount() {
+    const bool want = (state_ != nullptr) && (releaseFn_ != nullptr);
+    if (want == icacheReleaserCounted_)
+      return;
+    if (want) {
+      state_->icacheReleasersWired.fetchAdd(1);
+      icacheReleaserCounted_ = true;
+      return;
+    }
+    if (state_) {
+      uint32_t cur = state_->icacheReleasersWired.loadAcquire();
+      while (cur != 0 &&
+             !state_->icacheReleasersWired.compareExchange(cur, cur - 1))
+        ;
+    }
+    icacheReleaserCounted_ = false;
+  }
+  /// Publish this facade's local "needs per-core execute preparation" answer
+  /// into the blob, so every other facade -- including ones never handed the
+  /// seal mode -- gates the 0-dim shared scalar on it. Set-only: see
+  /// icachePerCorePrepare for why the monotone direction is the safe one.
+  void publishIcachePrepareMode() {
+    // Only a wired prepareCodeFn_ counts. 4K-seal mode is deliberately NOT
+    // per-core preparation here -- see icacheCrossCoreExecutable() for why, and
+    // for the assumption to re-check if a 0-dim entry ever faults.
+    if (state_ && prepareCodeFn_ != nullptr)
+      state_->icachePerCorePrepare.storeRelease(1);
+  }
 
   // Worker observability + startup-wait bound (owner-local).
   EJitAtomicU64 workerConsumeLoops_{0};

@@ -224,14 +224,26 @@ EJit::EJit(const Config &config) : config_(config) {
                             e->name1);
             break;
           }
-          if (!ejitIcacheRegisterSlot(idx, const_cast<void *>(e->ptr),
-                                      numDims)) {
-            // Declined (numDims above the cap): the cell stays null and every
-            // call to this function resolves through the taskpool. Correct,
-            // just without the fast path.
+          switch (ejitIcacheRegisterSlot(idx, const_cast<void *>(e->ptr),
+                                         numDims)) {
+          case EJitIcacheRegResult::Ok:
+            break;
+          case EJitIcacheRegResult::CapacityMiss:
+            // NOT an error. The inline cache holds EJIT_ICACHE_FUNC_SLOTS
+            // functions while the registry holds thousands, so a large
+            // application legitimately runs out. The cell stays null and the
+            // taskpool serves every call to this function. Recording an init
+            // error here would stop EJIT from starting at all.
+            EJIT_DIAG("register_icache_slot name=%s: no free inline-cache slot "
+                      "(idx=%u >= %u), continuing without the fast path",
+                      e->name1, idx, EJIT_ICACHE_FUNC_SLOTS);
+            break;
+          case EJitIcacheRegResult::Invalid:
             recordInitError(EJIT_ERR_INVALID_PARAM,
-                            "icache slot declined: numDims above the cap",
+                            "icache slot invalid: null base or numDims above "
+                            "the cap",
                             e->name1);
+            break;
           }
           break;
         }
@@ -481,9 +493,10 @@ bool EJit::activateAll(const std::string &periodName) {
   uint32_t dt = EJitLifecycleRegistry::instance().lookup(periodName);
   if (dt != kEJitInvalidDimType) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
+    // One batched call: the per-instance entry point drains the whole cell
+    // table each time, so looping it here cost MAX_INSTANCES full drains.
     if (EJitSharedTaskPool *sp = sharedTaskPool())
-      for (uint32_t i = 0; i < EJitSwitchController::MAX_INSTANCES; ++i)
-        sp->setInstanceEnabled(dt, i, /*enabled=*/true);
+      sp->setAllInstancesEnabled(dt, /*enabled=*/true);
 #else
     runtimeState_->activateAll(periodName);
     if (EJitTaskPool *tp = taskPool())
@@ -510,8 +523,7 @@ bool EJit::deactivateAll(const std::string &periodName) {
   if (dt != kEJitInvalidDimType) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
     if (EJitSharedTaskPool *sp = sharedTaskPool())
-      for (uint32_t i = 0; i < EJitSwitchController::MAX_INSTANCES; ++i)
-        sp->setInstanceEnabled(dt, i, /*enabled=*/false);
+      sp->setAllInstancesEnabled(dt, /*enabled=*/false);
 #else
     runtimeState_->deactivateAll(periodName);
     if (EJitTaskPool *tp = taskPool())

@@ -482,16 +482,28 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
               funcName);
     return;
   }
-  if (!ejitIcacheRegisterSlot(idx, slot, numDims)) {
+  switch (ejitIcacheRegisterSlot(idx, slot, numDims)) {
+  case EJitIcacheRegResult::Ok:
+    EJIT_DIAG_VERBOSE("register_icache_slot OK name=%s idx=%u numDims=%u",
+                      funcName, idx, numDims);
+    break;
+  case EJitIcacheRegResult::CapacityMiss:
+    // Expected in a large application: more ejit_entry functions than
+    // EJIT_ICACHE_FUNC_SLOTS. Not recorded as an error -- a registration error
+    // during construction fails ejit_init, and losing an optional fast path on
+    // one function must never do that.
+    EJIT_DIAG("register_icache_slot name=%s: no free inline-cache slot "
+              "(idx=%u >= %u), continuing without the fast path",
+              funcName, idx, EJIT_ICACHE_FUNC_SLOTS);
+    break;
+  case EJitIcacheRegResult::Invalid:
     EJitRegistrationStore::instance().recordError(
-        EJIT_ERR_INVALID_PARAM, "icache slot declined: numDims above the cap",
-        funcName);
+        EJIT_ERR_INVALID_PARAM,
+        "icache slot invalid: null base or numDims above the cap", funcName);
     EJIT_DIAG("register_icache_slot FAIL name=%s: numDims=%u above the cap %u",
               funcName, numDims, EJIT_ICACHE_MAX_DIMS);
-    return;
+    break;
   }
-  EJIT_DIAG_VERBOSE("register_icache_slot OK name=%s idx=%u numDims=%u",
-                    funcName, idx, numDims);
 }
 
 ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx) {

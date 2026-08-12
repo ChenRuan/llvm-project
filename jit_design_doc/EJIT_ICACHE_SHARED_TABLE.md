@@ -87,6 +87,16 @@ one shared bit, so a caller that lost the CAS may still have rewritten its copy.
 `version[]` still moves only on a real transition — its consumer discards an
 in-flight compile, and nothing re-enqueues a dropped one.
 
+**Cost, and prefer the bulk entry points.** A drain is O(registered slots ×
+`D^numDims`), and only `ejit_activate_all` / `ejit_deactivate_all` batch it —
+`setAllInstancesEnabled` does the CAS loop, then one `dispatchEpoch` bump and one
+drain. `ejit_activate` / `ejit_deactivate` / `ejit_set_instance_enabled` each go
+straight to `setInstanceEnabled`, so bringing 256 instances up one at a time at
+startup costs 256 full table walks and 256 epoch bumps, with the in-flight
+counter raised throughout (which also blocks concurrent fills). Use the bulk
+calls for bring-up; the per-instance ones are for steady-state toggles, where one
+drain per toggle is the intended behaviour.
+
 ### 3.3 Fill guard
 
 The one non-benign interleaving is a **fill landing after a drain**: the pointer
@@ -106,6 +116,15 @@ moved. The counter (not just the sequence) is what stops a fill slipping into a
 cell a drain has passed but not yet accounted for, and makes concurrent drains
 safe. The token is a **stack value**, not runtime state: on an RTOS a
 higher-priority task can preempt a resolve and run its own.
+
+Those checks can only *precede* the store, so they cannot cover it: a drain
+beginning after they pass can zero the cell and finish before the store lands,
+stranding a pre-toggle specialization nothing clears again — and a preempted
+filler makes that window unbounded. So the fill publishes optimistically, then
+re-reads `icacheDrainsInFlight` and `icacheDrainSeq` and writes 0 back on
+conflict. An overlapping drain has either bumped the sequence or is still in
+flight, so both are visible. Retracting discards only this core's own fill —
+under P1 no other core writes that cell — and a null cell is always safe.
 
 The probe reads none of this.
 
@@ -148,6 +167,22 @@ consults `icacheCrossCoreExecutable()` and declines unless a resolved pointer is
 callable everywhere the instant it exists; the cell then stays empty and the
 taskpool serves every call. The AOT probe is still emitted — the code is platform
 independent, only the fill is not.
+
+What counts as per-core preparation is deliberately narrow: **only a wired
+`prepareCodeFn_`** (the legacy whole-2MiB path). 4K-seal mode does not, because
+the seal acts on an address space every core translates through — a page sealed
+by one core is executable on all of them, and the per-core split the taskpool
+performs is bookkeeping over a shared mapping rather than a precondition for the
+jump. Counting the seal here left every 0-dim entry permanently unfillable on the
+only platform the inline cache ships on, paying the full taskpool path on every
+call for a shape that is safe there.
+
+> If a 0-dim entry ever faults on a peer core, this is the assumption to
+> re-check first. `EJitSharedPoolSplit` tracks `splitDoneMask` per core, which is
+> the runtime modelling the split as per-core state — consistent with per-core
+> bookkeeping over a shared mapping, but also with the mapping not being shared
+> at all. The board-side check is `ejit_icache_multiverify_test`'s `f_0`
+> executing on cores that never resolved it themselves.
 
 For a *dimensioned* entry `icacheFill` does **not** consult that gate. An earlier
 revision did, and it made the feature inert on every real target:

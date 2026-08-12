@@ -74,7 +74,7 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// v8: the SwitchController line gains icacheDrainSeq, bumped by every
 /// inline-cache drain so a resolve that raced the drain drops its fill rather
 /// than refilling a cell the drain just cleared.
-constexpr uint32_t kEJitSharedAbiVersion = 8u;
+constexpr uint32_t kEJitSharedAbiVersion = 9u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

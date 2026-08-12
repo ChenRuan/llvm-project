@@ -141,5 +141,9 @@ entry:
 !0 = distinct !{!{!"ejit_entry"}}
 !1 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
 !2 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}, !{!"ejit_period_arr_ind", !"trp", i32 1}}
+; Both arrays must declare no more entries than EJIT_ICACHE_DIM_SIZE (16), or
+; dimsProvablyInRange() declines the probe for any entry indexed by them and the
+; ICACHE checks below have nothing to match. `trp` used to say 32, which
+; silently turned two_dim_entry into a no-probe entry.
 !10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}}
-!11 = distinct !{!{!"ejit_period_arr", !"trp", i32 32}}
+!11 = distinct !{!{!"ejit_period_arr", !"trp", i32 16}}

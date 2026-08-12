@@ -279,6 +279,74 @@ struct IcacheSlotInfo {
   unsigned NumDims = 0;
 };
 
+// A period whose bound this module cannot prove. Larger than any legal
+// EJIT_ICACHE_DIM_SIZE, so dimsProvablyInRange() declines on it without needing
+// a second lookup structure.
+static constexpr uint32_t kUnprovablePeriodArraySize = ~0u;
+
+// Map periodName -> the largest declared ejit_period_arr element count, from
+// this module's globals. Used to decide whether an entry's dim arguments can be
+// trusted to index the cell table.
+//
+// The MAXIMUM matters, and taking the last one visited is a bug: the runtime
+// permits SEVERAL arrays under one period and activates them as a group, so a
+// lifecycle's valid identities run up to the largest sibling. Recording an 8
+// because it happened to be declared after a 32 would let dimsProvablyInRange()
+// approve a 16-cell probe for a period that legally produces identity 31, and
+// the wrapper would form an inbounds GEP past its own table -- into whatever
+// shares the section -- before the slow-path range check is ever reachable.
+// Aggregating the max makes the answer independent of module order.
+static std::map<std::string, uint32_t> collectPeriodArraySizes(const Module &M) {
+  std::map<std::string, uint32_t> Sizes;
+  for (const GlobalVariable &GV : M.globals()) {
+    const MDNode *MD = GV.getMetadata(MD_EJIT_METADATA);
+    if (!MD || !hasMDStringEntry(MD, TAG_EJIT_PERIOD_ARR))
+      continue;
+    StringRef PeriodName = getMDStringValue(MD, TAG_EJIT_PERIOD_ARR);
+    if (PeriodName.empty())
+      continue;
+    // A count of 0 is "this global does not state one". That is an unknown
+    // bound, not a small one, so it must survive being maxed against a sibling
+    // that does state one -- otherwise the order of the two decides the answer
+    // again, which is the bug being fixed.
+    const uint32_t Declared = getMDIntValue(MD, TAG_EJIT_PERIOD_ARR);
+    const uint32_t Effective = Declared ? Declared : kUnprovablePeriodArraySize;
+    auto It = Sizes.find(PeriodName.str());
+    if (It == Sizes.end())
+      Sizes.emplace(PeriodName.str(), Effective);
+    else
+      It->second = std::max(It->second, Effective);
+  }
+  return Sizes;
+}
+
+// Whether every ejit_dim argument of \p F provably lands inside the
+// [D]^numDims cell table.
+//
+// The accepted ranges do not agree: the taskpool takes instance ids up to
+// MAX_INSTANCES (256) and a period array may declare MAX_PERIOD_ARR_SIZE (100)
+// entries, against a D of 16. The probe indexes with the raw argument and has
+// no room to check, so an id of 16 would read past the wrapper's global into
+// its neighbour in the shared section and branch there.
+//
+// Rather than spend hit-path instructions, the probe is not emitted unless the
+// bound is provable: the function is still wrapped and the taskpool serves it,
+// the same degradation as running out of slots. An array declared in another
+// TU is not provable here and so also declines.
+static bool dimsProvablyInRange(const Function &F,
+                                const std::map<std::string, uint32_t> &Sizes) {
+  for (const PeriodArrIndInfo &Info : getPeriodArrIndInfo(F)) {
+    auto It = Sizes.find(Info.PeriodName);
+    if (It == Sizes.end())
+      return false; // size not visible in this module
+    // A count of 0 never reaches here: collectPeriodArraySizes() maps
+    // "not stated" to kUnprovablePeriodArraySize, which fails this same test.
+    if (It->second > EJIT_ICACHE_DIM_SIZE)
+      return false;
+  }
+  return true;
+}
+
 // Per-function pointer-typed global holding the inline-cache cell table: the
 // specialization pointer for each dim identity once resolved, null until then
 // and null again after a period toggle drains it. Internal linkage (each
@@ -585,8 +653,20 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   // it is only safe when a cached pointer is callable on any core.
   std::map<std::string, IcacheSlotInfo> IcacheFnGlobals;
   if (EJitInlineCache) {
+    const std::map<std::string, uint32_t> PeriodArraySizes =
+        collectPeriodArraySizes(M);
     for (Function *F : EntryFuncs) {
       unsigned NumDims = getPeriodArrIndInfo(*F).size();
+      // Skip functions whose dim arguments could index outside the table. The
+      // probe cannot bounds-check without giving up its shape, so it is not
+      // emitted at all; the taskpool serves the function instead.
+      if (!dimsProvablyInRange(*F, PeriodArraySizes)) {
+        LLVM_DEBUG(dbgs() << "ejit-wrapper-gen: no inline cache for "
+                          << F->getName()
+                          << ": dim range not provably < " << EJIT_ICACHE_DIM_SIZE
+                          << "\n");
+        continue;
+      }
       // Skip functions exceeding the cache dimensionality cap from the icache
       // map. They are still wrapped (taskpool path) but without an icache probe;
       // the per-function DimCount > EJIT_ICACHE_MAX_DIMS check below emits the
