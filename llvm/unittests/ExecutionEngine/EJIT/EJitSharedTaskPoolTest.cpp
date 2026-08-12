@@ -2986,13 +2986,16 @@ TEST_F(SharedTaskPoolTest, InlineCacheRegistrationRejectsAnOverCapShape) {
   EXPECT_TRUE(ejitIcacheRegisterSlot(3, &cells[0], 1));
 }
 
-// Cross-core executability gate. A shared cell publishes the pointer to every
-// core the instant it is written, so it may only be filled where a resolved
-// fnPtr is callable on every core with no per-core work. Wiring per-core
-// execute preparation (a prepareCode callback, or 4K-seal mode) makes that
-// false, and the fill must decline rather than hand a peer an address it has
-// not sealed.
-TEST_F(SharedTaskPoolTest, InlineCacheDeclinesFillWhenCoresPrepareIndividually) {
+// The fill does NOT depend on cross-core executability, and must not: every
+// build the AOT probe is allowed in (EJIT_SRE_SHARED_CODE_POINTERS) wires either
+// fourKSeal_ or prepareCodeFn_, so gating on icacheCrossCoreExecutable() here
+// would leave the inline cache inert everywhere it is supposed to run.
+//
+// What makes a cell safe to jump to under per-core preparation is the deployment
+// contract that cores drive disjoint dim identities: a core only reads cells it
+// filled itself, after resolving through the taskpool, which is where it
+// prepared the code. See the header.
+TEST_F(SharedTaskPoolTest, InlineCacheFillsWhenCoresPrepareIndividually) {
   constexpr uint32_t kFunc = 3;
   void *fn = codeFor(kFunc);
 
@@ -3002,27 +3005,29 @@ TEST_F(SharedTaskPoolTest, InlineCacheDeclinesFillWhenCoresPrepareIndividually) 
     uintptr_t slot = 0;
     registerSlot(kFunc, &slot, 0);
     ASSERT_TRUE(pool.icacheCrossCoreExecutable());
-  pool.icacheFill(kFunc, fn, nullptr, 0, pool.icacheBeginResolve());
+    pool.icacheFill(kFunc, fn, nullptr, 0, pool.icacheBeginResolve());
     ASSERT_NE(slot, 0u) << "baseline: no per-core preparation, fill allowed";
 
-    // Legacy 2M path: a wired prepareCode callback means each core must make the
-    // pointer executable itself.
+    // Legacy 2M path: a wired prepareCode callback means each core makes the
+    // pointer executable itself. The cache is still filled -- the core that
+    // fills has already prepared, and disjointness keeps peers off this cell.
     PrepareLog prepare;
     pool.setPrepareCodeCallback(&mockPrepareCode, &prepare);
-    EXPECT_FALSE(pool.icacheCrossCoreExecutable());
+    EXPECT_FALSE(pool.icacheCrossCoreExecutable())
+        << "the platform state is still reported, it is just not a fill gate";
     slot = 0;
-        pool.icacheFill(kFunc, fn, nullptr, 0, pool.icacheBeginResolve());
-    EXPECT_EQ(slot, 0u) << "prepareCode wired: fill must decline";
+    pool.icacheFill(kFunc, fn, nullptr, 0, pool.icacheBeginResolve());
+    EXPECT_NE(slot, 0u) << "prepareCode wired: fill must still happen";
 
     pool.setPrepareCodeCallback(nullptr, nullptr);
-    EXPECT_TRUE(pool.icacheCrossCoreExecutable());
-        pool.icacheFill(kFunc, fn, nullptr, 0, pool.icacheBeginResolve());
-    EXPECT_NE(slot, 0u) << "callback unwired: fill allowed again";
+    slot = 0;
+    pool.icacheFill(kFunc, fn, nullptr, 0, pool.icacheBeginResolve());
+    EXPECT_NE(slot, 0u) << "callback unwired: fill unchanged";
     pool.ownerShutdown(); // release the blob so the 4K pool below can own it
   }
 
-  // 4K-seal mode: each core splits its pool and seals the code's pages before
-  // executing a peer's code, so the shared cell may not be filled at all.
+  // 4K-seal mode: the mode the production board runs. This is the case that was
+  // silently disabling the whole feature.
   {
     ejitIcacheClearAll();
     FourKLog fourK;
@@ -3033,7 +3038,8 @@ TEST_F(SharedTaskPoolTest, InlineCacheDeclinesFillWhenCoresPrepareIndividually) 
     registerSlot(kFunc, &slot, 0);
     EXPECT_FALSE(sealPool.icacheCrossCoreExecutable());
     sealPool.icacheFill(kFunc, fn, nullptr, 0, sealPool.icacheBeginResolve());
-    EXPECT_EQ(slot, 0u) << "4K-seal mode: fill must decline";
+    EXPECT_NE(slot, 0u) << "4K-seal mode: fill must happen, or the inline cache "
+                           "is dead on every real target";
   }
 }
 

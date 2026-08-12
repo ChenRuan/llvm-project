@@ -510,13 +510,27 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
     }
     return;
   }
-  // Cross-core executability gate: this store publishes fnPtr to every core at
-  // once, including cores that have not prepared it. Where the platform needs
-  // per-core execute preparation a peer would jump to an address it has not
-  // sealed, so decline and let the taskpool -- which prepares -- serve every
-  // call. See icacheCrossCoreExecutable().
-  if (!icacheCrossCoreExecutable())
-    return;
+  // NO icacheCrossCoreExecutable() gate here, deliberately.
+  //
+  // Cells are addressed by dim identity, and the deployment contract is that
+  // cores drive DISJOINT ejit_period_lc instance indices. A core therefore only
+  // ever reads cells it filled itself, and it filled them after resolving
+  // through the taskpool -- which is where it did whatever per-core execute
+  // preparation the platform needs (4K seal / prepareCodeFn_). So the pointer
+  // it loads is always code it has already prepared, which is the guarantee a
+  // per-core .bss table used to give structurally.
+  //
+  // Gating on icacheCrossCoreExecutable() instead disables the cache in every
+  // build it is allowed in: EJitCompileDriver sets fourKSeal_ under
+  // EJIT_CODE_POOL_4K_SEAL and wires prepareCodeFn_ otherwise, both inside
+  // EJIT_SRE_SHARED_CODE_POINTERS, which the AOT probe requires. Both branches
+  // close it, so no cell was ever filled on any real target.
+  //
+  // What the gate would protect against is two cores sharing a dim identity,
+  // where the second loads a pointer only the first has sealed. That is a
+  // violation of the disjointness contract, and it cannot be detected from
+  // here: a cell carries no record of which core wrote it, and adding one puts
+  // a per-core gate back on a probe whose whole point is not having one.
   if (!state_ || !fnPtr || funcIndex >= EJIT_ICACHE_FUNC_SLOTS) {
     if (!gIcacheFillRejectLogged[kFillRejectArgs]) {
       gIcacheFillRejectLogged[kFillRejectArgs] = true;
