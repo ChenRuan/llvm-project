@@ -22,6 +22,10 @@
 ; 5 reads → above threshold → no warning.
 ; CHECK-NOT: EJit warning: ejit_entry function 'entry_five'
 
+; 1 read in a loop → K=1 is below threshold 4, but J=1 > 0 → the loop
+; load is high specialization value → no warning.
+; CHECK-NOT: EJit warning: ejit_entry function 'entry_one_in_loop'
+
 ; OFF threshold (0) → no warning at all.
 ; OFF-NOT: has only {{[0-9]+}} ejit_may_const read
 
@@ -90,6 +94,25 @@ define internal i32 @helper_two(i32 %c) {
   %v1 = load i32, ptr %p1, !ejit.may_const !{}
   %sum = add i32 %v0, %v1
   ret i32 %sum
+}
+
+; ── 1 read in a loop: below threshold 4, but in-loop → high value → no warn ──
+; Use an outer function call to tether the loop so the back-edge
+; survives preOptimize's SimplifyCFG.
+declare void @sink(i32)
+define i32 @entry_one_in_loop(i32 %n) !ejit.metadata !20 {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [0, %entry], [%i.next, %loop]
+  %p = getelementptr [16 x i32], ptr @cell_data, i32 0, i32 %i
+  %v = load i32, ptr %p, !ejit.may_const !{}
+  call void @sink(i32 %v)
+  %i.next = add i32 %i, 1
+  %cond = icmp slt i32 %i, %n
+  br i1 %cond, label %loop, label %exit
+exit:
+  ret i32 %v
 }
 
 !10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}, !{!"ejit_may_const_field", i32 0}}
