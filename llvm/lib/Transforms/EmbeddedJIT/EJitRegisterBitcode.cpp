@@ -692,12 +692,16 @@ static GlobalVariable *embedBitcode(Module &M, const std::string &Bitcode) {
   return GV;
 }
 
+static void collectFunctionsFromConstant(Constant *C,
+                                         SmallPtrSetImpl<Function *> &Funcs);
+
 /// Collect external symbols (functions + globals) referenced by the
 /// closure and generate ejit_register_symbol calls so the JIT can resolve
 /// them without dlsym — suitable for bare-metal embedded environments.
 static void generateSymbolRegisters(
     Module &M,
     const SetVector<Function *> &ClosureFuncs,
+    const SetVector<GlobalVariable *> &ClosureGlobals,
     Function *AutoReg) {
   LLVMContext &Ctx = M.getContext();
   const DataLayout &DL = M.getDataLayout();
@@ -759,16 +763,61 @@ static void generateSymbolRegisters(
       }
     }
   }
+
+  // Scan GlobalVariable initializers for function pointers stored in
+  // constant aggregates (e.g., const arrays of structs with fn_ptr
+  // fields used as indirect-call tables).  The instruction-level scan
+  // above only catches direct calls and direct GV operand references;
+  // indirect calls through loaded function pointers are missed because
+  // CI->getCalledFunction() returns nullptr.
+  for (GlobalVariable *GV : ClosureGlobals) {
+    if (!GV->hasInitializer())
+      continue;
+    SmallPtrSet<Function *, 8> FuncsInInit;
+    collectFunctionsFromConstant(GV->getInitializer(), FuncsInInit);
+    for (Function *F : FuncsInInit) {
+      if (!F->isDeclaration() || F->isIntrinsic())
+        continue;
+      std::string Name = F->getName().str();
+      if (registered.insert(Name).second) {
+        IRBuilder<> Builder(InsertBefore);
+        Builder.CreateCall(M.getFunction("ejit_register_symbol"),
+            {Builder.CreateGlobalString(Name),
+             Builder.CreateBitCast(F, PtrTy)});
+      }
+    }
+  }
+}
+
+/// Recursively walk a Constant (initializer of a GlobalVariable) and
+/// collect all Function declarations reachable through constant
+/// aggregates, structs, and expressions.  This discovers indirect-call
+/// targets stored in jump tables / callback arrays that are missed by
+/// the instruction-level direct-call scan.
+static void collectFunctionsFromConstant(Constant *C,
+                                         SmallPtrSetImpl<Function *> &Funcs) {
+  if (auto *F = dyn_cast<Function>(C)) {
+    Funcs.insert(F);
+    return;
+  }
+  // Stop at GlobalValues (other than Function, which is handled above)
+  // to avoid following references to other global variables.
+  if (isa<GlobalValue>(C))
+    return;
+  for (Value *Op : C->operands())
+    collectFunctionsFromConstant(cast<Constant>(Op), Funcs);
 }
 
 static void
 generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
                       const SetVector<Function *> &ClosureFuncs,
+                      const SetVector<GlobalVariable *> &ClosureGlobals,
                       GlobalVariable *BitcodeGV);
 
 static void generateRegisterCall(Module &M, GlobalVariable *BitcodeGV,
                                  const SmallVectorImpl<Function *> &EntryFuncs,
-                                 const SetVector<Function *> &ClosureFuncs) {
+                                 const SetVector<Function *> &ClosureFuncs,
+                                 const SetVector<GlobalVariable *> &ClosureGlobals) {
   LLVMContext &Ctx = M.getContext();
   auto *VoidTy = Type::getVoidTy(Ctx);
   auto *PtrTy = PointerType::getUnqual(Ctx);
@@ -801,13 +850,13 @@ static void generateRegisterCall(Module &M, GlobalVariable *BitcodeGV,
 
   // Auto-register external symbols referenced by the closure so the JIT
   // can resolve them without manual ejit_register_symbol calls.
-  generateSymbolRegisters(M, ClosureFuncs, AutoReg);
+  generateSymbolRegisters(M, ClosureFuncs, ClosureGlobals, AutoReg);
 
   if (EnableEJitGlobalCtors)
     appendToGlobalCtors(M, AutoReg, EJIT_CTOR_PRIORITY);
 
   // Always build the static registry table for bare-metal / testing fallback.
-  generateRegistryTable(M, EntryFuncs, ClosureFuncs, BitcodeGV);
+  generateRegistryTable(M, EntryFuncs, ClosureFuncs, ClosureGlobals, BitcodeGV);
 }
 
 /// Emit this translation unit's bitcode registry entries as a private array in
@@ -818,6 +867,7 @@ static void generateRegisterCall(Module &M, GlobalVariable *BitcodeGV,
 static void
 generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
                       const SetVector<Function *> &ClosureFuncs,
+                      const SetVector<GlobalVariable *> &ClosureGlobals,
                       GlobalVariable *BitcodeGV) {
   LLVMContext &Ctx = M.getContext();
   auto *I32Ty = Type::getInt32Ty(Ctx);
@@ -872,6 +922,19 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
             addSymbol(Callee);
       }
     }
+  }
+
+  // Also collect external function declarations referenced through
+  // GlobalVariable initializers (e.g., function pointers stored in
+  // constant struct arrays used as indirect-call targets).  The
+  // instruction scanning loop above only catches direct calls.
+  for (GlobalVariable *GV : ClosureGlobals) {
+    if (!GV->hasInitializer())
+      continue;
+    SmallPtrSet<Function *, 8> FuncsInInit;
+    collectFunctionsFromConstant(GV->getInitializer(), FuncsInInit);
+    for (Function *F : FuncsInInit)
+      addSymbol(F);
   }
 
   // Global variable symbol entries. Resolve through bitcasts/GEPs via
@@ -955,7 +1018,7 @@ EJitRegisterBitcodePass::run(Module &M, ModuleAnalysisManager &) {
   std::string Bitcode =
       extractAndSerialize(M, ClosureFuncs, ClosureGlobals, EntryFuncs);
   GlobalVariable *BitcodeGV = embedBitcode(M, Bitcode);
-  generateRegisterCall(M, BitcodeGV, EntryFuncs, ClosureFuncs);
+  generateRegisterCall(M, BitcodeGV, EntryFuncs, ClosureFuncs, ClosureGlobals);
 
   return PreservedAnalyses::none();
 }
