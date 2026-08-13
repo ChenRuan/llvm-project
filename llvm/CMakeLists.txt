@@ -781,23 +781,23 @@ message(STATUS "EmbeddedJIT: inline-cache slot capacity=${EJIT_ICACHE_FUNC_SLOTS
 # platform MUST measure the worker stack peak and tune it.
 set(EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE "1048576" CACHE STRING
   "EmbeddedJIT taskpool worker task stack size in bytes (default only)")
-set(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS "1" CACHE STRING
-  "EmbeddedJIT worker work items between throttle delays (0 disables)")
+set(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT "1" CACHE STRING
+  "EmbeddedJIT worker inter-task throttle delay multiplier (n in n*base ticks after every task; 0 disables)")
 set(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS "100" CACHE STRING
-  "EmbeddedJIT worker throttle delay in scheduler ticks after each burst (0 disables)")
+  "EmbeddedJIT worker throttle delay base in scheduler ticks (the base in MULT*DELAY_TICKS; 0 disables)")
 if(EJIT_SRE_TASKPOOL)
   add_definitions(-DEJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS})
   add_definitions(-DEJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY})
   add_definitions(-DEJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX})
   add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE})
-  add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS})
+  add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT})
   add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS})
   message(STATUS "EmbeddedJIT: SRE taskpool enabled "
                  "(buckets=${EJIT_SRE_TASKPOOL_BUCKETS}, "
                  "queue=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}, "
                  "maxFuncIndex=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}, "
                  "workerStack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}, "
-                 "throttleItems=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS}, "
+                 "throttleMult=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT}, "
                  "throttleDelayTicks=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS})")
 endif()
 

@@ -875,10 +875,19 @@ struct IdleScript {
   int initializingYields = 0;
   bool readyPublished = false;
   bool stopped = false;
+  // Record the ticks arg the idle/delay hook was called with, so tests can
+  // assert the throttle path passes MULT*DELAY_TICKS (not 1) and the wait/idle
+  // path passes 1.
+  uint32_t maxTicks = 0;
+  bool sawWaitTicks = false;
 };
-void scriptedIdle(void *ctx) {
+void scriptedIdle(void *ctx, uint32_t ticks) {
   auto *s = static_cast<IdleScript *>(ctx);
   ++s->idleCalls;
+  if (ticks > s->maxTicks)
+    s->maxTicks = ticks;
+  if (ticks == 1u)
+    s->sawWaitTicks = true;
   uint32_t st = s->st->initState.loadAcquire();
   if (st == static_cast<uint32_t>(EJitSharedInitState::Initializing)) {
     ++s->initializingYields;
@@ -994,6 +1003,12 @@ TEST_F(SharedTaskPoolTest, RealWorkerEntrySurvivesInitializingAndConsumes) {
   EXPECT_GE(script.initializingYields,
             3); // yielded (not exited) on Initializing
   EXPECT_GT(pool.workerIdleYields(), 0u); // worker yielded, never busy-spun
+  // The throttle path (after the consume) must pass MULT*DELAY_TICKS in ONE
+  // call (not 1, not a per-tick loop); the wait/idle path must pass 1.
+  EXPECT_EQ(script.maxTicks,
+            static_cast<uint32_t>(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT *
+                                  EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS));
+  EXPECT_TRUE(script.sawWaitTicks);
   EXPECT_TRUE(pool.workerWaitedForReady());
   EXPECT_GT(pool.workerConsumeLoops(),
             0u); // SAME worker reached Ready+consumed

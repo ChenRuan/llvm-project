@@ -7,8 +7,8 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
-#ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS
-#define EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS 1u
+#ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT
+#define EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT 1u
 #endif
 
 #ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS
@@ -53,16 +53,15 @@ void EJitWorker::taskEntry(void *ctx) { static_cast<EJitWorker *>(ctx)->run(); }
 void EJitWorker::run() {
   EJIT_DIAG("worker loop enter");
   running_.storeRelease(1);
-  uint32_t consumedSinceThrottle = 0;
   while (!task_.stopRequested()) {
     if (pool_.pollOne()) {
       processed_.fetchAdd(1);
-      if (EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS != 0u &&
-          EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS != 0u &&
-          ++consumedSinceThrottle >= EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS) {
-        consumedSinceThrottle = 0;
-        EJitSreTask::delay(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS);
-      }
+      // Throttle after EVERY consumed task: ONE delay(MULT*DELAY_TICKS) call,
+      // not DELAY_TICKS separate yields. Either 0 disables (no inter-task gap).
+      if (EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT != 0u &&
+          EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS != 0u)
+        EJitSreTask::delay(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT *
+                            EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS);
     } else {
       spins_.fetchAdd(1);
       // Idle hint so the single consumer does not spin the core at full speed.

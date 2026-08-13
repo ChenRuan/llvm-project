@@ -108,6 +108,11 @@ target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
   EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}
   EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS}
   EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}
+  # MULT=3 (not the default 1) so tests can assert the multiplier takes effect:
+  # the throttle must pass MULT*DELAY_TICKS=300 in one call, catching "passes 1"
+  # and "multiply omitted" regressions that MULT=1 cannot distinguish.
+  EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=3
+  EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=100
   )
 
 # Opt-in: build the shared taskpool tests with the load-only NO_RECLAIM seqlock

@@ -242,13 +242,17 @@ public:
   /// return until the worker has exited (no use-after-free of owner-private
   /// state).
   using WorkerStopFn = void (*)(void *startCtx);
-  /// Idle/yield hook the worker calls whenever it has no work to do (waiting on
-  /// the owner to publish Ready, or Ready with an empty queue). The production
-  /// build injects a platform yield (EJitSreTask::yield: SRE_TaskDelay on
-  /// freestanding, std::this_thread::yield on host) so a high-priority worker
-  /// never busy-spins and starves the core trying to publish Ready. MUST NOT be
-  /// called while holding a bucket lock / queue slot / dedup critical state.
-  using WorkerIdleFn = void (*)(void *ctx);
+  /// Idle/delay hook the worker calls in two situations: (1) whenever it has no
+  /// work to do (waiting on the owner to publish Ready, or Ready with an empty
+  /// queue), passed \p ticks=1 for a single yield; (2) after EVERY consumed
+  /// compile task as a throttle delay, passed \p ticks = MULT*DELAY_TICKS -- a
+  /// single delay(ticks) call, NOT ticks separate yield() calls. The production
+  /// build injects EJitSreTask::delay(ticks) (delay(1) == yield():
+  /// SRE_TaskDelay on freestanding, std::this_thread::yield on host) so a
+  /// high-priority worker never busy-spins and starves the core trying to
+  /// publish Ready. MUST NOT be called while holding a bucket lock / queue slot
+  /// / dedup critical state.
+  using WorkerIdleFn = void (*)(void *ctx, uint32_t ticks);
   /// Owner-only setup hook (see setOwnerElectedCallback). Return false to fail
   /// init. Runs on the elected owner, inside init(), before the worker starts.
   using OwnerElectedFn = bool (*)(void *ctx);
@@ -424,8 +428,10 @@ public:
     ownerReleased_ = fn;
     ownerReleasedCtx_ = ctx;
   }
-  /// Inject the worker idle/yield hook (see WorkerIdleFn). When unset the loop
-  /// falls back to a compiler reordering barrier only (used by step tests).
+  /// Inject the worker idle/delay hook (see WorkerIdleFn). When unset the loop
+  /// falls back to a compiler reordering barrier only (used by step tests). The
+  /// hook receives a tick count: 1 for a yield, MULT*DELAY_TICKS for the
+  /// post-task throttle delay.
   void setWorkerIdleHook(WorkerIdleFn fn, void *ctx) {
     workerIdle_ = fn;
     workerIdleCtx_ = ctx;
@@ -691,14 +697,16 @@ public:
   bool workerWaitedForReady() const {
     return workerWaitedForReady_.loadRelaxed() != 0;
   }
-  /// Number of times the worker yielded (idle hook calls): proves it does not
-  /// busy-spin while waiting or idle.
+  /// Number of idle-hook calls (idle yields AND post-task throttle delays):
+  /// proves the worker does not busy-spin while waiting, idle, or throttling.
   uint64_t workerIdleYields() const { return workerIdleYields_.loadRelaxed(); }
 
 private:
   static void workerEntryThunk(void *ctx);
-  /// Yield the CPU between work items (injected hook, or a reordering barrier).
-  void workerIdle();
+  /// Yield/delay the CPU (injected hook, or a reordering barrier). \p ticks=1
+  /// is a single yield (idle/wait); \p ticks=MULT*DELAY_TICKS is the post-task
+  /// throttle delay. Bumps workerIdleYields_ either way.
+  void workerIdle(uint32_t ticks);
 
   /// Result of a shared-cache lookup, including the cross-core fnPtr gate.
   struct SharedLookup {

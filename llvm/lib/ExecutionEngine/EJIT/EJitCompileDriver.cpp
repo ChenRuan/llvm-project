@@ -245,10 +245,13 @@ void EJitCompileDriver::sharedWorkerStop(void *ctx) {
       static_cast<EJitCompileDriver *>(ctx)->sharedWorkerTask_);
 }
 
-void EJitCompileDriver::sharedWorkerIdle(void * /*ctx*/) {
-  // Platform yield: SRE_TaskDelay(1) on freestanding, std::this_thread::yield()
-  // on host. The shared taskpool core never names SRE_TaskDelay directly.
-  EJitSreTask::yield();
+void EJitCompileDriver::sharedWorkerIdle(void * /*ctx*/, uint32_t ticks) {
+  // Platform delay: SRE_TaskDelay(ticks) on freestanding, ticks yields on host.
+  // ticks=1 is a single yield (idle/wait); ticks=MULT*DELAY_TICKS is the
+  // post-task throttle delay. The shared taskpool core never names
+  // SRE_TaskDelay directly -- it goes through this injected hook (delay(1) ==
+  // yield()).
+  EJitSreTask::delay(ticks);
 }
 
 bool EJitCompileDriver::sharedOwnerElected(void *ctx) {

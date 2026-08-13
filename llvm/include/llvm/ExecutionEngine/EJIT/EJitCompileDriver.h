@@ -150,9 +150,10 @@ private:
                                 EJitSharedTaskPool::WorkerEntryFn entry,
                                 void *entryCtx, uint64_t *outTaskId);
   static void sharedWorkerStop(void *ctx);
-  /// Worker idle/yield hook: defers to the platform task abstraction
-  /// (EJitSreTask::yield) so the shared worker never busy-spins.
-  static void sharedWorkerIdle(void *ctx);
+  /// Worker idle/delay hook: defers to the platform task abstraction
+  /// (EJitSreTask::delay) so the shared worker never busy-spins. ticks=1 is a
+  /// single yield; ticks=MULT*DELAY_TICKS is the post-task throttle delay.
+  static void sharedWorkerIdle(void *ctx, uint32_t ticks);
   /// Owner-elected hook: builds the engine on whichever core wins the election.
   /// ctx is the driver, which owns sharedPool_ and so always outlives it.
   static bool sharedOwnerElected(void *ctx);
