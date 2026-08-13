@@ -1,4 +1,4 @@
-// RUN: %clang_cc1 -fsyntax-only -verify=expected %s
+// RUN: %clang_cc1 -fsyntax-only -Wembedded-jit-addr-of-may-const -verify=expected %s
 // EmbeddedJIT attribute semantic analysis tests
 
 // === Correct usage -- should produce no diagnostics ===
@@ -63,6 +63,11 @@ struct WarnCfg {
 
 __attribute__((ejit_period_arr("cell"))) struct WarnCfg g_warn[4];
 
+void consume(int *p);
+void inspect(const int *p);
+__attribute__((ejit_period_lc("cell")))
+void lc_consume(__attribute__((ejit_period_arr_ind("cell"))) int idx, int *p);
+
 // A plain function (no ejit_period_lc) that writes may_const fields -> warn.
 void bad_writer(int i, int v) {
   g_warn[i].cellType = v;  // expected-warning {{modifying ejit_may_const field 'cellType' of 'g_warn' without ejit_period_lc attribute}}
@@ -72,6 +77,82 @@ void bad_writer(int i, int v) {
   g_warn[i].plain = v;     // no warning: 'plain' is not ejit_may_const
   int r = g_warn[i].cellType; // no warning: read, not a write
   (void)r;
+  int *p1 = &g_warn[i].cellType;        // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}}
+  const int *p2 = &g_warn[i].cellType;  // no warning: const qualifier on pointee
+  int *p3 = (int *)&g_warn[i].cellType; // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}} (explicit cast does not add const)
+  int *p4; p4 = &g_warn[i].cellType;    // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}} (plain assignment)
+  int &r1 = g_warn[i].cellType;         // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}} (non-const reference)
+  const int &r2 = g_warn[i].cellType;   // no warning: const reference
+  consume(&g_warn[i].cellType);         // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}} (call argument)
+  inspect(&g_warn[i].cellType);         // no warning: const parameter
+  lc_consume(i, &g_warn[i].cellType);   // no warning: ejit_period_lc callee is sanctioned
+  int *p5{&g_warn[i].cellType};         // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}} (braced init)
+  (void)p1; (void)p2; (void)p3; (void)p4; (void)r1; (void)r2; (void)p5;
+}
+
+// Returning a non-const reference to a may_const field -> warn (same escape
+// as a non-const pointer).
+int &bad_ref_return(int i) {
+  return g_warn[i].cellType; // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}}
+}
+
+// Extern declaration whose definition lives in another TU: the definition may
+// carry the period attribute, so treat it as possibly period data -> warn.
+extern struct WarnCfg g_ext[4];
+void extern_writer(int i) {
+  g_ext[i].cellType = 1;       // expected-warning {{modifying ejit_may_const field 'cellType' of 'g_ext' without ejit_period_lc attribute}}
+  int *p = &g_ext[i].cellType; // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_ext' without const qualifier}}
+  (void)p;
+}
+
+// Return statements inside a lambda are checked against the lambda's return
+// type, not the enclosing function's.
+const int *lambda_escape(int i) {
+  auto L = [i]() -> int * { return &g_warn[i].cellType; }; // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}}
+  return L();
+}
+int *lambda_safe(int i) {
+  auto L = [i]() -> const int * { return &g_warn[i].cellType; }; // no warning: lambda returns const pointer
+  return const_cast<int *>(L());
+}
+
+// Methods of local classes are checked once, via the enclosing function's
+// traversal, against the method's own return type.
+int *local_class_escape(int i) {
+  struct H { int *get() { return &g_warn[0].cellType; } }; // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}}
+  H h; return h.get();
+}
+const int *local_class_safe(int i) {
+  struct H { const int *get() { return &g_warn[0].cellType; } }; // no warning: const method return type
+  H h; return h.get();
+}
+
+// Returning a non-const pointer to a may_const field -> warn.
+int *bad_return(int i) {
+  return &g_warn[i].cellType; // expected-warning {{taking address of ejit_may_const field 'cellType' of 'g_warn' without const qualifier}}
+}
+
+// Non-period global: value-type base, not period data -> no warning.
+WarnCfg g_plain[4];
+
+void plain_global_writer(int i) {
+  g_plain[i].cellType = 1;       // no warning: g_plain is not period data
+  int *p = &g_plain[i].cellType; // no warning: value-type non-period global
+  (void)p;
+}
+
+// Local struct copy: value type, not period data -> no warning.
+void local_copy_writer(int i) {
+  WarnCfg local = g_warn[i];
+  local.cellType = 1;             // no warning: local copy, not period data
+  int *p = &local.cellType;       // no warning: local copy
+  (void)p;
+}
+
+// Member pointer formation does not escape a writable pointer -> no warning.
+void member_ptr_writer() {
+  int WarnCfg::*mp = &WarnCfg::cellType;  // no warning
+  (void)mp;
 }
 
 // An ejit_period_lc function is sanctioned to modify may_const fields -> no warning.
@@ -79,6 +160,7 @@ __attribute__((ejit_period_lc("cell")))
 void good_writer(__attribute__((ejit_period_arr_ind("cell"))) int i, int v) {
   g_warn[i].cellType = v;  // no warning: ejit_period_lc sanctions the write
   g_warn[i].flags += v;    // no warning
+  int *p1 = &g_warn[i].cellType;        // no warning: lc is exempt
 }
 
 // === Warning: always_inline conflicts with ejit_entry / ejit_period_lc ===
