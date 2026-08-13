@@ -83,11 +83,20 @@ add_llvm_unittest(EJITSharedTaskPoolTests
   EJitSharedTaskPoolTest.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
+  # Defines gEJitDiagLevel (the level gate behind every EJIT_DIAG* call in the
+  # two sources above). Needed when the global EJIT_DIAG_ENABLE is ON: without
+  # it the test binary fails to link, since this target deliberately links only
+  # LLVMSupport and never the full LLVMEJIT (which carries EJitLogger.cpp).
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
 
   PARTIAL_SOURCES_INTENDED
   )
 set(LLVM_LINK_COMPONENTS "${EJIT_SHARED_TASKPOOL_LINK_COMPONENTS_SAVED}")
 
+# The icache geometry must match the production LLVMEJIT build (same CMake
+# vars, same static_assert): these sources are compiled INTO the test target,
+# so without the definitions the header defaults apply and the FUNC_SLOTS
+# static_assert (64 >= 4096) fails.
 target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
   EJIT_SRE_TASKPOOL
   EJIT_SRE_SHARED_TASKPOOL
@@ -96,6 +105,9 @@ target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
   EJIT_SRE_TASKPOOL_BUCKETS=32
   EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
   EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=1048576
+  EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}
+  EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS}
+  EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}
   )
 
 # Opt-in: build the shared taskpool tests with the load-only NO_RECLAIM seqlock
@@ -132,6 +144,7 @@ if(EJIT_BUILD_CACHE_QUERY_BENCH)
     EJitSharedCacheQueryBench.cpp
     ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
     ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
+    ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
 
     PARTIAL_SOURCES_INTENDED
     )
@@ -141,6 +154,9 @@ if(EJIT_BUILD_CACHE_QUERY_BENCH)
     EJIT_SRE_TASKPOOL_TESTING
     EJIT_SRE_TASKPOOL_BUCKETS=32
     EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
+    EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}
+    EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS}
+    EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}
     )
   # Opt-in: build the benchmark with the load-only NO_RECLAIM seqlock hit path
   # + cross-core code sharing (so peer hits and the fixed-dim seqlock lookups

@@ -758,6 +758,22 @@ set(EJIT_SRE_TASKPOOL_QUEUE_CAPACITY "1024" CACHE STRING
 # Flat dedup table capacity = max dense funcIndex (spec §3.5 inFlight_[]).
 set(EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX "4096" CACHE STRING
   "EmbeddedJIT SRE taskpool flat dedup capacity (max dense funcIndex)")
+# EJIT_ICACHE_FUNC_SLOTS: capacity of the per-function inline-cache slot table
+# (gIcacheSlots[]). MUST be >= kEJitMaxFuncIndex (EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX),
+# else any funcIndex >= EJIT_ICACHE_FUNC_SLOTS has its icacheFill silently dropped
+# and the wrapper's inline probe misses forever - every call falls through to
+# MissFn -> tryCacheHit -> cacheHits++, defeating the inline cache. Default 4096
+# matches kEJitMaxFuncIndex so the two never desynchronize. Scoped to LLVMEJIT
+# (the icache runtime lives here), gated on the shared taskpool - same pattern
+# as EJIT_ICACHE_DIM_SIZE propagation below.
+set(EJIT_ICACHE_FUNC_SLOTS "4096" CACHE STRING
+  "EmbeddedJIT inline-cache slot table capacity (>= EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX)")
+# NOTE: the FUNC_SLOTS >= MAX_FUNC_INDEX hard check runs inside the
+# if(EJIT_SRE_SHARED_TASKPOOL) block below, because the icache is only
+# compiled under that option — a non-shared build must not be blocked by an
+# irrelevant slot-table limit. (The static_assert in EJitSharedTaskPool.cpp is
+# the compile-time backstop for non-CMake builds.)
+message(STATUS "EmbeddedJIT: inline-cache slot capacity=${EJIT_ICACHE_FUNC_SLOTS}")
 # Single source of truth for the worker task stack size (bytes). The worker —
 # shared OR per-instance — runs LLVM optimize/codegen/ORC/JITLink on its OWN
 # stack via EJitSreTask, so this drives the platform SRE_TaskCreate stack too
@@ -815,6 +831,17 @@ set(EJIT_SHARED_SECTION_ATTR "" CACHE STRING
 if(EJIT_SRE_SHARED_TASKPOOL)
   if(NOT EJIT_SRE_TASKPOOL)
     message(FATAL_ERROR "EJIT_SRE_SHARED_TASKPOOL requires EJIT_SRE_TASKPOOL=ON")
+  endif()
+  # FUNC_SLOTS is the gIcacheSlots[] capacity; any funcIndex >= FUNC_SLOTS has
+  # its icacheFill silently dropped and the wrapper's inline probe misses
+  # forever (every call falls through to MissFn -> tryCacheHit -> cacheHits++).
+  # It must cover the full dense funcIndex space.
+  if(EJIT_ICACHE_FUNC_SLOTS LESS EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX)
+    message(FATAL_ERROR
+      "EJIT_ICACHE_FUNC_SLOTS (${EJIT_ICACHE_FUNC_SLOTS}) must be >= "
+      "EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX (${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}); "
+      "otherwise funcIndex >= EJIT_ICACHE_FUNC_SLOTS silently drops icacheFill "
+      "and the wrapper's inline probe misses forever.")
   endif()
   add_definitions(-DEJIT_SRE_SHARED_TASKPOOL)
   add_definitions(-DEJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS=${EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS})
