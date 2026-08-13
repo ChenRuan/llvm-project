@@ -2720,6 +2720,48 @@ TEST_F(SharedTaskPoolTest, InlineCacheStickyFrozen) {
   ejitIcacheClearAll();
 }
 
+// The funcIndex space is dense up to EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX, so the
+// slot table must cover the WHOLE range: slots registered at a high (but
+// in-range) funcIndex must fill and hit exactly like a low one. Regression
+// guard for the FUNC_SLOTS < MAX_FUNC_INDEX desync that silently dropped
+// icacheFill for 85% of the functions in the field (slots were 64, funcIndex
+// space was 4096).
+TEST_F(SharedTaskPoolTest, InlineCacheHighFuncIndex) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+
+  // Top of the table: funcIndex = EJIT_ICACHE_FUNC_SLOTS - 1.
+  constexpr uint32_t kTop = EJIT_ICACHE_FUNC_SLOTS - 1;
+  uintptr_t slotTop = 0;
+  ejitIcacheRegisterSlot(kTop, &slotTop, 0);
+  void *fnTop = codeFor(kTop);
+  void *out = nullptr;
+
+  EXPECT_FALSE(pool.icacheTry(kTop, nullptr, 0, &out));
+  EXPECT_EQ(out, nullptr);
+  pool.icacheFill(kTop, fnTop, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kTop, nullptr, 0, &out));
+  EXPECT_EQ(out, fnTop);
+
+  // Mid-table index that the old 64-slot table would have dropped.
+  constexpr uint32_t kMid = 2000;
+  uintptr_t slotMid = 0;
+  ejitIcacheRegisterSlot(kMid, &slotMid, 0);
+  void *fnMid = codeFor(kMid);
+  pool.icacheFill(kMid, fnMid, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kMid, nullptr, 0, &out));
+  EXPECT_EQ(out, fnMid);
+
+  // icacheFill at funcIndex == EJIT_ICACHE_FUNC_SLOTS stays a no-op and must
+  // not disturb the neighbouring top slot.
+  pool.icacheFill(EJIT_ICACHE_FUNC_SLOTS, fnMid, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kTop, nullptr, 0, &out));
+  EXPECT_EQ(out, fnTop);
+
+  ejitIcacheClearAll();
+}
+
 // Safety gate: wiring a releaser means code may be freed, and v2 does no
 // HP-scan retire, so the cache auto-disables (icacheTry always misses,
 // icacheFill no-op) to avoid UAF. Unwiring the releaser re-enables it.
