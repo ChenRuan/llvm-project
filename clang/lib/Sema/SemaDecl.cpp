@@ -88,6 +88,11 @@ void checkEjitAttrMissingOnDefinition(Sema &S, FunctionDecl *FD);
 // Defined in SemaEJIT.cpp.
 void checkEjitMayConstWrites(Sema &S, const FunctionDecl *FD, Stmt *Body);
 
+// Forward declaration for EmbeddedJIT undeclared period dependency check.
+// Defined in SemaEJIT.cpp.
+void checkEjitUndeclaredPeriodDeps(Sema &S, const FunctionDecl *FD,
+                                   Stmt *Body);
+
 Sema::DeclGroupPtrTy Sema::ConvertDeclToDeclGroup(Decl *Ptr, Decl *OwnedType) {
   if (OwnedType) {
     Decl *Group[2] = { OwnedType, Ptr };
@@ -16652,10 +16657,14 @@ Decl *Sema::ActOnFinishFunctionBody(Decl *dcl, Stmt *Body,
 
       // EmbeddedJIT: warn if a non-ejit_period_lc function writes an
       // ejit_may_const field (would break the JIT's time-window constancy
-      // assumption). The check no-ops unless ejit_may_const is in use and the
-      // warning is enabled.
-      if (FD && !FD->isInvalidDecl())
+      // assumption), and warn if an ejit_entry function references an
+      // ejit_period_arr global without declaring the dependency via an
+      // ejit_period_arr_ind parameter. Both checks no-op unless the
+      // respective warning is enabled.
+      if (FD && !FD->isInvalidDecl()) {
         checkEjitMayConstWrites(*this, FD, Body);
+        checkEjitUndeclaredPeriodDeps(*this, FD, Body);
+      }
 
       if (CXXDestructorDecl *Destructor = dyn_cast<CXXDestructorDecl>(dcl)) {
         if (!Destructor->getParent()->isDependentType())

@@ -22,11 +22,23 @@
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
 
+// Compile-time guard: if EJIT_ICACHE_FUNC_SLOTS ever falls below
+// EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX (defined in EJitSharedTaskPoolState.h,
+// included above; kEJitMaxFuncIndex mirrors it), funcIndex >=
+// EJIT_ICACHE_FUNC_SLOTS silently drops icacheFill and the inline cache misses
+// for those functions. Caught at LLVMEJIT compile time in every build (debug
+// AND release - static_assert is a C++11 compile-time check, not a runtime
+// macro). Compare the two macros directly so this TU keeps its intentionally
+// light include set (the unit test target compiles it with LLVMSupport only).
+static_assert(EJIT_ICACHE_FUNC_SLOTS >= EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX,
+              "EJIT_ICACHE_FUNC_SLOTS must be >= EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX; "
+              "otherwise icacheFill silently drops high-funcIndex entries.");
+
 using namespace llvm;
 using namespace llvm::ejit;
 
-#ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS
-#define EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS 1u
+#ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT
+#define EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT 1u
 #endif
 
 #ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS
@@ -177,6 +189,30 @@ void llvm::ejit::ejitIcacheClearAll() {
   }
 }
 
+void llvm::ejit::ejitDumpIcacheSlots() {
+  EJIT_DIAG("=== gIcacheSlots dump (%u slots) ===",
+            (unsigned)EJIT_ICACHE_FUNC_SLOTS);
+  uint32_t registered = 0;
+  uint32_t filled = 0;
+  for (uint32_t f = 0; f < EJIT_ICACHE_FUNC_SLOTS; ++f) {
+    EJitIcacheSlotReg &reg = gIcacheSlots[f];
+    if (!reg.base)
+      continue;
+    registered++;
+    // For multi-dim arrays, cell[0] is the [0]...[0] element; for 0-dim,
+    // it is the scalar cell. Either way it tells us whether the first
+    // identity has been resolved yet.
+    bool cell0 = (reg.base[0] != 0);
+    if (cell0)
+      filled++;
+    EJIT_DIAG("  [%2u] base=%p numDims=%u cell[0]=%p %s",
+              f, (void *)reg.base, reg.numDims,
+              (void *)reg.base[0], cell0 ? "(filled)" : "(empty)");
+  }
+  EJIT_DIAG("=== icache slots: %u registered, %u with cell[0] filled ===",
+            registered, filled);
+}
+
 //===----------------------------------------------------------------------===//
 // Switch controller helpers (§5.1) over shared arrays.
 //===----------------------------------------------------------------------===//
@@ -321,13 +357,22 @@ void EJitSharedTaskPool::l0Fill(uint32_t funcIndex, void *fnPtr,
 
 void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
                                     const EJitDimPair *dims, uint32_t numDims) {
-  if (!icacheReclamationSafe_)
+  if (!icacheReclamationSafe_) {
+    EJIT_DIAG("icacheFill SKIP func=%u: reclamation not safe", funcIndex);
     return;
-  if (!state_ || !fnPtr || funcIndex >= EJIT_ICACHE_FUNC_SLOTS)
+  }
+  if (!state_ || !fnPtr || funcIndex >= EJIT_ICACHE_FUNC_SLOTS) {
+    EJIT_DIAG("icacheFill SKIP func=%u: state=%p fn=%p OOB=%u", funcIndex,
+              (void *)state_, fnPtr,
+              (unsigned)(funcIndex >= EJIT_ICACHE_FUNC_SLOTS));
     return;
+  }
   EJitIcacheSlotReg &reg = gIcacheSlots[funcIndex];
-  if (!reg.base || numDims != reg.numDims)
+  if (!reg.base || numDims != reg.numDims) {
+    EJIT_DIAG("icacheFill SKIP func=%u: base=%p regDims=%u callDims=%u",
+              funcIndex, (void *)reg.base, reg.numDims, numDims);
     return; // unregistered, or shape mismatch: nowhere to write.
+  }
   // Plain store: the slot is per-core private, so this write (on the calling
   // core) is ordered before the wrapper's read (same core) by program order.
   // The specialization is invariant per identity under the contract + NO_RECLAIM,
@@ -336,6 +381,8 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   // on the pointer orders this store-before-use.
   uintptr_t idx = icacheLinearize(dims, numDims);
   reg.base[idx] = reinterpret_cast<uintptr_t>(fnPtr);
+  EJIT_DIAG("icacheFill OK func=%u dims=%u idx=%zu fn=%p cell[0]=%p",
+            funcIndex, numDims, (size_t)idx, fnPtr, (void *)reg.base[0]);
 }
 
 void EJitSharedTaskPool::forEachCompiled(CompiledFuncCallback cb,
@@ -1621,7 +1668,7 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       // A peer racing the owner yields (not busy-spins) so a high-priority peer
       // never starves the owner core trying to finish init + publish Ready.
       if (workerIdle_)
-        workerIdle_(workerIdleCtx_);
+        workerIdle_(workerIdleCtx_, 1); // single yield while owner publishes
       else
         cpuRelax();
       break;
@@ -2197,29 +2244,26 @@ void EJitSharedTaskPool::runWorkerLoop() {
   // cannot starve the core that must publish Ready or enqueue work. The idle
   // hook runs OUTSIDE any bucket lock / queue slot / dedup critical state
   // (pollOne returns before we idle).
-  uint32_t consumedSinceThrottle = 0;
   for (;;) {
     EJitWorkerStep s = workerPollOnce();
     if (s == EJitWorkerStep::Exit)
       break;
     if (s == EJitWorkerStep::WaitForReady || s == EJitWorkerStep::Idle)
-      workerIdle();
-    else if (EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS != 0u &&
-             EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS != 0u &&
-             ++consumedSinceThrottle >=
-                 EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS) {
-      consumedSinceThrottle = 0;
-      for (uint32_t i = 0; i < EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS; ++i)
-        workerIdle();
-    }
+      workerIdle(1); // single yield while waiting / empty queue
+    else if (EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT != 0u &&
+             EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS != 0u)
+      // Throttle after EVERY consumed task: ONE delay(MULT*DELAY_TICKS) call,
+      // not DELAY_TICKS separate yields. Either 0 disables (no inter-task gap).
+      workerIdle(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT *
+                 EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS);
   }
   EJIT_DIAG_VERBOSE("shared worker loop leave");
 }
 
-void EJitSharedTaskPool::workerIdle() {
+void EJitSharedTaskPool::workerIdle(uint32_t ticks) {
   workerIdleYields_.fetchAdd(1);
   if (workerIdle_)
-    workerIdle_(workerIdleCtx_); // platform yield (SRE_TaskDelay / std::yield)
+    workerIdle_(workerIdleCtx_, ticks); // platform delay(ticks): 1=yield, N=throttle
   else
     cpuRelax(); // step/unit tests with no injected hook
 }

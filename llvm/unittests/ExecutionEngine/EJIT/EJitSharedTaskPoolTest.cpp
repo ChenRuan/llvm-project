@@ -875,10 +875,19 @@ struct IdleScript {
   int initializingYields = 0;
   bool readyPublished = false;
   bool stopped = false;
+  // Record the ticks arg the idle/delay hook was called with, so tests can
+  // assert the throttle path passes MULT*DELAY_TICKS (not 1) and the wait/idle
+  // path passes 1.
+  uint32_t maxTicks = 0;
+  bool sawWaitTicks = false;
 };
-void scriptedIdle(void *ctx) {
+void scriptedIdle(void *ctx, uint32_t ticks) {
   auto *s = static_cast<IdleScript *>(ctx);
   ++s->idleCalls;
+  if (ticks > s->maxTicks)
+    s->maxTicks = ticks;
+  if (ticks == 1u)
+    s->sawWaitTicks = true;
   uint32_t st = s->st->initState.loadAcquire();
   if (st == static_cast<uint32_t>(EJitSharedInitState::Initializing)) {
     ++s->initializingYields;
@@ -994,6 +1003,12 @@ TEST_F(SharedTaskPoolTest, RealWorkerEntrySurvivesInitializingAndConsumes) {
   EXPECT_GE(script.initializingYields,
             3); // yielded (not exited) on Initializing
   EXPECT_GT(pool.workerIdleYields(), 0u); // worker yielded, never busy-spun
+  // The throttle path (after the consume) must pass MULT*DELAY_TICKS in ONE
+  // call (not 1, not a per-tick loop); the wait/idle path must pass 1.
+  EXPECT_EQ(script.maxTicks,
+            static_cast<uint32_t>(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT *
+                                  EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS));
+  EXPECT_TRUE(script.sawWaitTicks);
   EXPECT_TRUE(pool.workerWaitedForReady());
   EXPECT_GT(pool.workerConsumeLoops(),
             0u); // SAME worker reached Ready+consumed
@@ -2701,6 +2716,48 @@ TEST_F(SharedTaskPoolTest, InlineCacheStickyFrozen) {
   // Out-of-range funcIndex misses without touching memory.
   EXPECT_FALSE(pool.icacheTry(EJIT_ICACHE_FUNC_SLOTS, nullptr, 0, &out));
   EXPECT_EQ(out, nullptr);
+
+  ejitIcacheClearAll();
+}
+
+// The funcIndex space is dense up to EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX, so the
+// slot table must cover the WHOLE range: slots registered at a high (but
+// in-range) funcIndex must fill and hit exactly like a low one. Regression
+// guard for the FUNC_SLOTS < MAX_FUNC_INDEX desync that silently dropped
+// icacheFill for 85% of the functions in the field (slots were 64, funcIndex
+// space was 4096).
+TEST_F(SharedTaskPoolTest, InlineCacheHighFuncIndex) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+
+  // Top of the table: funcIndex = EJIT_ICACHE_FUNC_SLOTS - 1.
+  constexpr uint32_t kTop = EJIT_ICACHE_FUNC_SLOTS - 1;
+  uintptr_t slotTop = 0;
+  ejitIcacheRegisterSlot(kTop, &slotTop, 0);
+  void *fnTop = codeFor(kTop);
+  void *out = nullptr;
+
+  EXPECT_FALSE(pool.icacheTry(kTop, nullptr, 0, &out));
+  EXPECT_EQ(out, nullptr);
+  pool.icacheFill(kTop, fnTop, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kTop, nullptr, 0, &out));
+  EXPECT_EQ(out, fnTop);
+
+  // Mid-table index that the old 64-slot table would have dropped.
+  constexpr uint32_t kMid = 2000;
+  uintptr_t slotMid = 0;
+  ejitIcacheRegisterSlot(kMid, &slotMid, 0);
+  void *fnMid = codeFor(kMid);
+  pool.icacheFill(kMid, fnMid, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kMid, nullptr, 0, &out));
+  EXPECT_EQ(out, fnMid);
+
+  // icacheFill at funcIndex == EJIT_ICACHE_FUNC_SLOTS stays a no-op and must
+  // not disturb the neighbouring top slot.
+  pool.icacheFill(EJIT_ICACHE_FUNC_SLOTS, fnMid, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kTop, nullptr, 0, &out));
+  EXPECT_EQ(out, fnTop);
 
   ejitIcacheClearAll();
 }

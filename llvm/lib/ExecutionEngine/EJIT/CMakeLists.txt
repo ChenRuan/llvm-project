@@ -167,6 +167,7 @@ endif()
 # taskpool, which is the only build the icache is compiled under.
 if(EJIT_SRE_SHARED_TASKPOOL)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE})
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS})
 endif()
 
 # EJIT_FREESTANDING must be visible in LLVMJITLink headers so that

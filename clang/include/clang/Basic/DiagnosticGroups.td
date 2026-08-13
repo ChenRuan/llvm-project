@@ -1767,3 +1767,15 @@ def ExperimentalOption : DiagGroup<"experimental-option">;
 def EmbeddedJITAttrMissingOnDef : DiagGroup<"embedded-jit-attr-missing-on-def">;
 
 def EmbeddedJIT : DiagGroup<"embedded-jit", [EmbeddedJITAttrMissingOnDef]>;
+
+// Address-of ejit_may_const without const qualifier.
+// Off by default — enable with -Wembedded-jit-addr-of-may-const.
+// Not part of -Wembedded-jit, so that flag won't enable it.
+def EmbeddedJITAddrOfMayConst : DiagGroup<"embedded-jit-addr-of-may-const">;
+
+// Function references ejit_period_arr without declaring the dependency
+// via ejit_period_arr_ind. Off by default — enable with
+// -Wembedded-jit-undeclared-period-dep.
+// Not part of -Wembedded-jit, so that flag won't enable it.
+def EmbeddedJITUndeclaredPeriodDep
+    : DiagGroup<"embedded-jit-undeclared-period-dep">;

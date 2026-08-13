@@ -17,7 +17,9 @@
 #include "clang/Basic/DiagnosticSema.h"
 #include "clang/Sema/ParsedAttr.h"
 #include "clang/Sema/Sema.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 
 using llvm::ejit::MAX_PERIOD_ARR_IND_PARAMS;
@@ -405,22 +407,123 @@ static const FieldDecl *findMayConstWriteTarget(Expr *E,
     if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
       BaseVar = VD;
 
+  // The EjitMayConstAttr lives on the FieldDecl and applies to every struct
+  // instance.  Suppress the warning when the base is a value type
+  // (not pointer/reference) that has a visible definition in this TU and no
+  // period annotation: such objects are local copies or plain globals that
+  // do not alias period data.  Pointers and references are kept because they
+  // may point to period data even though the variable itself lacks a period
+  // annotation, and declaration-only externs are kept because the definition
+  // in another TU may carry the attribute.  (getDefinition covers real
+  // definitions, getActingDefinition covers C tentative definitions.)
+  if (BaseVar &&
+      !BaseVar->hasAttr<EjitPeriodArrAttr>() &&
+      !BaseVar->hasAttr<EjitPeriodAttr>() &&
+      !BaseVar->getType()->isPointerType() &&
+      !BaseVar->getType()->isReferenceType() &&
+      (BaseVar->getDefinition() || BaseVar->getActingDefinition()))
+    return nullptr;
+
   return FD;
 }
 
 namespace {
 
-/// Visitor that locates writes to ejit_may_const fields within a function body.
+/// Visitor that locates writes to ejit_may_const fields within a function body
+/// and non-const pointers/references escaping to them.
 class EjitMayConstWriteVisitor
     : public RecursiveASTVisitor<EjitMayConstWriteVisitor> {
   Sema &S;
+  /// Return type of the innermost function whose body is being traversed.
+  /// Starts as the checked function's return type and is updated when
+  /// descending into lambda bodies, so a return inside a lambda is checked
+  /// against the lambda's return type, not the enclosing function's.
+  QualType CurReturnType;
+  /// Whether warn_ejit_may_const_addr_without_const is enabled for this
+  /// function. The address-of checks below are skipped when it is off
+  /// (its default) to avoid wasted traversal work.
+  bool AddrOfEnabled;
 
 public:
-  explicit EjitMayConstWriteVisitor(Sema &S) : S(S) {}
+  EjitMayConstWriteVisitor(Sema &S, const FunctionDecl *CurFD,
+                           bool AddrOfEnabled)
+      : S(S), CurReturnType(CurFD->getReturnType()),
+        AddrOfEnabled(AddrOfEnabled) {}
+
+  bool TraverseLambdaExpr(LambdaExpr *LE) {
+    QualType Saved = CurReturnType;
+    if (const auto *CallOp = LE->getCallOperator())
+      CurReturnType = CallOp->getReturnType();
+    bool Result =
+        RecursiveASTVisitor<EjitMayConstWriteVisitor>::TraverseLambdaExpr(LE);
+    CurReturnType = Saved;
+    return Result;
+  }
+
+  bool TraverseFunctionDecl(FunctionDecl *Nested) {
+    // Keep return checks inside nested functions (methods of local classes)
+    // tied to their own return type, not the enclosing function's.
+    QualType Saved = CurReturnType;
+    CurReturnType = Nested->getReturnType();
+    bool Result =
+        RecursiveASTVisitor<EjitMayConstWriteVisitor>::TraverseFunctionDecl(
+            Nested);
+    CurReturnType = Saved;
+    return Result;
+  }
 
   bool VisitBinaryOperator(BinaryOperator *BO) {
-    if (BO->isAssignmentOp() || BO->isCompoundAssignmentOp())
+    if (BO->isAssignmentOp() || BO->isCompoundAssignmentOp()) {
       checkWrite(BO->getLHS(), BO->getOperatorLoc());
+      // Also check RHS for &may_const_field assigned to non-const pointer.
+      if (AddrOfEnabled && BO->getOpcode() == BO_Assign)
+        checkAddrOfExpr(BO->getRHS(), BO->getLHS()->getType(),
+                        BO->getOperatorLoc());
+    }
+    return true;
+  }
+
+  bool VisitDeclStmt(DeclStmt *DS) {
+    if (!AddrOfEnabled)
+      return true;
+    for (auto *D : DS->decls()) {
+      auto *VD = dyn_cast<VarDecl>(D);
+      if (!VD || !VD->getInit())
+        continue;
+      checkAddrOfExpr(VD->getInit(), VD->getType(), VD->getLocation());
+    }
+    return true;
+  }
+
+  bool VisitCallExpr(CallExpr *CE) {
+    if (!AddrOfEnabled)
+      return true;
+    // A call argument bound to a non-const pointer/reference parameter is an
+    // escape of the same kind as an assignment: the callee can write through
+    // it.  Calls into ejit_period_lc functions are skipped: those are
+    // sanctioned to touch period data.  Variadic arguments have no parameter
+    // type and are not checked.
+    const FunctionDecl *Callee =
+        dyn_cast_or_null<FunctionDecl>(CE->getCalleeDecl());
+    if (Callee && Callee->hasAttr<EjitPeriodLcAttr>())
+      return true;
+    const auto *FPT = CE->getCallee()->getType()->getAs<FunctionProtoType>();
+    if (!FPT && Callee)
+      FPT = Callee->getType()->getAs<FunctionProtoType>();
+    if (!FPT)
+      return true;
+    unsigned NumParams = FPT->getNumParams();
+    for (unsigned I = 0; I < CE->getNumArgs() && I < NumParams; ++I)
+      checkAddrOfExpr(CE->getArg(I), FPT->getParamType(I),
+                      CE->getArg(I)->getBeginLoc());
+    return true;
+  }
+
+  bool VisitReturnStmt(ReturnStmt *RS) {
+    if (!AddrOfEnabled)
+      return true;
+    if (Expr *RetVal = RS->getRetValue())
+      checkAddrOfExpr(RetVal, CurReturnType, RS->getReturnLoc());
     return true;
   }
 
@@ -437,15 +540,72 @@ private:
     const FieldDecl *MayConstField = findMayConstWriteTarget(Target, BaseVar);
     if (!MayConstField)
       return;
-    // %0 = the may_const field; %1 = the variable that holds the struct.
-    // Falls back to the field's parent record when no base variable is
-    // identifiable (e.g. writes through unusual rvalue bases).
+    emitMayConstFieldDiag(diag::warn_ejit_may_const_modified_without_lc,
+                          MayConstField, BaseVar, Loc);
+  }
+
+  /// Emit a may-const-field diagnostic for \p FD.
+  /// %0 = the may_const field; %1 = the variable that holds the struct
+  /// (falls back to the field's parent record when no base variable is
+  /// identifiable, e.g. writes through unusual rvalue bases).
+  void emitMayConstFieldDiag(unsigned DiagID, const FieldDecl *FD,
+                             const VarDecl *BaseVar, SourceLocation Loc) {
     if (BaseVar)
-      S.Diag(Loc, diag::warn_ejit_may_const_modified_without_lc)
-          << MayConstField << BaseVar;
+      S.Diag(Loc, DiagID) << FD << BaseVar;
     else
-      S.Diag(Loc, diag::warn_ejit_may_const_modified_without_lc)
-          << MayConstField << MayConstField->getParent();
+      S.Diag(Loc, DiagID) << FD << FD->getParent();
+  }
+
+  /// Check if \p E escapes a may_const field as a non-const pointer or
+  /// reference.  Checked at consumer sites: VarDecl initializers,
+  /// plain-assignment RHS, call arguments, and return values.
+  /// \p DestType is the type of the destination (VarDecl type, LHS of
+  /// assignment, parameter type, return type) — if its pointee/referent is
+  /// const-qualified, the escape is safe and no warning is emitted.
+  ///
+  /// Uses IgnoreParenCasts() (not IgnoreParenImpCasts()) to see through
+  /// explicit casts like (int*)&field, which would otherwise hide the
+  /// underlying address-of operation.  A single-element braced initializer
+  /// (int *p{&field};) is unwrapped too.
+  void checkAddrOfExpr(Expr *E, QualType DestType, SourceLocation Loc) {
+    if (!AddrOfEnabled || !E)
+      return;
+
+    // If the destination is a const-qualified pointer or reference, it's
+    // safe — it cannot be used to write the field.
+    if ((DestType->isPointerType() || DestType->isReferenceType()) &&
+        DestType->getPointeeType().isConstQualified())
+      return;
+
+    // Walk through parens and all casts (implicit + explicit) to find the
+    // underlying & operator.  The const check is done on DestType (final
+    // type after all casts), so stripping intermediate casts is safe.
+    Expr *Inner = E->IgnoreParenCasts();
+    if (auto *ILE = dyn_cast<InitListExpr>(Inner))
+      if (ILE->getNumInits() == 1)
+        Inner = ILE->getInit(0)->IgnoreParenCasts();
+
+    Expr *Target = nullptr;
+    if (DestType->isReferenceType()) {
+      // A reference binding has no address-of node in the AST: the
+      // initializer is the referent itself, with the & implicit.  A
+      // non-const reference to a may_const field is the same escape as a
+      // non-const pointer.
+      Target = Inner;
+    } else {
+      auto *UO = dyn_cast<UnaryOperator>(Inner);
+      if (!UO || UO->getOpcode() != UO_AddrOf)
+        return;
+      Target = UO->getSubExpr();
+    }
+
+    const VarDecl *BaseVar = nullptr;
+    const FieldDecl *FD = findMayConstWriteTarget(Target, BaseVar);
+    if (!FD)
+      return;
+
+    emitMayConstFieldDiag(diag::warn_ejit_may_const_addr_without_const, FD,
+                          BaseVar, Loc);
   }
 };
 
@@ -464,12 +624,141 @@ void checkEjitMayConstWrites(Sema &S, const FunctionDecl *FD, Stmt *Body) {
   if (FD->hasAttr<EjitPeriodLcAttr>())
     return;
 
-  // Skip the traversal entirely when the warning is disabled
-  // (e.g. -Wno-embedded-jit), matching the AnalysisBasedWarnings pattern.
+  // Methods of local classes (including lambda call operators) are checked
+  // as part of the enclosing function's traversal, which descends into their
+  // bodies; checking them separately (ActOnFinishFunctionBody also runs for
+  // them) would double-diagnose everything inside them.
+  if (const auto *MD = dyn_cast<CXXMethodDecl>(FD))
+    if (MD->getParent()->isLocalClass())
+      return;
+
+  // Skip the traversal entirely when BOTH diagnostics are disabled
+  // (e.g. -Wno-embedded-jit plus the addr-of warning off, its default),
+  // matching the AnalysisBasedWarnings pattern. The write warning is
+  // default-on, so the visitor normally runs; the addr-of checks inside
+  // it are gated separately on AddrOfEnabled.
+  bool AddrOfEnabled = !S.getDiagnostics().isIgnored(
+      diag::warn_ejit_may_const_addr_without_const, FD->getLocation());
   if (S.getDiagnostics().isIgnored(
-          diag::warn_ejit_may_const_modified_without_lc, FD->getLocation()))
+          diag::warn_ejit_may_const_modified_without_lc, FD->getLocation()) &&
+      !AddrOfEnabled)
     return;
 
-  EjitMayConstWriteVisitor Visitor(S);
+  EjitMayConstWriteVisitor Visitor(S, FD, AddrOfEnabled);
   Visitor.TraverseStmt(Body);
+}
+
+namespace {
+
+/// Visitor that collects DeclRefExprs to ejit_period_arr globals within a
+/// function body.
+class EjitPeriodArrRefVisitor
+    : public RecursiveASTVisitor<EjitPeriodArrRefVisitor> {
+  SmallVector<const DeclRefExpr *, 4> Refs;
+
+public:
+  bool VisitDeclRefExpr(DeclRefExpr *DRE) {
+    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+      if (VD->hasAttr<EjitPeriodArrAttr>())
+        Refs.push_back(DRE);
+    return true;
+  }
+
+  // The operand of sizeof/alignof is unevaluated: it needs no runtime
+  // period data, so a reference there is not a real dependency
+  // (e.g. sizeof(g_cells)).  Exception: sizeof/alignof on a VLA evaluates
+  // the size expression at runtime, so both the operand and its VLA type
+  // (which holds the size expression) are real dependencies and must be
+  // traversed.
+  bool TraverseUnaryExprOrTypeTraitExpr(UnaryExprOrTypeTraitExpr *E) {
+    if (E->isArgumentType())
+      return TraverseType(E->getArgumentType());
+    if (E->getKind() == UETT_SizeOf || E->getKind() == UETT_AlignOf) {
+      if (E->getTypeOfArgument()->isVariableArrayType()) {
+        if (!TraverseStmt(E->getArgumentExpr()))
+          return false;
+        return TraverseType(E->getTypeOfArgument());
+      }
+    }
+    return true;
+  }
+
+  // decltype operands are unevaluated; skip both the type and TypeLoc
+  // traversal paths (e.g. the declared type of `decltype(g_cells) copy;`).
+  bool TraverseDecltypeType(DecltypeType *T) { return true; }
+  bool TraverseDecltypeTypeLoc(DecltypeTypeLoc TL) { return true; }
+
+  // typeid operands are unevaluated unless the operand is a potentially
+  // evaluated polymorphic glvalue.
+  bool TraverseCXXTypeidExpr(CXXTypeidExpr *E) {
+    if (!E->isPotentiallyEvaluated())
+      return true;
+    return RecursiveASTVisitor<EjitPeriodArrRefVisitor>::TraverseCXXTypeidExpr(
+        E);
+  }
+
+  // noexcept operands are unevaluated.
+  bool TraverseCXXNoexceptExpr(CXXNoexceptExpr *E) { return true; }
+
+  const SmallVectorImpl<const DeclRefExpr *> &getRefs() const { return Refs; }
+};
+
+} // anonymous namespace
+
+/// checkEjitUndeclaredPeriodDeps - Warn when an ejit_entry function references
+/// an ejit_period_arr global that is not declared as a dependency via an
+/// ejit_period_arr_ind parameter. Called from ActOnFinishFunctionBody after
+/// the function body is parsed.
+///
+/// Replaces the former AOT-pass check (EJitAotModulePass) that printed the
+/// same warning to stderr: Sema can point at the exact reference site and the
+/// diagnostic is controlled by -Wembedded-jit-undeclared-period-dep.
+///
+/// Note: only the entry function's own body is checked (pre-inline state).
+/// A dependency hidden in a callee that is later inlined is not detected
+/// here; declare it explicitly on the entry function.
+void checkEjitUndeclaredPeriodDeps(Sema &S, const FunctionDecl *FD,
+                                   Stmt *Body) {
+  if (!FD || !Body || FD->isInvalidDecl() || FD->isDependentContext())
+    return;
+
+  // Only ejit_entry functions declare dependencies, mirroring the former
+  // AOT-pass check which only looked at TAG_EJIT_ENTRY metadata.
+  if (!FD->hasAttr<EjitEntryAttr>())
+    return;
+
+  // Skip the traversal entirely when the warning is disabled
+  // (off by default via DefaultIgnore; enabled with
+  // -Wembedded-jit-undeclared-period-dep), matching the
+  // AnalysisBasedWarnings pattern.
+  if (S.getDiagnostics().isIgnored(diag::warn_ejit_undeclared_period_dep,
+                                   FD->getLocation()))
+    return;
+
+  // Collect declared period names from ejit_period_arr_ind parameters.
+  SmallVector<StringRef, 4> Declared;
+  for (const ParmVarDecl *P : FD->parameters())
+    if (auto *IdxAttr = P->getAttr<EjitPeriodArrIndAttr>())
+      Declared.push_back(IdxAttr->getPeriodName());
+
+  EjitPeriodArrRefVisitor Visitor;
+  Visitor.TraverseStmt(Body);
+
+  // Warn once per undeclared period, at the first reference site, with a
+  // note pointing at the period array definition.
+  llvm::SmallSet<StringRef, 4> Warned;
+  for (const DeclRefExpr *Ref : Visitor.getRefs()) {
+    const auto *VD = cast<VarDecl>(Ref->getDecl());
+    StringRef PeriodName = VD->getAttr<EjitPeriodArrAttr>()->getPeriodName();
+    if (is_contained(Declared, PeriodName) || !Warned.insert(PeriodName).second)
+      continue;
+    S.Diag(Ref->getLocation(), diag::warn_ejit_undeclared_period_dep)
+        << FD << PeriodName;
+    // Anchor the note at the definition when visible; an earlier
+    // declaration-only extern is not "defined here".
+    const VarDecl *DefVD = VD->getDefinition();
+    S.Diag(DefVD ? DefVD->getLocation() : VD->getLocation(),
+           diag::note_ejit_period_arr_defined_here)
+        << PeriodName;
+  }
 }
