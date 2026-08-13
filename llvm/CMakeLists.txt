@@ -725,6 +725,7 @@ endif()
 # linearization agree. Default 16; the product overrides it via the preset.
 set(EJIT_ICACHE_DIM_SIZE 16 CACHE STRING
   "EJIT inline-cache per-dim bound D (must be a power of 2)")
+ejit_require_numeric(EJIT_ICACHE_DIM_SIZE)
 if(EJIT_ICACHE_DIM_SIZE LESS 1)
   message(FATAL_ERROR
     "EJIT_ICACHE_DIM_SIZE must be a positive power of 2, got ${EJIT_ICACHE_DIM_SIZE}")

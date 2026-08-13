@@ -48,7 +48,9 @@ public:
 
   bool activateAll(const std::string &periodName);
   bool deactivateAll(const std::string &periodName);
-  bool isActive(const std::string &periodName, uint8_t cellIdx) const;
+  // uint32_t like activate/deactivate: an out-of-range index is rejected
+  // (false) before any narrowing, never truncated into instance 0.
+  bool isActive(const std::string &periodName, uint32_t cellIdx) const;
 
   // Compilation
   /// Pre-computed cacheKey = funcIdx(32b) | dims(4x8b). The AOT wrapper
@@ -56,7 +58,9 @@ public:
 
   // Cache management
   void clearCache();
-  void invalidateByPeriod(const std::string &periodName, uint8_t cellIdx);
+  // uint32_t like activate/deactivate: an out-of-range index is rejected
+  // (no-op) before any narrowing, never truncated into instance 0.
+  void invalidateByPeriod(const std::string &periodName, uint32_t cellIdx);
   void invalidateAllByPeriod(const std::string &periodName);
 
   // Configuration

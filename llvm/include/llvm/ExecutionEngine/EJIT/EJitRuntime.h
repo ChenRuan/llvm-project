@@ -77,6 +77,13 @@ typedef enum {
   EJIT_ERR_DISABLED = -9,
   EJIT_ERR_INSTANCE_DISABLED = -10,
   EJIT_PENDING = 1,
+  /* RESERVED sentinel, NOT a real status: the AOT wrapper-timing path passes
+   * this value to ejit_taskpool_trace_wrapper to tag icache-hit samples (see
+   * kEJitIcacheHitTimingStatus in EJitCommon.h, locked to this enumerator by
+   * static_assert in EJitRuntime.cpp). Assigning this value to any real
+   * status is a duplicate-enumerator compile error, so the reservation is
+   * structural, not comment-only. */
+  EJIT_STATUS_ICACHE_HIT_SENTINEL = 0xFE,
 } ejit_status_t;
 
 typedef enum {
@@ -177,7 +184,10 @@ ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx);
 ejit_status_t ejit_deactivate(const char *periodName, uint32_t cellIdx);
 ejit_status_t ejit_activate_all(const char *periodName);
 ejit_status_t ejit_deactivate_all(const char *periodName);
-bool ejit_is_active(const char *periodName, uint8_t cellIdx);
+// uint32_t for the same reason as ejit_activate above: an out-of-range index
+// is rejected (returns false) instead of being truncated at the ABI boundary
+// and silently querying instance 0.
+bool ejit_is_active(const char *periodName, uint32_t cellIdx);
 
 // Compilation
 // ejit_taskpool_compile_or_get is the single compilation entry point for both
@@ -361,7 +371,10 @@ void ejit_print_version(void);
 
 // Cache
 void ejit_clear_cache(void);
-void ejit_invalidate(const char *periodName, uint8_t cellIdx);
+// uint32_t for the same reason as ejit_activate above: an out-of-range index
+// is rejected (no-op) instead of being truncated at the ABI boundary and
+// silently invalidating instance 0.
+void ejit_invalidate(const char *periodName, uint32_t cellIdx);
 
 // Statistics
 ejit_status_t ejit_get_stats(ejit_stats_t *stats);

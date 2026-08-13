@@ -54,10 +54,17 @@ static_assert(EJIT_LOG_LVL_OFF == EJIT_LOG_OFF &&
               "EJIT_LOG_LVL_* (EJitDiag.h) must equal ejit_log_level_t "
               "(EJitRuntime.h) values.");
 
-// Wrapper-timing sentinel: must never collide with a real status. Real
-// statuses as uint32_t are 0 (EJIT_OK), 1 (EJIT_PENDING) and 0xFFFFFFF6..
-// 0xFFFFFFFF (EJIT_ERR_* = -1..-10). A collision would corrupt timing
-// aggregation in ejit_taskpool_trace_wrapper.
+// Wrapper-timing sentinel: must never collide with a real status. The value
+// is structurally RESERVED in the ejit_status_t enum itself
+// (EJIT_STATUS_ICACHE_HIT_SENTINEL = 0xFE) — a future real status assigned
+// 0xFE is a duplicate-enumerator compile error — and the two constants are
+// locked together here. The per-value comparisons below are a second,
+// explicit lock against every status that exists today: a collision would
+// corrupt timing aggregation in ejit_taskpool_trace_wrapper.
+static_assert(kEJitIcacheHitTimingStatus ==
+                  static_cast<uint32_t>(EJIT_STATUS_ICACHE_HIT_SENTINEL),
+              "kEJitIcacheHitTimingStatus (EJitCommon.h) must equal the "
+              "EJIT_STATUS_ICACHE_HIT_SENTINEL enumerator (EJitRuntime.h).");
 static_assert(kEJitIcacheHitTimingStatus != static_cast<uint32_t>(EJIT_OK) &&
                   kEJitIcacheHitTimingStatus !=
                       static_cast<uint32_t>(EJIT_PENDING) &&
@@ -541,9 +548,16 @@ ejit_status_t ejit_deactivate_all(const char *periodName) {
   return EJIT_OK;
 }
 
-bool ejit_is_active(const char *periodName, uint8_t cellIdx) {
+bool ejit_is_active(const char *periodName, uint32_t cellIdx) {
   if (!gEJIT) {
     EJIT_DIAG("is_active(%s,%u) failed: not initialized", periodName, cellIdx);
+    return false;
+  }
+  // Reject out-of-range indices instead of truncating at the ABI boundary and
+  // querying the wrong instance (pre-fix uint8_t signature).
+  if (cellIdx >= kEJitMaxInstances) {
+    EJIT_DIAG("is_active(%s,%u) rejected: instance index >= kEJitMaxInstances=%u",
+              periodName, cellIdx, kEJitMaxInstances);
     return false;
   }
   return gEJIT->isActive(periodName, cellIdx);
@@ -566,10 +580,17 @@ void ejit_clear_cache(void) {
 #endif
 }
 
-void ejit_invalidate(const char *periodName, uint8_t cellIdx) {
+void ejit_invalidate(const char *periodName, uint32_t cellIdx) {
   EJIT_DIAG("invalidate(%s,%u)", periodName, cellIdx);
   if (!gEJIT)
     return;
+  // Reject out-of-range indices instead of truncating at the ABI boundary and
+  // invalidating the wrong instance (pre-fix uint8_t signature).
+  if (cellIdx >= kEJitMaxInstances) {
+    EJIT_DIAG("invalidate(%s,%u) rejected: instance index >= kEJitMaxInstances=%u",
+              periodName, cellIdx, kEJitMaxInstances);
+    return;
+  }
   gEJIT->invalidateByPeriod(periodName, cellIdx);
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (auto *tp = gEJIT->sharedTaskPool())

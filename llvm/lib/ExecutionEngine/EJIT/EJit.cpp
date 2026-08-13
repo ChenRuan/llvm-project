@@ -523,7 +523,11 @@ bool EJit::deactivateAll(const std::string &periodName) {
 #endif
 }
 
-bool EJit::isActive(const std::string &periodName, uint8_t cellIdx) const {
+bool EJit::isActive(const std::string &periodName, uint32_t cellIdx) const {
+  // Range-check BEFORE any narrowing: the private state tables index by
+  // cellIdx, and a truncated 256 would silently read instance 0.
+  if (cellIdx >= kEJitMaxInstances)
+    return false;
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   // Cross-core: a registered lifecycle's activation lives in the shared
   // enabled bit (the producer's ejit_activate writes it). Query that, not the
@@ -536,12 +540,21 @@ bool EJit::isActive(const std::string &periodName, uint8_t cellIdx) const {
       return sp->isInstanceActive(dt, cellIdx);
   }
 #endif
-  return runtimeState_->isActive(periodName, cellIdx);
+  // Cell-index range already validated above; the private state still takes a
+  // uint8_t (its tables are sized kEJitMaxInstances, keyed by the validated
+  // index), so the narrowing here is provably safe.
+  return runtimeState_->isActive(periodName,
+                                 static_cast<uint8_t>(cellIdx));
 }
 
 void EJit::clearCache() { /* Legacy LRU cache retired */ }
 
-void EJit::invalidateByPeriod(const std::string &periodName, uint8_t cellIdx) {
+void EJit::invalidateByPeriod(const std::string &periodName, uint32_t cellIdx) {
+  // Range-check BEFORE any narrowing: a truncated 256 would invalidate
+  // instance 0. Legacy invalidation is a no-op, but the ABI contract is the
+  // same as the taskpool path.
+  if (cellIdx >= kEJitMaxInstances)
+    return;
   (void)periodName; (void)cellIdx;
 }
 

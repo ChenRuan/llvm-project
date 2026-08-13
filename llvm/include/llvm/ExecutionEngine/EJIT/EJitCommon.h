@@ -117,8 +117,10 @@ constexpr const char *FN_TASKPOOL_TRACE_WRAPPER =
 // Wrapper-timing sentinel status passed to ejit_taskpool_trace_wrapper for
 // icache-hit samples so they aggregate as their own report line (get_fn_avg =
 // probe cost, release_avg = 0), separate from the slow-path compile_or_get
-// samples. Collision-free: real ejit_status_t as uint32_t is 0 or
-// 0xFFFFFFF6..0xFFFFFFFF (EJIT_OK / EJIT_ERR_* = -1..-10).
+// samples. The value is RESERVED in the ejit_status_t enum itself
+// (EJIT_STATUS_ICACHE_HIT_SENTINEL = 0xFE in EJitRuntime.h): a future real
+// status assigned 0xFE is a duplicate-enumerator compile error, and a
+// static_assert in EJitRuntime.cpp locks this constant to that enumerator.
 constexpr uint32_t kEJitIcacheHitTimingStatus = 0xFEu;
 // Lifecycle activation is keyed by period/lifecycle name + instance index only.
 // PASS4 emits these name-level calls at ejit_period_lc entry/exit; there is no
