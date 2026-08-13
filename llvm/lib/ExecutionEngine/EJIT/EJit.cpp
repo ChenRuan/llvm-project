@@ -4,6 +4,7 @@
 #include "llvm/Config/Targets.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCommon.h" // SECT_EJIT_* section names
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
@@ -230,6 +231,20 @@ EJit::EJit(const Config &config) : config_(config) {
         }
       }
     };
+    // Diagnose an empty registry section before walking: on hosted builds the
+    // bounds are weak, so a missing linker script or a section-name typo (the
+    // AOT SECT_EJIT_* constants vs the script's KEEP patterns) silently yields
+    // an empty range — exactly the silent-desync class these diagnostics exist
+    // to catch. VERBOSE (not INFO): a bitcode-only app with no periods has a
+    // legitimately empty .ejit_period and must not warn at default level.
+    if (__start_ejit_bitcode == __stop_ejit_bitcode)
+      EJIT_DIAG_VERBOSE("registry walk: %s range is EMPTY "
+                        "(missing section or linker script mismatch)",
+                        SECT_EJIT_BITCODE);
+    if (__start_ejit_period == __stop_ejit_period)
+      EJIT_DIAG_VERBOSE("registry walk: %s range is EMPTY "
+                        "(missing section or linker script mismatch)",
+                        SECT_EJIT_PERIOD);
     walkRange(__start_ejit_bitcode, __stop_ejit_bitcode);
     walkRange(__start_ejit_period, __stop_ejit_period);
     for (auto &sym : tableSymbols)
@@ -374,7 +389,9 @@ void EJit::recordInitError(int code, const std::string &message,
             funcName.c_str());
 }
 
-bool EJit::activate(const std::string &periodName, uint8_t cellIdx) {
+bool EJit::activate(const std::string &periodName, uint32_t cellIdx) {
+  if (cellIdx >= kEJitMaxInstances)
+    return false;
 #ifdef EJIT_SRE_TASKPOOL
   // Taskpool build: a registered lifecycle updates the time-window activation
   // state AND the SwitchController (kept consistent; setEnabled bumps the
@@ -415,7 +432,9 @@ bool EJit::activate(const std::string &periodName, uint8_t cellIdx) {
 #endif
 }
 
-bool EJit::deactivate(const std::string &periodName, uint8_t cellIdx) {
+bool EJit::deactivate(const std::string &periodName, uint32_t cellIdx) {
+  if (cellIdx >= kEJitMaxInstances)
+    return false;
 #ifdef EJIT_SRE_TASKPOOL
   uint32_t dt = EJitLifecycleRegistry::instance().lookup(periodName);
   if (dt != kEJitInvalidDimType) {

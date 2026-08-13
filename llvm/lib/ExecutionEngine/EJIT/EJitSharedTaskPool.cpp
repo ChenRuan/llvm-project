@@ -34,6 +34,20 @@ static_assert(EJIT_ICACHE_FUNC_SLOTS >= EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX,
               "EJIT_ICACHE_FUNC_SLOTS must be >= EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX; "
               "otherwise icacheFill silently drops high-funcIndex entries.");
 
+// icacheLinearize indexes with shifts (idx = idx * D + instanceId), so D must
+// be a power of 2 — a non-pow2 D would corrupt the row-major stride silently.
+static_assert((EJIT_ICACHE_DIM_SIZE & (EJIT_ICACHE_DIM_SIZE - 1)) == 0,
+              "EJIT_ICACHE_DIM_SIZE must be a power of 2 "
+              "(the icache hit path uses shift-based indexing).");
+
+// The AOT wrapper emits [D]^numDims slot arrays up to EJIT_ICACHE_MAX_DIMS;
+// the shared cache identity stores dims up to kEJitSharedMaxDims. A drift
+// between the two would let the AOT emit 5+ dim wrappers whose identity the
+// runtime truncates — silently serving the wrong specialization.
+static_assert(EJIT_ICACHE_MAX_DIMS == llvm::ejit::kEJitSharedMaxDims,
+              "EJIT_ICACHE_MAX_DIMS (AOT wrapper dim cap) must equal "
+              "kEJitSharedMaxDims (shared cache identity cap).");
+
 using namespace llvm;
 using namespace llvm::ejit;
 

@@ -69,7 +69,12 @@ constexpr const char *TAG_EJIT_MAY_CONST_FIELD = "ejit_may_const_field";
 // Global variable and section names
 //===----------------------------------------------------------------------===//
 constexpr const char *GV_EJIT_BITCODE = "__ejit_bitcode";
-constexpr const char *SECT_EJIT_BITCODE = ".ejit.bitcode";
+// Registry input sections. MUST match the linker-script KEEP() patterns and
+// the __start_/__stop_ bounds symbols the runtime walks (EJit.cpp,
+// ejit_registry.ld): a typo on either side yields an empty registry with no
+// diagnostic. Keep these constants as the single source for the AOT side.
+constexpr const char *SECT_EJIT_BITCODE = ".ejit_bitcode";
+constexpr const char *SECT_EJIT_PERIOD = ".ejit_period";
 constexpr const char *FN_AUTO_REGISTER = "ejit_auto_register";
 constexpr const char *CTORS_GLOBAL = "llvm.global_ctors";
 
@@ -77,6 +82,9 @@ constexpr const char *CTORS_GLOBAL = "llvm.global_ctors";
 // Runtime function names (extern symbols called by AOT-generated code)
 //===----------------------------------------------------------------------===//
 constexpr const char *FN_REGISTER_BITCODE = "ejit_register_bitcode";
+// Symbol registration for the AOT-visible static-var symbol table
+// (EJitRuntime.cpp defines this entry point; the AOT pass emits the call).
+constexpr const char *FN_REGISTER_SYMBOL = "ejit_register_symbol";
 constexpr const char *FN_REGISTER_PERIOD_ARRAY = "ejit_register_period_array";
 constexpr const char *FN_REGISTER_STATIC_VAR = "ejit_register_static_var";
 constexpr const char *FN_REGISTER_LIFECYCLE = "ejit_register_lifecycle";
@@ -126,6 +134,10 @@ constexpr unsigned EJIT_CTOR_PRIORITY = 65535;
 //===----------------------------------------------------------------------===//
 // Limits
 //===----------------------------------------------------------------------===//
+// Sema consumes these via using-declarations (SemaEJIT.cpp). The user-facing
+// diagnostic TEXTS in clang/include/clang/Basic/DiagnosticSemaKinds.td
+// ("exceeds the maximum of 100" / "of 4") are a second copy — update them
+// together with these values.
 constexpr unsigned MAX_PERIOD_ARR_IND_PARAMS = 4;
 constexpr unsigned MAX_PERIOD_ARR_SIZE = 100;
 

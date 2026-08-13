@@ -628,12 +628,47 @@ if(EJIT_SRE_CODE_POOL)
   add_definitions(-DEJIT_SRE_ENABLE_EX)
 endif()
 
+# CMake's LESS/GREATER treat non-numeric strings as unequal to everything, so
+# a garbage cache value would silently BYPASS every numeric bounds check below
+# and only explode mid-build with a confusing -D<VAR>=garbage error. Reject
+# such values up front with a clear configure-time message. (Defined before
+# its first call site below.)
+function(ejit_require_numeric var)
+  if(NOT ${var} MATCHES "^[0-9]+$")
+    message(FATAL_ERROR
+      "${var} (\"${${var}}\") is not a non-negative integer. "
+      "The EmbeddedJIT numeric cache variables must be plain decimal integers.")
+  endif()
+endfunction()
+
 # Per-pool size in bytes (must be a multiple of the 2MiB enable_ex granularity).
 set(EJIT_SRE_CODE_POOL_SIZE "2097152" CACHE STRING
   "EmbeddedJIT SRE code pool size in bytes (default 2MiB)")
 # SRE memory partition number (ptNo) handed to SRE_MemDbgAlloc.
 set(EJIT_SRE_CODE_POOL_PTNO "8" CACHE STRING
   "EmbeddedJIT SRE code pool partition number (ptNo) for SRE_MemDbgAlloc")
+# Hard-check the pool geometry against the platform contract at configure time:
+# a non-2MiB-multiple pool breaks enable_ex page-granular sealing, and ptNo is
+# stored as an unsigned char by the SRE adapter (EJitSrePlatform.cpp), so >255
+# silently truncates.
+ejit_require_numeric(EJIT_SRE_CODE_POOL_SIZE)
+ejit_require_numeric(EJIT_SRE_CODE_POOL_PTNO)
+if(EJIT_SRE_CODE_POOL_SIZE LESS 1)
+  message(FATAL_ERROR
+    "EJIT_SRE_CODE_POOL_SIZE (${EJIT_SRE_CODE_POOL_SIZE}) must be >= 1 byte.")
+endif()
+math(EXPR _ejit_pool_size_rem "${EJIT_SRE_CODE_POOL_SIZE} % 2097152")
+if(NOT _ejit_pool_size_rem EQUAL 0)
+  message(FATAL_ERROR
+    "EJIT_SRE_CODE_POOL_SIZE (${EJIT_SRE_CODE_POOL_SIZE}) must be a multiple "
+    "of the 2MiB enable_ex granularity.")
+endif()
+unset(_ejit_pool_size_rem)
+if(EJIT_SRE_CODE_POOL_PTNO LESS 1 OR EJIT_SRE_CODE_POOL_PTNO GREATER 255)
+  message(FATAL_ERROR
+    "EJIT_SRE_CODE_POOL_PTNO (${EJIT_SRE_CODE_POOL_PTNO}) must be in [1, 255] "
+    "(it is stored as an unsigned char by the SRE adapter).")
+endif()
 if(EJIT_SRE_CODE_POOL)
   add_definitions(-DEJIT_SRE_CODE_POOL_SIZE=${EJIT_SRE_CODE_POOL_SIZE})
   add_definitions(-DEJIT_SRE_CODE_POOL_PTNO=${EJIT_SRE_CODE_POOL_PTNO})
@@ -686,7 +721,7 @@ endif()
 # @__ejit_icache_fn_<name> [D]^numDims inline-cache array. MUST be a power of 2
 # so the hit path indexes with shifts (no multiply). The same value is applied
 # to the runtime (LLVMEJIT -DEJIT_ICACHE_DIM_SIZE) and to the AOT pass (clang
-# -mllvm -ejit-icache-dim-size) so the AOT array layout and the runtime
+# -mllvm -print-ejit-icache-dim-size) so the AOT array layout and the runtime
 # linearization agree. Default 16; the product overrides it via the preset.
 set(EJIT_ICACHE_DIM_SIZE 16 CACHE STRING
   "EJIT inline-cache per-dim bound D (must be a power of 2)")
@@ -758,6 +793,29 @@ set(EJIT_SRE_TASKPOOL_QUEUE_CAPACITY "1024" CACHE STRING
 # Flat dedup table capacity = max dense funcIndex (spec §3.5 inFlight_[]).
 set(EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX "4096" CACHE STRING
   "EmbeddedJIT SRE taskpool flat dedup capacity (max dense funcIndex)")
+# Configure-time validation mirroring the compile-time static_asserts, so a bad
+# value fails at `cmake` time with a clear message instead of mid-build.
+ejit_require_numeric(EJIT_SRE_TASKPOOL_BUCKETS)
+ejit_require_numeric(EJIT_SRE_TASKPOOL_QUEUE_CAPACITY)
+ejit_require_numeric(EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX)
+if(EJIT_SRE_TASKPOOL_BUCKETS LESS 1 OR EJIT_SRE_TASKPOOL_BUCKETS GREATER 254)
+  message(FATAL_ERROR
+    "EJIT_SRE_TASKPOOL_BUCKETS (${EJIT_SRE_TASKPOOL_BUCKETS}) must be in "
+    "[1, 254] (bucket ids are stored in an 8-bit field).")
+endif()
+math(EXPR _ejit_queue_pow2
+  "${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY} & (${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY} - 1)")
+if(EJIT_SRE_TASKPOOL_QUEUE_CAPACITY LESS 2 OR NOT _ejit_queue_pow2 EQUAL 0)
+  message(FATAL_ERROR
+    "EJIT_SRE_TASKPOOL_QUEUE_CAPACITY (${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}) "
+    "must be a power of two >= 2 (the ring queue indexes with a mask).")
+endif()
+unset(_ejit_queue_pow2)
+if(EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX LESS 1)
+  message(FATAL_ERROR
+    "EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX (${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}) "
+    "must be >= 1.")
+endif()
 # EJIT_ICACHE_FUNC_SLOTS: capacity of the per-function inline-cache slot table
 # (gIcacheSlots[]). MUST be >= kEJitMaxFuncIndex (EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX),
 # else any funcIndex >= EJIT_ICACHE_FUNC_SLOTS has its icacheFill silently dropped
@@ -785,6 +843,21 @@ set(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT "1" CACHE STRING
   "EmbeddedJIT worker inter-task throttle delay multiplier (n in n*base ticks after every task; 0 disables)")
 set(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS "100" CACHE STRING
   "EmbeddedJIT worker throttle delay base in scheduler ticks (the base in MULT*DELAY_TICKS; 0 disables)")
+# Fail at configure time (not in the SRE platform layer's static_asserts) when
+# the worker geometry is nonsense.
+ejit_require_numeric(EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE)
+ejit_require_numeric(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT)
+ejit_require_numeric(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS)
+if(EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE LESS 1)
+  message(FATAL_ERROR
+    "EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE (${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}) "
+    "must be >= 1 byte.")
+endif()
+if(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT LESS 0 OR
+   EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS LESS 0)
+  message(FATAL_ERROR
+    "EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT/DELAY_TICKS must be >= 0 (0 disables).")
+endif()
 if(EJIT_SRE_TASKPOOL)
   add_definitions(-DEJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS})
   add_definitions(-DEJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY})
@@ -815,6 +888,12 @@ option(EJIT_SRE_TASKPOOL_NO_RECLAIM
 # live in shared memory, so each bucket is a fixed slot array).
 set(EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS "16" CACHE STRING
   "EmbeddedJIT shared taskpool fixed cache slots per bucket")
+ejit_require_numeric(EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS)
+if(EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS LESS 1)
+  message(FATAL_ERROR
+    "EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS (${EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS}) "
+    "must be >= 1 (fixed slot array per cache bucket).")
+endif()
 # Cross-core fnPtr sharing capability (spec §11). DEFAULT OFF: a non-owner core
 # cleanly falls back instead of reading a cache fnPtr. Turn ON only when the
 # platform GUARANTEES: same address space, the code pool mapped at the SAME VA
@@ -836,6 +915,7 @@ if(EJIT_SRE_SHARED_TASKPOOL)
   # its icacheFill silently dropped and the wrapper's inline probe misses
   # forever (every call falls through to MissFn -> tryCacheHit -> cacheHits++).
   # It must cover the full dense funcIndex space.
+  ejit_require_numeric(EJIT_ICACHE_FUNC_SLOTS)
   if(EJIT_ICACHE_FUNC_SLOTS LESS EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX)
     message(FATAL_ERROR
       "EJIT_ICACHE_FUNC_SLOTS (${EJIT_ICACHE_FUNC_SLOTS}) must be >= "

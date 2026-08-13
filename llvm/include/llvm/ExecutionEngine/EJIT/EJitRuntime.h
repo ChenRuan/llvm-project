@@ -169,8 +169,12 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
 // Lifecycle. Activation is keyed by lifecycle/period name + instance index
 // only; there is no array-pointer dimension in the active state (a period name
 // with multiple arrays is activated as a whole for that instance).
-ejit_status_t ejit_activate(const char *periodName, uint8_t cellIdx);
-ejit_status_t ejit_deactivate(const char *periodName, uint8_t cellIdx);
+// cellIdx is uint32_t on the ABI so an out-of-range instance index is
+// REJECTED by the runtime instead of being silently truncated to 8 bits at
+// the call boundary (the AOT wrapper passes an i32). The runtime checks
+// cellIdx < kEJitMaxInstances.
+ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx);
+ejit_status_t ejit_deactivate(const char *periodName, uint32_t cellIdx);
 ejit_status_t ejit_activate_all(const char *periodName);
 ejit_status_t ejit_deactivate_all(const char *periodName);
 bool ejit_is_active(const char *periodName, uint8_t cellIdx);

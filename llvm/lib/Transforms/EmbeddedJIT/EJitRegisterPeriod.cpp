@@ -196,7 +196,7 @@ generateRegistryTablePeriod(
   auto *GV = new GlobalVariable(M, ArrayTy, /*isConstant=*/true,
                                 GlobalValue::PrivateLinkage, ArrayInit,
                                 ".ejit.registry.period");
-  GV->setSection(".ejit_period");
+  GV->setSection(SECT_EJIT_PERIOD);
   GV->setAlignment(M.getDataLayout().getABITypeAlign(EntryTy));
   appendToUsed(M, {GV});
 }

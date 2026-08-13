@@ -33,6 +33,18 @@
 #include <string>
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 
+// Hard-lock the AOT-side contract constants against each other (the runtime
+// side locks its own copies in EJitRuntime.cpp / EJitSharedTaskPool.cpp):
+// a drift between the wrapper dim cap and the Sema param cap would let one
+// stage emit what the other rejects, and a non-pow2 D corrupts the [D]^N
+// icache array stride.
+static_assert(EJIT_ICACHE_MAX_DIMS == llvm::ejit::MAX_PERIOD_ARR_IND_PARAMS,
+              "EJIT_ICACHE_MAX_DIMS must equal MAX_PERIOD_ARR_IND_PARAMS "
+              "(wrapper dim cap vs Sema ejit_period_arr_ind cap).");
+static_assert((EJIT_ICACHE_DIM_SIZE & (EJIT_ICACHE_DIM_SIZE - 1)) == 0,
+              "EJIT_ICACHE_DIM_SIZE must be a power of 2 "
+              "([D]^numDims icache array stride).");
+
 using namespace llvm;
 using namespace llvm::ejit;
 
@@ -218,7 +230,7 @@ emitLifecycleRegistration(Module &M,
   auto *GV = new GlobalVariable(
       M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
       ConstantArray::get(ArrayTy, Entries), ".ejit.registry.lifecycle");
-  GV->setSection(".ejit_period");
+  GV->setSection(SECT_EJIT_PERIOD);
   GV->setAlignment(M.getDataLayout().getABITypeAlign(EntryTy));
   appendToUsed(M, {GV});
 }
@@ -353,7 +365,7 @@ emitFuncIndexRegistration(Module &M,
   auto *GV = new GlobalVariable(
       M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
       ConstantArray::get(ArrayTy, Entries), ".ejit.registry.funcindex");
-  GV->setSection(".ejit_period");
+  GV->setSection(SECT_EJIT_PERIOD);
   GV->setAlignment(M.getDataLayout().getABITypeAlign(EntryTy));
   appendToUsed(M, {GV});
 }
@@ -430,7 +442,7 @@ emitIcacheSlotRegistration(Module &M,
   auto *GV = new GlobalVariable(
       M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
       ConstantArray::get(ArrayTy, Entries), ".ejit.registry.icache");
-  GV->setSection(".ejit_period");
+  GV->setSection(SECT_EJIT_PERIOD);
   GV->setAlignment(M.getDataLayout().getABITypeAlign(EntryTy));
   appendToUsed(M, {GV});
 }
@@ -590,9 +602,10 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     auto PeriodInds = getPeriodArrIndInfo(*F);
     unsigned DimCount = PeriodInds.size();
 
-    if (DimCount > 4) {
-      F->getContext().emitError("ejit-wrapper-gen: more than 4 "
-                                "ejit_period_arr_ind dimensions are not "
+    if (DimCount > EJIT_ICACHE_MAX_DIMS) {
+      F->getContext().emitError("ejit-wrapper-gen: more than "
+                                + Twine(EJIT_ICACHE_MAX_DIMS) +
+                                " ejit_period_arr_ind dimensions are not "
                                 "supported");
       continue;
     }
