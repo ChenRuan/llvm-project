@@ -1760,4 +1760,10 @@ def ExplicitSpecializationStorageClass : DiagGroup<"explicit-specialization-stor
 def ExperimentalOption : DiagGroup<"experimental-option">;
 
 // Warnings related to EmbeddedJIT attributes
-def EmbeddedJIT : DiagGroup<"embedded-jit">;
+
+// A function definition omits ejit_entry / ejit_period_lc even though a prior
+// declaration carries the attribute. On by default; part of -Wembedded-jit.
+// Silenced individually by -Wno-embedded-jit-attr-missing-on-def.
+def EmbeddedJITAttrMissingOnDef : DiagGroup<"embedded-jit-attr-missing-on-def">;
+
+def EmbeddedJIT : DiagGroup<"embedded-jit", [EmbeddedJITAttrMissingOnDef]>;
