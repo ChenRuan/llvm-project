@@ -26,6 +26,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h" // seal/split granule contract
 
 #include <cstdint>
 
@@ -52,6 +53,16 @@ constexpr unsigned kSreMid = static_cast<unsigned>(EJIT_SRE_CODE_POOL_MID);
 constexpr size_t k2MiB = static_cast<size_t>(2) * 1024 * 1024;
 constexpr size_t k4KiB = static_cast<size_t>(4) * 1024;
 } // namespace
+
+// Hard-lock the platform split/seal granularities against the shared-pool
+// contract copies: splitting by one size and sealing by another would leave
+// RWX windows or fail seals — memory safety, not just a perf issue.
+static_assert(k2MiB == llvm::ejit::kEJitSharedSplitGranule,
+              "SRE pool split granule (2 MiB) must equal "
+              "kEJitSharedSplitGranule (EJitSharedTaskPoolState.h).");
+static_assert(k4KiB == llvm::ejit::kEJitSharedSealPage,
+              "SRE pool seal page (4 KiB) must equal "
+              "kEJitSharedSealPage (EJitSharedTaskPoolState.h).");
 
 //===----------------------------------------------------------------------===//
 // Platform primitives (declaration only — defined by the platform/business)

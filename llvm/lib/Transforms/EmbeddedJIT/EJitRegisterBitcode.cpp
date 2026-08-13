@@ -708,7 +708,7 @@ static void generateSymbolRegisters(
   auto *VoidTy = Type::getVoidTy(Ctx);
   auto *PtrTy = PointerType::getUnqual(Ctx);
 
-  M.getOrInsertFunction("ejit_register_symbol",
+  M.getOrInsertFunction(FN_REGISTER_SYMBOL,
       FunctionType::get(VoidTy, {PtrTy, PtrTy}, false));
 
   std::set<std::string> registered;
@@ -730,7 +730,7 @@ static void generateSymbolRegisters(
               std::string Name = Callee->getName().str();
               if (registered.insert(Name).second) {
                 IRBuilder<> Builder(InsertBefore);
-                Builder.CreateCall(M.getFunction("ejit_register_symbol"),
+                Builder.CreateCall(M.getFunction(FN_REGISTER_SYMBOL),
                     {Builder.CreateGlobalString(Name),
                      Builder.CreateBitCast(Callee, PtrTy)});
               }
@@ -754,7 +754,7 @@ static void generateSymbolRegisters(
             std::string Name = GV->getName().str();
             if (registered.insert(Name).second) {
               IRBuilder<> Builder(InsertBefore);
-              Builder.CreateCall(M.getFunction("ejit_register_symbol"),
+              Builder.CreateCall(M.getFunction(FN_REGISTER_SYMBOL),
                   {Builder.CreateGlobalString(Name),
                    Builder.CreateBitCast(GV, PtrTy)});
             }
@@ -992,7 +992,7 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
   auto *GV = new GlobalVariable(M, ArrayTy, /*isConstant=*/true,
                                 GlobalValue::PrivateLinkage, ArrayInit,
                                 ".ejit.registry.bitcode");
-  GV->setSection(".ejit_bitcode");
+  GV->setSection(SECT_EJIT_BITCODE);
   GV->setAlignment(M.getDataLayout().getABITypeAlign(EntryTy));
   appendToUsed(M, {GV});
 }

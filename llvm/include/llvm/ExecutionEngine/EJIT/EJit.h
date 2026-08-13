@@ -39,13 +39,18 @@ public:
 
   // Lifecycle — period-level (fans out to all arrays under periodName).
   // Returns false only in a taskpool build when periodName is not a registered
-  // lifecycle (no state is changed); always true in the legacy build.
-  bool activate(const std::string &periodName, uint8_t cellIdx);
-  bool deactivate(const std::string &periodName, uint8_t cellIdx);
+  // lifecycle (no state is changed), or when cellIdx >= kEJitMaxInstances;
+  // always true in the legacy build. cellIdx is uint32_t so an out-of-range
+  // instance index is rejected here instead of being truncated at the ABI
+  // boundary (see ejit_activate in EJitRuntime.h).
+  bool activate(const std::string &periodName, uint32_t cellIdx);
+  bool deactivate(const std::string &periodName, uint32_t cellIdx);
 
   bool activateAll(const std::string &periodName);
   bool deactivateAll(const std::string &periodName);
-  bool isActive(const std::string &periodName, uint8_t cellIdx) const;
+  // uint32_t like activate/deactivate: an out-of-range index is rejected
+  // (false) before any narrowing, never truncated into instance 0.
+  bool isActive(const std::string &periodName, uint32_t cellIdx) const;
 
   // Compilation
   /// Pre-computed cacheKey = funcIdx(32b) | dims(4x8b). The AOT wrapper
@@ -53,7 +58,9 @@ public:
 
   // Cache management
   void clearCache();
-  void invalidateByPeriod(const std::string &periodName, uint8_t cellIdx);
+  // uint32_t like activate/deactivate: an out-of-range index is rejected
+  // (no-op) before any narrowing, never truncated into instance 0.
+  void invalidateByPeriod(const std::string &periodName, uint32_t cellIdx);
   void invalidateAllByPeriod(const std::string &periodName);
 
   // Configuration

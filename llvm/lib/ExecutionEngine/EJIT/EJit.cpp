@@ -4,6 +4,7 @@
 #include "llvm/Config/Targets.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCommon.h" // SECT_EJIT_* section names
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
@@ -230,6 +231,20 @@ EJit::EJit(const Config &config) : config_(config) {
         }
       }
     };
+    // Diagnose an empty registry section before walking: on hosted builds the
+    // bounds are weak, so a missing linker script or a section-name typo (the
+    // AOT SECT_EJIT_* constants vs the script's KEEP patterns) silently yields
+    // an empty range — exactly the silent-desync class these diagnostics exist
+    // to catch. VERBOSE (not INFO): a bitcode-only app with no periods has a
+    // legitimately empty .ejit_period and must not warn at default level.
+    if (__start_ejit_bitcode == __stop_ejit_bitcode)
+      EJIT_DIAG_VERBOSE("registry walk: %s range is EMPTY "
+                        "(missing section or linker script mismatch)",
+                        SECT_EJIT_BITCODE);
+    if (__start_ejit_period == __stop_ejit_period)
+      EJIT_DIAG_VERBOSE("registry walk: %s range is EMPTY "
+                        "(missing section or linker script mismatch)",
+                        SECT_EJIT_PERIOD);
     walkRange(__start_ejit_bitcode, __stop_ejit_bitcode);
     walkRange(__start_ejit_period, __stop_ejit_period);
     for (auto &sym : tableSymbols)
@@ -374,7 +389,9 @@ void EJit::recordInitError(int code, const std::string &message,
             funcName.c_str());
 }
 
-bool EJit::activate(const std::string &periodName, uint8_t cellIdx) {
+bool EJit::activate(const std::string &periodName, uint32_t cellIdx) {
+  if (cellIdx >= kEJitMaxInstances)
+    return false;
 #ifdef EJIT_SRE_TASKPOOL
   // Taskpool build: a registered lifecycle updates the time-window activation
   // state AND the SwitchController (kept consistent; setEnabled bumps the
@@ -415,7 +432,9 @@ bool EJit::activate(const std::string &periodName, uint8_t cellIdx) {
 #endif
 }
 
-bool EJit::deactivate(const std::string &periodName, uint8_t cellIdx) {
+bool EJit::deactivate(const std::string &periodName, uint32_t cellIdx) {
+  if (cellIdx >= kEJitMaxInstances)
+    return false;
 #ifdef EJIT_SRE_TASKPOOL
   uint32_t dt = EJitLifecycleRegistry::instance().lookup(periodName);
   if (dt != kEJitInvalidDimType) {
@@ -504,7 +523,11 @@ bool EJit::deactivateAll(const std::string &periodName) {
 #endif
 }
 
-bool EJit::isActive(const std::string &periodName, uint8_t cellIdx) const {
+bool EJit::isActive(const std::string &periodName, uint32_t cellIdx) const {
+  // Range-check BEFORE any narrowing: the private state tables index by
+  // cellIdx, and a truncated 256 would silently read instance 0.
+  if (cellIdx >= kEJitMaxInstances)
+    return false;
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   // Cross-core: a registered lifecycle's activation lives in the shared
   // enabled bit (the producer's ejit_activate writes it). Query that, not the
@@ -517,12 +540,21 @@ bool EJit::isActive(const std::string &periodName, uint8_t cellIdx) const {
       return sp->isInstanceActive(dt, cellIdx);
   }
 #endif
-  return runtimeState_->isActive(periodName, cellIdx);
+  // Cell-index range already validated above; the private state still takes a
+  // uint8_t (its tables are sized kEJitMaxInstances, keyed by the validated
+  // index), so the narrowing here is provably safe.
+  return runtimeState_->isActive(periodName,
+                                 static_cast<uint8_t>(cellIdx));
 }
 
 void EJit::clearCache() { /* Legacy LRU cache retired */ }
 
-void EJit::invalidateByPeriod(const std::string &periodName, uint8_t cellIdx) {
+void EJit::invalidateByPeriod(const std::string &periodName, uint32_t cellIdx) {
+  // Range-check BEFORE any narrowing: a truncated 256 would invalidate
+  // instance 0. Legacy invalidation is a no-op, but the ABI contract is the
+  // same as the taskpool path.
+  if (cellIdx >= kEJitMaxInstances)
+    return;
   (void)periodName; (void)cellIdx;
 }
 

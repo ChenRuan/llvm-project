@@ -107,20 +107,29 @@ enum class EJitWorkerStep : uint32_t {
 // the owner core uses the cache, so one global slot suffices.
 //===----------------------------------------------------------------------===//
 #ifndef EJIT_ICACHE_FUNC_SLOTS
-#define EJIT_ICACHE_FUNC_SLOTS 64u
+// Fallback ONLY for a non-CMake compile. The default must cover the full
+// dense funcIndex space (EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX, default 4096) —
+// the historical 64-slot default silently dropped icacheFill for every
+// funcIndex >= 64 and defeated the inline cache in production. The
+// static_assert in EJitSharedTaskPool.cpp hard-fails any build where
+// FUNC_SLOTS < MAX_FUNC_INDEX.
+#define EJIT_ICACHE_FUNC_SLOTS 4096u
 #endif
 
 // Per-dim bound D of the multi-version inline cache (@__ejit_icache_fn_<name>
 // is a [D]^numDims array). MUST be a power of 2 (the hit path indexes with
 // shifts, no multiply). The CMake EJIT_ICACHE_DIM_SIZE var overrides this
-// default; the AOT pass reads the same value via -mllvm -ejit-icache-dim-size
+// default; the same CMake var feeds the AOT pass, and configure time
+// cross-checks the built compiler via -mllvm -print-ejit-icache-dim-size,
 // so array layout and runtime linearization agree.
 #ifndef EJIT_ICACHE_DIM_SIZE
 #define EJIT_ICACHE_DIM_SIZE 16u
 #endif
 // Maximum number of ejit_dim params a cached ejit_entry may have. An entry
-// with more is a compile error (the wrapper is not emitted). 4 matches the
-// taskpool DimCount cap.
+// with more is a compile error (the wrapper is not emitted). Must equal
+// kEJitSharedMaxDims (EJitSharedTaskPoolState.h) and MAX_PERIOD_ARR_IND_PARAMS
+// (EJitCommon.h); hard-locked by static_asserts in EJitSharedTaskPool.cpp and
+// EJitRuntime.cpp.
 #ifndef EJIT_ICACHE_MAX_DIMS
 #define EJIT_ICACHE_MAX_DIMS 4u
 #endif

@@ -5,13 +5,16 @@
 #include "llvm/Config/llvm-config.h"
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCommon.h" // contract constants + kEJitMax*
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h" // ejit_reg_entry_t layout
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h" // EJitDimPair layout
 // Build-time-generated: EJIT_GIT_COMMIT / EJIT_GIT_BRANCH (git HEAD of the
 // llvm-project source tree). Lives in the LLVMEJIT build directory.
 #include "EJitVersion.h"
@@ -32,6 +35,103 @@
 
 using namespace llvm;
 using namespace llvm::ejit;
+
+//===----------------------------------------------------------------------===//
+// Compile-time contract checks: each assert locks two independently defined
+// copies of one config value (AOT pass vs runtime, or runtime header vs
+// runtime header). Editing one copy without the other now fails the LLVMEJIT
+// build instead of silently desynchronizing — the exact class of bug that
+// shipped as EJIT_ICACHE_FUNC_SLOTS=64 vs a 4096 funcIndex space.
+//===----------------------------------------------------------------------===//
+
+// Log-level gate thresholds (EJitDiag.h macros) vs the public C ABI enum
+// (EJitRuntime.h): ejit_set_log_level() feeds the macros, so a drift would
+// change which diagnostics fire for a given API level.
+static_assert(EJIT_LOG_LVL_OFF == EJIT_LOG_OFF &&
+                  EJIT_LOG_LVL_INFO == EJIT_LOG_INFO &&
+                  EJIT_LOG_LVL_VERBOSE == EJIT_LOG_VERBOSE &&
+                  EJIT_LOG_LVL_DEBUG == EJIT_LOG_DEBUG,
+              "EJIT_LOG_LVL_* (EJitDiag.h) must equal ejit_log_level_t "
+              "(EJitRuntime.h) values.");
+
+// Wrapper-timing sentinel: must never collide with a real status. The value
+// is structurally RESERVED in the ejit_status_t enum itself
+// (EJIT_STATUS_ICACHE_HIT_SENTINEL = 0xFE) — a future real status assigned
+// 0xFE is a duplicate-enumerator compile error — and the two constants are
+// locked together here. The per-value comparisons below are a second,
+// explicit lock against every status that exists today: a collision would
+// corrupt timing aggregation in ejit_taskpool_trace_wrapper.
+static_assert(kEJitIcacheHitTimingStatus ==
+                  static_cast<uint32_t>(EJIT_STATUS_ICACHE_HIT_SENTINEL),
+              "kEJitIcacheHitTimingStatus (EJitCommon.h) must equal the "
+              "EJIT_STATUS_ICACHE_HIT_SENTINEL enumerator (EJitRuntime.h).");
+static_assert(kEJitIcacheHitTimingStatus != static_cast<uint32_t>(EJIT_OK) &&
+                  kEJitIcacheHitTimingStatus !=
+                      static_cast<uint32_t>(EJIT_PENDING) &&
+                  kEJitIcacheHitTimingStatus !=
+                      static_cast<uint32_t>(EJIT_ERR_INVALID_PARAM) &&
+                  kEJitIcacheHitTimingStatus !=
+                      static_cast<uint32_t>(EJIT_ERR_NOT_ACTIVE) &&
+                  kEJitIcacheHitTimingStatus !=
+                      static_cast<uint32_t>(EJIT_ERR_COMPILE_FAILED) &&
+                  kEJitIcacheHitTimingStatus !=
+                      static_cast<uint32_t>(EJIT_ERR_CACHE_FULL) &&
+                  kEJitIcacheHitTimingStatus !=
+                      static_cast<uint32_t>(EJIT_ERR_MEMORY) &&
+                  kEJitIcacheHitTimingStatus !=
+                      static_cast<uint32_t>(EJIT_ERR_BITCODE_NOT_FOUND) &&
+                  kEJitIcacheHitTimingStatus !=
+                      static_cast<uint32_t>(EJIT_ERR_QUEUE_FULL) &&
+                  kEJitIcacheHitTimingStatus !=
+                      static_cast<uint32_t>(EJIT_ERR_DEDUP_FULL) &&
+                  kEJitIcacheHitTimingStatus !=
+                      static_cast<uint32_t>(EJIT_ERR_DISABLED) &&
+                  kEJitIcacheHitTimingStatus !=
+                      static_cast<uint32_t>(EJIT_ERR_INSTANCE_DISABLED),
+              "kEJitIcacheHitTimingStatus (0xFE) collides with a real "
+              "ejit_status_t value.");
+
+// Registry entry ABI: {i32 type; ptr; ptr; ptr; u64 size}, 8-byte aligned,
+// 40 bytes on 64-bit. The AOT passes emit these as constant structs and the
+// runtime walks them in EJit.cpp; the linker scripts (ejit_registry.ld,
+// ejit_baremetal.ld) hardcode the same alignment. EJIT targets are 64-bit
+// (aarch64_be / x86_64).
+#if UINTPTR_MAX == UINT64_MAX
+static_assert(sizeof(ejit_reg_entry_t) == 40,
+              "ejit_reg_entry_t must be 40 bytes on 64-bit "
+              "(AOT-emitted registry entry layout).");
+static_assert(alignof(ejit_reg_entry_t) == 8,
+              "ejit_reg_entry_t must be 8-byte aligned "
+              "(linker script ALIGN(8) contract).");
+#endif
+
+// Dim-pair identity layout: {uint32_t dimType, uint32_t instanceId}, field
+// order dimType-first, identical in the C ABI type and the queue POD type.
+// The AOT wrapper builds this struct in IR with the same order; a swap would
+// key the cache on the wrong identity.
+static_assert(offsetof(ejit_dim_pair_t, dimType) ==
+                      offsetof(EJitDimPair, dimType) &&
+                  offsetof(ejit_dim_pair_t, instanceId) ==
+                      offsetof(EJitDimPair, instanceId) &&
+                  sizeof(ejit_dim_pair_t) == sizeof(EJitDimPair),
+              "ejit_dim_pair_t (C ABI) and EJitDimPair (queue POD) must have "
+              "identical {dimType, instanceId} layout.");
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+// Shared-taskpool capacity constants must mirror the single-instance ones:
+// the shared cache's enabled[dimType][instanceId] tables index by these, and
+// a smaller shared copy would go OOB on the shared blob for indices the
+// single-instance side accepts.
+static_assert(kEJitMaxDimTypes == kEJitSharedDimTypes,
+              "kEJitMaxDimTypes (EJitCommon.h) must equal kEJitSharedDimTypes "
+              "(EJitSharedTaskPoolState.h).");
+static_assert(kEJitMaxInstances == kEJitSharedInstances,
+              "kEJitMaxInstances (EJitCommon.h) must equal "
+              "kEJitSharedInstances (EJitSharedTaskPoolState.h).");
+static_assert(kEJitMaxFuncIndex == kEJitSharedMaxFuncIndex,
+              "kEJitMaxFuncIndex (EJitCommon.h) must equal "
+              "kEJitSharedMaxFuncIndex (EJitSharedTaskPoolState.h).");
+#endif // EJIT_SRE_SHARED_TASKPOOL
 
 static EJit *gEJIT = nullptr;
 
@@ -386,10 +486,18 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
                     funcName, idx, numDims);
 }
 
-ejit_status_t ejit_activate(const char *periodName, uint8_t cellIdx) {
+ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx) {
   if (!gEJIT) {
     EJIT_DIAG("activate(%s,%u) failed: not initialized", periodName, cellIdx);
     return EJIT_ERR_NOT_ACTIVE;
+  }
+  // The AOT call site passes the instance index as an i32; reject anything the
+  // runtime tables cannot hold instead of silently activating the wrong
+  // instance (the pre-fix uint8_t signature truncated at the call boundary).
+  if (cellIdx >= kEJitMaxInstances) {
+    EJIT_DIAG("activate(%s,%u) failed: instance index >= kEJitMaxInstances=%u",
+              periodName, cellIdx, kEJitMaxInstances);
+    return EJIT_ERR_INVALID_PARAM;
   }
   EJIT_DIAG("activate(%s,%u)", periodName, cellIdx);
   // In a taskpool build this also syncs the SwitchController and returns false
@@ -400,10 +508,15 @@ ejit_status_t ejit_activate(const char *periodName, uint8_t cellIdx) {
   return EJIT_OK;
 }
 
-ejit_status_t ejit_deactivate(const char *periodName, uint8_t cellIdx) {
+ejit_status_t ejit_deactivate(const char *periodName, uint32_t cellIdx) {
   if (!gEJIT) {
     EJIT_DIAG("deactivate(%s,%u) failed: not initialized", periodName, cellIdx);
     return EJIT_ERR_NOT_ACTIVE;
+  }
+  if (cellIdx >= kEJitMaxInstances) {
+    EJIT_DIAG("deactivate(%s,%u) failed: instance index >= kEJitMaxInstances=%u",
+              periodName, cellIdx, kEJitMaxInstances);
+    return EJIT_ERR_INVALID_PARAM;
   }
   EJIT_DIAG("deactivate(%s,%u)", periodName, cellIdx);
   if (!gEJIT->deactivate(periodName, cellIdx))
@@ -435,9 +548,16 @@ ejit_status_t ejit_deactivate_all(const char *periodName) {
   return EJIT_OK;
 }
 
-bool ejit_is_active(const char *periodName, uint8_t cellIdx) {
+bool ejit_is_active(const char *periodName, uint32_t cellIdx) {
   if (!gEJIT) {
     EJIT_DIAG("is_active(%s,%u) failed: not initialized", periodName, cellIdx);
+    return false;
+  }
+  // Reject out-of-range indices instead of truncating at the ABI boundary and
+  // querying the wrong instance (pre-fix uint8_t signature).
+  if (cellIdx >= kEJitMaxInstances) {
+    EJIT_DIAG("is_active(%s,%u) rejected: instance index >= kEJitMaxInstances=%u",
+              periodName, cellIdx, kEJitMaxInstances);
     return false;
   }
   return gEJIT->isActive(periodName, cellIdx);
@@ -460,10 +580,17 @@ void ejit_clear_cache(void) {
 #endif
 }
 
-void ejit_invalidate(const char *periodName, uint8_t cellIdx) {
+void ejit_invalidate(const char *periodName, uint32_t cellIdx) {
   EJIT_DIAG("invalidate(%s,%u)", periodName, cellIdx);
   if (!gEJIT)
     return;
+  // Reject out-of-range indices instead of truncating at the ABI boundary and
+  // invalidating the wrong instance (pre-fix uint8_t signature).
+  if (cellIdx >= kEJitMaxInstances) {
+    EJIT_DIAG("invalidate(%s,%u) rejected: instance index >= kEJitMaxInstances=%u",
+              periodName, cellIdx, kEJitMaxInstances);
+    return;
+  }
   gEJIT->invalidateByPeriod(periodName, cellIdx);
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (auto *tp = gEJIT->sharedTaskPool())

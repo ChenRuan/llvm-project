@@ -54,12 +54,16 @@ add_llvm_unittest(EJITTaskPoolTests
   )
 set(LLVM_LINK_COMPONENTS "${EJIT_TASKPOOL_LINK_COMPONENTS_SAVED}")
 
+# Numeric geometry must come from the CMake cache vars (not literals), so the
+# test TU compiles the shared sources with the SAME values as production
+# LLVMEJIT — a tuned cache var silently stopping being tested is exactly the
+# config-desync class this whole file guards against.
 target_compile_definitions(EJITTaskPoolTests PRIVATE
   EJIT_SRE_TASKPOOL
   EJIT_SRE_TASKPOOL_TESTING
   EJIT_STATS_ENABLE
-  EJIT_SRE_TASKPOOL_BUCKETS=32
-  EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
+  EJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS}
+  EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}
   EJIT_TASKPOOL_SOURCE_DIR="${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT"
   EJIT_TASKPOOL_INCLUDE_DIR="${LLVM_MAIN_SRC_DIR}/include/llvm/ExecutionEngine/EJIT"
   )
@@ -95,16 +99,17 @@ set(LLVM_LINK_COMPONENTS "${EJIT_SHARED_TASKPOOL_LINK_COMPONENTS_SAVED}")
 
 # The icache geometry must match the production LLVMEJIT build (same CMake
 # vars, same static_assert): these sources are compiled INTO the test target,
-# so without the definitions the header defaults apply and the FUNC_SLOTS
-# static_assert (64 >= 4096) fails.
+# so the ${EJIT_*} cache vars must be forwarded explicitly — the header
+# fallbacks exist only for non-CMake builds and the static_asserts would fire
+# (or silently test different geometry) if they diverged.
 target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
   EJIT_SRE_TASKPOOL
   EJIT_SRE_SHARED_TASKPOOL
   EJIT_SRE_TASKPOOL_TESTING
   EJIT_STATS_ENABLE
-  EJIT_SRE_TASKPOOL_BUCKETS=32
-  EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
-  EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=1048576
+  EJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS}
+  EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}
+  EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}
   EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}
   EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS}
   EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}
@@ -157,8 +162,8 @@ if(EJIT_BUILD_CACHE_QUERY_BENCH)
     EJIT_SRE_TASKPOOL
     EJIT_SRE_SHARED_TASKPOOL
     EJIT_SRE_TASKPOOL_TESTING
-    EJIT_SRE_TASKPOOL_BUCKETS=32
-    EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
+    EJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS}
+    EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}
     EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}
     EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS}
     EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}

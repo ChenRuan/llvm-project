@@ -23,6 +23,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 
 using llvm::ejit::MAX_PERIOD_ARR_IND_PARAMS;
+using llvm::ejit::MAX_PERIOD_ARR_SIZE;
 
 using namespace clang;
 
@@ -147,7 +148,7 @@ void handleEjitPeriodArrAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   if (const ArrayType *AT = S.Context.getAsArrayType(VT)) {
     if (const auto *CAT = dyn_cast<ConstantArrayType>(AT)) {
       uint64_t Size = CAT->getSize().getZExtValue();
-      if (Size > 100) {
+      if (Size > MAX_PERIOD_ARR_SIZE) {
         S.Diag(AL.getLoc(), diag::err_ejit_period_arr_too_large)
             << VD << static_cast<unsigned>(Size);
         return;
@@ -296,7 +297,7 @@ void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD) {
     }
   }
 
-  if (Count > 4 && OverflowPVD) {
+  if (Count > MAX_PERIOD_ARR_IND_PARAMS && OverflowPVD) {
     // Get the attribute location from the overflow parameter
     if (auto *A = OverflowPVD->getAttr<EjitPeriodArrIndAttr>()) {
       S.Diag(A->getLocation(), diag::err_ejit_period_arr_ind_too_many)

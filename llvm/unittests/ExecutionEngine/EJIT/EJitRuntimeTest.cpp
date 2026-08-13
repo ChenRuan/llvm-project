@@ -668,10 +668,10 @@ extern "C" {
 typedef enum { EJIT_OK_C = 0 } ejit_status_test_t;
 extern ejit_status_test_t ejit_init(const void *config);
 extern void ejit_shutdown(void);
-extern ejit_status_test_t ejit_activate(const char *, uint8_t);
-extern ejit_status_test_t ejit_deactivate(const char *, uint8_t);
-extern bool ejit_is_active(const char *, uint8_t);
-extern void ejit_invalidate(const char *, uint8_t);
+extern ejit_status_test_t ejit_activate(const char *, uint32_t);
+extern ejit_status_test_t ejit_deactivate(const char *, uint32_t);
+extern bool ejit_is_active(const char *, uint32_t);
+extern void ejit_invalidate(const char *, uint32_t);
 extern void ejit_clear_cache(void);
 extern void ejit_register_period_array(const char *, const char *, void *,
                                        uint64_t);
@@ -755,6 +755,17 @@ TEST(EJitCApi, DynamicCellIdxBoundaries) {
   EXPECT_TRUE(ejit_is_active("bound", (uint8_t)0));
   EXPECT_EQ(ejit_activate("bound", (uint8_t)255), EJIT_OK_C);
   EXPECT_TRUE(ejit_is_active("bound", (uint8_t)255));
+  // Out-of-range instance index must be REJECTED (post uint32_t-ABI fix), not
+  // truncated to 8 bits at the call boundary and applied to the wrong cell.
+  EXPECT_NE(ejit_activate("bound", 256u), EJIT_OK_C);
+  EXPECT_NE(ejit_deactivate("bound", 256u), EJIT_OK_C);
+  // Same contract for the query/invalidate entry points: 256 must neither
+  // read nor invalidate instance 0.
+  ejit_activate("bound", (uint8_t)0);
+  EXPECT_TRUE(ejit_is_active("bound", (uint8_t)0));
+  EXPECT_FALSE(ejit_is_active("bound", 256u));
+  ejit_invalidate("bound", 256u);
+  EXPECT_TRUE(ejit_is_active("bound", (uint8_t)0)); // instance 0 untouched
   ejit_deactivate("bound", 0);
   EXPECT_FALSE(ejit_is_active("bound", 0));
   EXPECT_TRUE(ejit_is_active("bound", (uint8_t)255));
