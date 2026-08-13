@@ -328,6 +328,48 @@ void checkEjitAlwaysInlineConflict(Sema &S, FunctionDecl *FD) {
   }
 }
 
+/// checkEjitAttrMissingOnDefinition - A definition that inherits ejit_entry /
+/// ejit_period_lc from a prior declaration (e.g. a header prototype) but does
+/// not repeat the attribute itself is NOT JIT-specialized: warn and drop the
+/// inherited attribute so CodeGen emits no !ejit.metadata and the
+/// AOT/runtime pipelines skip the function. An attribute written on the
+/// definition suppresses the inherited clone (DeclHasAttr in
+/// mergeDeclAttribute), so isInherited() distinguishes the two cases.
+/// Called from CheckFunctionDeclaration after MergeFunctionDecl and from
+/// ActOnStartOfFunctionDef (for MSVC delayed template bodies).
+void checkEjitAttrMissingOnDefinition(Sema &S, FunctionDecl *FD) {
+  // Implicit and explicit instantiations reproduce the pattern definition
+  // (whose attribute was already dropped, so the inherited clone here is the
+  // only copy). The mismatch is diagnosed once, at the pattern definition;
+  // instantiations are handled silently.
+  bool Warn = !FD->isTemplateInstantiation();
+
+  if (const EjitEntryAttr *EA = FD->getAttr<EjitEntryAttr>()) {
+    if (EA->isInherited()) {
+      if (Warn) {
+        S.Diag(FD->getLocation(), diag::warn_ejit_attr_missing_on_definition)
+            << FD << "ejit_entry";
+        S.Diag(EA->getLocation(), diag::note_ejit_attr_declared_here)
+            << "ejit_entry";
+      }
+      FD->dropAttr<EjitEntryAttr>();
+    }
+  }
+
+  for (const EjitPeriodLcAttr *LA : FD->specific_attrs<EjitPeriodLcAttr>()) {
+    if (LA->isInherited()) {
+      if (Warn) {
+        S.Diag(FD->getLocation(), diag::warn_ejit_attr_missing_on_definition)
+            << FD << "ejit_period_lc";
+        S.Diag(LA->getLocation(), diag::note_ejit_attr_declared_here)
+            << "ejit_period_lc";
+      }
+      FD->dropAttrs<EjitPeriodLcAttr>();
+      break;
+    }
+  }
+}
+
 /// If \p E is an lvalue that writes an ejit_may_const field, return that field
 /// and set \p BaseVar to the underlying variable (if any). Strips parentheses
 /// and implicit casts, and walks through array-subscript / member chains to

@@ -13515,6 +13515,12 @@ def warn_ejit_always_inline_conflict : Warning<
   "out-of-line so it survives the inliner for JIT specialization; "
   "ignoring 'always_inline'">,
   InGroup<EmbeddedJIT>;
+def warn_ejit_attr_missing_on_definition : Warning<
+  "function %0 is declared with '%1' but defined without it; "
+  "EmbeddedJIT specialization is disabled for this definition">,
+  InGroup<EmbeddedJIT>;
+def note_ejit_attr_declared_here : Note<
+  "'%0' declared here">;
 def note_ejit_period_arr_defined_here : Note<
   "ejit_period_arr '%0' defined here">;
 def note_ejit_entry_defined_here : Note<

@@ -80,6 +80,10 @@ void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD);
 // Defined in SemaEJIT.cpp.
 void checkEjitAlwaysInlineConflict(Sema &S, FunctionDecl *FD);
 
+// Forward declaration for EmbeddedJIT missing-attribute-on-definition check.
+// Defined in SemaEJIT.cpp.
+void checkEjitAttrMissingOnDefinition(Sema &S, FunctionDecl *FD);
+
 // Forward declaration for EmbeddedJIT may_const write check.
 // Defined in SemaEJIT.cpp.
 void checkEjitMayConstWrites(Sema &S, const FunctionDecl *FD, Stmt *Body);
@@ -12273,6 +12277,12 @@ bool Sema::CheckFunctionDeclaration(Scope *S, FunctionDecl *NewFD,
     }
   }
 
+  // A function defined without ejit_entry / ejit_period_lc even though a
+  // prior declaration carries the attribute is not JIT-specialized: warn and
+  // drop the inherited attribute so CodeGen emits no !ejit.metadata.
+  if (DeclIsDefn)
+    checkEjitAttrMissingOnDefinition(*this, NewFD);
+
   if (LangOpts.OpenMP)
     OpenMP().ActOnFinishedFunctionDefinitionInOpenMPAssumeScope(NewFD);
 
@@ -15951,6 +15961,14 @@ Decl *Sema::ActOnStartOfFunctionDef(Scope *FnBodyScope, Decl *D,
   // call e.g. isInlineDefinitionExternallyVisible while we're still parsing
   // this function.
   FD->setWillHaveBody();
+
+  // MSVC delayed template parsing reaches this point with the inherited
+  // ejit_entry / ejit_period_lc still in place (CheckFunctionDeclaration ran
+  // with DeclIsDefn == false). Diagnose and drop it before the body is
+  // parsed; for ordinary definitions the attribute was already dropped there
+  // and this is a no-op.
+  if (FD->hasAttr<EjitEntryAttr>() || FD->hasAttr<EjitPeriodLcAttr>())
+    checkEjitAttrMissingOnDefinition(*this, FD);
 
   // If we are instantiating a generic lambda call operator, push
   // a LambdaScopeInfo onto the function stack.  But use the information

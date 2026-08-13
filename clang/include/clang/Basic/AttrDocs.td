@@ -9523,6 +9523,10 @@ AOT code is executed.
 
 Recursive functions are not supported.
 
+If a function is declared with this attribute, its definition must also carry
+the attribute. A definition without it is compiled as a plain AOT function
+(JIT specialization is disabled) and a warning is emitted.
+
 .. code-block:: c
 
   __attribute__((ejit_entry))
