@@ -25,8 +25,8 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
-#ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS
-#define EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS 1u
+#ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT
+#define EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT 1u
 #endif
 
 #ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS
@@ -1621,7 +1621,7 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       // A peer racing the owner yields (not busy-spins) so a high-priority peer
       // never starves the owner core trying to finish init + publish Ready.
       if (workerIdle_)
-        workerIdle_(workerIdleCtx_);
+        workerIdle_(workerIdleCtx_, 1); // single yield while owner publishes
       else
         cpuRelax();
       break;
@@ -2197,29 +2197,26 @@ void EJitSharedTaskPool::runWorkerLoop() {
   // cannot starve the core that must publish Ready or enqueue work. The idle
   // hook runs OUTSIDE any bucket lock / queue slot / dedup critical state
   // (pollOne returns before we idle).
-  uint32_t consumedSinceThrottle = 0;
   for (;;) {
     EJitWorkerStep s = workerPollOnce();
     if (s == EJitWorkerStep::Exit)
       break;
     if (s == EJitWorkerStep::WaitForReady || s == EJitWorkerStep::Idle)
-      workerIdle();
-    else if (EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS != 0u &&
-             EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS != 0u &&
-             ++consumedSinceThrottle >=
-                 EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS) {
-      consumedSinceThrottle = 0;
-      for (uint32_t i = 0; i < EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS; ++i)
-        workerIdle();
-    }
+      workerIdle(1); // single yield while waiting / empty queue
+    else if (EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT != 0u &&
+             EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS != 0u)
+      // Throttle after EVERY consumed task: ONE delay(MULT*DELAY_TICKS) call,
+      // not DELAY_TICKS separate yields. Either 0 disables (no inter-task gap).
+      workerIdle(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT *
+                 EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS);
   }
   EJIT_DIAG_VERBOSE("shared worker loop leave");
 }
 
-void EJitSharedTaskPool::workerIdle() {
+void EJitSharedTaskPool::workerIdle(uint32_t ticks) {
   workerIdleYields_.fetchAdd(1);
   if (workerIdle_)
-    workerIdle_(workerIdleCtx_); // platform yield (SRE_TaskDelay / std::yield)
+    workerIdle_(workerIdleCtx_, ticks); // platform delay(ticks): 1=yield, N=throttle
   else
     cpuRelax(); // step/unit tests with no injected hook
 }
