@@ -296,6 +296,24 @@ void ejit_taskpool_print_stats();
 void ejit_taskpool_print_compiled();
 uint32_t ejit_taskpool_get_worker_core();
 
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+// Online-PGO value-profiling observability (EJIT_VALUE_PROFILE.md §9). All
+// counters are cold-path (Tier-2 merge / transform), so they are always
+// compiled when the feature is; the per-call cost stays zero. Fixed layout
+// (uint64_t only) for stable ABI across the aarch64_be target.
+typedef struct {
+  uint64_t merges;            ///< Tier-2 value-profile merges performed.
+  uint64_t icValueSites;      ///< Indirect-call value sites merged.
+  uint64_t memopValueSites;   ///< Memop-size value sites merged.
+  uint64_t scalarValueSites;  ///< Scalar sites merged (pre-threshold).
+  uint64_t scalarDropped;     ///< Scalar sites dropped by the thresholds.
+  uint64_t scalarSpecialized; ///< Guarded scalar specializations created.
+  uint64_t reserved;          ///< Reserved; always 0.
+} ejit_vp_stats_t;
+
+ejit_status_t ejit_vp_get_stats(ejit_vp_stats_t *out);
+#endif
+
 /// Enable name-filtered JIT IR+ASM capture. When \p name is non-null and
 /// non-empty, the next time a specialization whose entry name exactly matches
 /// \p name is JIT-compiled, the engine saves (in memory) post-optimization IR

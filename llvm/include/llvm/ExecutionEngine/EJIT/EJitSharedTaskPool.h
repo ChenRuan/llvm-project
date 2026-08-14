@@ -34,8 +34,8 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h" // EJitCompileMode, status enum
-#include <atomic>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 
 namespace llvm {
@@ -67,7 +67,8 @@ struct EJitSharedDiagnostics {
   uint64_t compileFailed;
   uint64_t publishFailed;
   uint64_t instanceDisabled;
-  uint64_t instanceDisabledPreActivate; ///< instanceDisabled before first activate.
+  uint64_t
+      instanceDisabledPreActivate; ///< instanceDisabled before first activate.
   uint64_t executePrepareFailed;
   uint32_t pgoActiveFunctionCount;
   uint32_t pgoMaxActiveFunctions;
@@ -300,7 +301,8 @@ inline uint32_t ejitL0Index(uint32_t funcIndex, const EJitDimPair *dims,
                             uint32_t numDims) {
   uint32_t k = funcIndex * 2654435761u;
   for (uint32_t i = 0; i < numDims; ++i)
-    k = (k ^ (dims[i].dimType * 2654435761u) ^ dims[i].instanceId) * 2654435761u;
+    k = (k ^ (dims[i].dimType * 2654435761u) ^ dims[i].instanceId) *
+        2654435761u;
   return (k >> 26) & (kEJitL0Slots - 1);
 }
 
@@ -310,6 +312,8 @@ public:
   /// true and *outFn on success.
   using CompileCallback = bool (*)(void *ctx, const EJitCompileRequest &req,
                                    void **outFn);
+  using PublishCallback = void (*)(void *ctx, const EJitCompileRequest &req,
+                                   bool published);
   /// Owner-private physical-code release callback for an overwritten/retired
   /// pointer. Optional; a purely logical drop happens when unset.
   using ReleaseCallback = void (*)(void *ctx, void *oldFn);
@@ -331,8 +335,8 @@ public:
   /// stats. The owner publishes this into the shared mirror after every
   /// successful compile so every core's ejit_print_code_pool_stats is
   /// consistent (the real pools are owner-private). Returns false when no code
-  /// pool exists (clean fallback). Optional: when unset, the shared mirror stays
-  /// zero and readers fall back to their per-core (empty) view.
+  /// pool exists (clean fallback). Optional: when unset, the shared mirror
+  /// stays zero and readers fall back to their per-core (empty) view.
   using CodePoolStatsCallback = bool (*)(void *ctx, EJitCodePoolStatsOut *out);
   /// Per-core platform primitive: split a 2MiB-aligned [poolBase, poolBase +
   /// poolSize) window into 4KiB mappings in the CALLING core's translation
@@ -472,6 +476,10 @@ public:
     compileFn_ = fn;
     compileCtx_ = ctx;
   }
+  void setPublishCallback(PublishCallback fn, void *ctx) {
+    publishFn_ = fn;
+    publishCtx_ = ctx;
+  }
   void setReleaser(ReleaseCallback fn, void *ctx) {
     const bool had = (releaseFn_ != nullptr);
     releaseFn_ = fn;
@@ -554,7 +562,8 @@ public:
     codeRangeFn_ = fn;
     codeRangeCtx_ = ctx;
   }
-  /// Owner: provide the code-pool stats snapshotter (see CodePoolStatsCallback).
+  /// Owner: provide the code-pool stats snapshotter (see
+  /// CodePoolStatsCallback).
   void setCodePoolStatsProvider(CodePoolStatsCallback fn, void *ctx) {
     codePoolStatsFn_ = fn;
     codePoolStatsCtx_ = ctx;
@@ -663,18 +672,16 @@ public:
   /// slot's hitCount; the hit that crosses \p threshold arms a one-shot
   /// Tier-2 (PGOUse) lazy recompile via enqueue. \p threshold 0 disables
   /// the trigger (hits are still counted).
-  void setPgoEnabled(bool enable, uint32_t threshold,
-                     uint32_t maxConcurrentProfiles =
-                         EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES) {
-    maxConcurrentProfiles =
-        std::max(1u, std::min(maxConcurrentProfiles,
-                              kEJitSharedMaxConcurrentProfiles));
+  void setPgoEnabled(
+      bool enable, uint32_t threshold,
+      uint32_t maxConcurrentProfiles = EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES) {
+    maxConcurrentProfiles = std::max(
+        1u, std::min(maxConcurrentProfiles, kEJitSharedMaxConcurrentProfiles));
     pgoEnabled_.storeRelaxed(enable ? 1 : 0);
     tier2Threshold_.storeRelaxed(enable ? threshold : 0u);
     pgoMaxConcurrentProfiles_.storeRelaxed(maxConcurrentProfiles);
-    if (!state_ ||
-        state_->initState.loadAcquire() !=
-            static_cast<uint32_t>(EJitSharedInitState::Ready))
+    if (!state_ || state_->initState.loadAcquire() !=
+                       static_cast<uint32_t>(EJitSharedInitState::Ready))
       return;
 
     // Publish the threshold before enabling so a peer that acquires the
@@ -719,9 +726,8 @@ public:
   ///     owner publishes the desired mode during init().
   void setSharedMode(EJitCompileMode mode) {
     configuredMode_ = mode;
-    if (state_ &&
-        state_->initState.loadAcquire() ==
-            static_cast<uint32_t>(EJitSharedInitState::Ready))
+    if (state_ && state_->initState.loadAcquire() ==
+                      static_cast<uint32_t>(EJitSharedInitState::Ready))
       state_->mode.storeRelease(static_cast<uint32_t>(mode));
   }
   /// Publish \p mode only if the blob is still Ready at generation \p gen --
@@ -748,9 +754,8 @@ public:
   /// The current cross-core compile mode: the shared state's mode (acquire
   /// load) once the blob is Ready, otherwise the staged configuredMode_.
   EJitCompileMode getSharedMode() const {
-    if (state_ &&
-        state_->initState.loadAcquire() ==
-            static_cast<uint32_t>(EJitSharedInitState::Ready))
+    if (state_ && state_->initState.loadAcquire() ==
+                      static_cast<uint32_t>(EJitSharedInitState::Ready))
       return static_cast<EJitCompileMode>(state_->mode.loadAcquire());
     return configuredMode_;
   }
@@ -921,10 +926,10 @@ public:
     std::atomic_signal_fence(std::memory_order_acquire);
 
     void *fn = e.fn;
-    const bool match = fn != nullptr && e.epoch == state_->dispatchEpoch.loadRelaxed() &&
-                       e.core == EJitCoreId::current() &&
-                       e.funcIndex == funcIndex && e.numDims == numDims &&
-                       dimsEqual(e.dims, dims, numDims);
+    const bool match =
+        fn != nullptr && e.epoch == state_->dispatchEpoch.loadRelaxed() &&
+        e.core == EJitCoreId::current() && e.funcIndex == funcIndex &&
+        e.numDims == numDims && dimsEqual(e.dims, dims, numDims);
 
     std::atomic_signal_fence(std::memory_order_acquire);
     if (e.seq != s0 || !match)
@@ -1039,8 +1044,8 @@ private:
     /// releaseRead() is a safe no-op (its range check rejects it).
     bool noTokenHit = false;
     /// Set by peerPrepareSlot() when the pointer came from the out-of-line cold
-    /// first-touch path (which self-revalidates), so the seqlock caller must not
-    /// second-guess it with the bucket publishSeq check.
+    /// first-touch path (which self-revalidates), so the seqlock caller must
+    /// not second-guess it with the bucket publishSeq check.
     bool coldPrepared = false;
   };
 
@@ -1202,6 +1207,8 @@ private:
   EJitSharedTaskPoolState *state_ = nullptr;
   CompileCallback compileFn_ = nullptr;
   void *compileCtx_ = nullptr;
+  PublishCallback publishFn_ = nullptr;
+  void *publishCtx_ = nullptr;
   ReleaseCallback releaseFn_ = nullptr;
   void *releaseCtx_ = nullptr;
   PrepareCodeCallback prepareCodeFn_ = nullptr;

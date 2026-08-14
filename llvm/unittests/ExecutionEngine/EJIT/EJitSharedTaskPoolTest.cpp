@@ -80,8 +80,8 @@ bool mockPrepareCode(void *ctx, const void * /*fnPtr*/) {
 // chosen seal step (to exercise the re-validate-after-prepare protocol).
 //===----------------------------------------------------------------------===//
 struct FourKLog {
-  std::vector<std::pair<uintptr_t, uint32_t>> splits; // (poolBase, core)
-  std::vector<std::pair<uintptr_t, uint32_t>> seals;  // (pageVA, core)
+  std::vector<std::pair<uintptr_t, uint32_t>> splits;  // (poolBase, core)
+  std::vector<std::pair<uintptr_t, uint32_t>> seals;   // (pageVA, core)
   std::vector<std::pair<uintptr_t, uint32_t>> rwPages; // (pageVA, core)
   bool splitOk = true;
   int failSealAtIndex = -1;           // fail the Nth (0-based) seal call
@@ -171,6 +171,17 @@ bool mockCompileSeq(void *ctx, const EJitCompileRequest & /*req*/,
   return true;
 }
 
+struct PublishObserver {
+  uint32_t calls = 0;
+  bool lastPublished = false;
+
+  static void notify(void *ctx, const EJitCompileRequest &, bool published) {
+    auto *self = static_cast<PublishObserver *>(ctx);
+    ++self->calls;
+    self->lastPublished = published;
+  }
+};
+
 // Injectable worker hooks. The entry is never run on a real thread here; tests
 // drive pollOne() manually, so these only prove "exactly one worker started".
 struct WorkerHooks {
@@ -192,8 +203,8 @@ bool mockWorkerStart(void *ctx, EJitSharedTaskPool::WorkerEntryFn /*entry*/,
 void mockWorkerStop(void *ctx) { ++static_cast<WorkerHooks *>(ctx)->stops; }
 
 // Stands in for building/releasing the owner's ORC engine, and records what the
-// blob looked like WHILE it ran -- the ordering against the worker start and the
-// Ready publish is the contract, not just that it ran.
+// blob looked like WHILE it ran -- the ordering against the worker start and
+// the Ready publish is the contract, not just that it ran.
 struct OwnerEngineLog {
   int built = 0;
   int released = 0;
@@ -644,7 +655,9 @@ TEST_F(SharedTaskPoolTest, DeactivateDuringCompileBlocksPublish) {
   owner.bind(state_.get());
   owner.setMode(EJitCompileMode::Async);
   ToggleCtx tctx{&owner, 0, 7};
+  PublishObserver observer;
   owner.setCompiler(&mockCompileThenToggle, &tctx);
+  owner.setPublishCallback(&PublishObserver::notify, &observer);
   ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
   owner.setInstanceEnabled(0, 7, true);
 
@@ -656,6 +669,18 @@ TEST_F(SharedTaskPoolTest, DeactivateDuringCompileBlocksPublish) {
   owner.getDiagnostics(d);
   EXPECT_EQ(d.cacheReadyCount, 0u); // nothing published
   EXPECT_EQ(d.compileFailed, 1u);
+  EXPECT_EQ(observer.calls, 1u);
+  EXPECT_FALSE(observer.lastPublished);
+}
+
+TEST_F(SharedTaskPoolTest, PublishCallbackRunsAfterCommit) {
+  EJitSharedTaskPool owner;
+  PublishObserver observer;
+  bringUpOwner(owner);
+  owner.setPublishCallback(&PublishObserver::notify, &observer);
+  publish(owner, 10);
+  EXPECT_EQ(observer.calls, 1u);
+  EXPECT_TRUE(observer.lastPublished);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3003,7 +3028,8 @@ static BatchStats summarize(std::vector<double> &perIterNs) {
   return s;
 }
 static void report(const char *name, const BatchStats &s) {
-  printf("  %-28s avg=%.1fns p50=%.1f p90=%.1f p99=%.1f max=%.1f (n=%zu batches)\n",
+  printf("  %-28s avg=%.1fns p50=%.1f p90=%.1f p99=%.1f max=%.1f (n=%zu "
+         "batches)\n",
          name, s.avgNs, s.p50, s.p90, s.p99, s.maxNs, s.samples);
 }
 } // namespace
@@ -3015,9 +3041,10 @@ TEST_F(SharedTaskPoolTest, DISABLED_HotHitMicroBench) {
   EJitCoreId::setCurrentForTest(0); // owner-core hit path
   const uint64_t freq = benchFreq();
   const double tickNs = 1e9 / static_cast<double>(freq);
-  const uint32_t kIters = 2000;    // per batch
-  const uint32_t kBatches = 2000;  // distribution samples
-  printf("HotHit micro-bench: cntfrq=%llu Hz (%.3f ns/tick), %u iters x %u batches\n",
+  const uint32_t kIters = 2000;   // per batch
+  const uint32_t kBatches = 2000; // distribution samples
+  printf("HotHit micro-bench: cntfrq=%llu Hz (%.3f ns/tick), %u iters x %u "
+         "batches\n",
          (unsigned long long)freq, tickNs, kIters, kBatches);
 
   // Warm up + correctness sanity.
@@ -3051,7 +3078,8 @@ TEST_F(SharedTaskPoolTest, DISABLED_HotHitMicroBench) {
     owner.releaseRead(r.bucketIndex);
   });
 
-  // (B) Lookup only (read-token acquired but released untimed): isolates get_fn.
+  // (B) Lookup only (read-token acquired but released untimed): isolates
+  // get_fn.
   auto lookup = runBatches([&] {
     auto r = owner.tryCacheHit0D(42);
     sink = r.fnPtr;
@@ -3093,9 +3121,9 @@ TEST_F(SharedTaskPoolTest, DISABLED_HotHitMicroBench) {
 }
 
 // Multi-core contention model of the real board: N cores hammering the SAME hot
-// function share one bucket cache line. The read-token RMW (fetchAdd/fetchSub on
-// bucket.readers) then bounces that line between cores; a load-only seqlock read
-// does not. This is the scenario the 6us regression comes from.
+// function share one bucket cache line. The read-token RMW (fetchAdd/fetchSub
+// on bucket.readers) then bounces that line between cores; a load-only seqlock
+// read does not. This is the scenario the 6us regression comes from.
 TEST_F(SharedTaskPoolTest, DISABLED_HotHitContendedBench) {
   EJitSharedTaskPool owner;
   bringUpOwner(owner, /*codeSharing=*/true);
@@ -4014,7 +4042,8 @@ TEST_F(SharedTaskPoolTest, L0RetiredByPublishAndByVersionChange) {
   ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
 
   publish(pool, 9);
-  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out)) << "publish must retire the L0";
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out))
+      << "publish must retire the L0";
 
   pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
   ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
@@ -4295,7 +4324,8 @@ TEST_F(SharedTaskPoolTest, SharedPgoInlineCacheWaitsForTier2) {
   ASSERT_TRUE(pool.pollOne());
   auto tier1 = pool.tryCacheHit0D(kFunc);
   ASSERT_EQ(tier1.status, EJitCompileOrGetStatus::CacheHit);
-  pool.icacheFill(kFunc, tier1.fnPtr, nullptr, 0);
+  pool.icacheFill(kFunc, tier1.fnPtr, nullptr, 0,
+                  pool.icacheBeginResolve());
   EXPECT_EQ(cell, 0u);
   EXPECT_EQ(pool.pendingCount(), 1u);
   if (tier1.hasReadToken)
@@ -4306,7 +4336,8 @@ TEST_F(SharedTaskPoolTest, SharedPgoInlineCacheWaitsForTier2) {
   ASSERT_TRUE(pool.pollOne());
   auto tier2 = pool.tryCacheHit0D(kFunc);
   ASSERT_EQ(tier2.status, EJitCompileOrGetStatus::CacheHit);
-  pool.icacheFill(kFunc, tier2.fnPtr, nullptr, 0);
+  pool.icacheFill(kFunc, tier2.fnPtr, nullptr, 0,
+                  pool.icacheBeginResolve());
   EXPECT_EQ(cell, reinterpret_cast<uintptr_t>(tier2.fnPtr));
   EXPECT_NE(tier2.fnPtr, tier1.fnPtr);
   if (tier2.hasReadToken)
@@ -4344,9 +4375,9 @@ TEST_F(SharedTaskPoolTest, SharedPgoInlineCacheRequiresExactTier2Identity) {
   auto tier2 = pool.tryCacheHit1D(kFunc, 1, 0);
   ASSERT_EQ(tier2.status, EJitCompileOrGetStatus::CacheHit);
 
-  pool.icacheFill(kFunc, tier2.fnPtr, d1, 1);
+  pool.icacheFill(kFunc, tier2.fnPtr, d1, 1, pool.icacheBeginResolve());
   EXPECT_EQ(cells[1], 0u) << "a Tier-2 pointer must not fill another identity";
-  pool.icacheFill(kFunc, tier2.fnPtr, d0, 1);
+  pool.icacheFill(kFunc, tier2.fnPtr, d0, 1, pool.icacheBeginResolve());
   EXPECT_EQ(cells[0], reinterpret_cast<uintptr_t>(tier2.fnPtr));
   if (tier2.hasReadToken)
     pool.releaseRead(tier2.bucketIndex);
@@ -4435,16 +4466,14 @@ TEST_F(SharedTaskPoolTest, SharedPgoProfilesFunctionsSequentially) {
             EJitCompileOrGetStatus::EnqueuedPending);
   EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
   EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 6u);
-  EXPECT_EQ(state_->enqueuePos.loadRelaxed() -
-                state_->dequeuePos.loadRelaxed(),
+  EXPECT_EQ(state_->enqueuePos.loadRelaxed() - state_->dequeuePos.loadRelaxed(),
             1u);
 
   // A different function stays on its AOT fallback and adds no compiler work.
   auto deferred = pool.compileOrGet(6, nullptr, 0, codeFor(6));
   EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::AlreadyPending);
   EXPECT_EQ(deferred.fnPtr, codeFor(6));
-  EXPECT_EQ(state_->enqueuePos.loadRelaxed() -
-                state_->dequeuePos.loadRelaxed(),
+  EXPECT_EQ(state_->enqueuePos.loadRelaxed() - state_->dequeuePos.loadRelaxed(),
             1u);
   EXPECT_EQ(state_->pgoDeferredMisses.loadRelaxed(), 1u);
 
@@ -4556,8 +4585,7 @@ TEST_F(SharedTaskPoolTest,
     EJitCoreId::setCurrentForTest(kProducerCores[i]);
     peers[i].bind(state_.get());
     peers[i].setMode(EJitCompileMode::Async);
-    ASSERT_EQ(peers[i].init(),
-              EJitSharedTaskPool::InitResult::AttachedReady);
+    ASSERT_EQ(peers[i].init(), EJitSharedTaskPool::InitResult::AttachedReady);
   }
   ASSERT_EQ(hooks.starts, 1) << "peer cores must not start workers";
 
@@ -4572,7 +4600,7 @@ TEST_F(SharedTaskPoolTest,
       while (!go.load(std::memory_order_acquire))
         std::this_thread::yield();
       first[i] = peers[i].compileOrGet(kFuncIndices[i], nullptr, 0,
-                                      codeFor(kFuncIndices[i]));
+                                       codeFor(kFuncIndices[i]));
     });
   }
   while (ready.load(std::memory_order_acquire) != kProducerCount)
@@ -4627,8 +4655,8 @@ TEST_F(SharedTaskPoolTest,
         std::this_thread::yield();
       unsigned calls = i == deferred ? 1u : 2u;
       for (unsigned hit = 0; hit < calls; ++hit) {
-        profile[i][hit] = peers[i].compileOrGet(
-            kFuncIndices[i], nullptr, 0, codeFor(kFuncIndices[i]));
+        profile[i][hit] = peers[i].compileOrGet(kFuncIndices[i], nullptr, 0,
+                                                codeFor(kFuncIndices[i]));
         if (profile[i][hit].hasReadToken)
           peers[i].releaseRead(profile[i][hit].bucketIndex);
       }
@@ -4642,8 +4670,7 @@ TEST_F(SharedTaskPoolTest,
 
   EXPECT_EQ(profile[deferred][0].status,
             EJitCompileOrGetStatus::AlreadyPending);
-  EXPECT_EQ(profile[deferred][0].fnPtr,
-            codeFor(kFuncIndices[deferred]));
+  EXPECT_EQ(profile[deferred][0].fnPtr, codeFor(kFuncIndices[deferred]));
   EXPECT_EQ(owner.pendingCount(), 2u);
   uint32_t profilesAtThreshold = 0;
   for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {

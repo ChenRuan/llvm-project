@@ -923,6 +923,26 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     if (!EntryF->isDeclaration() && EntryF->hasLocalLinkage())
       EntryF->setLinkage(GlobalValue::ExternalLinkage);
 
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  // Value-profile target capture (EJIT_VALUE_PROFILE.md §5.1): the Tier-1
+  // compile resolves EVERY module function's runtime address to build the
+  // verified address -> IR-PGO-name-MD5 table. Most callees are internal
+  // linkage (C `static`), which ORC excludes from the JITDylib symbol table,
+  // so lookup would fail for exactly the targets the indirect-call promotion
+  // needs. Two-part fix: (1) export every defined function here, BEFORE
+  // addIRModule, so ORC claims the symbol; (2) the optimizer's capture
+  // re-exports them again AFTER the transform (phase 1 internalized them for
+  // IPSCCP) so the EMITTED symbol is global again - a claimed-but-local
+  // symbol would link as a null absolute (same claim discipline as the
+  // __profc_* counters, §5.2).
+  if (P->activeCtx &&
+      P->activeCtx->tier == CompileTier::Instrumented) {
+    for (Function &F : (**ModuleOrErr).functions())
+      if (!F.isDeclaration() && !F.isIntrinsic() && F.hasLocalLinkage())
+        F.setLinkage(GlobalValue::ExternalLinkage);
+  }
+#endif
+
   // Collect global variable addresses from the registry for symbols
   // that appear as external declarations in the bitcode module.
   orc::SymbolMap globalSymbols;
@@ -1119,6 +1139,12 @@ const SpecializationContext *EJitOrcEngine::getActiveContext() const {
 ArrayRef<std::string> EJitOrcEngine::getLastCounterNames() const {
   if (P->optimizer)
     return P->optimizer->getLastCounterNames();
+  return {};
+}
+
+ArrayRef<EJitVpFunctionInfo> EJitOrcEngine::getLastVpFunctions() const {
+  if (P->optimizer)
+    return P->optimizer->getLastVpFunctions();
   return {};
 }
 

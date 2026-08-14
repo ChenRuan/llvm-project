@@ -18,9 +18,28 @@ add_llvm_unittest(EJITTests
   EJitFieldOffsetTest.cpp
   EJitLinkOptimizationPluginTest.cpp
   EJitPgoTest.cpp
+  EJitVpMergeTest.cpp
+  EJitVpScalarSpecTest.cpp
+  EJitVpPipelineTest.cpp
 
   PARTIAL_SOURCES_INTENDED
   )
+
+# The value-profile test sources are #ifdef EJIT_SRE_PGO_VALUE_PROFILE-gated,
+# matching the LLVMEJIT build; without these definitions they compile to empty
+# translation units.
+if(EJIT_SRE_PGO_VALUE_PROFILE)
+  target_compile_definitions(EJITTests PRIVATE
+    EJIT_SRE_PGO_VALUE_PROFILE
+    EJIT_SRE_VP_K=${EJIT_SRE_VP_K}
+    EJIT_SRE_VP_SITES_PER_CORE=${EJIT_SRE_VP_SITES_PER_CORE}
+    EJIT_SRE_VP_MAX_CORES=${EJIT_SRE_VP_MAX_CORES}
+    EJIT_SRE_VP_TOP_N=${EJIT_SRE_VP_TOP_N}
+    EJIT_SRE_VP_DRAIN_TICKS=${EJIT_SRE_VP_DRAIN_TICKS}
+    EJIT_SRE_VP_MIN_SAMPLES=${EJIT_SRE_VP_MIN_SAMPLES}
+    EJIT_SRE_VP_MIN_CONF_PERCENT=${EJIT_SRE_VP_MIN_CONF_PERCENT}
+  )
+endif()
 
 # EJit.cpp calls InitializeAllAsmParsers(); a target's AsmParser lib is only
 # referenced at runtime (no CMake dependency edge), so when listed via
@@ -192,6 +211,40 @@ add_custom_target(check-ejit-tier1-writable
   COMMAND $<TARGET_FILE:EJITTier1WritableIntegrationTests>
   DEPENDS EJITTier1WritableIntegrationTests
   COMMENT "Running EmbeddedJIT Tier-1 runtime-writable integration test"
+  USES_TERMINAL
+  )
+
+# Online-PGO value-profiling collector tests: compile the collector sources
+# directly with the VP macros so they build and run independently of LLVMEJIT
+# and need no real SRE platform symbols. Only LLVMSupport is linked (the gtest
+# harness), so this target never pulls in OrcJIT/EJIT. Multi-core behavior is
+# simulated in one host process via the injectable EJitCoreId (no real thread).
+set(EJIT_VP_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
+set(LLVM_LINK_COMPONENTS Support)
+add_llvm_unittest(EJITValueProfileTests
+  EJitVpCollectorTest.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitVpCollector.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSreTask_host.cpp
+
+  PARTIAL_SOURCES_INTENDED
+  )
+set(LLVM_LINK_COMPONENTS "${EJIT_VP_LINK_COMPONENTS_SAVED}")
+
+target_compile_definitions(EJITValueProfileTests PRIVATE
+  EJIT_SRE_PGO_VALUE_PROFILE
+  EJIT_SRE_VP_K=2
+  EJIT_SRE_VP_SITES_PER_CORE=64
+  EJIT_SRE_VP_MAX_CORES=${EJIT_SRE_VP_MAX_CORES}
+  EJIT_SRE_VP_TOP_N=2
+  EJIT_SRE_VP_DRAIN_TICKS=64
+  )
+
+# Convenience target: build + run only the value-profiling collector tests.
+add_custom_target(check-ejit-value-profile
+  COMMAND $<TARGET_FILE:EJITValueProfileTests>
+  DEPENDS EJITValueProfileTests
+  COMMENT "Running EmbeddedJIT online-PGO value-profiling collector unit tests"
   USES_TERMINAL
   )
 

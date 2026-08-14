@@ -5,6 +5,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+#include "llvm/ExecutionEngine/EJIT/EJitValueProfile.h"
+#endif
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Metadata.h"
@@ -14,32 +17,31 @@
 // The post-specialization cleanup is the real LLVM -O2 function-simplification
 // pipeline (PassBuilder::buildFunctionSimplificationPipeline); only the light
 // cleanupFPM_ and the LowerExpect prefix are hand-added below.
-#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/IR/GlobalValue.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/VirtualFileSystem.h"
+#include "llvm/Transforms/IPO/Inliner.h"
 #include "llvm/Transforms/IPO/SCCP.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Instrumentation/InstrProfiling.h"
+#include "llvm/Transforms/Instrumentation/PGOInstrumentation.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
-#include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
-#include "llvm/Transforms/Scalar/SCCP.h"
-#include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Scalar/IndVarSimplify.h"
 #include "llvm/Transforms/Scalar/LoopDeletion.h"
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
 #include "llvm/Transforms/Scalar/LoopUnrollPass.h"
+#include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
+#include "llvm/Transforms/Scalar/SCCP.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
-#include "llvm/Transforms/Instrumentation/PGOInstrumentation.h"
-#include "llvm/Transforms/Instrumentation/InstrProfiling.h"
-#include "llvm/Transforms/IPO/Inliner.h"
-#include "llvm/Support/VirtualFileSystem.h"
-#include "llvm/Support/MemoryBuffer.h"
-#include "llvm/IR/GlobalValue.h"
 
 using namespace llvm;
 using namespace llvm::ejit;
 
 #define DEBUG_TYPE "ejit-optimizer"
 
-EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
-    : registry_(reg) {
+EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg) : registry_(reg) {
   // Use the real llvm::PassBuilder to register the FULL analysis set. The O2
   // function-simplification pipeline (GVN, CorrelatedValuePropagation, etc.)
   // needs analyses the minimal EJitPassBuilder does not register (~13 vs ~40).
@@ -64,7 +66,8 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
   // buildFunctionSimplificationPipeline, and the AOT IR carries llvm.expect
   // guards (__builtin_expect / LIKELY) on top of may_const conditions. Once
   // StructFieldPass (phase 1c) turns those conditions into constants, lowering
-  // expect(x,y) -> x lets the O2 pipeline fold the branch and DCE its dead half.
+  // expect(x,y) -> x lets the O2 pipeline fold the branch and DCE its dead
+  // half.
   lowerExpectFPM_.addPass(LowerExpectIntrinsicPass());
 
   simplifyO1_ = PB.buildFunctionSimplificationPipeline(
@@ -79,8 +82,8 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
   // the additional Tier-2 memory-operation specialization here.
   pgoUseFPM_.addPass(PGOMemOPSizeOpt());
 
-  // cleanupFPM_ — Phase 4, run after the second StructFieldPass. Unrolling turns
-  // a loop-variant array access g_arr[k].field into constant-index GEPs
+  // cleanupFPM_ — Phase 4, run after the second StructFieldPass. Unrolling
+  // turns a loop-variant array access g_arr[k].field into constant-index GEPs
   // (g_arr[0]/[1]/...), which only then become substitutable. Once
   // StructFieldPass replaces them, this fold/propagate/simplify pass collapses
   // the freshly-constant values and drops what became dead — the same treatment
@@ -98,14 +101,15 @@ void EJitOptimizer::clearAnalyses() {
   MAM_.clear();
 }
 
-void EJitOptimizer::runPipeline(Module &M,
-                                const SpecializationContext &ctx) {
+void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   EJIT_DIAG_VERBOSE("pipeline begin func=%s key=0x%016lx opt=%d dims=%zu "
                     "tier=%d module=%s",
                     ctx.fnName.c_str(), ctx.cacheKey,
                     static_cast<int>(ctx.optLevel), ctx.dimensions.size(),
                     static_cast<int>(ctx.tier), M.getName().str().c_str());
   lastCounterNames_.clear();
+  lastVpFunctions_.clear();
+  scalarSiteCountsByFunc_.clear();
 
   // Phase 1 - specialize (common to all tiers): turn the period index and
   // every may_const field into a compile-time constant.
@@ -171,9 +175,25 @@ void EJitOptimizer::runPipeline(Module &M,
     InstrProfOpts.Atomic = true;
     GenMPM.addPass(InstrProfilingLoweringPass(InstrProfOpts));
     GenMPM.run(M, MAM_);
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+    // Scalar/loop-bound value sites (EJIT_VALUE_PROFILE.md §7.1): discover +
+    // instrument AFTER the Gen/Lowering passes (so the CFG carries the same
+    // critical-edge splits the Tier-2 Use phase will reproduce - the site
+    // numbering must agree) and BEFORE captureCounterGlobals (which merges the
+    // per-function site counts into the capture the compile driver reads).
+    {
+      for (Function &F : M.functions())
+        if (!F.isDeclaration())
+          runValueProfileOnFunction(F, FAM_, EJitValueProfileMode::Instrument,
+                                    [this](StringRef name, uint32_t count) {
+                                      recordScalarSiteCount(name, count);
+                                    });
+    }
+#endif
     captureCounterGlobals(M);
-    EJIT_DIAG_VERBOSE("pipeline done (Tier-1) func=%s key=0x%016lx counters=%zu",
-                      ctx.fnName.c_str(), ctx.cacheKey, lastCounterNames_.size());
+    EJIT_DIAG_VERBOSE(
+        "pipeline done (Tier-1) func=%s key=0x%016lx counters=%zu",
+        ctx.fnName.c_str(), ctx.cacheKey, lastCounterNames_.size());
     return; // codegen; counters land in RW data
   }
 
@@ -194,15 +214,53 @@ void EJitOptimizer::runPipeline(Module &M,
           IntrusiveRefCntPtr<vfs::FileSystem>(InMemFS)));
       UseMPM.run(M, MAM_);
     }
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+    // Scalar/loop-bound sites (EJIT_VALUE_PROFILE.md §7.1): annotate with
+    // !ejit.vp metadata AFTER the Use phase (same post-split CFG as Tier-1's
+    // discovery, so site numbering matches) and BEFORE the inliner (so the
+    // metadata rides inlined instructions into their callers).
+    if (!ctx.scalarValueSites.empty()) {
+      for (Function &F : M.functions())
+        if (!F.isDeclaration())
+          runValueProfileOnFunction(F, FAM_, EJitValueProfileMode::Annotate);
+    }
+#endif
     // PGO-guided inline (§12 阶段3): profile-aware inlining of callees, after
     // PGOUse set ProfileSummary so the InlineAdvisor uses the profile. Requires
     // non-pre-inlined bitcode (PASS1 PGO mode, stage 3b) to have callees to
     // inline; a no-op on already-pre-inlined bitcode.
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+    // Value profiling (EJIT_VALUE_PROFILE.md §6): official indirect-call
+    // promotion over the !prof value metadata PGOInstrumentationUse annotated.
+    // Runs before the PGO inliner so promoted hot direct calls can be inlined
+    // during this same Tier-2 build.
+    // A no-op on modules whose profile carries no indirect-call value data.
+    {
+      ModulePassManager IcpMPM;
+      IcpMPM.addPass(PGOIndirectCallPromotion());
+      IcpMPM.run(M, MAM_);
+    }
+#endif
+    // Run the module inliner after ICP so the guarded direct hot call can be
+    // inlined during this Tier-2 compilation.
     {
       ModulePassManager InlineMPM;
       InlineMPM.addPass(ModuleInlinerWrapperPass());
       InlineMPM.run(M, MAM_);
     }
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+    // Guarded scalar/loop-bound specialization over the merged side table:
+    // versions the qualifying loops (guard + cloned fallback) so the following
+    // optimization pipeline sees the constant bound in the hot loop.
+    if (!ctx.scalarValueSites.empty()) {
+      EJitScalarValueSpecPass SpecPass(ctx.scalarValueSites);
+      FunctionPassManager SpecFPM;
+      SpecFPM.addPass(std::move(SpecPass));
+      for (Function &F : M.functions())
+        if (!F.isDeclaration())
+          SpecFPM.run(F, FAM_);
+    }
+#endif
     runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
     EJIT_DIAG_VERBOSE("pipeline done (Tier-2) func=%s key=0x%016lx",
                       ctx.fnName.c_str(), ctx.cacheKey);
@@ -240,10 +298,45 @@ void EJitOptimizer::captureCounterGlobals(Module &M) {
       // PGOFuncName = name with the "__profc_" prefix stripped.
       lastCounterNames_.emplace_back(Name.drop_front(strlen("__profc_")).str());
   }
+
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  // Value-profile capture (EJIT_VALUE_PROFILE.md §5.1): every function of the
+  // module with its IR-PGO-name MD5 - the SAME hash the Tier-2 module symtab
+  // (InstrProfSymtab::create) keys targets by, so IndirectCallPromotion can
+  // resolve the merged profile values. Declarations are captured too: they
+  // are potential external call targets the driver may resolve through the
+  // registered user symbols.
+  //
+  // Also re-export every defined function: phase 1 internalized them (for
+  // IPSCCP), but the ORC claims made at addIRModule came from the module as
+  // loaded - where the Instrumented tier had already exported them
+  // (EJitOrcEngine::loadBitcodeModule) - and a claimed symbol that the
+  // emitted object defines only as a LOCAL would link as a null absolute.
+  // Re-externalizing here (after the pipeline, nothing optimizes afterwards)
+  // makes the emitted symbol GLOBAL again so the driver's ORC lookup of
+  // internal targets resolves their real addresses.
+  for (Function &F : M.functions()) {
+    if (F.isIntrinsic() || !F.hasName() || F.getName().empty())
+      continue;
+    EJitVpFunctionInfo Info;
+    Info.name = F.getName().str();
+    Info.pgoHash = IndexedInstrProf::ComputeHash(getIRPGOFuncName(F));
+    auto it = scalarSiteCountsByFunc_.find(Info.name);
+    if (it != scalarSiteCountsByFunc_.end())
+      Info.numScalarSites = it->second;
+    lastVpFunctions_.push_back(std::move(Info));
+    if (!F.isDeclaration() && F.hasLocalLinkage()) {
+      // The IR verifier requires default visibility with external linkage;
+      // phase 1 already set default visibility when internalizing.
+      F.setVisibility(GlobalValue::DefaultVisibility);
+      F.setLinkage(GlobalValue::ExternalLinkage);
+    }
+  }
+#endif
 }
 
-void EJitOptimizer::preReplacePeriodIndices(
-    Module &M, const SpecializationContext &ctx) {
+void EJitOptimizer::preReplacePeriodIndices(Module &M,
+                                            const SpecializationContext &ctx) {
   LLVM_DEBUG(dbgs() << "ejit-optimizer: preReplacePeriodIndices, "
                     << ctx.dimensions.size() << " dim(s)\n");
   for (Function &F : M.functions()) {
