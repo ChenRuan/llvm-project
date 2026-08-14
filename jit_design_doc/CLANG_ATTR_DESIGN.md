@@ -466,6 +466,11 @@ static void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 /// 语义检查:
 ///   1. 仅可标记在 FunctionDecl 上 (由 Subjects 保证)
 ///   2. 不支持递归函数
+///   3. 不能与 ejit_period_lc 同时标记（checkEjitEntryLcConflict，与书写
+///      顺序无关。三处检查：ActOnFunctionDeclarator 属性处理完毕后 [同一
+///      声明上的组合]、CheckFunctionDeclaration 的 MergeFunctionDecl 之后
+///      [跨声明的组合]、ActOnExplicitInstantiation 属性落地后 [显式实例化
+///      声明不走前两条路径]）
 static void handleEjitEntryAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   auto *FD = cast<FunctionDecl>(D);
 
@@ -491,6 +496,8 @@ static void handleEjitEntryAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 /// 语义检查:
 ///   1. 仅可标记在 FunctionDecl 上
 ///   2. 必须有对应的 ejit_period_arr_ind(name) 参数
+///   3. 不能与 ejit_entry 同时标记（见 4.3.5 检查 3；同一函数可标记多个
+///      ejit_period_lc，这是 multi-period 入口的正常形态）
 static void handleEjitPeriodLcAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   auto *FD = cast<FunctionDecl>(D);
 

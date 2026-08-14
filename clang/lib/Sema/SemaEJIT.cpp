@@ -306,6 +306,72 @@ void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD) {
   }
 }
 
+/// checkEjitEntryLcConflict - ejit_entry and ejit_period_lc are mutually
+/// exclusive on one function. PASS3 (EJitWrapperGen) replaces an entry's body
+/// with a single-function dispatch wrapper, and PASS4 (EJitPeriodHandler)
+/// inserts lifecycle guards at a lifecycle function's entry and returns; the
+/// two rewrites would both claim the body. Reject the combination at the
+/// source instead of letting the AOT pipeline fight over the function.
+///
+/// Called twice per declaration:
+///  * from ActOnFunctionDeclarator after ProcessDeclAttributes (AfterMerge ==
+///    false), where the check is independent of the source order of the two
+///    attributes;
+///  * from CheckFunctionDeclaration after MergeFunctionDecl (AfterMerge ==
+///    true), which is the only point that sees a combination assembled from
+///    attributes written on DIFFERENT declarations. There the check fires
+///    only when exactly one attribute was inherited from an earlier
+///    declaration: if both were written on this declarator the first call
+///    already diagnosed the pair, and if both are inherited some earlier
+///    declaration already was the first to carry both.
+/// reportEjitEntryLcConflict - Emit the conflict diagnostic: the error at
+/// \p ErrorLoc, the "conflicting attribute is here" note at \p NoteLoc.
+/// Split out of checkEjitEntryLcConflict because the explicit-instantiation
+/// site (ActOnExplicitInstantiation) knows which attribute ITS declarator
+/// wrote and anchors the error there.
+void reportEjitEntryLcConflict(Sema &S, const FunctionDecl *FD,
+                               SourceLocation ErrorLoc,
+                               SourceLocation NoteLoc) {
+  S.Diag(ErrorLoc, diag::err_ejit_entry_lc_conflict) << FD;
+  S.Diag(NoteLoc, diag::note_conflicting_attribute);
+}
+
+void checkEjitEntryLcConflict(Sema &S, FunctionDecl *FD, bool AfterMerge) {
+  if (!FD)
+    return;
+  const EjitEntryAttr *EA = FD->getAttr<EjitEntryAttr>();
+  const EjitPeriodLcAttr *LA = FD->getAttr<EjitPeriodLcAttr>();
+  if (!EA || !LA)
+    return;
+  if (AfterMerge) {
+    if (EA->isInherited() == LA->isInherited())
+      return;
+    // If the immediate previous declaration already carried both, the
+    // conflict was diagnosed there; repeating one attribute on a later
+    // redeclaration must not re-fire (attributes written after a definition
+    // are rejected by clang's own redeclaration rules before they reach
+    // this merge).
+    const FunctionDecl *Prev = FD->getPreviousDecl();
+    if (Prev && Prev->hasAttr<EjitEntryAttr>() &&
+        Prev->hasAttr<EjitPeriodLcAttr>())
+      return;
+    // Instantiations reproduce the pattern's attribute pair; the pattern
+    // declaration was diagnosed already.
+    if (FD->isTemplateInstantiation())
+      return;
+    // Exactly one attribute came from an earlier declaration: point the
+    // error at the attribute written on THIS declaration and the note at
+    // the inherited one, not the other way around.
+    if (EA->isInherited()) {
+      reportEjitEntryLcConflict(S, FD, LA->getLocation(), EA->getLocation());
+      return;
+    }
+    reportEjitEntryLcConflict(S, FD, EA->getLocation(), LA->getLocation());
+    return;
+  }
+  reportEjitEntryLcConflict(S, FD, LA->getLocation(), EA->getLocation());
+}
+
 /// checkEjitAlwaysInlineConflict - An ejit_entry / ejit_period_lc function
 /// must stay out-of-line: CodeGen and PASS3 mark it noinline so it survives
 /// the LTO inliner for PASS1 (bitcode extraction), PASS3 (wrapper), and
