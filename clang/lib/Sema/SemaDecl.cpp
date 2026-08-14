@@ -80,6 +80,10 @@ void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD);
 // Defined in SemaEJIT.cpp.
 void checkEjitAlwaysInlineConflict(Sema &S, FunctionDecl *FD);
 
+// Forward declaration for EmbeddedJIT ejit_entry / ejit_period_lc conflict
+// check. Defined in SemaEJIT.cpp.
+void checkEjitEntryLcConflict(Sema &S, FunctionDecl *FD, bool AfterMerge);
+
 // Forward declaration for EmbeddedJIT missing-attribute-on-definition check.
 // Defined in SemaEJIT.cpp.
 void checkEjitAttrMissingOnDefinition(Sema &S, FunctionDecl *FD);
@@ -10531,6 +10535,10 @@ Sema::ActOnFunctionDeclarator(Scope *S, Declarator &D, DeclContext *DC,
   // (it conflicts with the noinline CodeGen/PASS3 add for LTO survival).
   checkEjitAlwaysInlineConflict(*this, NewFD);
 
+  // ejit_entry and ejit_period_lc are mutually exclusive on one function:
+  // PASS3 (wrapper) and PASS4 (lifecycle guards) both rewrite its body.
+  checkEjitEntryLcConflict(*this, NewFD, /*AfterMerge=*/false);
+
   const auto *NewTVA = NewFD->getAttr<TargetVersionAttr>();
   if (Context.getTargetInfo().getTriple().isAArch64() && NewTVA &&
       !NewTVA->isDefaultVersion() &&
@@ -12281,6 +12289,10 @@ bool Sema::CheckFunctionDeclaration(Scope *S, FunctionDecl *NewFD,
       NewFD->addAttr(OverloadableAttr::CreateImplicit(Context));
     }
   }
+
+  // A function redeclaration may have assembled ejit_entry on one declaration
+  // and ejit_period_lc on another; only the merged declaration shows the pair.
+  checkEjitEntryLcConflict(*this, NewFD, /*AfterMerge=*/true);
 
   // A function defined without ejit_entry / ejit_period_lc even though a
   // prior declaration carries the attribute is not JIT-specialized: warn and

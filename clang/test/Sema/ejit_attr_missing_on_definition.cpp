@@ -19,12 +19,122 @@ void lc_fn(__attribute__((ejit_period_arr_ind("static"))) int idx);
 // expected-note@-2 {{'ejit_period_lc' declared here}}
 void lc_fn(int idx) {} // expected-warning {{function 'lc_fn' is declared with 'ejit_period_lc' but defined without it; EmbeddedJIT specialization is disabled for this definition}}
 
-// --- Definition repeats ejit_entry but omits ejit_period_lc: warn only for lc ---
+// --- Error: ejit_entry and ejit_period_lc cannot be combined ---
+// PASS3 (EJitWrapperGen) rewrites an entry's body and PASS4
+// (EJitPeriodHandler) inserts lifecycle guards; one function cannot be both.
 
 __attribute__((ejit_entry, ejit_period_lc("static")))
-void mixed_fn(__attribute__((ejit_period_arr_ind("static"))) int idx);
-// expected-note@-2 {{'ejit_period_lc' declared here}}
-__attribute__((ejit_entry)) void mixed_fn(int idx) {} // expected-warning {{function 'mixed_fn' is declared with 'ejit_period_lc' but defined without it; EmbeddedJIT specialization is disabled for this definition}}
+void conflict_fn(__attribute__((ejit_period_arr_ind("static"))) int idx) {}
+// expected-error@-2 {{'ejit_entry' and 'ejit_period_lc' cannot be combined on function 'conflict_fn'}}
+// expected-note@-3 {{conflicting attribute is here}}
+
+// --- Error regardless of attribute order ---
+
+__attribute__((ejit_period_lc("static"), ejit_entry))
+void conflict_fn_rev(__attribute__((ejit_period_arr_ind("static"))) int idx) {}
+// expected-error@-2 {{'ejit_entry' and 'ejit_period_lc' cannot be combined on function 'conflict_fn_rev'}}
+// expected-note@-3 {{conflicting attribute is here}}
+
+// --- Error when the two attributes arrive on different declarations ---
+
+__attribute__((ejit_entry))
+void cross_fn(__attribute__((ejit_period_arr_ind("static"))) int idx);
+// expected-note@-2 {{conflicting attribute is here}}
+__attribute__((ejit_period_lc("static")))
+void cross_fn(__attribute__((ejit_period_arr_ind("static"))) int idx);
+// expected-error@-2 {{'ejit_entry' and 'ejit_period_lc' cannot be combined on function 'cross_fn'}}
+
+// --- No duplicate conflict error: the pair was already diagnosed on the
+//     prototype; the definition repeating only ejit_entry gets the usual
+//     missing-on-definition treatment for the omitted ejit_period_lc ---
+
+__attribute__((ejit_entry, ejit_period_lc("static")))
+void once_fn(__attribute__((ejit_period_arr_ind("static"))) int idx);
+// expected-error@-2 {{'ejit_entry' and 'ejit_period_lc' cannot be combined on function 'once_fn'}}
+// expected-note@-3 {{conflicting attribute is here}}
+// expected-note@-4 {{'ejit_period_lc' declared here}}
+__attribute__((ejit_entry))
+void once_fn(__attribute__((ejit_period_arr_ind("static"))) int idx) {}
+// expected-warning@-1 {{function 'once_fn' is declared with 'ejit_period_lc' but defined without it; EmbeddedJIT specialization is disabled for this definition}}
+
+// --- Error with the reverse cross-declaration order: the error points at
+//     the attribute written on THIS declaration, the note at the inherited
+//     one ---
+
+__attribute__((ejit_period_lc("static")))
+void cross_fn_rev(__attribute__((ejit_period_arr_ind("static"))) int idx);
+// expected-note@-2 {{conflicting attribute is here}}
+__attribute__((ejit_entry))
+void cross_fn_rev(__attribute__((ejit_period_arr_ind("static"))) int idx);
+// expected-error@-2 {{'ejit_entry' and 'ejit_period_lc' cannot be combined on function 'cross_fn_rev'}}
+
+// --- Error: both attributes written on an explicit instantiation declarator
+//     (that path bypasses ActOnFunctionDeclarator) ---
+
+template <typename T>
+void ei_fn(__attribute__((ejit_period_arr_ind("static"))) int) {}
+template __attribute__((ejit_entry, ejit_period_lc("static")))
+void ei_fn<int>(__attribute__((ejit_period_arr_ind("static"))) int);
+// expected-error@-2 {{'ejit_entry' and 'ejit_period_lc' cannot be combined on function 'ei_fn<int>'}}
+// expected-note@-3 {{conflicting attribute is here}}
+
+// --- Error: an explicit instantiation assembles the pair (ejit_entry on the
+//     pattern, ejit_period_lc written here) ---
+
+template <typename T>
+__attribute__((ejit_entry))
+void ei_fn2(__attribute__((ejit_period_arr_ind("static"))) int) {}
+// expected-note@-2 {{conflicting attribute is here}}
+template __attribute__((ejit_period_lc("static")))
+void ei_fn2<int>(__attribute__((ejit_period_arr_ind("static"))) int);
+// expected-error@-2 {{'ejit_entry' and 'ejit_period_lc' cannot be combined on function 'ei_fn2<int>'}}
+
+// --- No duplicate: the pair was diagnosed on the pattern; a plain explicit
+//     instantiation reproduces it silently ---
+
+template <typename T>
+__attribute__((ejit_entry, ejit_period_lc("static")))
+void ei_fn3(__attribute__((ejit_period_arr_ind("static"))) int) {}
+// expected-error@-2 {{'ejit_entry' and 'ejit_period_lc' cannot be combined on function 'ei_fn3'}}
+// expected-note@-3 {{conflicting attribute is here}}
+template void ei_fn3<int>(__attribute__((ejit_period_arr_ind("static"))) int);
+
+// --- Error with the mirror order: ejit_period_lc on the pattern, ejit_entry
+//     written on the instantiation. The error anchors at the attribute
+//     written HERE, the note at the pre-existing one ---
+
+template <typename T>
+__attribute__((ejit_period_lc("static")))
+void ei_fn4(__attribute__((ejit_period_arr_ind("static"))) int) {}
+// expected-note@-2 {{conflicting attribute is here}}
+template __attribute__((ejit_entry))
+void ei_fn4<int>(__attribute__((ejit_period_arr_ind("static"))) int);
+// expected-error@-2 {{'ejit_entry' and 'ejit_period_lc' cannot be combined on function 'ei_fn4<int>'}}
+
+// --- The pair assembled across TWO explicit instantiation declarations
+//     (an extern declaration then the definition), lc first then entry: the
+//     error anchors at the entry written on the current declaration ---
+
+template <typename T>
+void m_fn(__attribute__((ejit_period_arr_ind("static"))) int) {}
+extern template __attribute__((ejit_period_lc("static")))
+void m_fn<int>(__attribute__((ejit_period_arr_ind("static"))) int);
+// expected-note@-2 {{conflicting attribute is here}}
+template __attribute__((ejit_entry))
+void m_fn<int>(__attribute__((ejit_period_arr_ind("static"))) int);
+// expected-error@-2 {{'ejit_entry' and 'ejit_period_lc' cannot be combined on function 'm_fn<int>'}}
+
+// --- ... and entry first then lc: the error anchors at the lc written on
+//     the current declaration ---
+
+template <typename T>
+void m_fn2(__attribute__((ejit_period_arr_ind("static"))) int) {}
+extern template __attribute__((ejit_entry))
+void m_fn2<int>(__attribute__((ejit_period_arr_ind("static"))) int);
+// expected-note@-2 {{conflicting attribute is here}}
+template __attribute__((ejit_period_lc("static")))
+void m_fn2<int>(__attribute__((ejit_period_arr_ind("static"))) int);
+// expected-error@-2 {{'ejit_entry' and 'ejit_period_lc' cannot be combined on function 'm_fn2<int>'}}
 
 // --- No warning: definition repeats the attribute ---
 

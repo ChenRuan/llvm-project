@@ -13503,6 +13503,8 @@ def err_ejit_entry_recursive : Error<
   "ejit_entry function %0 cannot be recursive">;
 def err_ejit_period_lc_no_index : Error<
   "ejit_period_lc(%0) requires a corresponding ejit_period_arr_ind(%0) parameter">;
+def err_ejit_entry_lc_conflict : Error<
+  "'ejit_entry' and 'ejit_period_lc' cannot be combined on function %0">;
 def warn_ejit_may_const_modified_without_lc : Warning<
   "modifying ejit_may_const field %0 of %1 without ejit_period_lc attribute">,
   InGroup<EmbeddedJIT>;
