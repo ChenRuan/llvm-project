@@ -135,6 +135,11 @@ static_assert(kEJitMaxFuncIndex == kEJitSharedMaxFuncIndex,
 
 static EJit *gEJIT = nullptr;
 
+#ifdef EJIT_DIAG_ENABLE
+EJitAtomicU64 gIcacheNullFillSkips;
+constexpr uint64_t kIcacheNullFillLogEvery = 1000;
+#endif
+
 #ifdef EJIT_FREESTANDING
 extern "C" uint64_t SRE_CycleCountGet64(void);
 #endif
@@ -694,7 +699,14 @@ inline void ejitIcacheFillOnSuccess(uint32_t funcIndex, void *fnPtr,
                                     uint32_t numDims) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (!fnPtr) {
-    EJIT_DIAG("icacheFillOnSuccess SKIP func=%u: fnPtr is null", funcIndex);
+#ifdef EJIT_DIAG_ENABLE
+    if (gEJitDiagLevel >= EJIT_LOG_LVL_DEBUG) {
+      uint64_t skips = gIcacheNullFillSkips.fetchAdd(1) + 1;
+      if (skips % kIcacheNullFillLogEvery == 0)
+        EJIT_DIAG_DEBUG("icacheFillOnSuccess null skips=%llu latest_func=%u",
+                        static_cast<unsigned long long>(skips), funcIndex);
+    }
+#endif
     return;
   }
   EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr;
