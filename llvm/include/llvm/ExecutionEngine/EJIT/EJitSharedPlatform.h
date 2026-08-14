@@ -74,7 +74,13 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// v8: the SwitchController line gains icacheDrainSeq, bumped by every
 /// inline-cache drain so a resolve that raced the drain drops its fill rather
 /// than refilling a cell the drain just cleared.
-constexpr uint32_t kEJitSharedAbiVersion = 9u;
+/// v9 adds the shared inline-cache gates and diagnostics needed by every core.
+/// v10: each cache slot carries PGO fields (hitCount + profcAddr + profdAddr)
+/// for online PGO hotspot detection and Tier-1 counter capture (§6/§7.1).
+/// The shared counters struct gains tier1Compiles/tier2Compiles/
+/// profileMergeFails. PGO behavior is opt-in (Config::enablePgo); the fields
+/// exist in every build for a stable layout and are 0 when PGO is off.
+constexpr uint32_t kEJitSharedAbiVersion = 10u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;
