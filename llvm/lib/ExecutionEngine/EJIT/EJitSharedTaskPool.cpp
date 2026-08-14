@@ -17,11 +17,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
-#include <atomic>
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
-#include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
+#include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 
 // Compile-time guard: if EJIT_ICACHE_FUNC_SLOTS ever falls below
@@ -76,10 +76,10 @@ inline void cpuRelax() { __asm__ __volatile__("" ::: "memory"); }
 // because in that build a published fnPtr is never physically freed (the code
 // pool never reclaims; the taskpool releaser is never installed), so a hit that
 // hands back a pointer without a read token can never dangle. The writer still
-// takes writeFlag for writer/writer exclusion and additionally bumps a monotonic
-// per-bucket publishSeq (odd while writing, even when done) that the reader uses
-// to detect and discard a read that raced a publish. The default (token) build
-// is unchanged: publishSeq is never touched.
+// takes writeFlag for writer/writer exclusion and additionally bumps a
+// monotonic per-bucket publishSeq (odd while writing, even when done) that the
+// reader uses to detect and discard a read that raced a publish. The default
+// (token) build is unchanged: publishSeq is never touched.
 //===----------------------------------------------------------------------===//
 bool bucketTryRead(EJitSharedCacheBucket &b) {
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
@@ -106,9 +106,9 @@ void bucketReadRelease(EJitSharedCacheBucket &b) {
 #endif
 }
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-// Seqlock begin: snapshot the publish sequence. Returns false if a publish is in
-// progress (odd), so the caller cleanly falls back rather than reading a slot
-// mid-overwrite.
+// Seqlock begin: snapshot the publish sequence. Returns false if a publish is
+// in progress (odd), so the caller cleanly falls back rather than reading a
+// slot mid-overwrite.
 static inline bool bucketSeqBegin(EJitSharedCacheBucket &b, uint32_t &seq) {
   seq = b.publishSeq.loadAcquire();
   return (seq & 1u) == 0;
@@ -169,19 +169,19 @@ constexpr uint64_t kHashMul = 0x9e3779b97f4a7c15ULL;
 // Per-function inline-cache slot registry (multi-version direct-indexed). Each
 // entry records the wrapper's per-function @__ejit_icache_fn_<name> global base
 // (a uintptr_t cell, or a [D]^numDims array of them for a multi-version entry)
-// plus its dimensionality, registered by name at ejit_auto_register / .ejit_period
-// time via ejit_register_icache_slot (which calls ejitIcacheRegisterSlot). The
-// wrapper reads its OWN global directly (a GEP by the ejit_dim arg values + one
-// plain load + null-check + indirect call) with NO ejit_icache_try call and NO
-// per-call guards. icacheFill writes the specialization pointer through the cell
-// at [i0][i1]... (linearized from dims) on a successful resolve; icacheTry
-// (test/diagnostic only) reads it. The slot is PER-CORE PRIVATE (default BSS),
-// so the fill and the read are same-core, ordered by program order; the
-// indirect call's data dependency on the loaded pointer orders the load before
-// the br. So NO atomic/acquire/CAS is needed -- plain load (ldr) / store (str)
-// is correct. Process-static, zero-filled by the loader (base starts null =
-// unregistered = probe misses = taskpool fallback). See the header for the
-// safety model.
+// plus its dimensionality, registered by name at ejit_auto_register /
+// .ejit_period time via ejit_register_icache_slot (which calls
+// ejitIcacheRegisterSlot). The wrapper reads its OWN global directly (a GEP by
+// the ejit_dim arg values + one plain load + null-check + indirect call) with
+// NO ejit_icache_try call and NO per-call guards. icacheFill writes the
+// specialization pointer through the cell at [i0][i1]... (linearized from dims)
+// on a successful resolve; icacheTry (test/diagnostic only) reads it. The slot
+// is PER-CORE PRIVATE (default BSS), so the fill and the read are same-core,
+// ordered by program order; the indirect call's data dependency on the loaded
+// pointer orders the load before the br. So NO atomic/acquire/CAS is needed --
+// plain load (ldr) / store (str) is correct. Process-static, zero-filled by the
+// loader (base starts null = unregistered = probe misses = taskpool fallback).
+// See the header for the safety model.
 struct EJitIcacheSlotReg {
   uintptr_t *base;
   uint32_t numDims;
@@ -210,12 +210,12 @@ void llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
 }
 
 void llvm::ejit::ejitIcacheClearAll() {
-  // Unregister every slot: nulling base makes all probes miss (icacheTry/icacheFill
-  // see no base and bail), which is the "empty" state. We do NOT dereference the
-  // base pointers here: in tests the slots are stack locals that may already be
-  // destroyed by the time a later test clears (e.g. if an ASSERT returned early
-  // and skipped the prior test's end-clear), so dereferencing would be a
-  // use-after-free. Production never calls this.
+  // Unregister every slot: nulling base makes all probes miss
+  // (icacheTry/icacheFill see no base and bail), which is the "empty" state. We
+  // do NOT dereference the base pointers here: in tests the slots are stack
+  // locals that may already be destroyed by the time a later test clears (e.g.
+  // if an ASSERT returned early and skipped the prior test's end-clear), so
+  // dereferencing would be a use-after-free. Production never calls this.
   for (uint32_t f = 0; f < EJIT_ICACHE_FUNC_SLOTS; ++f) {
     gIcacheSlots[f].base = nullptr;
     gIcacheSlots[f].numDims = 0;
@@ -282,12 +282,12 @@ uint32_t EJitSharedTaskPool::instanceVersion(uint32_t dimType,
 // diagnostics. icacheFill writes the specialization pointer through the cell at
 // [i0][i1]... (linearized from dims) on a successful resolve; it is a frozen,
 // one-shot fill PER CELL - each identity's cell is written once and never
-// refilled, so a cell's pointer is always the correct (invariant) specialization
-// for that identity. Lifetime is safe because JIT code is never freed in
-// production; the safety gate auto-disables the cache if a releaser is wired
-// (no HP-scan retire). The code-sharing gate retains the cross-core pointer
-// discipline of resolveMatchedSlot (relevant to icacheTry in non-shared test
-// builds; the wrapper's inline probe is only enabled under
+// refilled, so a cell's pointer is always the correct (invariant)
+// specialization for that identity. Lifetime is safe because JIT code is never
+// freed in production; the safety gate auto-disables the cache if a releaser is
+// wired (no HP-scan retire). The code-sharing gate retains the cross-core
+// pointer discipline of resolveMatchedSlot (relevant to icacheTry in non-shared
+// test builds; the wrapper's inline probe is only enabled under
 // EJIT_SRE_SHARED_CODE_POINTERS, where the gate is compile-time true).
 //===----------------------------------------------------------------------===//
 bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
@@ -422,10 +422,10 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
     return;
   // Plain store: the slot is per-core private, so this write (on the calling
   // core) is ordered before the wrapper's read (same core) by program order.
-  // The specialization is invariant per identity under the contract + NO_RECLAIM,
-  // so overwriting on a later resolve (same pointer) is harmless -- no one-shot
-  // CAS is needed. No atomic/release: same-core, and the read's data dependency
-  // on the pointer orders this store-before-use.
+  // The specialization is invariant per identity under the contract +
+  // NO_RECLAIM, so overwriting on a later resolve (same pointer) is harmless --
+  // no one-shot CAS is needed. No atomic/release: same-core, and the read's
+  // data dependency on the pointer orders this store-before-use.
   uintptr_t idx = icacheLinearize(dims, numDims);
   reg.base[idx] = reinterpret_cast<uintptr_t>(fnPtr);
   EJIT_DIAG("icacheFill OK func=%u dims=%u idx=%zu fn=%p cell[0]=%p",
@@ -482,7 +482,8 @@ bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,
     // Latch on the first successful enable of ANY instance: this brackets the
     // init→activate window during which instanceDisabled hits are tallied
     // separately (instanceDisabledPreActivate) for diagnosing the pre-activate
-    // fallback storm. Once latched it stays 1 until the next (re)initialization.
+    // fallback storm. Once latched it stays 1 until the next
+    // (re)initialization.
     if (enabled)
       state_->anyInstanceActivated.storeRelease(1);
     return true;
@@ -756,8 +757,8 @@ EJitSharedTaskPool::cacheLookupSeq(uint32_t funcIndex, const EJitDimPair *dims,
       break;
     }
     // Validate that the scan + resolve observed a single stable publish epoch.
-    // A cold peer preparation (coldPrepared) re-validates itself and may legally
-    // span a publish, so it is exempt from the outer seq re-check.
+    // A cold peer preparation (coldPrepared) re-validates itself and may
+    // legally span a publish, so it is exempt from the outer seq re-check.
     if (hit.fnPtr && !hit.coldPrepared && !bucketSeqStable(B, seq0)) {
       cpuRelax();
       continue; // publish raced the read -> retry
@@ -958,8 +959,7 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
                    oldQuarter, quarter)) {
         }
         if (quarter > oldQuarter)
-          EJIT_DIAG("PGO profile progress func=%u: %llu/%u",
-                    Slot.funcIndex,
+          EJIT_DIAG("PGO profile progress func=%u: %llu/%u", Slot.funcIndex,
                     static_cast<unsigned long long>(prev + 1), threshold);
       }
       // >= (not ==): if the enqueue fails (queue full / already pending),
@@ -1110,8 +1110,7 @@ bool EJitSharedTaskPool::admitPgoFunction(uint32_t funcIndex,
   return true;
 }
 
-void EJitSharedTaskPool::finishPgoFunction(uint32_t funcIndex,
-                                           bool completed) {
+void EJitSharedTaskPool::finishPgoFunction(uint32_t funcIndex, bool completed) {
   const uint32_t encoded = funcIndex + 1;
   uint32_t expected = 0;
   while (!state_->pgoAdmissionLock.compareExchange(expected, 1))
@@ -1232,11 +1231,12 @@ EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
     S2.executableCoreMask.fetchOr(CoreBit);
   R.fnPtr = Snap.fn;
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-  // NO_RECLAIM: this cold path already fully re-validated identity/versions/fnPtr
-  // above under a load-only re-read, so it hands back a validated pointer with no
-  // read token. coldPrepared tells the seqlock caller not to re-check publishSeq
-  // (this out-of-line path legally spanned platform calls and possible publishes,
-  // but the re-validation guarantees the returned pointer is current).
+  // NO_RECLAIM: this cold path already fully re-validated
+  // identity/versions/fnPtr above under a load-only re-read, so it hands back a
+  // validated pointer with no read token. coldPrepared tells the seqlock caller
+  // not to re-check publishSeq (this out-of-line path legally spanned platform
+  // calls and possible publishes, but the re-validation guarantees the returned
+  // pointer is current).
   R.noTokenHit = true;
   R.coldPrepared = true;
   R.bucketIndex = kEJitSharedCacheBuckets; // sentinel -> releaseRead no-op
@@ -1492,22 +1492,24 @@ bool EJitSharedTaskPool::ensurePoolSplitForCurrentCore(uint32_t self,
                                                        uintptr_t poolBase,
                                                        uint64_t poolSize) {
   EJIT_DIAG_VERBOSE("ensurePoolSplit: core=%u poolBase=0x%llx size=%llu", self,
-            static_cast<unsigned long long>(poolBase),
-            static_cast<unsigned long long>(poolSize));
+                    static_cast<unsigned long long>(poolBase),
+                    static_cast<unsigned long long>(poolSize));
   // Cores beyond the 64-bit memo width cannot record split state, so they must
   // re-run the (idempotent) split on every hit rather than risk skipping it.
   if (self >= kEJitSharedMaxMemoCores) {
     bool ok = splitPoolFn_ && splitPoolFn_(splitPoolCtx_, poolBase, poolSize);
     if (!ok)
       EJIT_DIAG("ensurePoolSplit FAIL: core=%u >= memoWidth, split callback "
-                "missing/failed", self);
+                "missing/failed",
+                self);
     return ok;
   }
 
   EJitSharedPoolSplit *P = findOrClaimPoolSlot(poolBase);
   if (!P) {
-    EJIT_DIAG_VERBOSE("ensurePoolSplit fallback: core=%u poolBase=0x%llx split table full",
-              self, static_cast<unsigned long long>(poolBase));
+    EJIT_DIAG_VERBOSE(
+        "ensurePoolSplit fallback: core=%u poolBase=0x%llx split table full",
+        self, static_cast<unsigned long long>(poolBase));
     return false; // table full -> clean fallback.
   }
 
@@ -1531,9 +1533,10 @@ bool EJitSharedTaskPool::ensurePoolSplitForCurrentCore(uint32_t self,
     }
     bool done = (P->splitDoneMask.loadAcquire() & Bit) != 0;
     if (!done)
-      EJIT_DIAG_VERBOSE("ensurePoolSplit fallback: core=%u poolBase=0x%llx peer split "
-                "did not publish done", self,
-                static_cast<unsigned long long>(poolBase));
+      EJIT_DIAG_VERBOSE(
+          "ensurePoolSplit fallback: core=%u poolBase=0x%llx peer split "
+          "did not publish done",
+          self, static_cast<unsigned long long>(poolBase));
     return done;
   }
 
@@ -1545,8 +1548,9 @@ bool EJitSharedTaskPool::ensurePoolSplitForCurrentCore(uint32_t self,
     P->splitPreparingMask.fetchAnd(~Bit);
     return true;
   }
-  EJIT_DIAG("ensurePoolSplit FAIL: core=%u poolBase=0x%llx split callback failed",
-            self, static_cast<unsigned long long>(poolBase));
+  EJIT_DIAG(
+      "ensurePoolSplit FAIL: core=%u poolBase=0x%llx split callback failed",
+      self, static_cast<unsigned long long>(poolBase));
   P->splitPreparingMask.fetchAnd(~Bit);
   return false;
 }
@@ -1554,11 +1558,11 @@ bool EJitSharedTaskPool::ensurePoolSplitForCurrentCore(uint32_t self,
 bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
                                                    uint32_t self) {
   EJIT_DIAG_VERBOSE("prepareExec: core=%u fn=%p codeStart=0x%llx codeSize=%llu "
-            "poolBase=0x%llx fourK=%u", self, R.fn,
-            static_cast<unsigned long long>(R.codeStart),
-            static_cast<unsigned long long>(R.codeSize),
-            static_cast<unsigned long long>(R.poolBase),
-            static_cast<unsigned>(fourKSeal_));
+                    "poolBase=0x%llx fourK=%u",
+                    self, R.fn, static_cast<unsigned long long>(R.codeStart),
+                    static_cast<unsigned long long>(R.codeSize),
+                    static_cast<unsigned long long>(R.poolBase),
+                    static_cast<unsigned>(fourKSeal_));
   if (!fourKSeal_) {
     // Legacy whole-2MiB-pool seal: align fnPtr to its pool base and enable_ex
     // that page. Range metadata is not required (spec §6 — 2M unchanged). When
@@ -1569,32 +1573,38 @@ bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
       return true;
     bool ok = prepareCodeFn_(prepareCodeCtx_, R.fn);
     if (!ok)
-      EJIT_DIAG("prepareExec FAIL: core=%u legacy prepareCode fn=%p", self, R.fn);
+      EJIT_DIAG("prepareExec FAIL: core=%u legacy prepareCode fn=%p", self,
+                R.fn);
     return ok;
   }
 
   // 4K page seal needs the real executable extent. A slot with no recorded
   // range (or a malformed one) is a clean fallback, never a guessed seal.
-  if (R.codeStart == 0 || R.codeSize == 0 || R.poolBase == 0 || R.poolSize == 0) {
-    EJIT_DIAG_VERBOSE("prepareExec fallback: core=%u fn=%p malformed range "
-              "(codeStart=0x%llx codeSize=%llu poolBase=0x%llx poolSize=%llu)",
-              self, R.fn, static_cast<unsigned long long>(R.codeStart),
-              static_cast<unsigned long long>(R.codeSize),
-              static_cast<unsigned long long>(R.poolBase),
-              static_cast<unsigned long long>(R.poolSize));
+  if (R.codeStart == 0 || R.codeSize == 0 || R.poolBase == 0 ||
+      R.poolSize == 0) {
+    EJIT_DIAG_VERBOSE(
+        "prepareExec fallback: core=%u fn=%p malformed range "
+        "(codeStart=0x%llx codeSize=%llu poolBase=0x%llx poolSize=%llu)",
+        self, R.fn, static_cast<unsigned long long>(R.codeStart),
+        static_cast<unsigned long long>(R.codeSize),
+        static_cast<unsigned long long>(R.poolBase),
+        static_cast<unsigned long long>(R.poolSize));
     return false;
   }
   if (R.codeStart + R.codeSize < R.codeStart) { // code range overflow
-    EJIT_DIAG_VERBOSE("prepareExec fallback: core=%u code range overflow", self);
+    EJIT_DIAG_VERBOSE("prepareExec fallback: core=%u code range overflow",
+                      self);
     return false;
   }
   if (R.poolBase + R.poolSize < R.poolBase) { // pool range overflow
-    EJIT_DIAG_VERBOSE("prepareExec fallback: core=%u pool range overflow", self);
+    EJIT_DIAG_VERBOSE("prepareExec fallback: core=%u pool range overflow",
+                      self);
     return false;
   }
   if (R.codeStart < R.poolBase ||
       R.codeStart + R.codeSize > R.poolBase + R.poolSize) {
-    EJIT_DIAG_VERBOSE("prepareExec fallback: core=%u code not inside pool", self);
+    EJIT_DIAG_VERBOSE("prepareExec fallback: core=%u code not inside pool",
+                      self);
     return false; // code must lie wholly inside its pool.
   }
 
@@ -1681,8 +1691,8 @@ bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
   // prepared may the caller publish this core's prepared bit.
   for (uintptr_t VA = CodePageStart; VA < CodePageEnd; VA += Page)
     if (!sealPageFn_ || !sealPageFn_(sealPageCtx_, VA)) {
-      EJIT_DIAG("prepareExec FAIL: core=%u sealPage pageVA=0x%llx",
-                self, static_cast<unsigned long long>(VA));
+      EJIT_DIAG("prepareExec FAIL: core=%u sealPage pageVA=0x%llx", self,
+                static_cast<unsigned long long>(VA));
       return false; // any page failure -> no callable pointer is returned.
     }
   EJIT_DIAG_VERBOSE("prepareExec OK: core=%u fn=%p pages=[0x%llx,0x%llx)", self,
@@ -2383,9 +2393,10 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   if (state_->mode.loadAcquire() ==
       static_cast<uint32_t>(EJitCompileMode::Sync)) {
     if (!isOwner_ || !compileFn_) {
-      EJIT_DIAG_VERBOSE("shared taskpool sync fallback func=%u: not owner (owner=%u fn=%p)",
-                        funcIndex, static_cast<unsigned>(isOwner_),
-                        reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(compileFn_)));
+      EJIT_DIAG_VERBOSE(
+          "shared taskpool sync fallback func=%u: not owner (owner=%u fn=%p)",
+          funcIndex, static_cast<unsigned>(isOwner_),
+          reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(compileFn_)));
       R.status = EJitCompileOrGetStatus::OffMode;
       return R;
     }
@@ -2408,7 +2419,8 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
       return R;
     }
     if (!versionsCurrent(ReqLocal)) {
-      if (releaseFn_) releaseFn_(releaseCtx_, fn);
+      if (releaseFn_)
+        releaseFn_(releaseCtx_, fn);
       EJIT_STAT_INC(state_->counters.compileFailed);
       EJIT_DIAG("shared taskpool sync compile drop func=%u: version changed",
                 funcIndex);
@@ -2416,7 +2428,8 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
       return R;
     }
     EJitCompiledCodeInfo info;
-    if (codeRangeFn_) codeRangeFn_(codeRangeCtx_, fn, &info);
+    if (codeRangeFn_)
+      codeRangeFn_(codeRangeCtx_, fn, &info);
     EJitPublishStatus PS =
         cachePublish(ReqLocal, fn, info.codeSize ? &info : nullptr);
     if (PS == EJitPublishStatus::Published) {
@@ -2429,8 +2442,8 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
         R.fnPtr = Hit2.fnPtr;
         R.bucketIndex = Hit2.bucketIndex; // sentinel -> releaseRead no-op
         R.hasReadToken = Hit2.hasReadToken;
-        EJIT_DIAG_VERBOSE("shared taskpool sync compiled func=%u fn=%p", funcIndex,
-                          Hit2.fnPtr);
+        EJIT_DIAG_VERBOSE("shared taskpool sync compiled func=%u fn=%p",
+                          funcIndex, Hit2.fnPtr);
         return R;
       }
 #else
@@ -2440,17 +2453,18 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
         R.fnPtr = Hit2.fnPtr;
         R.bucketIndex = Hit2.bucketIndex;
         R.hasReadToken = true;
-        EJIT_DIAG_VERBOSE("shared taskpool sync compiled func=%u fn=%p", funcIndex,
-                          Hit2.fnPtr);
+        EJIT_DIAG_VERBOSE("shared taskpool sync compiled func=%u fn=%p",
+                          funcIndex, Hit2.fnPtr);
         return R;
       }
 #endif
     } else {
-      if (releaseFn_) releaseFn_(releaseCtx_, fn);
+      if (releaseFn_)
+        releaseFn_(releaseCtx_, fn);
     }
     EJIT_STAT_INC(state_->counters.compileFailed);
-    EJIT_DIAG("shared taskpool sync compile failed func=%u publish=%u", funcIndex,
-              static_cast<unsigned>(PS));
+    EJIT_DIAG("shared taskpool sync compile failed func=%u publish=%u",
+              funcIndex, static_cast<unsigned>(PS));
     R.status = EJitCompileOrGetStatus::CompileFailed;
     return R;
   }
@@ -2480,7 +2494,8 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     if (newlyAdmitted)
       finishPgoFunction(funcIndex, /*completed=*/false);
     EJIT_STAT_INC(state_->counters.alreadyPending);
-    EJIT_DIAG_VERBOSE("shared taskpool coalesced func=%u: already pending", funcIndex);
+    EJIT_DIAG_VERBOSE("shared taskpool coalesced func=%u: already pending",
+                      funcIndex);
     R.status = EJitCompileOrGetStatus::AlreadyPending;
     return R;
   case EJitDedupResult::InvalidFuncIndex:
@@ -2563,8 +2578,8 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
                 realFuncIndex);
     }
   };
-  EJIT_DIAG_VERBOSE("shared worker compile begin func=%u dims=%u gen=%u", req.funcIndex,
-            req.numDims, req.generation);
+  EJIT_DIAG_VERBOSE("shared worker compile begin func=%u dims=%u gen=%u",
+                    req.funcIndex, req.numDims, req.generation);
   // Checkpoint 0 (spec §11): generation guard. A request enqueued under an
   // earlier generation (owner re-init in between) is dropped before compiling.
   // dedupClear is generation-aware, so this never clears a NEW generation's
@@ -2572,7 +2587,8 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   if (req.generation != state_->generation.loadAcquire()) {
     dedupClear(req.funcIndex, req.generation);
     EJIT_STAT_INC(state_->counters.compileFailed);
-    EJIT_DIAG("shared worker compile drop func=%u: generation changed", req.funcIndex);
+    EJIT_DIAG("shared worker compile drop func=%u: generation changed",
+              req.funcIndex);
     return;
   }
   // Checkpoint 1: invalidated before compile started.
@@ -2581,8 +2597,9 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
       finishPgoFunction(realFuncIndex, /*completed=*/false);
     dedupClear(req.funcIndex, req.generation);
     EJIT_STAT_INC(state_->counters.compileFailed);
-    EJIT_DIAG("shared worker compile drop func=%u: version changed before compile",
-              req.funcIndex);
+    EJIT_DIAG(
+        "shared worker compile drop func=%u: version changed before compile",
+        req.funcIndex);
     return;
   }
   void *fn = nullptr;
@@ -2607,6 +2624,8 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   // the result.
   if (req.generation != state_->generation.loadAcquire() ||
       !versionsCurrent(req)) {
+    if (publishFn_)
+      publishFn_(publishCtx_, req, false);
     if (req.generation == state_->generation.loadAcquire() &&
         (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse))
       finishPgoFunction(realFuncIndex, /*completed=*/false);
@@ -2614,14 +2633,17 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
       releaseFn_(releaseCtx_, fn);
     dedupClear(req.funcIndex, req.generation);
     EJIT_STAT_INC(state_->counters.compileFailed);
-    EJIT_DIAG("shared worker compile drop func=%u: version/gen changed after compile",
-              req.funcIndex);
+    EJIT_DIAG(
+        "shared worker compile drop func=%u: version/gen changed after compile",
+        req.funcIndex);
     return;
   }
   EJitPublishStatus PS = cachePublish(req, fn, &info, pgoClearExclusive);
   switch (PS) {
   case EJitPublishStatus::Published:
     EJIT_STAT_INC(state_->counters.asyncCompiles);
+    if (publishFn_)
+      publishFn_(publishCtx_, req, true);
     if (tier == kEJitTierInstrumented) {
       EJIT_STAT_INC(state_->counters.tier1Compiles);
       EJIT_DIAG("PGO Tier-1 published func=%u: collecting 0/%u hits",
@@ -2632,9 +2654,12 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
     }
     publishCodePoolStats();
     dedupClear(req.funcIndex, req.generation);
-    EJIT_DIAG_VERBOSE("shared worker publish ok func=%u fn=%p", req.funcIndex, fn);
+    EJIT_DIAG_VERBOSE("shared worker publish ok func=%u fn=%p", req.funcIndex,
+                      fn);
     return;
   case EJitPublishStatus::VersionMismatch:
+    if (publishFn_)
+      publishFn_(publishCtx_, req, false);
     if (req.generation == state_->generation.loadAcquire() &&
         (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse))
       finishPgoFunction(realFuncIndex, /*completed=*/false);
@@ -2642,10 +2667,13 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
       releaseFn_(releaseCtx_, fn);
     dedupClear(req.funcIndex, req.generation);
     EJIT_STAT_INC(state_->counters.compileFailed);
-    EJIT_DIAG("shared worker publish drop func=%u: version mismatch", req.funcIndex);
+    EJIT_DIAG("shared worker publish drop func=%u: version mismatch",
+              req.funcIndex);
     return;
   case EJitPublishStatus::InvalidParam:
   case EJitPublishStatus::Failed:
+    if (publishFn_)
+      publishFn_(publishCtx_, req, false);
     finishPgoOnFailure();
     if (releaseFn_)
       releaseFn_(releaseCtx_, fn);
@@ -2796,11 +2824,9 @@ void EJitSharedTaskPool::getDiagnostics(EJitSharedDiagnostics &out) const {
       state_->counters.instanceDisabledPreActivate.loadRelaxed();
   out.executePrepareFailed =
       state_->counters.executePrepareFailed.loadRelaxed();
-  out.pgoActiveFunctionCount =
-      state_->pgoActiveFunctionCount.loadAcquire();
+  out.pgoActiveFunctionCount = state_->pgoActiveFunctionCount.loadAcquire();
   out.pgoMaxActiveFunctions = state_->pgoMaxActiveFunctions.loadAcquire();
-  out.pgoCompletedFunctions =
-      state_->pgoCompletedFunctions.loadRelaxed();
+  out.pgoCompletedFunctions = state_->pgoCompletedFunctions.loadRelaxed();
   out.pgoDeferredMisses = state_->pgoDeferredMisses.loadRelaxed();
   out.tier1Compiles = state_->counters.tier1Compiles.loadRelaxed();
   out.tier2Compiles = state_->counters.tier2Compiles.loadRelaxed();

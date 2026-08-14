@@ -29,15 +29,28 @@
 // extern so taking their address resolves to the target's existing
 // definitions (uintptr_t matches the compiler-rt declaration). Provided by
 // the bare-metal pseudo-OS runtime already linked into the AOT binary.
+// On Windows hosts the MSVC CRT defines no such ABI symbols and clang-cl JIT
+// code never references them, so they are excluded there (the Linux/SRE
+// symbol set is unchanged).
+#ifndef _WIN32
 extern "C" {
 extern uintptr_t __stack_chk_guard;
 extern void __stack_chk_fail(void);
 }
+#endif
 
 namespace llvm {
 namespace ejit {
 
 ArrayRef<LibcallSymbol> getLibcallSymbols() {
+#ifdef _WIN32
+  static const LibcallSymbol Symbols[] = {
+      {"memset", reinterpret_cast<void *>(&std::memset)},
+      {"memcpy", reinterpret_cast<void *>(&std::memcpy)},
+      {"memmove", reinterpret_cast<void *>(&std::memmove)},
+      {"memcmp", reinterpret_cast<void *>(&std::memcmp)},
+  };
+#else
   static const LibcallSymbol Symbols[] = {
       {"memset", reinterpret_cast<void *>(&std::memset)},
       {"memcpy", reinterpret_cast<void *>(&std::memcpy)},
@@ -46,6 +59,7 @@ ArrayRef<LibcallSymbol> getLibcallSymbols() {
       {"__stack_chk_guard", reinterpret_cast<void *>(&__stack_chk_guard)},
       {"__stack_chk_fail", reinterpret_cast<void *>(&__stack_chk_fail)},
   };
+#endif
   return Symbols;
 }
 

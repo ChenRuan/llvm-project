@@ -92,6 +92,14 @@ public:
   /// Atomic add, returning the previous value (acq_rel).
   T fetchAdd(T v) { return __atomic_fetch_add(&value_, v, __ATOMIC_ACQ_REL); }
 
+  /// Atomic add, returning the previous value (relaxed). Used by per-core
+  /// value-profiling shard cells whose line is written by ONE core only, so
+  /// the RMW resolves entirely in that core's private L1 without barriers and
+  /// without coherence traffic (EJIT_VALUE_PROFILE.md §3.2).
+  T fetchAddRelaxed(T v) {
+    return __atomic_fetch_add(&value_, v, __ATOMIC_RELAXED);
+  }
+
   /// Atomic subtract, returning the previous value (acq_rel).
   T fetchSub(T v) { return __atomic_fetch_sub(&value_, v, __ATOMIC_ACQ_REL); }
 

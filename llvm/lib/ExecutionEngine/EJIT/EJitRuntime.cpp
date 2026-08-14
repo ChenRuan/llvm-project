@@ -24,6 +24,9 @@
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #endif
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+#include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
+#endif
 #ifndef EJIT_FREESTANDING
 #include <chrono>
 #endif
@@ -1294,6 +1297,29 @@ ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out) {
   return EJIT_OK;
 #endif
 }
+
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+ejit_status_t ejit_vp_get_stats(ejit_vp_stats_t *out) {
+  if (!out) {
+    EJIT_DIAG("vp_get_stats failed: null out pointer");
+    return EJIT_ERR_INVALID_PARAM;
+  }
+  // The stats live in the collector's shared blob (not behind gEJIT), so they
+  // are readable once the collector is initialized, with or without an EJIT
+  // facade; the blob is zero until the first merge, which is also a valid
+  // answer.
+  EJitVpStatsOut s;
+  ejitVpStatsSnapshot(s);
+  out->merges = s.merges;
+  out->icValueSites = s.icValueSites;
+  out->memopValueSites = s.memopValueSites;
+  out->scalarValueSites = s.scalarValueSites;
+  out->scalarDropped = s.scalarDropped;
+  out->scalarSpecialized = s.scalarSpecialized;
+  out->reserved = 0;
+  return EJIT_OK;
+}
+#endif
 
 void ejit_taskpool_print_stats() {
   ejit_taskpool_stats_t s = {0};

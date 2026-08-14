@@ -73,6 +73,17 @@ struct MockCompiler {
   }
 };
 
+struct PublishObserver {
+  uint32_t calls = 0;
+  bool lastPublished = false;
+
+  static void notify(void *ctx, const EJitCompileRequest &, bool published) {
+    auto *self = static_cast<PublishObserver *>(ctx);
+    ++self->calls;
+    self->lastPublished = published;
+  }
+};
+
 /// Bounded busy-wait (no sleep) used by the real-worker tests.
 template <typename Pred> bool spinUntil(Pred P, uint64_t MaxIters = 200000000) {
   for (uint64_t i = 0; i < MaxIters; ++i) {
@@ -391,9 +402,9 @@ TEST(EJitCacheTest, PublishTier2StripsTierAndOverwritesTier1) {
   // this would be a different identity; with strip it must overwrite Tier-1.
   uint32_t tier2Func = encodeReqTier(10, kEJitTierPgoUse);
   EXPECT_NE(tier2Func, 10u);
-  EXPECT_EQ(C.publish(tier2Func, D, 1, versions,
-                       reinterpret_cast<void *>(&DummyFn1)),
-            EJitPublishStatus::Published);
+  EXPECT_EQ(
+      C.publish(tier2Func, D, 1, versions, reinterpret_cast<void *>(&DummyFn1)),
+      EJitPublishStatus::Published);
 
   // Lookup with the plain (stripped) funcIndex must see the Tier-2 fnPtr.
   EJitCacheLookupResult R = C.lookup(10, D, 1);
@@ -1027,7 +1038,7 @@ TEST(EJitTaskPoolTest, PgoTier2DiscardedOnVersionBump) {
   // pollOne consumes the Tier-2 req, but publish must VersionMismatch (the
   // req's versions are pre-toggle) -> Tier-2 discarded, Tier-1 untouched.
   EXPECT_TRUE(P.pollOne());
-  EXPECT_EQ(P.pendingCount(), 0u);         // Tier-2 req consumed (not published)
+  EXPECT_EQ(P.pendingCount(), 0u); // Tier-2 req consumed (not published)
   EXPECT_EQ(P.cache().hitCountOf(5, D, 1), 3u); // NOT reset => Tier-2 discarded
 }
 
@@ -1405,7 +1416,9 @@ TEST(EJitTaskPoolTest, ToggleBetweenCheckpointAndPublishRejectsResult) {
   EJitTaskPool P(8, false);
   P.switchController().setMode(EJitCompileMode::Async);
   MockCompiler C;
+  PublishObserver O;
   P.setCompiler(&MockCompiler::compile, &C);
+  P.setPublishCallback(&PublishObserver::notify, &O);
   P.cache().setPrePublishHookForTest(
       [](void *ctx) {
         static_cast<EJitTaskPool *>(ctx)->switchController().setEnabled(0, 1,
@@ -1418,12 +1431,29 @@ TEST(EJitTaskPoolTest, ToggleBetweenCheckpointAndPublishRejectsResult) {
   EXPECT_TRUE(P.pollOne()); // compiles, then publish is rejected at the gate
   P.cache().setPrePublishHookForTest(nullptr, nullptr);
   EXPECT_EQ(C.calls.loadAcquire(), 1u); // it did compile
-  EXPECT_EQ(P.pendingCount(), 0u);      // dedup released
+  EXPECT_EQ(O.calls, 1u);
+  EXPECT_FALSE(O.lastPublished);
+  EXPECT_EQ(P.pendingCount(), 0u); // dedup released
   // Re-enable so the instance check passes; lookup must still miss (nothing was
   // published for the stale result).
   P.switchController().setEnabled(0, 1, true);
   auto r = P.compileOrGet(40, D, 1, nullptr);
   EXPECT_NE(r.status, EJitCompileOrGetStatus::CacheHit);
+}
+
+TEST(EJitTaskPoolTest, PublishCallbackRunsAfterCommit) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  PublishObserver O;
+  P.setCompiler(&MockCompiler::compile, &C);
+  P.setPublishCallback(&PublishObserver::notify, &O);
+  EJitDimPair D[1] = {{0, 1}};
+  EXPECT_EQ(P.compileOrGet(41, D, 1, nullptr).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(P.pollOne());
+  EXPECT_EQ(O.calls, 1u);
+  EXPECT_TRUE(O.lastPublished);
 }
 
 // A toggle strictly AFTER a successful publish invalidates the entry on the

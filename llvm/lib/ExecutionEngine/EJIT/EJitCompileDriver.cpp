@@ -1,6 +1,7 @@
 //===-- EJitCompileDriver.cpp - Compilation Scheduler ---------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
@@ -9,6 +10,7 @@
 #ifndef EJIT_FREESTANDING
 #include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
 #endif
+#include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
@@ -37,6 +39,12 @@ bool taskpoolCompileThunk(void *ctx, const EJitCompileRequest &req,
   void *fn = drv->compileNow(req);
   *outFn = fn;
   return fn != nullptr;
+}
+
+void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
+                          bool published) {
+  static_cast<EJitCompileDriver *>(ctx)->notifyTaskpoolPublished(req,
+                                                                 published);
 }
 
 #ifdef EJIT_SRE_SHARED_TASKPOOL
@@ -153,8 +161,7 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
                                      EJitRuntimeState &runtimeState,
                                      EJitModuleLoader &loader,
                                      EJitLogger *logger)
-    : config_(config), runtimeState_(runtimeState),
-      loader_(loader)
+    : config_(config), runtimeState_(runtimeState), loader_(loader)
 #ifndef EJIT_FREESTANDING
       ,
       logger_(logger)
@@ -168,10 +175,11 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   taskPool_ = std::make_unique<EJitTaskPool>(EJIT_SRE_TASKPOOL_QUEUE_CAPACITY,
                                              /*autoStartWorker=*/false);
   taskPool_->setCompiler(&taskpoolCompileThunk, this);
+  taskPool_->setPublishCallback(&taskpoolPublishThunk, this);
   taskPool_->switchController().setMode(
-      config_.compileMode == CompileMode::Async   ? EJitCompileMode::Async
+      config_.compileMode == CompileMode::Async  ? EJitCompileMode::Async
       : config_.compileMode == CompileMode::Sync ? EJitCompileMode::Sync
-                                                  : EJitCompileMode::Off);
+                                                 : EJitCompileMode::Off);
 #endif
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   // Bind the cross-core shared pool to the process-global shared state and wire
@@ -181,6 +189,7 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   // a platform asserts same-VA, sealed, I/D-coherent code (spec §11).
   sharedPool_.bind(&gEJitSharedTaskPoolState);
   sharedPool_.setCompiler(&taskpoolCompileThunk, this);
+  sharedPool_.setPublishCallback(&taskpoolPublishThunk, this);
   sharedPool_.setWorkerHooks(&EJitCompileDriver::sharedWorkerStart,
                              &EJitCompileDriver::sharedWorkerStop, this);
   // Inject the platform yield so the worker never busy-spins while waiting for
@@ -195,9 +204,10 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
                                       this);
   sharedPool_.setOwnerReleasedCallback(&EJitCompileDriver::sharedOwnerReleased,
                                        this);
-  sharedPool_.setMode(config_.compileMode == CompileMode::Async   ? EJitCompileMode::Async
-                          : config_.compileMode == CompileMode::Sync ? EJitCompileMode::Sync
-                                                                     : EJitCompileMode::Off);
+  sharedPool_.setMode(
+      config_.compileMode == CompileMode::Async  ? EJitCompileMode::Async
+      : config_.compileMode == CompileMode::Sync ? EJitCompileMode::Sync
+                                                 : EJitCompileMode::Off);
   // Cross-core fnPtr sharing is gated by the build capability flag
   // EJIT_SRE_SHARED_CODE_POINTERS (default OFF -> clean fallback for non-owner
   // cores). Only the platform may assert same-VA + sealed + I/D-cache-coherent
@@ -327,8 +337,8 @@ bool EJitCompileDriver::ensureJitEngine() {
   if (jitEngine_)
     return true;
 
-  auto engine =
-      EJitOrcEngine::Create(config_, runtimeState_.getRegistry(), runtimeState_);
+  auto engine = EJitOrcEngine::Create(config_, runtimeState_.getRegistry(),
+                                      runtimeState_);
   if (!engine) {
     EJIT_DIAG("FAILED to create OrcJIT engine");
 #ifndef EJIT_FREESTANDING
@@ -367,7 +377,7 @@ void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
 }
 
 void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
-                                          bool storeLru) {
+                                     bool storeLru) {
   // ── Cold path: decode cacheKey, verify, compile ────────────────────────
   uint32_t funcIdx = static_cast<uint32_t>(cacheKey >> 32);
   uint8_t dims[4] = {
@@ -419,7 +429,8 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     // during compilation is handled by runCompile's version checkpoints
     // (cp1/cp2), not this gate.
     uint32_t dt = meta.dimTypes[i];
-    if (dt == kEJitInvalidDimType || !sharedPool_.isInstanceActive(dt, dims[i])) {
+    if (dt == kEJitInvalidDimType ||
+        !sharedPool_.isInstanceActive(dt, dims[i])) {
       EJIT_DIAG("compile SKIP key=0x%016lx func=%s: period %s[%u] not active",
                 cacheKey, funcName.c_str(), periodNames[i].c_str(), dims[i]);
       return nullptr;
@@ -461,13 +472,89 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         refs.reserve(it->second.size());
         for (const auto &c : it->second)
           refs.push_back({c.pgoName.c_str(), c.profcAddr, c.profdAddr});
-        ctx.profileData = synthesizeProfileBuffer(refs);
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+        // Value-profile merge (EJIT_VALUE_PROFILE.md §5): snapshot every
+        // core's retired payload half, aggregate per site, map verified
+        // indirect-call targets to IR-PGO-name MD5s, and carry the official
+        // kinds in the SAME indexed profile as the edge counters. Scalar
+        // sites (with the min-samples / confidence thresholds applied) ride
+        // the ctx side table to the Tier-2 transform.
+        SmallVector<PgoValueSite, 8> valueSites;
+        SmallVector<PgoValueFunction, 8> vpFuncs;
+        SmallVector<PgoScalarSite, 8> scalarSites;
+        auto vpIt = tier1Vp_.find(cacheKey);
+        bool haveVp =
+            vpIt != tier1Vp_.end() && readValueSiteInventory(refs, vpFuncs);
+        if (haveVp) {
+          // Patch per-function scalar site counts from the Tier-1 capture.
+          // The counts are keyed by the IR-PGO-name hash (EJIT_VALUE_PROFILE.md
+          // §5.2); the inventory carries that hash as pgoNameHash (profd
+          // NameRef) next to the CFG hash funcHash.
+          DenseMap<uint64_t, uint32_t> scalarByHash;
+          for (const PgoValueFunction &f : vpIt->second.functions)
+            scalarByHash[f.pgoNameHash] = f.numScalarSites;
+          for (PgoValueFunction &f : vpFuncs)
+            f.numScalarSites = scalarByHash.lookup(f.pgoNameHash);
+          std::vector<EJitVpSiteSample> samples;
+          haveVp = ejitVpTakeSnapshot(samples);
+          if (haveVp) {
+            (void)aggregateValueSamples(samples, vpFuncs, vpIt->second.targets,
+                                        valueSites, scalarSites);
+            const size_t totalScalar = scalarSites.size();
+            size_t dropped = 0;
+            for (PgoScalarSite &s : scalarSites) {
+              if (s.topCount < EJIT_SRE_VP_MIN_SAMPLES ||
+                  s.topCount * 100 < s.total * EJIT_SRE_VP_MIN_CONF_PERCENT)
+                dropped++;
+            }
+            // Apply the dominance thresholds: below them a site stays on the
+            // generic fallback path.
+            llvm::erase_if(scalarSites, [](const PgoScalarSite &s) {
+              return s.topCount < EJIT_SRE_VP_MIN_SAMPLES ||
+                     s.topCount * 100 < s.total * EJIT_SRE_VP_MIN_CONF_PERCENT;
+            });
+            ctx.scalarValueSites.assign(scalarSites.begin(), scalarSites.end());
+            ctx.profileData = synthesizeProfileBuffer(refs, valueSites);
+            // Consume: forget this function's collected values so a later
+            // round starts clean (the instrumented Tier-1 stays live until
+            // publish, so post-snapshot records just re-populate the shard
+            // harmlessly for the retry path).
+            for (const PgoValueFunction &f : vpFuncs) {
+              EJitVpKindSiteCount counts[] = {
+                  {kEJitVpIndirectCall, f.numIcSites},
+                  {kEJitVpMemOpSize, f.numMemSites},
+                  {kEJitVpScalar, f.numScalarSites}};
+              ejitVpResetFunction(f.pgoNameHash,
+                                  ArrayRef<EJitVpKindSiteCount>(counts));
+            }
+            size_t icSites = 0, memSites = 0;
+            for (const PgoValueSite &s : valueSites)
+              (s.valueKind == IPVK_IndirectCallTarget ? icSites : memSites)++;
+            ejitVpBumpMergeCounts(icSites, memSites, totalScalar, dropped);
+            EJIT_DIAG("VP merge key=0x%016lx func=%s: rawSites=%zu "
+                      "ics=%zu memops=%zu scalars=%zu dropped=%zu",
+                      cacheKey, funcName.c_str(), samples.size(), icSites,
+                      memSites, scalarSites.size(), dropped);
+          }
+        }
+        if (!haveVp) {
+          // Edge-only profile: value data unavailable (no snapshot / no
+          // capture). Tier-2 still consumes the edge counters.
+          EJIT_DIAG_DEBUG("VP merge key=0x%016lx: value data unavailable, "
+                          "edge-only profile",
+                          cacheKey);
+          ctx.profileData = synthesizeProfileBuffer(refs, {});
+        }
+#else
+        ctx.profileData = synthesizeProfileBuffer(refs, {});
+#endif
         if (ctx.profileData.empty())
           EJIT_DIAG("compileCold Tier-2 key=0x%016lx: profile synthesis empty",
                     cacheKey);
       } else {
-        EJIT_DIAG("compileCold Tier-2 key=0x%016lx: no Tier-1 counters captured",
-                  cacheKey);
+        EJIT_DIAG(
+            "compileCold Tier-2 key=0x%016lx: no Tier-1 counters captured",
+            cacheKey);
       }
     } else {
       ctx.tier = CompileTier::Instrumented;
@@ -521,8 +608,9 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   void *funcPtr = *addrOrErr;
 
   // PGO Tier-1: capture counter addresses for a later Tier-2 synthesis (§5.2).
-  // The __profc_*/__profd_* globals were forced External by captureCounterGlobals
-  // during the transform; resolve them by name in the specialization JITDylib.
+  // The __profc_*/__profd_* globals were forced External by
+  // captureCounterGlobals during the transform; resolve them by name in the
+  // specialization JITDylib.
   if (ctx.tier == CompileTier::Instrumented) {
     auto &counters = tier1Counters_[cacheKey];
     counters.clear();
@@ -541,6 +629,62 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     }
     EJIT_DIAG("compileCold Tier-1 key=0x%016lx: captured %zu counter set(s)",
               cacheKey, counters.size());
+
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+    // Value-profile capture (EJIT_VALUE_PROFILE.md §5.1): build the verified
+    // target table from the module's function list - each function's runtime
+    // address (ORC lookup for module definitions, registered user symbols for
+    // externals) mapped to the MD5 of its IR-level PGO name. Addresses that
+    // resolve to nothing are simply absent from the table, so the merge can
+    // never pass an unverified raw address as a profile value.
+    Tier1VpState &vp = tier1Vp_[cacheKey];
+    vp.targets.clear();
+    vp.functions.clear();
+    for (const EJitVpFunctionInfo &f : jitEngine_->getLastVpFunctions()) {
+      uintptr_t addr = 0;
+      if (auto a = jitEngine_->lookup(cacheKey, f.name))
+        addr = reinterpret_cast<uintptr_t>(*a);
+      else
+        consumeError(a.takeError());
+      if (!addr)
+        for (const auto &us : userSymbols_)
+          if (us.first == f.name) {
+            addr = reinterpret_cast<uintptr_t>(us.second);
+            break;
+          }
+      if (addr)
+        vp.targets.push_back({addr, f.pgoHash});
+      // The capture records the IR-PGO-name hash in BOTH hash fields: it is
+      // the scalar site key, and the merge re-pairs the entry with the
+      // inventory (CFG hash) via this name hash.
+      vp.functions.push_back({f.pgoHash, f.pgoHash, 0, 0, f.numScalarSites});
+    }
+    // Start this function's collection round clean: reset its own sites (IC /
+    // memop counts come from the just-captured __profd_ structs), leave other
+    // admitted functions untouched, then arm the collector.
+    {
+      std::vector<PgoCounterRef> refs;
+      refs.reserve(counters.size());
+      for (const auto &c : counters)
+        refs.push_back({c.pgoName.c_str(), c.profcAddr, c.profdAddr});
+      SmallVector<PgoValueFunction, 8> inv;
+      if (readValueSiteInventory(refs, inv)) {
+        for (const PgoValueFunction &pf : inv) {
+          EJitVpKindSiteCount counts[] = {{kEJitVpIndirectCall, pf.numIcSites},
+                                          {kEJitVpMemOpSize, pf.numMemSites},
+                                          {kEJitVpScalar, pf.numScalarSites}};
+          ejitVpResetFunction(pf.pgoNameHash,
+                              ArrayRef<EJitVpKindSiteCount>(counts));
+        }
+      }
+    }
+    ejitVpEnsureInitialized();
+    ejitVpSetArmed(true);
+    ++vpRoundsActive_;
+    EJIT_DIAG_DEBUG("VP capture key=0x%016lx: %zu function(s), %zu verified "
+                    "target(s)",
+                    cacheKey, vp.functions.size(), vp.targets.size());
+#endif
   }
 
   // PGO Tier-2: profile consumed; drop the captured counters (§7.1).
@@ -564,7 +708,8 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
   EJIT_DIAG("compileNow begin func=%u dims=%u tier=%u", funcIdx, req.numDims,
             tier);
   if (req.numDims > 4) {
-    EJIT_DIAG("compileNow reject func=%u: numDims=%u > 4", funcIdx, req.numDims);
+    EJIT_DIAG("compileNow reject func=%u: numDims=%u > 4", funcIdx,
+              req.numDims);
     return nullptr;
   }
 
@@ -628,5 +773,19 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
             funcIdx, cacheKey, packedDims[0], packedDims[1], packedDims[2],
             packedDims[3]);
   return compileCold(cacheKey, tier, /*storeLru=*/false);
+}
+
+void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
+                                                bool published) {
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  const uint32_t tier = decodeReqTier(req.funcIndex);
+  const bool consumesRound = (tier == kEJitTierPgoUse && published) ||
+                             (tier == kEJitTierInstrumented && !published);
+  if (consumesRound && vpRoundsActive_ > 0 && --vpRoundsActive_ == 0)
+    ejitVpSetArmed(false);
+#else
+  (void)req;
+  (void)published;
+#endif
 }
 #endif

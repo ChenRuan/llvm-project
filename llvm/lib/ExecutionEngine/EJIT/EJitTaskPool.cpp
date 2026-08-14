@@ -263,8 +263,8 @@ EJitPublishStatus EJitTaskPoolCache::publish(uint32_t funcIndex,
 }
 
 uint64_t EJitTaskPoolCache::hitCountOf(uint32_t funcIndex,
-                                              const EJitDimPair *dims,
-                                              uint32_t numDims) {
+                                       const EJitDimPair *dims,
+                                       uint32_t numDims) {
   funcIndex = stripReqTier(funcIndex);
   if (numDims > 4)
     return 0;
@@ -386,15 +386,16 @@ EJitTaskPool::tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
                           uint32_t numDims) {
   CompileOrGetResult R;
 
-  // Parameter check already done by the C API layer (ejit_taskpool_compile_or_get).
+  // Parameter check already done by the C API layer
+  // (ejit_taskpool_compile_or_get).
 
   // 1. Instance-enabled check (§5.2 step 0) — a disabled instance falls back
   //    and never reaches the cache, so it is never served a stale cached JIT.
   for (uint32_t i = 0; i < numDims; ++i) {
     if (!switch_.isInstanceEnabled(dims[i].dimType, dims[i].instanceId)) {
       EJIT_STAT_INC(counters_.instanceDisabled);
-      EJIT_DIAG_VERBOSE("taskpool disabled func=%u dim[%u]=(%u,%u)", funcIndex, i,
-                dims[i].dimType, dims[i].instanceId);
+      EJIT_DIAG_VERBOSE("taskpool disabled func=%u dim[%u]=(%u,%u)", funcIndex,
+                        i, dims[i].dimType, dims[i].instanceId);
       R.status = EJitCompileOrGetStatus::InstanceDisabled;
       R.fastPathTerminal = true;
       return R;
@@ -562,7 +563,8 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     if (!versionsMatch(Req)) {
       cache_.retireCode(fn);
       EJIT_STAT_INC(counters_.compileFailed);
-      EJIT_DIAG("taskpool sync compile drop func=%u: version changed", funcIndex);
+      EJIT_DIAG("taskpool sync compile drop func=%u: version changed",
+                funcIndex);
       R.status = EJitCompileOrGetStatus::CompileFailed;
       return R;
     }
@@ -638,7 +640,8 @@ bool EJitTaskPool::versionsMatch(const EJitCompileRequest &req) const {
 }
 
 void EJitTaskPool::runCompile(const EJitCompileRequest &req) {
-  EJIT_DIAG_VERBOSE("worker compile begin func=%u dims=%u", req.funcIndex, req.numDims);
+  EJIT_DIAG_VERBOSE("worker compile begin func=%u dims=%u", req.funcIndex,
+                    req.numDims);
   // Checkpoint 1 (§5.3): drop a request invalidated before compilation started.
   if (!versionsMatch(req)) {
     queue_.release(req.funcIndex);
@@ -661,6 +664,8 @@ void EJitTaskPool::runCompile(const EJitCompileRequest &req) {
 
   // Checkpoint 2 (§5.3): a toggle during compilation invalidates the result.
   if (!versionsMatch(req)) {
+    if (publishFn_)
+      publishFn_(publishCtx_, req, false);
     cache_.retireCode(fn); // Retire the now-stale code (real callback only).
     queue_.release(req.funcIndex);
     EJIT_STAT_INC(counters_.compileFailed);
@@ -677,10 +682,14 @@ void EJitTaskPool::runCompile(const EJitCompileRequest &req) {
   switch (PS) {
   case EJitPublishStatus::Published:
     EJIT_STAT_INC(counters_.asyncCompiles);
+    if (publishFn_)
+      publishFn_(publishCtx_, req, true);
     queue_.release(req.funcIndex);
     EJIT_DIAG_VERBOSE("worker publish ok func=%u fn=%p", req.funcIndex, fn);
     return;
   case EJitPublishStatus::VersionMismatch:
+    if (publishFn_)
+      publishFn_(publishCtx_, req, false);
     // Rejected at the commit gate: retire the stale code, do not overwrite any
     // existing entry, release the dedup slot, count as a (cancelled) failure.
     cache_.retireCode(fn);
@@ -690,6 +699,8 @@ void EJitTaskPool::runCompile(const EJitCompileRequest &req) {
     return;
   case EJitPublishStatus::InvalidParam:
   case EJitPublishStatus::Failed:
+    if (publishFn_)
+      publishFn_(publishCtx_, req, false);
     cache_.retireCode(fn);
     queue_.release(req.funcIndex);
     EJIT_STAT_INC(counters_.publishFailed);
