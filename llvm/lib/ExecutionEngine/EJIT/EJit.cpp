@@ -14,6 +14,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+#include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
+#endif
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/LLVMContext.h"
@@ -301,6 +304,23 @@ EJit::EJit(const Config &config) : config_(config) {
   // elected owner long after this constructor (and `data`) is gone.
   for (auto &sym : data.userSymbols)
     compileDriver_->registerSymbol(sym.name, sym.addr);
+
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  // Value-profiling runtime hooks (EJIT_VALUE_PROFILE.md §2.1): the Tier-1
+  // machine code calls these; resolve them against this image's runtime. On a
+  // same-image cross-core platform every core's image carries the identical
+  // copy at the same VA, so the published shared code resolves correctly on
+  // every core (same precondition as shared code pointers).
+  compileDriver_->registerSymbol(
+      "__llvm_profile_instrument_target",
+      reinterpret_cast<void *>(&__llvm_profile_instrument_target));
+  compileDriver_->registerSymbol(
+      "__llvm_profile_instrument_memop",
+      reinterpret_cast<void *>(&__llvm_profile_instrument_memop));
+  compileDriver_->registerSymbol(
+      "ejit_vp_record_scalar",
+      reinterpret_cast<void *>(&ejit_vp_record_scalar));
+#endif
 
   // Build the ORC engine. On the shared-taskpool async path this is DEFERRED to
   // the core that wins the owner election: only the owner's worker ever invokes

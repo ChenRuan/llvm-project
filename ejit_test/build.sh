@@ -136,6 +136,11 @@ if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
   if grep -q "^EJIT_SRE_SHARED_TASKPOOL:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
     EJIT_SRE_CFLAGS="${EJIT_SRE_CFLAGS} -DEJIT_SRE_SHARED_TASKPOOL"
   fi
+  # Value profiling: the multicore value-profile test gates its stats checks
+  # on this macro, which must match the runtime library's build.
+  if grep -q "^EJIT_SRE_PGO_VALUE_PROFILE:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
+    EJIT_SRE_CFLAGS="${EJIT_SRE_CFLAGS} -DEJIT_SRE_PGO_VALUE_PROFILE"
+  fi
 fi
 [[ -n "${EJIT_SRE_CFLAGS}" ]] && echo "Taskpool flags: ${EJIT_SRE_CFLAGS}"
 
@@ -194,6 +199,8 @@ ALL_TESTS=(
   ejit_volatile_test
   ejit_l0_dispatch_test
   ejit_pgo_test
+  ejit_pgo_sre_multicore_test
+  ejit_vp_multicore_test
 )
 
 # Per-test compile flags (e.g. for disabling global constructors)
@@ -242,6 +249,8 @@ TEST_ARGS[ejit_multidim_test]="0"
 TEST_ARGS[ejit_nested_struct_test]="0"
 TEST_ARGS[ejit_trace_test]="0"
 TEST_ARGS[ejit_pgo_test]="0"
+TEST_ARGS[ejit_pgo_sre_multicore_test]=""
+TEST_ARGS[ejit_vp_multicore_test]=""
 TEST_ARGS[ejit_attr_test]="0"
 TEST_ARGS[ejit_config_api_test]="0"
 TEST_ARGS[ejit_perf_bench]="0 1"

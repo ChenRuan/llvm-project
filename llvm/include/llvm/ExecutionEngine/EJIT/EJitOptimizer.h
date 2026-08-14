@@ -12,7 +12,10 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
+#include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/IR/Module.h"
@@ -20,6 +23,17 @@
 
 namespace llvm {
 namespace ejit {
+
+/// One function of the last Tier-1 compile, captured for the value-profile
+/// merge: its symbol name, the MD5 hash of its IR-level PGO name (the same
+/// value LLVM's IndirectCallPromotion resolves through the module symtab),
+/// and how many scalar/loop-bound value sites the Tier-1 instrumentation
+/// created in it (zero for functions without sites).
+struct EJitVpFunctionInfo {
+  std::string name;
+  uint64_t pgoHash = 0;
+  uint32_t numScalarSites = 0;
+};
 
 /// JIT optimization pipeline. Runs on the extracted bitcode module during
 /// JIT compilation to specialize the code for the current time-window values.
@@ -51,6 +65,22 @@ public:
   /// names to capture counter addresses for Tier-2 profile synthesis.
   ArrayRef<std::string> getLastCounterNames() const {
     return lastCounterNames_;
+  }
+
+  /// Value-profile capture of the last Instrumented (Tier-1) compile: every
+  /// function of the module with its symbol name, IR-PGO-name MD5 hash and
+  /// scalar site count (EJIT_VALUE_PROFILE.md §5.1). The compile driver
+  /// resolves each name to its runtime address to build the verified
+  /// address -> hash map used by the Tier-2 merge. Empty for Baseline/PGOUse.
+  ArrayRef<EJitVpFunctionInfo> getLastVpFunctions() const {
+    return lastVpFunctions_;
+  }
+
+  /// Record the scalar/loop-bound value-site count the Tier-1 instrumentation
+  /// created in \p funcName (called by the value-profile instrumentation pass
+  /// before captureCounterGlobals merges the counts into lastVpFunctions_).
+  void recordScalarSiteCount(StringRef funcName, uint32_t count) {
+    scalarSiteCountsByFunc_[funcName] = count;
   }
 
 private:
@@ -124,6 +154,12 @@ private:
   // PGO: PGOFuncNames captured by the last Tier-1 compile (see
   // captureCounterGlobals). Cleared at the start of each runPipeline.
   SmallVector<std::string, 4> lastCounterNames_;
+  // Value profile (EJIT_VALUE_PROFILE.md §5.1): function table captured by the
+  // last Tier-1 compile. Cleared at the start of each runPipeline. The scalar
+  // instrumentation pass records per-function site counts into
+  // scalarSiteCountsByFunc_ before capture; captureCounterGlobals merges them.
+  SmallVector<EJitVpFunctionInfo, 8> lastVpFunctions_;
+  StringMap<uint32_t> scalarSiteCountsByFunc_;
 
   // Grant the unit-test accessor visibility into the private pipeline steps.
   // runPipeline() remains the only production entry point; this friend keeps

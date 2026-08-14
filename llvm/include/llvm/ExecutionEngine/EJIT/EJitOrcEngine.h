@@ -11,10 +11,12 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
+#include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/Support/Error.h"
 #include <memory>
 #include <string>
+#include <vector>
 
 #ifdef EJIT_SRE_CODE_POOL
 #include "llvm/ExecutionEngine/EJIT/EJitCodePool.h"
@@ -28,6 +30,7 @@ namespace ejit {
 class PeriodArrayRegistry;
 class EJitRuntimeState;
 struct EJitSharedTaskPoolState;
+struct EJitVpFunctionInfo; // defined in EJitOptimizer.h (value-profile capture)
 
 namespace detail {
 /// Render one function definition without the rest of its specialization
@@ -88,6 +91,11 @@ struct SpecializationContext {
   /// EJitProfileMerge before loadBitcode). Empty for Baseline/Instrumented.
   /// Owned by the context; lives through the JIT transform that consumes it.
   std::string profileData;
+  /// Scalar/loop-bound specialization side table (EJIT_VALUE_PROFILE.md §7):
+  /// filled by the Tier-2 merge with the top-1 dominant value per qualifying
+  /// site (min samples + confidence thresholds applied by the driver). Empty
+  /// for Baseline/Instrumented and when value profiling is not built.
+  std::vector<PgoScalarSite> scalarValueSites;
 };
 
 /// Wraps an LLJIT instance with EmbeddedJIT-specific configuration:
@@ -123,6 +131,11 @@ public:
   /// driver looks up __profc_/__profd_ by these names after a Tier-1 compile to
   /// capture counter addresses for Tier-2 profile synthesis (§5.2).
   ArrayRef<std::string> getLastCounterNames() const;
+
+  /// Value profile: function table captured by the last Tier-1 compile (see
+  /// EJitOptimizer::getLastVpFunctions). Empty unless the Tier-1 compile ran
+  /// with EJIT_SRE_PGO_VALUE_PROFILE.
+  ArrayRef<EJitVpFunctionInfo> getLastVpFunctions() const;
 
   /// Register a user-defined external symbol (function or global) that the
   /// JIT can resolve when compiling bitcode modules. Required for bare-metal

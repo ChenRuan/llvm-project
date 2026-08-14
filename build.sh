@@ -30,6 +30,8 @@
 #   --sre-taskpool-worker-stack-size=<bytes>  shared worker task stack size (default: 1048576)
 #   --sre-shared-code-pointers / --no-sre-shared-code-pointers  allow non-owner cores to read shared cache fnPtrs (default OFF; needs platform same-VA + cache coherence)
 #   --sre-shared-worker-core=<n>  pin the shared taskpool worker to core <n>; only that core may win the owner election (default: empty = open CAS election; needs --sre-shared-taskpool)
+#   --sre-pgo-value-profile / --no-sre-pgo-value-profile  enable/disable Online-PGO value profiling (default OFF)
+#   --sre-pgo-max-concurrent-profiles=<n>  simultaneous profiling admissions, 1..16 (default: 1)
 #   --stats / --no-stats  embed EJIT taskpool statistics counters (default OFF; per-call atomic cost on the hot path)
 #   -h              show help
 #===----------------------------------------------------------------------===#
@@ -118,6 +120,8 @@ do_configure() {
         -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS} \
         -DEJIT_SRE_SHARED_CODE_POINTERS=${EJIT_SRE_SHARED_CODE_POINTERS} \
         -DEJIT_SRE_SHARED_TASKPOOL_WORKER_CORE=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE} \
+        -DEJIT_SRE_PGO_VALUE_PROFILE=${EJIT_SRE_PGO_VALUE_PROFILE} \
+        -DEJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES} \
         -DEJIT_STATS_ENABLE=${EJIT_STATS_ENABLE} \
         "-DEJIT_DEFAULT_TARGET_TRIPLE=${EJIT_TARGET_TRIPLE:-${default_triple}}" \
         -DLLVM_ENABLE_ZLIB=OFF \
@@ -146,6 +150,8 @@ do_configure() {
         -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS} \
         -DEJIT_SRE_SHARED_CODE_POINTERS=${EJIT_SRE_SHARED_CODE_POINTERS} \
         -DEJIT_SRE_SHARED_TASKPOOL_WORKER_CORE=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE} \
+        -DEJIT_SRE_PGO_VALUE_PROFILE=${EJIT_SRE_PGO_VALUE_PROFILE} \
+        -DEJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES} \
         -DEJIT_STATS_ENABLE=${EJIT_STATS_ENABLE} \
         "-DEJIT_DEFAULT_TARGET_TRIPLE=${EJIT_TARGET_TRIPLE:-${default_triple}}" \
         -DLLVM_USE_SPLIT_DWARF=ON \
@@ -189,6 +195,8 @@ do_configure() {
       -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS}
       -DEJIT_SRE_SHARED_CODE_POINTERS=${EJIT_SRE_SHARED_CODE_POINTERS}
       -DEJIT_SRE_SHARED_TASKPOOL_WORKER_CORE=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE}
+      -DEJIT_SRE_PGO_VALUE_PROFILE=${EJIT_SRE_PGO_VALUE_PROFILE}
+      -DEJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES}
       -DEJIT_STATS_ENABLE=${EJIT_STATS_ENABLE}
     "
     # shellcheck disable=SC2086
@@ -233,6 +241,8 @@ do_configure() {
       -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS}
       -DEJIT_SRE_SHARED_CODE_POINTERS=${EJIT_SRE_SHARED_CODE_POINTERS}
       -DEJIT_SRE_SHARED_TASKPOOL_WORKER_CORE=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE}
+      -DEJIT_SRE_PGO_VALUE_PROFILE=${EJIT_SRE_PGO_VALUE_PROFILE}
+      -DEJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES}
       -DEJIT_STATS_ENABLE=${EJIT_STATS_ENABLE}
     "
     # shellcheck disable=SC2086
@@ -309,10 +319,12 @@ EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=1
 EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=100
 EJIT_SRE_SHARED_CODE_POINTERS=OFF
 EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE=
+EJIT_SRE_PGO_VALUE_PROFILE=OFF
+EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=1
 EJIT_STATS_ENABLE=OFF
 
 if [[ "${1:-}" = "-h" || "${1:-}" = "--help" ]]; then
-  sed -n '2,31p' "$0"
+  sed -n '2,35p' "$0"
   exit 0
 fi
 
@@ -345,16 +357,26 @@ while [[ $# -gt 0 ]]; do
     --no-sre-shared-code-pointers) EJIT_SRE_SHARED_CODE_POINTERS=OFF ;;
     --sre-shared-worker-core=*) EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE="${1#--sre-shared-worker-core=}" ;;
     --no-sre-shared-worker-core) EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE="" ;;
+    --sre-pgo-value-profile) EJIT_SRE_PGO_VALUE_PROFILE=ON ;;
+    --no-sre-pgo-value-profile) EJIT_SRE_PGO_VALUE_PROFILE=OFF ;;
+    --sre-pgo-max-concurrent-profiles=*) EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES="${1#--sre-pgo-max-concurrent-profiles=}" ;;
     --stats) EJIT_STATS_ENABLE=ON ;;
     --no-stats) EJIT_STATS_ENABLE=OFF ;;
     -h|--help)
-      sed -n '2,31p' "$0"
+      sed -n '2,35p' "$0"
       exit 0
       ;;
     *) err "Unknown argument: $1"; exit 1 ;;
   esac
   shift
 done
+
+if ! [[ "${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES}" =~ ^[0-9]+$ ]] ||
+   (( EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES < 1 ||
+      EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES > 16 )); then
+  err "--sre-pgo-max-concurrent-profiles must be an integer in [1, 16]"
+  exit 1
+fi
 
 if [ -z "$TYPE" ] || [ -z "$ARCH" ]; then
   err "Usage: ./build.sh <debug|release> <x86|aarch64> [minimal] [-c|-b]"

@@ -2,8 +2,14 @@
 
 **版本**: 0.14
 **日期**: 2026-07-11
-**关联文档**: SPEC4.md, PLAN4.md, PASS6_EJitStructFieldPass.md, PASS7_EJitRuntime_OrcJITLink.md, EJIT_SRE_TASKPOOL.md, EJIT_SRE_CODE_POOL.md, EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL_STUBS.md
+**关联文档**: SPEC4.md, PLAN4.md, PASS6_EJitStructFieldPass.md, PASS7_EJitRuntime_OrcJITLink.md, EJIT_SRE_TASKPOOL.md, EJIT_SRE_CODE_POOL.md, EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL_STUBS.md, [EJIT_VALUE_PROFILE.md](EJIT_VALUE_PROFILE.md)
 **目标平台**: SRE 裸核(AArch64, RAM 100KB–2MB, 无文件系统, 单 worker)
+
+> **Value profiling 扩展**: 见 [EJIT_VALUE_PROFILE.md](EJIT_VALUE_PROFILE.md) —
+> 在本文档的 edge-profile 链路上新增三类 value site（indirect-call target /
+> dynamic memop size / scalar loop-bound）的采集、合并与带 guard 的 Tier-2
+> 特化，构建宏 `EJIT_SRE_PGO_VALUE_PROFILE`（默认 OFF）控制，任务池共享
+> ABI（v10）与本文档的既有行为不变。
 
 > **v0.2 变更**: 经源码核实修正 5 处实质性错误(PGOInstrumentationGen 不产计数器全局、计数器符号 PrivateLinkage、lowering 拖入 runtime 符号、PGO 价值范围、InstrProfWriter 合成方式);新增分阶段 Pass 清单(§12)与分析依赖(§13);补充 Sync 模式 Tier-2 策略、CompileRequest/共享 ABI 约束、publish 字段重置。
 >

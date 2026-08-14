@@ -228,7 +228,8 @@ public:
   void retireCode(void *fnPtr);
 
   /// PGO test/diagnostic: the hitCount of the entry matching (funcIndex, dims),
-  /// or 0 if no match. Strips tier bits from funcIndex (publish stores stripped).
+  /// or 0 if no match. Strips tier bits from funcIndex (publish stores
+  /// stripped).
   uint64_t hitCountOf(uint32_t funcIndex, const EJitDimPair *dims,
                       uint32_t numDims);
 
@@ -313,6 +314,8 @@ class EJitTaskPool {
 public:
   using CompileCallback = bool (*)(void *ctx, const EJitCompileRequest &req,
                                    void **outFn);
+  using PublishCallback = void (*)(void *ctx, const EJitCompileRequest &req,
+                                   bool published);
 
   struct CompileOrGetResult {
     EJitCompileOrGetStatus status = EJitCompileOrGetStatus::CompileFailed;
@@ -340,6 +343,10 @@ public:
   void setCompiler(CompileCallback fn, void *ctx) {
     compileFn_ = fn;
     compileCtx_ = ctx;
+  }
+  void setPublishCallback(PublishCallback fn, void *ctx) {
+    publishFn_ = fn;
+    publishCtx_ = ctx;
   }
 
   /// Install the optional physical-code release callback used when publish
@@ -427,6 +434,8 @@ private:
   bool pgoEnabled_ = false; // PGO (§6): gates the Tier-2 trigger
   CompileCallback compileFn_ = nullptr;
   void *compileCtx_ = nullptr;
+  PublishCallback publishFn_ = nullptr;
+  void *publishCtx_ = nullptr;
   // Value-initialized: EJitAtomic now has a trivial default ctor (so the shared
   // state blob needs no dynamic init / .init_array), so this heap-resident
   // counters block zeroes itself explicitly rather than via the atomic ctor.
