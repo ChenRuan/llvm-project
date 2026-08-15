@@ -136,6 +136,57 @@ template __attribute__((ejit_period_lc("static")))
 void m_fn2<int>(__attribute__((ejit_period_arr_ind("static"))) int);
 // expected-error@-2 {{'ejit_entry' and 'ejit_period_lc' cannot be combined on function 'm_fn2<int>'}}
 
+// --- OK: the ejit_period_arr_ind may live on an earlier declaration's
+//     parameter; it is propagated by the declaration merge before the
+//     ejit_period_lc no-index check runs ---
+
+void ok_split_a(__attribute__((ejit_period_arr_ind("cell"))) int idx);
+__attribute__((ejit_period_lc("cell"))) void ok_split_a(int idx);
+
+__attribute__((ejit_period_lc("cell")))
+void ok_split_b(__attribute__((ejit_period_arr_ind("cell"))) int idx);
+__attribute__((ejit_period_lc("cell"))) void ok_split_b(int idx);
+
+void ok_split_def(__attribute__((ejit_period_arr_ind("cell"))) int idx);
+__attribute__((ejit_period_lc("cell"))) void ok_split_def(int idx) {}
+
+// --- Error: NO declaration provides a matching ejit_period_arr_ind; the lc
+//     written on the second declaration is diagnosed there ---
+
+void missing_idx(__attribute__((ejit_period_arr_ind("other"))) int idx);
+__attribute__((ejit_period_lc("cell"))) void missing_idx(int idx);
+// expected-error@-1 {{ejit_period_lc(cell) requires a corresponding ejit_period_arr_ind(cell) parameter}}
+
+// --- OK: an ejit_period_lc written on an explicit instantiation declarator
+//     finds its ejit_period_arr_ind on the pattern's parameter ---
+
+template <typename T>
+void ei_lc_ok(__attribute__((ejit_period_arr_ind("cell"))) int) {}
+template __attribute__((ejit_period_lc("cell")))
+void ei_lc_ok<int>(int);
+
+// --- Error: the pattern's parameter lacks the arr_ind, so an
+//     ejit_period_lc written on the instantiation declarator has no index ---
+
+template <typename T>
+void ei_lc_missing(int) {}
+template __attribute__((ejit_period_lc("cell")))
+void ei_lc_missing<int>(int);
+// expected-error@-2 {{ejit_period_lc(cell) requires a corresponding ejit_period_arr_ind(cell) parameter}}
+
+// --- Known limitation (pinned): clang silently discards parameter
+//     attributes on explicit instantiation declarators, so an
+//     ejit_period_arr_ind written here never attaches and the check errors.
+//     The arr_ind must live on the pattern's parameter. If clang ever starts
+//     applying declarator param attributes on explicit instantiations, this
+//     expectation must be revisited. ---
+
+template <typename T>
+void ei_lc_together(int) {}
+template __attribute__((ejit_period_lc("cell")))
+void ei_lc_together<int>(__attribute__((ejit_period_arr_ind("cell"))) int);
+// expected-error@-2 {{ejit_period_lc(cell) requires a corresponding ejit_period_arr_ind(cell) parameter}}
+
 // --- No warning: definition repeats the attribute ---
 
 __attribute__((ejit_entry)) int ok_entry_fn(void);
