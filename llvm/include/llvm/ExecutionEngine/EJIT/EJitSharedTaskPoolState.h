@@ -343,6 +343,54 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
       EJitAtomicU8 enabled[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 version[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 mode; ///< EJitCompileMode (Off=0, Async=1)
+  /// Counts inline-cache drains. Bumped by icacheDrainAll() AFTER it zeroes the
+  /// shared cell table, so a resolve that started before the drain can tell its
+  /// fnPtr may be specialized for period values that have since changed, and
+  /// drop the fill rather than re-populate a cell the drain just cleared. The
+  /// hit path never reads it: the cells are shared, so the drain reaches every
+  /// core directly. Bumped, never reset.
+  EJitAtomicU32 icacheDrainSeq;
+  /// Drains currently zeroing the table. Raised before the first cell store and
+  /// lowered after the sequence bump, so the pair brackets the whole drain: a
+  /// fill that sees 0 at both ends of its resolve and an unchanged sequence
+  /// provably did not overlap one. Needed because a drain that has passed a cell
+  /// but not yet bumped the sequence would otherwise let a fill slip in behind
+  /// it, and because several cores can drain at once.
+  EJitAtomicU32 icacheDrainsInFlight;
+  /// 1 => at least one cell has been armed since the last drain emptied the
+  /// table. A drain reads this first and skips the whole walk when it is clear,
+  /// which is what makes bring-up affordable: N cores each calling ejit_activate
+  /// per instance produce N x instances drains, and until something is actually
+  /// cached every one of them writes 0 over 0 across every cell of every
+  /// registered slot (5 slots at dims 0..4 is ~70k cells per drain).
+  ///
+  /// Safety does NOT rest on this flag -- the in-flight/sequence bracket and the
+  /// post-store retract already guarantee no cell survives a drain. The flag
+  /// only removes work, and it errs on the side of doing it: icacheFill sets it
+  /// with release BEFORE storing the cell, so any drain that could observe a
+  /// non-null cell observes the flag first. A retracted fill leaves it set,
+  /// which costs one redundant walk and nothing else.
+  EJitAtomicU32 icacheArmed;
+  /// 1 => at least one core needs per-core execute preparation (4K seal, or a
+  /// wired prepareCode callback) before it may run JIT code.
+  ///
+  /// Must be SHARED, not per-facade: the property gates the 0-dim inline-cache
+  /// fill, and a peer facade that was never handed the seal mode would evaluate
+  /// its private copy as "no preparation needed" and arm the one shared scalar
+  /// that every core reads. Published by any facade that observes it locally and
+  /// never cleared except by (re)initialization -- "set" is the conservative
+  /// direction, and being monotone means no core can race another into a weaker
+  /// answer.
+  EJitAtomicU32 icachePerCorePrepare;
+  /// Number of bound facades that currently have a physical-code releaser wired.
+  /// Non-zero disables the inline cache for EVERY core: code may then be freed
+  /// and the probe does no HP-scan retire, so any cell still holding a pointer
+  /// can dangle.
+  ///
+  /// Must be SHARED for the same reason, and it is a count rather than a flag
+  /// because facades wire and unwire independently: the cache may only re-arm
+  /// once the LAST releaser is gone.
+  EJitAtomicU32 icacheReleasersWired;
   EJitAtomicU32 anyInstanceActivated; ///< 1 once any instance first
                                       ///< setInstanceEnabled(true); gates the
                                       ///< instanceDisabledPreActivate counter.

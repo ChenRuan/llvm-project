@@ -71,7 +71,10 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// the optional EJIT_SRE_TASKPOOL_NO_RECLAIM seqlock reader.
 /// v7: full IR/ASM payloads are worker-local again; shared dump state contains
 /// only a bounded filter and latest-capture metadata. publishSeq is unchanged.
-constexpr uint32_t kEJitSharedAbiVersion = 7u;
+/// v8: the SwitchController line gains icacheDrainSeq, bumped by every
+/// inline-cache drain so a resolve that raced the drain drops its fill rather
+/// than refilling a cell the drain just cleared.
+constexpr uint32_t kEJitSharedAbiVersion = 9u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

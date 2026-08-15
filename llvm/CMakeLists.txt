@@ -772,6 +772,18 @@ else()
         "Ensure the compiler was built with EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}.")
 endif()
 
+# EJIT_ICACHE_SECTION: the section the AOT pass places the
+# @__ejit_icache_fn_<name> cell table into. Defaults to ".mc_shared", the same
+# inter-core shared region the taskpool state blob (EJIT_SHARED_SECTION_ATTR)
+# and the period data already live in. Sharing the table is what lets a
+# deactivate on any core zero the cells every other core reads.
+#
+# Set to "" to leave the table in ordinary .bss, which on a multi-core target is
+# per-core private -- a deactivate then drains only the core it runs on.
+set(EJIT_ICACHE_SECTION ".mc_shared" CACHE STRING
+  "Section for the EJIT inline-cache cell table; must be inter-core shared on a multi-core target")
+message(STATUS "EmbeddedJIT: inline-cache cell table section=${EJIT_ICACHE_SECTION}")
+
 #===-- EmbeddedJIT SRE taskpool compile scheduler -------------------------===#
 # Route ejit_compile_or_get through a unified taskpool (cache + dedup + queue)
 # instead of calling the synchronous compile driver directly. Sync and async
@@ -954,12 +966,22 @@ if(EJIT_SRE_SHARED_TASKPOOL)
   if(EJIT_SRE_SHARED_CODE_POINTERS)
     add_definitions(-DEJIT_SRE_SHARED_CODE_POINTERS)
   endif()
+  # An empty EJIT_ICACHE_SECTION puts the inline-cache cells in per-core .bss,
+  # where a period toggle on one core cannot drain another's. Warn rather than
+  # fail: -ejit-inline-cache is opt-in per application TU.
+  if(EJIT_FREESTANDING AND NOT EJIT_ICACHE_SECTION)
+    message(WARNING
+      "EJIT_SRE_SHARED_TASKPOOL + EJIT_FREESTANDING with an empty "
+      "EJIT_ICACHE_SECTION: TUs built with -ejit-inline-cache get a PER-CORE "
+      "cell table, which a period toggle on another core cannot drain.")
+  endif()
   message(STATUS "EmbeddedJIT: cross-core shared taskpool enabled "
                  "(cacheSlots=${EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS}, "
                  "workerStack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}, "
                  "platformCoreId=${EJIT_FREESTANDING}, "
                  "codePointers=${EJIT_SRE_SHARED_CODE_POINTERS}, "
-                 "sharedSection=${_ejit_shared_section})")
+                 "sharedSection=${_ejit_shared_section}, "
+                 "icacheSection=${EJIT_ICACHE_SECTION})")
 endif()
 
 if(EJIT_SRE_TASKPOOL_NO_RECLAIM AND NOT EJIT_SRE_SHARED_TASKPOOL)
