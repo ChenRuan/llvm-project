@@ -1397,6 +1397,7 @@ void ejit_taskpool_print_compiled() {
                   numDims > 2 ? dims[2].instanceId : 0,
                   numDims > 3 ? dims[3].dimType : 0,
                   numDims > 3 ? dims[3].instanceId : 0, fnPtr);
+        ejitDiagPrintThrottle();
 #else
         (void)funcIndex;
         (void)dims;

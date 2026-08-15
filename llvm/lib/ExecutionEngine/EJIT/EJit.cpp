@@ -808,17 +808,22 @@ void EJit::printRegistry() const {
     if (!bc)
       consumeError(bc.takeError());
     EJIT_DIAG("  idx=%u name=%s size=%zu", idx, name.c_str(), sz);
+    ejitDiagPrintThrottle();
   }
 
   EJIT_DIAG("registry: period arrays:");
   for (const auto &kv : reg.arraysByPeriod())
-    for (const auto &info : kv.second)
+    for (const auto &info : kv.second) {
       EJIT_DIAG("  period=%s var=%s base=%p size=%zu", kv.first.c_str(),
                 info.varName.c_str(), info.baseAddr, info.arraySize);
+      ejitDiagPrintThrottle();
+    }
 
   EJIT_DIAG("registry: static vars (%zu):", reg.getStaticVars().size());
-  for (const auto &sv : reg.getStaticVars())
+  for (const auto &sv : reg.getStaticVars()) {
     EJIT_DIAG("  var=%s addr=%p", sv.varName.c_str(), sv.varAddr);
+    ejitDiagPrintThrottle();
+  }
 }
 
 void EJit::printFuncMeta(const std::string &funcName) {
@@ -884,6 +889,7 @@ void EJit::printFuncMeta(const std::string &funcName) {
     }
     OS.flush();
     EJIT_DIAG("  %s %s", tag.str().c_str(), rest.c_str());
+    ejitDiagPrintThrottle();
   }
 }
 
@@ -968,6 +974,7 @@ void EJit::printActive() const {
     for (uint32_t cell = 0; cell < kEJitMaxInstances; ++cell) {
       if (isActive(period, static_cast<uint8_t>(cell))) {
         EJIT_DIAG("  period=%s cell=%u", period.c_str(), cell);
+        ejitDiagPrintThrottle();
         ++activeCells;
       }
     }

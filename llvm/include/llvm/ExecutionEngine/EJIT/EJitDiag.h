@@ -36,6 +36,8 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITDIAG_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITDIAG_H
 
+#include <cstdint>
+
 // Runtime log-level thresholds. Mirrored by enum ejit_log_level in
 // EJitRuntime.h (the public C ABI contract) — keep the two in sync.
 #define EJIT_LOG_LVL_OFF 0
@@ -46,6 +48,39 @@
 // Process-wide runtime log level. Defined in EJitLogger.cpp (always compiled,
 // hosted and freestanding). Default INFO. Set via ejit_set_log_level().
 extern int gEJitDiagLevel;
+
+//===-- Diagnostic dump print delay -----------------------------------------===//
+// Diagnostic dumps (registry, active cells, compiled list, captured IR/ASM,
+// icache slots) emit one line per item inside a loop. On SRE builds the
+// serial-log shell ring buffer is small (512 B default, ~7 aligned 64-byte
+// lines) and its consumer polls once per drain period (10 ticks = 100 ms),
+// so those loops call ejitDiagPrintThrottle() once per printed line: each
+// call delays the producer by EJIT_DIAG_PRINT_THROTTLE_TICKS scheduler
+// ticks (SRE_TaskDelay), letting the consumer drain between lines.
+// Compile-time configurable; 0 disables. Hosted builds do not delay;
+// diagnostics compiled out (no EJIT_DIAG_ENABLE) => pure no-op.
+
+#ifndef EJIT_DIAG_PRINT_THROTTLE_TICKS
+#define EJIT_DIAG_PRINT_THROTTLE_TICKS 20
+#endif
+
+#if defined(EJIT_DIAG_ENABLE) && defined(EJIT_FREESTANDING)
+// Provided by the platform task API.  Must be declared exactly as written so
+// the linker can resolve it against the device firmware / BSP.
+extern "C" uint32_t SRE_TaskDelay(uint32_t tick);
+#endif
+
+/// Delay the caller for EJIT_DIAG_PRINT_THROTTLE_TICKS scheduler ticks so a
+/// diagnostic dump loop stays behind the serial-log consumer. Call once
+/// right after each line the loop printed; a no-op when the line was not
+/// actually emitted (log level below INFO) or the delay is disabled.
+inline void ejitDiagPrintThrottle() {
+#if defined(EJIT_DIAG_ENABLE) && defined(EJIT_FREESTANDING) &&                  \
+    EJIT_DIAG_PRINT_THROTTLE_TICKS > 0
+  if (gEJitDiagLevel >= EJIT_LOG_LVL_INFO)
+    (void)SRE_TaskDelay(EJIT_DIAG_PRINT_THROTTLE_TICKS);
+#endif
+}
 
 #ifdef EJIT_DIAG_ENABLE
 

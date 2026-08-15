@@ -278,6 +278,7 @@ void llvm::ejit::ejitDumpIcacheSlots() {
     EJIT_DIAG("  [%2u] base=%p numDims=%u cell[0]=%p %s",
               f, (void *)reg.base, reg.numDims, (void *)c0,
               c0 ? "(filled)" : "(empty)");
+    ejitDiagPrintThrottle();
   }
   EJIT_DIAG("=== icache slots: %u registered, %u with cell[0] filled ===",
             registered, filled);

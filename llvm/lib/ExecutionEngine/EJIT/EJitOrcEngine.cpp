@@ -33,10 +33,6 @@
 #include <string>
 
 #ifdef EJIT_FREESTANDING
-extern "C" uint32_t SRE_TaskDelay(uint32_t tick);
-#endif
-
-#ifdef EJIT_FREESTANDING
 #include "llvm/ExecutionEngine/EJIT/EJitBareMetal.h"
 #else
 #include <mutex>
@@ -148,25 +144,6 @@ using DumpMutexType = DumpSpinLock;
 #else
 using DumpMutexType = std::mutex;
 #endif
-
-#ifndef EJIT_DUMP_PRINT_THROTTLE_LINES
-#define EJIT_DUMP_PRINT_THROTTLE_LINES 16
-#endif
-
-#ifndef EJIT_DUMP_PRINT_THROTTLE_TICKS
-#define EJIT_DUMP_PRINT_THROTTLE_TICKS 50
-#endif
-
-static void throttleDumpPrint(unsigned printedLines) {
-#if defined(EJIT_FREESTANDING) && EJIT_DUMP_PRINT_THROTTLE_LINES > 0 &&        \
-    EJIT_DUMP_PRINT_THROTTLE_TICKS > 0
-  if (printedLines != 0 &&
-      (printedLines % EJIT_DUMP_PRINT_THROTTLE_LINES) == 0)
-    (void)SRE_TaskDelay(EJIT_DUMP_PRINT_THROTTLE_TICKS);
-#else
-  (void)printedLines;
-#endif
-}
 
 // Process-wide function-name filter and payload store. The mutex protects both
 // because the shell may update/print while the worker captures.
@@ -293,7 +270,6 @@ static void dumpBytesSafe(const char *label, const char *data, size_t n) {
   EJIT_DIAG("=== %s begin size=%u ===", label, (unsigned)n);
   size_t i = 0;
   unsigned lineNo = 0;
-  unsigned printedLines = 0;
   while (i < n) {
     size_t lineEnd = i;
     while (lineEnd < n && data[lineEnd] != '\n')
@@ -310,7 +286,7 @@ static void dumpBytesSafe(const char *label, const char *data, size_t n) {
         pos += chunk;
       }
     }
-    throttleDumpPrint(++printedLines);
+    ejitDiagPrintThrottle();
     ++lineNo;
     i = lineEnd + 1;
   }
@@ -475,8 +451,10 @@ void printDumped(const char *name) {
       }
     } else if (!gDumpStore.empty()) {
       EJIT_DIAG("print_dumped saved entries=%u", (unsigned)gDumpStore.size());
-      for (auto &kv : gDumpStore)
+      for (auto &kv : gDumpStore) {
         printOneDumpSafe(nullptr, kv.first, kv.second);
+        ejitDiagPrintThrottle();
+      }
       return;
     }
   }
