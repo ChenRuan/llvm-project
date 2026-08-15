@@ -20,3 +20,15 @@ int g(__attribute__((ejit_period_arr_ind("static"))) int idx);
 __attribute__((ejit_period_lc("static")))
 int g(__attribute__((ejit_period_arr_ind("static"))) int idx);
 // expected-error@-2 {{'ejit_entry' and 'ejit_period_lc' cannot be combined on function 'g'}}
+
+// --- OK: the ejit_period_arr_ind may live on an earlier declaration's
+//     parameter; it is propagated by the merge before the no-index check ---
+
+void h(__attribute__((ejit_period_arr_ind("cell"))) int idx);
+__attribute__((ejit_period_lc("cell"))) void h(int idx) {}
+
+// --- Error: NO declaration provides a matching ejit_period_arr_ind ---
+
+void missing_idx(__attribute__((ejit_period_arr_ind("other"))) int idx);
+__attribute__((ejit_period_lc("cell"))) void missing_idx(int idx);
+// expected-error@-1 {{ejit_period_lc(cell) requires a corresponding ejit_period_arr_ind(cell) parameter}}

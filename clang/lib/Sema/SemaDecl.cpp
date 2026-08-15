@@ -84,6 +84,13 @@ void checkEjitAlwaysInlineConflict(Sema &S, FunctionDecl *FD);
 // check. Defined in SemaEJIT.cpp.
 void checkEjitEntryLcConflict(Sema &S, FunctionDecl *FD, bool AfterMerge);
 
+// Forward declaration for EmbeddedJIT ejit_period_lc no-index check. Defined
+// in SemaEJIT.cpp.
+void checkEjitPeriodLcIndex(Sema &S, const FunctionDecl *FD);
+void checkEjitPeriodLcIndexNewAttrs(
+    Sema &S, const FunctionDecl *FD,
+    ArrayRef<const EjitPeriodLcAttr *> PreExisting);
+
 // Forward declaration for EmbeddedJIT missing-attribute-on-definition check.
 // Defined in SemaEJIT.cpp.
 void checkEjitAttrMissingOnDefinition(Sema &S, FunctionDecl *FD);
@@ -12293,6 +12300,12 @@ bool Sema::CheckFunctionDeclaration(Scope *S, FunctionDecl *NewFD,
   // A function redeclaration may have assembled ejit_entry on one declaration
   // and ejit_period_lc on another; only the merged declaration shows the pair.
   checkEjitEntryLcConflict(*this, NewFD, /*AfterMerge=*/true);
+
+  // Every written ejit_period_lc must find a matching ejit_period_arr_ind
+  // parameter on the MERGED declaration: the arr_ind may live on an earlier
+  // declaration's parameter (propagated by the merge), so this runs here
+  // rather than at attribute-handling time.
+  checkEjitPeriodLcIndex(*this, NewFD);
 
   // A function defined without ejit_entry / ejit_period_lc even though a
   // prior declaration carries the attribute is not JIT-specialized: warn and

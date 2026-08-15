@@ -495,7 +495,13 @@ static void handleEjitEntryAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 /// handleEjitPeriodLcAttr - 处理 ejit_period_lc(name) 属性
 /// 语义检查:
 ///   1. 仅可标记在 FunctionDecl 上
-///   2. 必须有对应的 ejit_period_arr_ind(name) 参数
+///   2. 必须有对应的 ejit_period_arr_ind(name) 参数——该检查不在 handler
+///      内执行，而在 CheckFunctionDeclaration 的 MergeFunctionDecl 之后
+///      （checkEjitPeriodLcIndex）：arr_ind 可能写在更早声明的参数上，
+///      由参数属性传播补全后才可见；显式实例化声明由 ActOnExplicitInstantiation
+///      处的 checkEjitPeriodLcIndexNewAttrs 检查。注意：显式实例化声明器上
+///      的参数属性会被 clang 静默丢弃，所以 arr_ind 必须写在模板 pattern
+///      的参数上
 ///   3. 不能与 ejit_entry 同时标记（见 4.3.5 检查 3；同一函数可标记多个
 ///      ejit_period_lc，这是 multi-period 入口的正常形态）
 static void handleEjitPeriodLcAttr(Sema &S, Decl *D, const ParsedAttr &AL) {

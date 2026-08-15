@@ -51,6 +51,11 @@ using namespace sema;
 // diagnostic itself.
 void reportEjitEntryLcConflict(Sema &S, const FunctionDecl *FD,
                                SourceLocation ErrorLoc, SourceLocation NoteLoc);
+// Forward declaration for the EmbeddedJIT ejit_period_lc no-index check
+// (defined in SemaEJIT.cpp; see also SemaDecl.cpp).
+void checkEjitPeriodLcIndexNewAttrs(
+    Sema &S, const FunctionDecl *FD,
+    ArrayRef<const EjitPeriodLcAttr *> PreExisting);
 
 // Exported for use by Parser.
 SourceRange
@@ -10765,6 +10770,9 @@ DeclResult Sema::ActOnExplicitInstantiation(Scope *S,
   // re-report it.
   const bool HadEntry = Specialization->hasAttr<EjitEntryAttr>();
   const bool HadLc = Specialization->hasAttr<EjitPeriodLcAttr>();
+  SmallVector<const EjitPeriodLcAttr *, 2> PreExistingLc;
+  for (const auto *A : Specialization->specific_attrs<EjitPeriodLcAttr>())
+    PreExistingLc.push_back(A);
   ProcessDeclAttributeList(S, Specialization, D.getDeclSpec().getAttributes());
   ProcessAPINotes(Specialization);
   if ((!HadEntry || !HadLc) && Specialization->hasAttr<EjitEntryAttr>() &&
@@ -10781,6 +10789,11 @@ DeclResult Sema::ActOnExplicitInstantiation(Scope *S,
       reportEjitEntryLcConflict(*this, Specialization, LA->getLocation(),
                                 EA->getLocation());
   }
+  // An ejit_period_lc written on this declarator must find its matching
+  // ejit_period_arr_ind parameter on the specialization (the pattern's
+  // parameter attributes are instantiated onto it); lc attributes copied
+  // from the pattern were checked on the pattern itself.
+  checkEjitPeriodLcIndexNewAttrs(*this, Specialization, PreExistingLc);
 
   // In MSVC mode, dllimported explicit instantiation definitions are treated as
   // instantiation declarations.
