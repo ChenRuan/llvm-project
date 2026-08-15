@@ -247,7 +247,12 @@ void handleEjitEntryAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 /// handleEjitPeriodLcAttr - Process the ejit_period_lc(name) attribute.
 /// Checks:
 ///   1. Applies only to FunctionDecl
-///   2. Must have a corresponding ejit_period_arr_ind(name) parameter
+///
+/// The "must have a matching ejit_period_arr_ind(name) parameter" check is
+/// NOT here: at handler time only the CURRENT declaration's parameters exist,
+/// and the arr_ind may legitimately live on an earlier declaration's
+/// parameter (propagated by mergeParamDeclAttributes during the merge). The
+/// check runs after the merge instead -- see checkEjitPeriodLcIndex.
 void handleEjitPeriodLcAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   auto *FD = dyn_cast<FunctionDecl>(D);
   if (!FD) {
@@ -260,22 +265,6 @@ void handleEjitPeriodLcAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   StringRef PeriodName;
   if (!S.checkStringLiteralArgumentAttr(AL, 0, PeriodName))
     return;
-
-  // Check for matching ejit_period_arr_ind parameter
-  bool HasMatchingIdx = false;
-  for (const ParmVarDecl *P : FD->parameters()) {
-    if (auto *IdxAttr = P->getAttr<EjitPeriodArrIndAttr>()) {
-      if (IdxAttr->getPeriodName() == PeriodName) {
-        HasMatchingIdx = true;
-        break;
-      }
-    }
-  }
-
-  if (!HasMatchingIdx) {
-    S.Diag(AL.getLoc(), diag::err_ejit_period_lc_no_index) << PeriodName;
-    return;
-  }
 
   D->addAttr(::new (S.Context) EjitPeriodLcAttr(S.Context, AL, PeriodName));
 }
@@ -303,6 +292,126 @@ void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD) {
       S.Diag(A->getLocation(), diag::err_ejit_period_arr_ind_too_many)
           << FD << Count;
     }
+  }
+}
+
+/// checkEjitEntryLcConflict - ejit_entry and ejit_period_lc are mutually
+/// exclusive on one function. PASS3 (EJitWrapperGen) replaces an entry's body
+/// with a single-function dispatch wrapper, and PASS4 (EJitPeriodHandler)
+/// inserts lifecycle guards at a lifecycle function's entry and returns; the
+/// two rewrites would both claim the body. Reject the combination at the
+/// source instead of letting the AOT pipeline fight over the function.
+///
+/// Called twice per declaration:
+///  * from ActOnFunctionDeclarator after ProcessDeclAttributes (AfterMerge ==
+///    false), where the check is independent of the source order of the two
+///    attributes;
+///  * from CheckFunctionDeclaration after MergeFunctionDecl (AfterMerge ==
+///    true), which is the only point that sees a combination assembled from
+///    attributes written on DIFFERENT declarations. There the check fires
+///    only when exactly one attribute was inherited from an earlier
+///    declaration: if both were written on this declarator the first call
+///    already diagnosed the pair, and if both are inherited some earlier
+///    declaration already was the first to carry both.
+/// reportEjitEntryLcConflict - Emit the conflict diagnostic: the error at
+/// \p ErrorLoc, the "conflicting attribute is here" note at \p NoteLoc.
+/// Split out of checkEjitEntryLcConflict because the explicit-instantiation
+/// site (ActOnExplicitInstantiation) knows which attribute ITS declarator
+/// wrote and anchors the error there.
+void reportEjitEntryLcConflict(Sema &S, const FunctionDecl *FD,
+                               SourceLocation ErrorLoc,
+                               SourceLocation NoteLoc) {
+  S.Diag(ErrorLoc, diag::err_ejit_entry_lc_conflict) << FD;
+  S.Diag(NoteLoc, diag::note_conflicting_attribute);
+}
+
+void checkEjitEntryLcConflict(Sema &S, FunctionDecl *FD, bool AfterMerge) {
+  if (!FD)
+    return;
+  const EjitEntryAttr *EA = FD->getAttr<EjitEntryAttr>();
+  const EjitPeriodLcAttr *LA = FD->getAttr<EjitPeriodLcAttr>();
+  if (!EA || !LA)
+    return;
+  if (AfterMerge) {
+    if (EA->isInherited() == LA->isInherited())
+      return;
+    // If the immediate previous declaration already carried both, the
+    // conflict was diagnosed there; repeating one attribute on a later
+    // redeclaration must not re-fire (attributes written after a definition
+    // are rejected by clang's own redeclaration rules before they reach
+    // this merge).
+    const FunctionDecl *Prev = FD->getPreviousDecl();
+    if (Prev && Prev->hasAttr<EjitEntryAttr>() &&
+        Prev->hasAttr<EjitPeriodLcAttr>())
+      return;
+    // Instantiations reproduce the pattern's attribute pair; the pattern
+    // declaration was diagnosed already.
+    if (FD->isTemplateInstantiation())
+      return;
+    // Exactly one attribute came from an earlier declaration: point the
+    // error at the attribute written on THIS declaration and the note at
+    // the inherited one, not the other way around.
+    if (EA->isInherited()) {
+      reportEjitEntryLcConflict(S, FD, LA->getLocation(), EA->getLocation());
+      return;
+    }
+    reportEjitEntryLcConflict(S, FD, EA->getLocation(), LA->getLocation());
+    return;
+  }
+  reportEjitEntryLcConflict(S, FD, LA->getLocation(), EA->getLocation());
+}
+
+/// One attribute's no-index check: does the (merged) parameter list carry an
+/// ejit_period_arr_ind with the same period name? Diagnose at \p LA if not.
+static void checkEjitPeriodLcIndexForAttr(Sema &S, const FunctionDecl *FD,
+                                          const EjitPeriodLcAttr *LA) {
+  StringRef PeriodName = LA->getPeriodName();
+  for (const ParmVarDecl *P : FD->parameters()) {
+    if (auto *IdxAttr = P->getAttr<EjitPeriodArrIndAttr>())
+      if (IdxAttr->getPeriodName() == PeriodName)
+        return;
+  }
+  S.Diag(LA->getLocation(), diag::err_ejit_period_lc_no_index) << PeriodName;
+}
+
+/// checkEjitPeriodLcIndex - Every written (non-inherited) ejit_period_lc must
+/// name a period that a parameter of the MERGED function carries
+/// ejit_period_arr_ind for. Called from CheckFunctionDeclaration after
+/// MergeFunctionDecl: at attribute-handling time only the current
+/// declaration's parameters exist, and an arr_ind written on an earlier
+/// declaration's parameter is only propagated to this declaration's
+/// parameters by the merge (mergeParamDeclAttributes) -- checking before it
+/// would reject a valid redeclaration. Inherited lc attributes were checked
+/// on the declaration that wrote them, and template instantiations reproduce
+/// a pattern that was checked there.
+///
+/// The arr_ind must therefore be visible at or BEFORE the declaration that
+/// writes the lc: parameter attributes propagate forward only, so an arr_ind
+/// on a LATER declaration never reaches the declaration carrying the lc.
+void checkEjitPeriodLcIndex(Sema &S, const FunctionDecl *FD) {
+  if (!FD || FD->isTemplateInstantiation())
+    return;
+  for (const EjitPeriodLcAttr *LA : FD->specific_attrs<EjitPeriodLcAttr>()) {
+    if (LA->isInherited())
+      continue;
+    checkEjitPeriodLcIndexForAttr(S, FD, LA);
+  }
+}
+
+/// checkEjitPeriodLcIndexNewAttrs - Variant for ActOnExplicitInstantiation:
+/// only the lc attributes the declarator wrote (those not in
+/// \p PreExisting) are checked against the specialization's parameters.
+/// Attributes copied from the pattern are skipped here -- the pattern's own
+/// declarations were checked by checkEjitPeriodLcIndex.
+void checkEjitPeriodLcIndexNewAttrs(
+    Sema &S, const FunctionDecl *FD,
+    ArrayRef<const EjitPeriodLcAttr *> PreExisting) {
+  if (!FD)
+    return;
+  for (const EjitPeriodLcAttr *LA : FD->specific_attrs<EjitPeriodLcAttr>()) {
+    if (llvm::is_contained(PreExisting, LA))
+      continue;
+    checkEjitPeriodLcIndexForAttr(S, FD, LA);
   }
 }
 

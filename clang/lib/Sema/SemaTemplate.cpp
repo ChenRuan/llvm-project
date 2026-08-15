@@ -44,6 +44,19 @@
 using namespace clang;
 using namespace sema;
 
+// Forward declaration for the EmbeddedJIT ejit_entry / ejit_period_lc conflict
+// diagnostic (defined in SemaEJIT.cpp; the check itself lives in SemaDecl.cpp's
+// call sites). Explicit instantiation declarators bypass ActOnFunctionDeclarator
+// and CheckFunctionDeclaration, so ActOnExplicitInstantiation emits the
+// diagnostic itself.
+void reportEjitEntryLcConflict(Sema &S, const FunctionDecl *FD,
+                               SourceLocation ErrorLoc, SourceLocation NoteLoc);
+// Forward declaration for the EmbeddedJIT ejit_period_lc no-index check
+// (defined in SemaEJIT.cpp; see also SemaDecl.cpp).
+void checkEjitPeriodLcIndexNewAttrs(
+    Sema &S, const FunctionDecl *FD,
+    ArrayRef<const EjitPeriodLcAttr *> PreExisting);
+
 // Exported for use by Parser.
 SourceRange
 clang::getTemplateParamsRange(TemplateParameterList const * const *Ps,
@@ -10749,8 +10762,38 @@ DeclResult Sema::ActOnExplicitInstantiation(Scope *S,
         return (Decl*) nullptr;
   }
 
+  // Explicit instantiation declarators bypass ActOnFunctionDeclarator and
+  // CheckFunctionDeclaration, so the ejit_entry / ejit_period_lc conflict is
+  // checked here, after the declarator's attributes land on the
+  // specialization. Snapshot each attribute first: if the pair already
+  // existed (copied from the pattern, where it was diagnosed), do not
+  // re-report it.
+  const bool HadEntry = Specialization->hasAttr<EjitEntryAttr>();
+  const bool HadLc = Specialization->hasAttr<EjitPeriodLcAttr>();
+  SmallVector<const EjitPeriodLcAttr *, 2> PreExistingLc;
+  for (const auto *A : Specialization->specific_attrs<EjitPeriodLcAttr>())
+    PreExistingLc.push_back(A);
   ProcessDeclAttributeList(S, Specialization, D.getDeclSpec().getAttributes());
   ProcessAPINotes(Specialization);
+  if ((!HadEntry || !HadLc) && Specialization->hasAttr<EjitEntryAttr>() &&
+      Specialization->hasAttr<EjitPeriodLcAttr>()) {
+    // The pair was completed by this declarator. Anchor the error at the
+    // attribute written HERE when exactly one was new; with both written
+    // keep the error-at-ejit_period_lc convention of the declarator check.
+    const EjitEntryAttr *EA = Specialization->getAttr<EjitEntryAttr>();
+    const EjitPeriodLcAttr *LA = Specialization->getAttr<EjitPeriodLcAttr>();
+    if (!HadEntry && HadLc)
+      reportEjitEntryLcConflict(*this, Specialization, EA->getLocation(),
+                                LA->getLocation());
+    else
+      reportEjitEntryLcConflict(*this, Specialization, LA->getLocation(),
+                                EA->getLocation());
+  }
+  // An ejit_period_lc written on this declarator must find its matching
+  // ejit_period_arr_ind parameter on the specialization (the pattern's
+  // parameter attributes are instantiated onto it); lc attributes copied
+  // from the pattern were checked on the pattern itself.
+  checkEjitPeriodLcIndexNewAttrs(*this, Specialization, PreExistingLc);
 
   // In MSVC mode, dllimported explicit instantiation definitions are treated as
   // instantiation declarations.

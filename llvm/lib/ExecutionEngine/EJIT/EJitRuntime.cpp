@@ -135,6 +135,11 @@ static_assert(kEJitMaxFuncIndex == kEJitSharedMaxFuncIndex,
 
 static EJit *gEJIT = nullptr;
 
+#ifdef EJIT_DIAG_ENABLE
+EJitAtomicU64 gIcacheNullFillSkips;
+constexpr uint64_t kIcacheNullFillLogEvery = 1000;
+#endif
+
 #ifdef EJIT_FREESTANDING
 extern "C" uint64_t SRE_CycleCountGet64(void);
 #endif
@@ -729,7 +734,15 @@ inline void ejitIcacheFillOnSuccess(uint32_t funcIndex, void *fnPtr,
   // until the JIT warms up -- logging it drowned the board's log in lines that
   // report nothing wrong. The decline reasons that ARE worth seeing live in
   // icacheFill(), one-shot per reason.
-  if (!fnPtr)
+  if (!fnPtr) {
+#ifdef EJIT_DIAG_ENABLE
+    if (gEJitDiagLevel >= EJIT_LOG_LVL_DEBUG) {
+      uint64_t skips = gIcacheNullFillSkips.fetchAdd(1) + 1;
+      if (skips % kIcacheNullFillLogEvery == 0)
+        EJIT_DIAG_DEBUG("icacheFillOnSuccess null skips=%llu latest_func=%u",
+                        static_cast<unsigned long long>(skips), funcIndex);
+    }
+#endif
     return;
   EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr;
   if (!sp) {
