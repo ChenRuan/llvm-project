@@ -564,6 +564,24 @@ if(EJIT_SRE_DIAG)
   add_definitions(-DEJIT_SRE_DIAG)
 endif()
 
+# Per-line delay for diagnostic dump loops (registry, active cells, compiled
+# list, captured IR/ASM, icache slots): after each printed line the producer
+# delays EJIT_DIAG_PRINT_THROTTLE_TICKS scheduler ticks (SRE_TaskDelay) so the
+# serial-log shell consumer (ring buffer ~7 lines, 100 ms drain period) keeps
+# up. Freestanding + EJIT_DIAG_ENABLE only; 0 disables. Consumed by
+# ejitDiagPrintThrottle() in EJitDiag.h.
+set(EJIT_DIAG_PRINT_THROTTLE_TICKS "20" CACHE STRING
+  "EmbeddedJIT diagnostic dump print delay: SRE_TaskDelay scheduler ticks per printed line (0 disables)")
+if(EJIT_DIAG_ENABLE)
+  if(NOT EJIT_DIAG_PRINT_THROTTLE_TICKS MATCHES "^[0-9]+$")
+    message(FATAL_ERROR
+      "EJIT_DIAG_PRINT_THROTTLE_TICKS must be a non-negative integer, got '${EJIT_DIAG_PRINT_THROTTLE_TICKS}'")
+  endif()
+  add_definitions(-DEJIT_DIAG_PRINT_THROTTLE_TICKS=${EJIT_DIAG_PRINT_THROTTLE_TICKS})
+  message(STATUS "EmbeddedJIT: diagnostic dump print delay enabled "
+                 "(ticksPerLine=${EJIT_DIAG_PRINT_THROTTLE_TICKS})")
+endif()
+
 # Embed the per-call taskpool statistics counters (cacheHits, compiles, disabled
 # instances, ...). Each increment is an acq_rel atomic RMW on a shared cache
 # line, and cacheHits is hit on every JIT call, so this is the dominant per-call
