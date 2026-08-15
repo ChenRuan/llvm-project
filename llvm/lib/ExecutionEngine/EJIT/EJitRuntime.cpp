@@ -744,6 +744,7 @@ inline void ejitIcacheFillOnSuccess(uint32_t funcIndex, void *fnPtr,
     }
 #endif
     return;
+  }
   EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr;
   if (!sp) {
     // Unlike the above this is a real misconfiguration, but it would repeat on
