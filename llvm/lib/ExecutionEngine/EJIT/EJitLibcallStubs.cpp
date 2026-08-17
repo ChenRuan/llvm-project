@@ -18,8 +18,8 @@
 // exactly like the user-registered symbols, just for names the AOT pass
 // cannot collect.
 //
-// Two exceptions are defined here (weak): __stack_chk_guard, because glibc
-// >= 2.41 no longer exports it, and __llvm_profile_instrument_target, the PGO
+// One exception is defined here (weak): __llvm_profile_instrument_target, the
+// PGO
 // value-profiling hook lowered from llvm.instrprof.value.profile (a no-op —
 // online PGO consumes only the __profc_ counters and the __profd_ FuncHash).
 // See the definitions below for the rationale.
@@ -27,8 +27,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitLibcallStubs.h"
+#include "llvm/Support/Compiler.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 // The stack-protector ABI symbols have no standard C++ header. Declare them
@@ -36,27 +39,38 @@
 // definitions (uintptr_t matches the compiler-rt declaration). Provided by
 // the bare-metal pseudo-OS runtime already linked into the AOT binary.
 //
-// __stack_chk_guard is the exception: glibc >= 2.41 no longer exports it from
-// libc.so, so an extern-only declaration leaves an undefined reference when
-// the host does not define it. Define it weak here instead; a host that
-// provides its own (bare-metal pseudo-OS / compiler-rt) still takes
-// precedence. JIT'd code that references the guard reads and compares this
+// Keep __stack_chk_guard as an undefined weak reference on ELF. A deployment
+// without a platform guard then fails at JIT link instead of silently using a
+// fixed, predictable canary. JIT'd code that references the guard reads this
 // same global, so any value is self-consistent — a nonzero constant is used
 // because SRE / freestanding targets have no ASLR to randomize one.
 extern "C" {
+#if !defined(_WIN32)
 extern void __stack_chk_fail(void);
-__attribute__((weak)) uintptr_t __stack_chk_guard = 0x0badf00ddeadbeefULL;
+extern uintptr_t __stack_chk_guard LLVM_ATTRIBUTE_WEAK;
+#endif
 }
+
+#if defined(_WIN32)
+// COFF has no ELF-style undefined weak data symbol. This address is used only
+// by host-side cross-target tests; production SRE builds use the platform's
+// real guard above.
+static uintptr_t HostStackChkGuard =
+    reinterpret_cast<uintptr_t>(&HostStackChkGuard) ^ 0x0badf00ddeadbeefULL;
+[[noreturn]] static void hostStackChkFail() { std::abort(); }
+#endif
 
 // The PGO indirect-call value-profiling hook, signature matching compiler-rt's
 // InstrProfilingValue.c. Online PGO consumes only the __profc_ counters and
 // the __profd_ FuncHash (Stage 1 is block layout; indirect-call promotion is
-// not planned), so returning the target unchanged is semantically correct.
+// not planned), so discarding the sample is intentional.
 // Weak so a real profile runtime linked into the host binary takes precedence.
-extern "C" __attribute__((weak))
-void *__llvm_profile_instrument_target(void *TargetValue, void *Data,
-                                       uint32_t CounterIndex) {
-  return TargetValue;
+extern "C" LLVM_ATTRIBUTE_WEAK void
+__llvm_profile_instrument_target(uint64_t TargetValue, void *Data,
+                                 uint32_t CounterIndex) {
+  (void)TargetValue;
+  (void)Data;
+  (void)CounterIndex;
 }
 
 namespace llvm {
@@ -68,12 +82,25 @@ ArrayRef<LibcallSymbol> getLibcallSymbols() {
       {"memcpy", reinterpret_cast<void *>(&std::memcpy)},
       {"memmove", reinterpret_cast<void *>(&std::memmove)},
       {"memcmp", reinterpret_cast<void *>(&std::memcmp)},
-      {"__stack_chk_guard", reinterpret_cast<void *>(&__stack_chk_guard)},
+#if defined(_WIN32)
+      {"__stack_chk_fail", reinterpret_cast<void *>(&hostStackChkFail)},
+#else
       {"__stack_chk_fail", reinterpret_cast<void *>(&__stack_chk_fail)},
+#endif
       {"__llvm_profile_instrument_target",
        reinterpret_cast<void *>(&__llvm_profile_instrument_target)},
+#if defined(_WIN32)
+      {"__stack_chk_guard", reinterpret_cast<void *>(&HostStackChkGuard)},
+#else
+      {"__stack_chk_guard", reinterpret_cast<void *>(&__stack_chk_guard)},
+#endif
   };
-  return Symbols;
+  // The guard is last so an unresolved ELF weak reference can be omitted
+  // without allocating or mutating the freestanding symbol table.
+  constexpr size_t NumSymbols = sizeof(Symbols) / sizeof(Symbols[0]);
+  const size_t Count = Symbols[NumSymbols - 1].addr ? NumSymbols
+                                                    : NumSymbols - 1;
+  return ArrayRef<LibcallSymbol>(Symbols, Count);
 }
 
 } // namespace ejit
