@@ -33,7 +33,9 @@ SRE 串口日志经 shell 环形 buffer 转发，相关平台参数只有两条�
 | compiled list | `ejit_taskpool_print_compiled` | 逐缓存条目 |
 | icache slots | `ejitDumpIcacheSlots` | 逐 slot |
 
-**compiled list 条目行**用 `EJIT_DIAG_RAW`（无 `[EJIT] func:line` 前缀）打印：前缀在逐条目行上完全相同，只占 ring buffer 空间，带前缀的汇总行仍保留便于检索。**汇总行先打印**（两遍遍历：第一遍只统计，第二遍才打印条目），报总数、槽位占用、统计遍历中被锁竞争跳过的桶数与按维度数分布（`byDims: 0d=.. 1d=..`，只列非零档）；若打印遍历本身又跳过桶，末尾补一行说明（固定行数，不延时），`forEachCompiled` 返回的统计使跳过的桶不再静默。dims 只打实际个数（无 `0:0` 填充）；VERBOSE 级同行追加 `ver/size/pool/gen`（版本快照、代码大小、池号、owner 代）。两遍遍历之间的并发 publish 可能使汇总与条目行略有出入（遍历本就不是快照）。
+**全部 dump 输出行（头/尾固定行与循环条目行）统一用 `EJIT_DIAG_RAW` 打印**（无 `[EJIT] func:line` 前缀）：同一前缀在一块 dump 里逐行重复，只占 ring buffer 空间；grep 锚点是各块自带的文字标签（`registry:`、`active periods:`、`code pool:`、`stats_t:`、`=== ... ===`、`compiled:` 等）。正常路径（非 dump）日志仍用 `EJIT_DIAG`，保留 func:line 来源；hosted 构建（std::printf 分支）同样无前缀。信息量增强：active cells 每 period 先打 `active=N` 计数行（0 个时打 `active=0`，替代原 "(no active cells)"；计数与条目行两遍扫描之间状态可能翻转，同 compiled list 一样非快照）；func meta 条目行为 `op=<原始操作数下标> tag=<名> vals=<值>`（op= 与 bitcode 中 `!ejit.metadata` 的操作数位置一一对应，被跳过的条目也占号）；IR/ASM 长行按 180 B 分块，非末块尾缀 `...`；icache slots 带函数名（模块 loader 按 funcIndex 解析，查不到为 `<unknown>`、未传 loader 为 `?`，超 24 字符截断）与槽容量 `cells=16^numDims`；taskpool stats 补 shared 诊断 9 字段（initState/ownerCore/gen/lastInitErr/initAttempts/share + workerTaskId/regFingerprint/execPrepFailed，直读 getDiagnostics()，不动 C ABI 结构体）；code pool stats 末行补 `total/used/usage` 汇总（total=reservedBytes，打印时整数千分比派生，无 FPU）。
+
+**compiled list 汇总行先打印**（两遍遍历：第一遍只统计，第二遍才打印条目），报总数、槽位占用、统计遍历中被锁竞争跳过的桶数与按维度数分布（`byDims: 0d=.. 1d=..`，只列非零档）；若打印遍历本身又跳过桶，末尾补一行说明（固定行数，不延时），`forEachCompiled` 返回的统计使跳过的桶不再静默。dims 只打实际个数（无 `0:0` 填充）；VERBOSE 级同行追加 `ver/size/pool/gen`（版本快照、代码大小、池号、owner 代）。两遍遍历之间的并发 publish 可能使汇总与条目行略有出入（遍历本就不是快照）。
 
 **范围之外**：正常路径日志（注册、编译、错误回报等）不延时；固定行数的 dump（taskpool/code pool stats）无循环、不延时；正常路径上已有的延时（worker 任务间节流等）保持不变。
 

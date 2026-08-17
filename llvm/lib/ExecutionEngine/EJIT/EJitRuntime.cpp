@@ -1329,41 +1329,56 @@ ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out) {
 void ejit_taskpool_print_stats() {
   ejit_taskpool_stats_t s = {0};
   ejit_taskpool_get_stats(&s);
-  EJIT_DIAG("stats_t:");
-  EJIT_DIAG("  cacheHits        = %llu",
-            static_cast<unsigned long long>(s.cacheHits));
-  EJIT_DIAG("  asyncCompiles    = %llu",
-            static_cast<unsigned long long>(s.asyncCompiles));
-  EJIT_DIAG("  asyncEnqueues    = %llu",
-            static_cast<unsigned long long>(s.asyncEnqueues));
-  EJIT_DIAG("  alreadyPending   = %llu",
-            static_cast<unsigned long long>(s.alreadyPending));
-  EJIT_DIAG("  queueFull        = %llu",
-            static_cast<unsigned long long>(s.queueFull));
-  EJIT_DIAG("  compileFailed    = %llu",
-            static_cast<unsigned long long>(s.compileFailed));
-  EJIT_DIAG("  publishFailed    = %llu",
-            static_cast<unsigned long long>(s.publishFailed));
-  EJIT_DIAG("  instanceDisabled = %llu",
-            static_cast<unsigned long long>(s.instanceDisabled));
-  EJIT_DIAG("  instanceDisabledPreActivate  = %llu   (init->activate window)",
-            static_cast<unsigned long long>(s.instanceDisabledPreActivate));
-  EJIT_DIAG("  instanceDisabledPostActivate = %llu   (after first activate)",
-            static_cast<unsigned long long>(
-                s.instanceDisabled > s.instanceDisabledPreActivate
-                    ? s.instanceDisabled - s.instanceDisabledPreActivate
-                    : 0));
-  EJIT_DIAG("  readyEntries     = %u", s.readyEntries);
-  EJIT_DIAG("  pendingEntries   = %u", s.pendingEntries);
-  EJIT_DIAG("  queueApproxSize  = %u", s.queueApproxSize);
-  EJIT_DIAG("  reserved         = %u", s.reserved);
+  EJIT_DIAG_RAW("stats_t:");
+  EJIT_DIAG_RAW("  cacheHits        = %llu",
+                static_cast<unsigned long long>(s.cacheHits));
+  EJIT_DIAG_RAW("  asyncCompiles    = %llu",
+                static_cast<unsigned long long>(s.asyncCompiles));
+  EJIT_DIAG_RAW("  asyncEnqueues    = %llu",
+                static_cast<unsigned long long>(s.asyncEnqueues));
+  EJIT_DIAG_RAW("  alreadyPending   = %llu",
+                static_cast<unsigned long long>(s.alreadyPending));
+  EJIT_DIAG_RAW("  queueFull        = %llu",
+                static_cast<unsigned long long>(s.queueFull));
+  EJIT_DIAG_RAW("  compileFailed    = %llu",
+                static_cast<unsigned long long>(s.compileFailed));
+  EJIT_DIAG_RAW("  publishFailed    = %llu",
+                static_cast<unsigned long long>(s.publishFailed));
+  EJIT_DIAG_RAW("  instanceDisabled = %llu",
+                static_cast<unsigned long long>(s.instanceDisabled));
+  EJIT_DIAG_RAW("  instanceDisabledPreActivate  = %llu   (init->activate window)",
+                static_cast<unsigned long long>(s.instanceDisabledPreActivate));
+  EJIT_DIAG_RAW("  instanceDisabledPostActivate = %llu   (after first activate)",
+                static_cast<unsigned long long>(
+                    s.instanceDisabled > s.instanceDisabledPreActivate
+                        ? s.instanceDisabled - s.instanceDisabledPreActivate
+                        : 0));
+  EJIT_DIAG_RAW("  readyEntries     = %u", s.readyEntries);
+  EJIT_DIAG_RAW("  pendingEntries   = %u", s.pendingEntries);
+  EJIT_DIAG_RAW("  queueApproxSize  = %u", s.queueApproxSize);
+  EJIT_DIAG_RAW("  reserved         = %u", s.reserved);
 
-  // Diagnostic: dump the inline-cache slot registry to help diagnose
-  // why cacheHits keeps growing despite icache being enabled.
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  ejitDumpIcacheSlots();
+  // Shared-pool fields not mirrored in the C ABI stats struct: read straight
+  // from the diagnostics snapshot (public getDiagnostics()), no ABI change.
+  if (EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr) {
+    EJitSharedDiagnostics d;
+    sp->getDiagnostics(d);
+    EJIT_DIAG_RAW("  initState=%u ownerCore=%u gen=%u lastInitErr=%u "
+                  "initAttempts=%u share=%u",
+                  d.initState, d.ownerCoreId, d.generation, d.lastInitError,
+                  d.initAttempts, d.codeSharingEnabled);
+    EJIT_DIAG_RAW("  workerTaskId=%llu regFingerprint=%llu execPrepFailed=%llu",
+                  static_cast<unsigned long long>(d.workerTaskId),
+                  static_cast<unsigned long long>(d.registrationFingerprint),
+                  static_cast<unsigned long long>(d.executePrepareFailed));
+  }
+  // Diagnostic: dump the inline-cache slot registry to help diagnose
+  // why cacheHits keeps growing despite icache being enabled. Hand the
+  // module loader in so slots resolve to function names.
+  ejitDumpIcacheSlots(gEJIT ? &gEJIT->moduleLoader() : nullptr);
 #else
-  EJIT_DIAG("  icacheSlots       = (n/a: shared taskpool not built)");
+  EJIT_DIAG_RAW("  icacheSlots       = (n/a: shared taskpool not built)");
 #endif
 }
 
@@ -1374,7 +1389,7 @@ void ejit_taskpool_print_compiled() {
   return;
 #else
   if (!gEJIT) {
-    EJIT_DIAG("print_compiled: not initialized");
+    EJIT_DIAG_RAW("print_compiled: not initialized");
     return;
   }
 #ifdef EJIT_SRE_SHARED_TASKPOOL
@@ -1384,7 +1399,7 @@ void ejit_taskpool_print_compiled() {
     return;
   EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
   if (!sp || !sp->state()) {
-    EJIT_DIAG("print_compiled: no shared taskpool / state");
+    EJIT_DIAG_RAW("print_compiled: no shared taskpool / state");
     return;
   }
   EJitModuleLoader &loader = gEJIT->moduleLoader();
@@ -1421,10 +1436,10 @@ void ejit_taskpool_print_compiled() {
   if (p >= end)
     p = end - 1;
   *p = '\0';
-  EJIT_DIAG("compiled: %u entries (%u/%u slots, %u buckets skipped)%s%s",
-            st.visitedSlots, st.visitedSlots,
-            kEJitSharedCacheBuckets * kEJitSharedCacheSlots,
-            st.skippedBuckets, byDims[0] ? " byDims: " : "", byDims);
+  EJIT_DIAG_RAW("compiled: %u entries (%u/%u slots, %u buckets skipped)%s%s",
+                st.visitedSlots, st.visitedSlots,
+                kEJitSharedCacheBuckets * kEJitSharedCacheSlots,
+                st.skippedBuckets, byDims[0] ? " byDims: " : "", byDims);
   // Entry lines: one RAW (prefix-free) line per Ready slot, throttled after
   // each printed line.
   EJitSharedTaskPool::ForEachCompiledStats st2 = sp->forEachCompiled(
@@ -1484,10 +1499,10 @@ void ejit_taskpool_print_compiled() {
   // contended buckets, its lines are incomplete relative to it — report the
   // shortfall (fixed line count, so no throttle) instead of dropping it.
   if (st2.skippedBuckets)
-    EJIT_DIAG("compiled: %u buckets skipped during entry walk",
-              st2.skippedBuckets);
+    EJIT_DIAG_RAW("compiled: %u buckets skipped during entry walk",
+                  st2.skippedBuckets);
 #else
-  EJIT_DIAG("print_compiled: shared taskpool not enabled");
+  EJIT_DIAG_RAW("print_compiled: shared taskpool not enabled");
 #endif
 #endif
 }
@@ -1502,7 +1517,7 @@ void ejit_dump_func(const char *name) {
 
 void ejit_print_dumped(const char *name) {
   // gDumpSharedState is bound once in ejit_init; no per-call rebind needed.
-  EJIT_DIAG("print_dumped name=%s", (name && name[0]) ? name : "(all)");
+  EJIT_DIAG_RAW("print_dumped name=%s", (name && name[0]) ? name : "(all)");
   printDumped(name);
 }
 
@@ -1549,7 +1564,7 @@ ejit_log_level_t ejit_get_log_level(void) {
 
 void ejit_print_registry(void) {
   if (!gEJIT) {
-    EJIT_DIAG("print_registry: not initialized");
+    EJIT_DIAG_RAW("print_registry: not initialized");
     return;
   }
   gEJIT->printRegistry();
@@ -1557,11 +1572,11 @@ void ejit_print_registry(void) {
 
 void ejit_print_func_meta(const char *funcName) {
   if (!funcName || !funcName[0]) {
-    EJIT_DIAG("print_func_meta: null/empty name");
+    EJIT_DIAG_RAW("print_func_meta: null/empty name");
     return;
   }
   if (!gEJIT) {
-    EJIT_DIAG("print_func_meta: not initialized");
+    EJIT_DIAG_RAW("print_func_meta: not initialized");
     return;
   }
   gEJIT->printFuncMeta(funcName);
@@ -1585,7 +1600,7 @@ ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out) {
 
 void ejit_print_code_pool_stats(void) {
   if (!gEJIT) {
-    EJIT_DIAG("print_code_pool_stats: not initialized");
+    EJIT_DIAG_RAW("print_code_pool_stats: not initialized");
     return;
   }
   gEJIT->printCodePoolStats();
@@ -1593,7 +1608,7 @@ void ejit_print_code_pool_stats(void) {
 
 void ejit_print_active(void) {
   if (!gEJIT) {
-    EJIT_DIAG("print_active: not initialized");
+    EJIT_DIAG_RAW("print_active: not initialized");
     return;
   }
   gEJIT->printActive();

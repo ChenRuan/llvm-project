@@ -40,6 +40,8 @@
 namespace llvm {
 namespace ejit {
 
+class EJitModuleLoader;
+
 //===----------------------------------------------------------------------===//
 // Read-only diagnostics snapshot (spec §11 observability). Every field is a
 // plain copy of an atomic load; no field exposes a raw shared pointer.
@@ -226,12 +228,15 @@ EJitIcacheRegResult ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
                                            uint32_t numDims);
 
 /// Diagnostic: dump every registered icache slot to the diagnostic log.
-/// Shows funcIndex, base pointer, numDims, and cell[0] (the scalar or
-/// [0]...[0] cell) so the caller can quickly see which slots are wired,
-/// which are null, and whether the first cell has been filled.
+/// Shows funcIndex, base pointer, numDims, the per-slot cell capacity
+/// (16^numDims), and cell[0] (the scalar or [0]...[0] cell) so the caller
+/// can quickly see which slots are wired, which are null, and whether the
+/// first cell has been filled. When \p loader is given the slot's
+/// funcIndex is resolved to a function name ("<unknown>" when the registry
+/// has none; "?" without a loader).
 /// NOTE: dereferences base[0] of every registered slot — bases must be
 /// module-lifetime storage, never stack locals (see ejitIcacheClearAll).
-void ejitDumpIcacheSlots();
+void ejitDumpIcacheSlots(const EJitModuleLoader *loader = nullptr);
 
 /// Retire one in-flight drain that was announced under generation \p gen.
 ///

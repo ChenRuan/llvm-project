@@ -794,11 +794,11 @@ const EJitSharedTaskPool *EJit::sharedTaskPool() const {
 
 void EJit::printRegistry() const {
   const PeriodArrayRegistry &reg = runtimeState_->getRegistry();
-  EJIT_DIAG("registry: funcIndexes=%u lifecycles=%u",
-            EJitFuncRegistry::instance().count(),
-            EJitLifecycleRegistry::instance().count());
+  EJIT_DIAG_RAW("registry: funcIndexes=%u lifecycles=%u",
+                EJitFuncRegistry::instance().count(),
+                EJitLifecycleRegistry::instance().count());
 
-  EJIT_DIAG("registry: bitcodes (%u):", EJitFuncRegistry::instance().count());
+  EJIT_DIAG_RAW("registry: bitcodes (%u):", EJitFuncRegistry::instance().count());
   for (uint32_t idx = 0; idx < EJitFuncRegistry::instance().count(); ++idx) {
     const std::string &name = moduleLoader_->getFuncNameByFuncIdx(idx);
     if (name.empty())
@@ -807,21 +807,21 @@ void EJit::printRegistry() const {
     size_t sz = bc ? bc->size() : 0;
     if (!bc)
       consumeError(bc.takeError());
-    EJIT_DIAG("  idx=%u name=%s size=%zu", idx, name.c_str(), sz);
+    EJIT_DIAG_RAW("  idx=%u name=%s size=%zu", idx, name.c_str(), sz);
     ejitDiagPrintThrottle();
   }
 
-  EJIT_DIAG("registry: period arrays:");
+  EJIT_DIAG_RAW("registry: period arrays:");
   for (const auto &kv : reg.arraysByPeriod())
     for (const auto &info : kv.second) {
-      EJIT_DIAG("  period=%s var=%s base=%p size=%zu", kv.first.c_str(),
-                info.varName.c_str(), info.baseAddr, info.arraySize);
+      EJIT_DIAG_RAW("  period=%s var=%s base=%p size=%zu", kv.first.c_str(),
+                    info.varName.c_str(), info.baseAddr, info.arraySize);
       ejitDiagPrintThrottle();
     }
 
-  EJIT_DIAG("registry: static vars (%zu):", reg.getStaticVars().size());
+  EJIT_DIAG_RAW("registry: static vars (%zu):", reg.getStaticVars().size());
   for (const auto &sv : reg.getStaticVars()) {
-    EJIT_DIAG("  var=%s addr=%p", sv.varName.c_str(), sv.varAddr);
+    EJIT_DIAG_RAW("  var=%s addr=%p", sv.varName.c_str(), sv.varAddr);
     ejitDiagPrintThrottle();
   }
 }
@@ -829,13 +829,13 @@ void EJit::printRegistry() const {
 void EJit::printFuncMeta(const std::string &funcName) {
   uint32_t idx = EJitFuncRegistry::instance().lookup(funcName);
   if (idx == kEJitInvalidFuncIndex) {
-    EJIT_DIAG("func_meta: name=%s not registered", funcName.c_str());
+    EJIT_DIAG_RAW("func_meta: name=%s not registered", funcName.c_str());
     return;
   }
   auto bc = moduleLoader_->getBitcodeByFuncIdx(idx);
   if (!bc) {
-    EJIT_DIAG("func_meta: name=%s funcIdx=%u bitcode lookup error",
-              funcName.c_str(), idx);
+    EJIT_DIAG_RAW("func_meta: name=%s funcIdx=%u bitcode lookup error",
+                  funcName.c_str(), idx);
     consumeError(bc.takeError());
     return;
   }
@@ -843,27 +843,30 @@ void EJit::printFuncMeta(const std::string &funcName) {
   auto Buf = MemoryBuffer::getMemBuffer(*bc, "meta_" + std::to_string(idx) + ".bc");
   auto MOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *Ctx);
   if (!MOrErr) {
-    EJIT_DIAG("func_meta: name=%s funcIdx=%u parse bitcode error",
-              funcName.c_str(), idx);
+    EJIT_DIAG_RAW("func_meta: name=%s funcIdx=%u parse bitcode error",
+                  funcName.c_str(), idx);
     consumeError(MOrErr.takeError());
     return;
   }
   Function *F = (*MOrErr)->getFunction(funcName);
-  EJIT_DIAG("func_meta name=%s funcIdx=%u found=%d", funcName.c_str(), idx,
-            F && !F->isDeclaration() ? 1 : 0);
+  EJIT_DIAG_RAW("func_meta name=%s funcIdx=%u found=%d", funcName.c_str(), idx,
+                F && !F->isDeclaration() ? 1 : 0);
   if (!F || F->isDeclaration()) {
-    EJIT_DIAG("  (no definition in bitcode)");
+    EJIT_DIAG_RAW("  (no definition in bitcode)");
     return;
   }
   MDNode *MD = F->getMetadata(MD_EJIT_METADATA);
   if (!MD) {
-    EJIT_DIAG("  (no !ejit.metadata)");
+    EJIT_DIAG_RAW("  (no !ejit.metadata)");
     return;
   }
-  EJIT_DIAG("  ejit_entry=%d",
-            hasMDStringEntry(MD, TAG_EJIT_ENTRY) ? 1 : 0);
-  for (const MDOperand &Op : MD->operands()) {
-    auto *Sub = dyn_cast<MDNode>(Op.get());
+  EJIT_DIAG_RAW("  ejit_entry=%d",
+                hasMDStringEntry(MD, TAG_EJIT_ENTRY) ? 1 : 0);
+  // op= is the RAW operand index inside !ejit.metadata: entries skipped by
+  // the continue guards still consume an index, so a printed op= locates the
+  // entry in the bitcode exactly (no renumbering against skipped items).
+  for (unsigned op = 0; op < MD->getNumOperands(); ++op) {
+    auto *Sub = dyn_cast<MDNode>(MD->getOperand(op));
     if (!Sub || Sub->getNumOperands() == 0)
       continue;
     auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
@@ -888,7 +891,8 @@ void EJit::printFuncMeta(const std::string &funcName) {
         OS << "?";
     }
     OS.flush();
-    EJIT_DIAG("  %s %s", tag.str().c_str(), rest.c_str());
+    EJIT_DIAG_RAW("  op=%u tag=%s vals=%s", op, tag.str().c_str(),
+                  rest.c_str());
     ejitDiagPrintThrottle();
   }
 }
@@ -943,20 +947,21 @@ void EJit::printCodePoolStats() const {
 #ifdef EJIT_SRE_CODE_POOL
   ejit_code_pool_stats_t s{};
   if (!getCodePoolStats(&s)) {
-    EJIT_DIAG("code pool: not available (no engine)");
+    EJIT_DIAG_RAW("code pool: not available (no engine)");
     return;
   }
-  EJIT_DIAG("code pool: pools=%llu sealed=%llu active=%llu",
-            (unsigned long long)s.poolCount, (unsigned long long)s.sealedCount,
-            (unsigned long long)s.activeCount);
-  EJIT_DIAG("  bytes used=%llu reserved=%llu wasted=%llu",
-            (unsigned long long)s.usedBytes,
-            (unsigned long long)s.reservedBytes,
-            (unsigned long long)s.wastedBytes);
-  EJIT_DIAG("  sealInvocations=%llu splitInvocations=%llu finalizedRanges=%llu",
-            (unsigned long long)s.sealInvocations,
-            (unsigned long long)s.splitInvocations,
-            (unsigned long long)s.finalizedRangeCount);
+  EJIT_DIAG_RAW("code pool: pools=%llu sealed=%llu active=%llu",
+                (unsigned long long)s.poolCount,
+                (unsigned long long)s.sealedCount,
+                (unsigned long long)s.activeCount);
+  EJIT_DIAG_RAW("  bytes used=%llu reserved=%llu wasted=%llu",
+                (unsigned long long)s.usedBytes,
+                (unsigned long long)s.reservedBytes,
+                (unsigned long long)s.wastedBytes);
+  EJIT_DIAG_RAW("  sealInvocations=%llu splitInvocations=%llu finalizedRanges=%llu",
+                (unsigned long long)s.sealInvocations,
+                (unsigned long long)s.splitInvocations,
+                (unsigned long long)s.finalizedRangeCount);
   // Whole-pool usage summary, derived at print time (no new counters):
   // total = reservedBytes = capacity of every carved pool. Caveats:
   //  - 4K-seal mode rounds usedBytes up per allocation (page-aligned bump
@@ -965,34 +970,43 @@ void EJit::printCodePoolStats() const {
   //  - fixed-region mode counts only carved pools, so un-carved region
   //    space is not reflected in total.
   const uint64_t permille = ejitDiagPermille(s.usedBytes, s.reservedBytes);
-  EJIT_DIAG("  total=%llu used=%llu usage=%llu.%u%%",
-            (unsigned long long)s.reservedBytes,
-            (unsigned long long)s.usedBytes,
-            (unsigned long long)(permille / 10), (unsigned)(permille % 10));
+  EJIT_DIAG_RAW("  total=%llu used=%llu usage=%llu.%u%%",
+                (unsigned long long)s.reservedBytes,
+                (unsigned long long)s.usedBytes,
+                (unsigned long long)(permille / 10), (unsigned)(permille % 10));
+  (void)permille; // consumed by EJIT_DIAG_RAW only; silence DIAG-off builds
 #else
-  EJIT_DIAG("code pool: EJIT_SRE_CODE_POOL not enabled");
+  EJIT_DIAG_RAW("code pool: EJIT_SRE_CODE_POOL not enabled");
 #endif
 }
 
 void EJit::printActive() const {
   const PeriodArrayRegistry &reg = runtimeState_->getRegistry();
-  EJIT_DIAG("active periods:");
+  EJIT_DIAG_RAW("active periods:");
   // Query the same isActive() path the JIT gate uses (shared SwitchController
   // in shared-taskpool builds, per-instance arrayStates_ otherwise), so the
   // printed view matches the compile decision.
   for (const auto &kv : reg.arraysByPeriod()) {
     const std::string &period = kv.first;
+    // Count first so every period leads with its active-cell count; zero
+    // prints "active=0" (replaces the old "(no active cells)" marker).
+    // isActive() is a table lookup, so the second 256-cell scan per period
+    // is negligible next to the per-line print throttle.
     uint32_t activeCells = 0;
+    for (uint32_t cell = 0; cell < kEJitMaxInstances; ++cell)
+      if (isActive(period, static_cast<uint8_t>(cell)))
+        ++activeCells;
+    EJIT_DIAG_RAW("  period=%s active=%u", period.c_str(), activeCells);
+    ejitDiagPrintThrottle();
+    (void)activeCells; // consumed by EJIT_DIAG_RAW only; silence DIAG-off builds
     for (uint32_t cell = 0; cell < kEJitMaxInstances; ++cell) {
       if (isActive(period, static_cast<uint8_t>(cell))) {
-        EJIT_DIAG("  period=%s cell=%u", period.c_str(), cell);
+        EJIT_DIAG_RAW("  period=%s cell=%u", period.c_str(), cell);
         ejitDiagPrintThrottle();
-        ++activeCells;
       }
     }
-    if (activeCells == 0)
-      EJIT_DIAG("  period=%s (no active cells)", period.c_str());
   }
   // The built-in "static" time window is always active.
-  EJIT_DIAG("active static vars: %zu (always active)", reg.getStaticVars().size());
+  EJIT_DIAG_RAW("active static vars: %zu (always active)",
+                reg.getStaticVars().size());
 }

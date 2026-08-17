@@ -267,7 +267,7 @@ struct DumpEntry {
 static std::map<std::string, DumpEntry> gDumpStore;
 
 static void dumpBytesSafe(const char *label, const char *data, size_t n) {
-  EJIT_DIAG("=== %s begin size=%u ===", label, (unsigned)n);
+  EJIT_DIAG_RAW("=== %s begin size=%u ===", label, (unsigned)n);
   size_t i = 0;
   unsigned lineNo = 0;
   while (i < n) {
@@ -276,13 +276,17 @@ static void dumpBytesSafe(const char *label, const char *data, size_t n) {
       ++lineEnd;
     size_t pos = i;
     if (pos == lineEnd) {
-      EJIT_DIAG("%s:%u: ", label, lineNo);
+      EJIT_DIAG_RAW("%s:%u: ", label, lineNo);
     } else {
+      // A long source line is emitted in bounded chunks; every chunk but
+      // the last gets a trailing "..." so a wrapped line is tellable from
+      // consecutive short ones.
       while (pos < lineEnd) {
         size_t chunk = lineEnd - pos;
         if (chunk > 180)
           chunk = 180;
-        EJIT_DIAG("%s:%u: %.*s", label, lineNo, (int)chunk, data + pos);
+        EJIT_DIAG_RAW("%s:%u: %.*s%s", label, lineNo, (int)chunk, data + pos,
+                      pos + chunk < lineEnd ? "..." : "");
         pos += chunk;
       }
     }
@@ -291,7 +295,7 @@ static void dumpBytesSafe(const char *label, const char *data, size_t n) {
     i = lineEnd + 1;
   }
   (void)lineNo;
-  EJIT_DIAG("=== %s end lines=%u ===", label, lineNo);
+  EJIT_DIAG_RAW("=== %s end lines=%u ===", label, lineNo);
 }
 
 /// Emit a multi-line blob (IR or ASM) through EJIT_DIAG. SRE-safe: no lambda,
@@ -382,15 +386,15 @@ static bool printSharedDumpHint(const char *name) {
   (void)keyLo;
   (void)stored;
   if (workerCore == kEJitInvalidCoreId)
-    EJIT_DIAG("print_dumped: dump for \"%s\" is worker-local; run "
-              "ejit_print_dumped(\"%s\") on the worker core. ir_size=%u "
-              "asm_size=%u key_hi=0x%08x key_lo=0x%08x",
-              stored, stored, irSize, asmSize, keyHi, keyLo);
+    EJIT_DIAG_RAW("print_dumped: dump for \"%s\" is worker-local; run "
+                  "ejit_print_dumped(\"%s\") on the worker core. ir_size=%u "
+                  "asm_size=%u key_hi=0x%08x key_lo=0x%08x",
+                  stored, stored, irSize, asmSize, keyHi, keyLo);
   else
-    EJIT_DIAG("print_dumped: dump for \"%s\" is stored on worker core %u; "
-              "run ejit_print_dumped(\"%s\") on that core. ir_size=%u "
-              "asm_size=%u key_hi=0x%08x key_lo=0x%08x",
-              stored, workerCore, stored, irSize, asmSize, keyHi, keyLo);
+    EJIT_DIAG_RAW("print_dumped: dump for \"%s\" is stored on worker core %u; "
+                  "run ejit_print_dumped(\"%s\") on that core. ir_size=%u "
+                  "asm_size=%u key_hi=0x%08x key_lo=0x%08x",
+                  stored, workerCore, stored, irSize, asmSize, keyHi, keyLo);
   return true;
 }
 #endif
@@ -422,10 +426,10 @@ static void printOneDumpSafe(const char *requestedName,
   uint32_t keyLo = (uint32_t)(e.cacheKey & 0xffffffffu);
   (void)keyHi;
   (void)keyLo;
-  EJIT_DIAG("print_dumped hit requested=%s stored=%s key_hi=0x%08x "
-            "key_lo=0x%08x ir_size=%u asm_size=%u",
-            requestedName ? requestedName : "(list)", storedName.c_str(), keyHi,
-            keyLo, (unsigned)e.IR.size(), (unsigned)e.ASM.size());
+  EJIT_DIAG_RAW("print_dumped hit requested=%s stored=%s key_hi=0x%08x "
+                "key_lo=0x%08x ir_size=%u asm_size=%u",
+                requestedName ? requestedName : "(list)", storedName.c_str(),
+                keyHi, keyLo, (unsigned)e.IR.size(), (unsigned)e.ASM.size());
   if (!e.IR.empty())
     dumpLinesSafe("dump IR", e.IR);
   if (!e.ASM.empty())
@@ -450,7 +454,7 @@ void printDumped(const char *name) {
         return;
       }
     } else if (!gDumpStore.empty()) {
-      EJIT_DIAG("print_dumped saved entries=%u", (unsigned)gDumpStore.size());
+      EJIT_DIAG_RAW("print_dumped saved entries=%u", (unsigned)gDumpStore.size());
       for (auto &kv : gDumpStore) {
         printOneDumpSafe(nullptr, kv.first, kv.second);
         ejitDiagPrintThrottle();
@@ -468,7 +472,7 @@ void printDumped(const char *name) {
     EJIT_DIAG_DEBUG("print_dumped miss name=%s store_size=%u", name,
                     (unsigned)gDumpStore.size());
   else
-    EJIT_DIAG("print_dumped: nothing saved");
+    EJIT_DIAG_RAW("print_dumped: nothing saved");
 }
 
 } // namespace ejit

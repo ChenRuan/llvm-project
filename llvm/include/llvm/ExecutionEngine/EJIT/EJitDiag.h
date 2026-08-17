@@ -107,10 +107,13 @@ extern "C" int SRE_printf(const char *fmt, ...);
       SRE_printf("[EJIT] %s:%d " fmt "\n", __func__, __LINE__,               \
                  ##__VA_ARGS__);                                             \
   } while (0)
-// Same as EJIT_DIAG but WITHOUT the "[EJIT] func:line" prefix, for dump entry
-// lines inside a loop (e.g. ejit_taskpool_print_compiled): the prefix is
-// identical on every line of the dump and only eats ring-buffer space, and
-// the bracketing header/footer lines already carry it for grep-ability.
+// Same as EJIT_DIAG but WITHOUT the "[EJIT] func:line" prefix. ALL
+// diagnostic DUMP output prints through this macro - header and footer
+// lines as well as per-item entry lines - so a dump block carries no
+// per-line prefix and ring-buffer space goes to payload only. Grep
+// anchors are the blocks' own text labels ("registry:", "code pool:",
+// "stats_t:", "=== ... ===", "compiled:"). Normal-path (non-dump)
+// logging keeps EJIT_DIAG so the func:line origin stays attached.
 #define EJIT_DIAG_RAW(fmt, ...)                                              \
   do {                                                                       \
     if (gEJitDiagLevel >= EJIT_LOG_LVL_INFO)                                 \
@@ -137,7 +140,8 @@ extern "C" int SRE_printf(const char *fmt, ...);
       std::printf("[EJIT] %s:%d " fmt "\n", __func__, __LINE__,              \
                   ##__VA_ARGS__);                                            \
   } while (0)
-// See the SRE variant above: prefix-free line for dump entry loops.
+// See the SRE variant above: prefix-free lines for ALL diagnostic dump
+// output (headers and entry lines alike).
 #define EJIT_DIAG_RAW(fmt, ...)                                              \
   do {                                                                       \
     if (gEJitDiagLevel >= EJIT_LOG_LVL_INFO)                                 \
