@@ -648,6 +648,69 @@ TEST_F(SharedTaskPoolTest, PublishLookupAndReadTokenRelease) {
 }
 
 //===----------------------------------------------------------------------===//
+// forEachCompiled walk stats: visited Ready slots and skipped (write-lock
+// contended) buckets are reported, so a diagnostic dump is never silently
+// incomplete.
+//===----------------------------------------------------------------------===//
+TEST_F(SharedTaskPoolTest, ForEachCompiledReportsVisitedAndSkipped) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+
+  // Two published entries: one 0-dim, one 1-dim.
+  publish(owner, 30);
+  owner.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+  ASSERT_EQ(owner.compileOrGet(31, d0, 1, codeFor(31)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_TRUE(owner.pollOne());
+
+  auto isReady = [&](uint32_t b, uint32_t s) {
+    return state_->buckets[b].slots[s].state.loadAcquire() ==
+           static_cast<uint32_t>(EJitSharedSlotState::Ready);
+  };
+  uint32_t readyBefore = 0;
+  for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
+    for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s)
+      readyBefore += isReady(b, s);
+  ASSERT_EQ(readyBefore, 2u);
+
+  struct Count {
+    uint32_t visited = 0;
+  };
+  auto cb = [](const EJitSharedCacheSlot &slot, void *ctx) {
+    ++static_cast<Count *>(ctx)->visited;
+    (void)slot;
+  };
+  Count count;
+  auto st = owner.forEachCompiled(cb, &count);
+  EXPECT_EQ(count.visited, 2u);
+  EXPECT_EQ(st.visitedSlots, 2u);
+  EXPECT_EQ(st.skippedBuckets, 0u);
+
+  // Hold bucket 0's writer flag: the walk's read-lock retries all fail, the
+  // bucket is skipped, and the callback only sees the other buckets.
+  state_->buckets[0].writeFlag.storeRelaxed(1);
+  uint32_t readyInB0 = 0;
+  for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s)
+    readyInB0 += isReady(0, s);
+
+  Count count2;
+  auto st2 = owner.forEachCompiled(cb, &count2);
+  EXPECT_EQ(st2.skippedBuckets, 1u);
+  EXPECT_EQ(st2.visitedSlots, 2u - readyInB0);
+  EXPECT_EQ(count2.visited, st2.visitedSlots);
+
+  state_->buckets[0].writeFlag.storeRelaxed(0);
+
+  // Every walk paired its bucketTryRead with bucketReadRelease: no read
+  // tokens are left held on any bucket (0 in both lock modes: the token
+  // build decrements back to 0, NO_RECLAIM never increments).
+  for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
+    EXPECT_EQ(state_->buckets[b].readers.loadAcquire(), 0u) << "bucket " << b;
+}
+
+//===----------------------------------------------------------------------===//
 // 11/ Cross-core fnPtr sharing gate.
 //===----------------------------------------------------------------------===//
 TEST_F(SharedTaskPoolTest, CrossCoreFnPtrSharingGate) {

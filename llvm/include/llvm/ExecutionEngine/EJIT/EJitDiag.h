@@ -53,15 +53,15 @@ extern int gEJitDiagLevel;
 // Diagnostic dumps (registry, active cells, compiled list, captured IR/ASM,
 // icache slots) emit one line per item inside a loop. On SRE builds the
 // serial-log shell ring buffer is small (512 B default, ~7 aligned 64-byte
-// lines) and its consumer polls once per drain period (10 ticks = 100 ms),
-// so those loops call ejitDiagPrintThrottle() once per printed line: each
-// call delays the producer by EJIT_DIAG_PRINT_THROTTLE_TICKS scheduler
+// lines) and its consumer polls once per drain period (10 ticks; 1 tick =
+// 1 ms), so those loops call ejitDiagPrintThrottle() once per printed line:
+// each call delays the producer by EJIT_DIAG_PRINT_THROTTLE_TICKS scheduler
 // ticks (SRE_TaskDelay), letting the consumer drain between lines.
 // Compile-time configurable; 0 disables. Hosted builds do not delay;
 // diagnostics compiled out (no EJIT_DIAG_ENABLE) => pure no-op.
 
 #ifndef EJIT_DIAG_PRINT_THROTTLE_TICKS
-#define EJIT_DIAG_PRINT_THROTTLE_TICKS 20
+#define EJIT_DIAG_PRINT_THROTTLE_TICKS 50
 #endif
 
 #if defined(EJIT_DIAG_ENABLE) && defined(EJIT_FREESTANDING)
@@ -96,6 +96,15 @@ extern "C" int SRE_printf(const char *fmt, ...);
       SRE_printf("[EJIT] %s:%d " fmt "\n", __func__, __LINE__,               \
                  ##__VA_ARGS__);                                             \
   } while (0)
+// Same as EJIT_DIAG but WITHOUT the "[EJIT] func:line" prefix, for dump entry
+// lines inside a loop (e.g. ejit_taskpool_print_compiled): the prefix is
+// identical on every line of the dump and only eats ring-buffer space, and
+// the bracketing header/footer lines already carry it for grep-ability.
+#define EJIT_DIAG_RAW(fmt, ...)                                              \
+  do {                                                                       \
+    if (gEJitDiagLevel >= EJIT_LOG_LVL_INFO)                                 \
+      SRE_printf(fmt "\n", ##__VA_ARGS__);                                   \
+  } while (0)
 #define EJIT_DIAG_VERBOSE(fmt, ...)                                          \
   do {                                                                       \
     if (gEJitDiagLevel >= EJIT_LOG_LVL_VERBOSE)                              \
@@ -117,6 +126,12 @@ extern "C" int SRE_printf(const char *fmt, ...);
       std::printf("[EJIT] %s:%d " fmt "\n", __func__, __LINE__,              \
                   ##__VA_ARGS__);                                            \
   } while (0)
+// See the SRE variant above: prefix-free line for dump entry loops.
+#define EJIT_DIAG_RAW(fmt, ...)                                              \
+  do {                                                                       \
+    if (gEJitDiagLevel >= EJIT_LOG_LVL_INFO)                                 \
+      std::printf(fmt "\n", ##__VA_ARGS__);                                  \
+  } while (0)
 #define EJIT_DIAG_VERBOSE(fmt, ...)                                          \
   do {                                                                       \
     if (gEJitDiagLevel >= EJIT_LOG_LVL_VERBOSE)                              \
@@ -135,6 +150,7 @@ extern "C" int SRE_printf(const char *fmt, ...);
 
 // Expand to ((void)0) regardless of argument count by matching everything.
 #define EJIT_DIAG(...) ((void)0)
+#define EJIT_DIAG_RAW(...) ((void)0)
 #define EJIT_DIAG_VERBOSE(...) ((void)0)
 #define EJIT_DIAG_DEBUG(...) ((void)0)
 

@@ -421,19 +421,29 @@ public:
   }
   EJitSharedTaskPoolState *state() const { return state_; }
 
-  /// Callback type for forEachCompiled: receives the funcIndex, its dim
-  /// identity (dimType:instanceId pairs, numDims entries), the compiled
-  /// function pointer, and the caller-provided context.
-  using CompiledFuncCallback = void (*)(uint32_t funcIndex,
-                                        const EJitDimPair *dims,
-                                        uint32_t numDims, void *fnPtr,
+  /// Callback type for forEachCompiled: receives the Ready cache slot itself
+  /// (funcIndex/dims/numDims/fnPtr plus publish metadata such as versions,
+  /// codeSize, poolId, generation) and the caller-provided context.
+  using CompiledFuncCallback = void (*)(const EJitSharedCacheSlot &slot,
                                         void *ctx);
+
+  /// Walk outcome of forEachCompiled, so diagnostics can report completeness
+  /// instead of silently missing contended buckets.
+  struct ForEachCompiledStats {
+    uint32_t visitedSlots = 0;   ///< Ready slots the callback ran for.
+    uint32_t skippedBuckets = 0; ///< Buckets skipped (write lock contention).
+  };
 
   /// Invoke \p cb once for every successfully compiled (Ready) cache entry.
   /// For diagnostics (e.g. ejit_taskpool_print_compiled). Best-effort: a slot
   /// mid-publish is skipped, and this is not a snapshot — concurrent publishes
-  /// may add entries during iteration.
-  void forEachCompiled(CompiledFuncCallback cb, void *ctx) const;
+  /// may add entries during iteration. A bucket whose write lock stays held
+  /// after a brief retry is skipped and reported in the returned stats. In a
+  /// NO_RECLAIM build the slot is read without the hit-path seqlock snapshot,
+  /// so a publish racing the write-flag check can tear a printed field;
+  /// diagnostics only, never a hit path.
+  ForEachCompiledStats forEachCompiled(CompiledFuncCallback cb,
+                                       void *ctx) const;
 
   //--- owner-only configuration (applied if this core wins election) ----------
   void setCompiler(CompileCallback fn, void *ctx) {

@@ -731,10 +731,11 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   }
 }
 
-void EJitSharedTaskPool::forEachCompiled(CompiledFuncCallback cb,
-                                         void *ctx) const {
+EJitSharedTaskPool::ForEachCompiledStats
+EJitSharedTaskPool::forEachCompiled(CompiledFuncCallback cb, void *ctx) const {
+  ForEachCompiledStats stats;
   if (!state_ || !cb)
-    return;
+    return stats;
   for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b) {
     EJitSharedCacheBucket &B = state_->buckets[b];
     // Acquire the per-bucket read lock; retry briefly if a writer is
@@ -748,18 +749,24 @@ void EJitSharedTaskPool::forEachCompiled(CompiledFuncCallback cb,
       }
       cpuRelax();
     }
-    if (!locked)
+    if (!locked) {
+      // Skipped, not silent: the caller reports it from the returned stats.
+      ++stats.skippedBuckets;
       continue;
+    }
     for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
       const EJitSharedCacheSlot &slot = B.slots[s];
       if (static_cast<EJitSharedSlotState>(slot.state.loadAcquire()) !=
           EJitSharedSlotState::Ready)
         continue;
-      void *fn = reinterpret_cast<void *>(slot.fnPtr.loadAcquire());
-      cb(slot.funcIndex, slot.dims, slot.numDims, fn, ctx);
+      // Pass the whole slot; the callback reads fnPtr with its own acquire
+      // load, per the publish protocol (state Ready acquire orders it).
+      cb(slot, ctx);
+      ++stats.visitedSlots;
     }
     bucketReadRelease(B);
   }
+  return stats;
 }
 
 bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,

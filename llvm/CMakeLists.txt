@@ -567,10 +567,10 @@ endif()
 # Per-line delay for diagnostic dump loops (registry, active cells, compiled
 # list, captured IR/ASM, icache slots): after each printed line the producer
 # delays EJIT_DIAG_PRINT_THROTTLE_TICKS scheduler ticks (SRE_TaskDelay) so the
-# serial-log shell consumer (ring buffer ~7 lines, 100 ms drain period) keeps
+# serial-log shell consumer (ring buffer ~7 lines, 10 ms drain period) keeps
 # up. Freestanding + EJIT_DIAG_ENABLE only; 0 disables. Consumed by
 # ejitDiagPrintThrottle() in EJitDiag.h.
-set(EJIT_DIAG_PRINT_THROTTLE_TICKS "20" CACHE STRING
+set(EJIT_DIAG_PRINT_THROTTLE_TICKS "50" CACHE STRING
   "EmbeddedJIT diagnostic dump print delay: SRE_TaskDelay scheduler ticks per printed line (0 disables)")
 if(EJIT_DIAG_ENABLE)
   if(NOT EJIT_DIAG_PRINT_THROTTLE_TICKS MATCHES "^[0-9]+$")
