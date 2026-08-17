@@ -86,6 +86,13 @@ inline void ejitDiagPrintThrottle() {
 #endif
 }
 
+/// Integer permille (used / reserved * 1000) for diagnostic "usage"
+/// rendering: freestanding-safe (no FPU), 0 when reserved == 0, truncating
+/// (never rounds up). The caller prints it as permille/10 "." permille%10.
+inline uint64_t ejitDiagPermille(uint64_t used, uint64_t reserved) {
+  return reserved ? used * 1000 / reserved : 0;
+}
+
 #ifdef EJIT_DIAG_ENABLE
 
 #ifdef EJIT_SRE_DIAG

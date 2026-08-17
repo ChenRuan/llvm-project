@@ -957,6 +957,18 @@ void EJit::printCodePoolStats() const {
             (unsigned long long)s.sealInvocations,
             (unsigned long long)s.splitInvocations,
             (unsigned long long)s.finalizedRangeCount);
+  // Whole-pool usage summary, derived at print time (no new counters):
+  // total = reservedBytes = capacity of every carved pool. Caveats:
+  //  - 4K-seal mode rounds usedBytes up per allocation (page-aligned bump
+  //    cursor in EJitCodePool.cpp allocateCode), slightly over-reporting
+  //    usage;
+  //  - fixed-region mode counts only carved pools, so un-carved region
+  //    space is not reflected in total.
+  const uint64_t permille = ejitDiagPermille(s.usedBytes, s.reservedBytes);
+  EJIT_DIAG("  total=%llu used=%llu usage=%llu.%u%%",
+            (unsigned long long)s.reservedBytes,
+            (unsigned long long)s.usedBytes,
+            (unsigned long long)(permille / 10), (unsigned)(permille % 10));
 #else
   EJIT_DIAG("code pool: EJIT_SRE_CODE_POOL not enabled");
 #endif

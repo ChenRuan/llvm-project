@@ -13,6 +13,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
+#include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
@@ -3084,6 +3085,19 @@ TEST(EJitDiagnostics, CodePoolStatsNoCrash) {
 
 TEST(EJitDiagnostics, PrintCodePoolStatsNoCrash) {
   ejit_print_code_pool_stats(); // uninitialized or no pool: prints a notice
+}
+
+// ejitDiagPermille() drives the code-pool usage percentage: integer-only
+// (freestanding builds have no FPU), 0 when the denominator is 0, and
+// truncating (never rounds up).
+TEST(EJitDiagnostics, DiagPermille) {
+  EXPECT_EQ(ejitDiagPermille(0, 0), uint64_t{0});
+  EXPECT_EQ(ejitDiagPermille(7, 0), uint64_t{0});
+  EXPECT_EQ(ejitDiagPermille(50, 100), uint64_t{500});
+  EXPECT_EQ(ejitDiagPermille(65536, 524288), uint64_t{125}); // "12.5%"
+  EXPECT_EQ(ejitDiagPermille(1, 3), uint64_t{333});          // truncates
+  EXPECT_EQ(ejitDiagPermille(3, 2), uint64_t{1500});         // >100%: 4K-seal rounding
+  EXPECT_EQ(ejitDiagPermille(100, 100), uint64_t{1000});     // "100.0%"
 }
 
 TEST(EJitDiagnostics, PrintActiveNoCrash) {
