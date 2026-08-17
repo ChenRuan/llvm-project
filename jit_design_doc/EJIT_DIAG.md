@@ -1,7 +1,7 @@
 # EmbeddedJIT 诊断 dump：逐行打印延时
 
-> 适用分支：`ejit-throttle-simplify-djq`
-> 开关：`EJIT_DIAG_PRINT_THROTTLE_TICKS`（CMake 缓存变量，默认 50，0 关闭）
+> 适用分支：`ejit-print-compiled-fmt-djq`
+> 开关：`EJIT_DIAG_PRINT_THROTTLE_TICKS`（CMake 缓存变量，默认 20，0 关闭）
 > 目标平台：`aarch64_be`（SRE，shell 环形 buffer 串口日志）
 
 ---
@@ -17,10 +17,10 @@ SRE 串口日志经 shell 环形 buffer 转发，相关平台参数只有两条�
 
 诊断 dump API 的**循环打印**（每个数据项一行）在每打印一行后调用 `ejitDiagPrintThrottle()`（`EJitDiag.h`），即**每循环一轮延时一次**：
 
-- 每次延时 `EJIT_DIAG_PRINT_THROTTLE_TICKS` 个调度 tick（`SRE_TaskDelay`，默认 **50** tick = 50 ms = 5 个消费者排空周期）
+- 每次延时 `EJIT_DIAG_PRINT_THROTTLE_TICKS` 个调度 tick（`SRE_TaskDelay`，默认 **20** tick = 20 ms = 2 个消费者排空周期：第一个周期完成排空，第二个周期是吸收消费者抖动与多核日志交错的裕量）
 - 仅在 `EJIT_DIAG_ENABLE` + `EJIT_FREESTANDING` 下生效；host 构建与诊断关闭时为零开销 no-op
 - 行未实际打印（日志级别低于 INFO）时不延时
-- 参数经 CMake 缓存变量传递（`llvm/CMakeLists.txt`，非负整数校验，0 关闭），`ejit-minimal-aarch64_be` 预设配 50
+- 参数经 CMake 缓存变量传递（`llvm/CMakeLists.txt`，非负整数校验，0 关闭），`ejit-minimal-aarch64_be` 预设配 20
 
 ## 3. 覆盖的循环
 
@@ -39,12 +39,12 @@ SRE 串口日志经 shell 环形 buffer 转发，相关平台参数只有两条�
 
 ## 4. 效果与依据
 
-- 实测：逐行 delay=2 tick（2 ms）时生产速率（1 行/2 ms）远超消费者排空容量（约 7 行/10 ms），丢行；delay=100 tick 稳定但过慢。预设 50 tick/行（50 ms = 5 个排空周期，28 行 dump ≈ 1.4 s）在排空边界上留有裕度，长行（compiled list VERBOSE 条目）也被 5 个排空周期覆盖，可按板子 UART 速率调低。
+- 实测：逐行 delay=2 tick（2 ms）时生产速率（1 行/2 ms）远超消费者排空容量（约 7 行/10 ms），丢行；delay=100 tick 稳定但过慢。选值 20 tick/行（20 ms = 2 个排空周期，28 行 dump ≈ 560 ms）：每行留 1 个完整排空周期裕量，多核日志交错场景下 ring（约 7 行）仍有 5 行以上余量；15 tick（1.5 个排空周期）裕量减半被否，50 tick（5 个排空周期，≈1.4 s）过于保守。长行（compiled list VERBOSE 条目）也被 2 个排空周期覆盖，可按板子 UART 速率再调。
 - 每个 dump 循环的逐项行是信息量最大的部分，也是唯一需要节流的部分——头部/汇总行数量固定且少，不参与延时。
 
 ## 5. 相关代码
 
 - `llvm/include/llvm/ExecutionEngine/EJIT/EJitDiag.h` — `ejitDiagPrintThrottle()`、`EJIT_DIAG_PRINT_THROTTLE_TICKS` 默认值
 - `llvm/CMakeLists.txt` — `EJIT_DIAG_PRINT_THROTTLE_TICKS` 缓存变量与校验
-- `llvm/CMakePresets.json` — `ejit-minimal-aarch64_be` 预设（50）
+- `llvm/CMakePresets.json` — `ejit-minimal-aarch64_be` 预设（20）
 - `llvm/lib/ExecutionEngine/EJIT/` — `EJit.cpp` / `EJitRuntime.cpp` / `EJitOrcEngine.cpp` / `EJitSharedTaskPool.cpp` 中的循环调用点
