@@ -41,6 +41,7 @@ std::string ejit::synthesizeProfileBuffer(ArrayRef<PgoCounterRef> counters) {
                 "EJIT PGO runtime profile-data offsets assume 64-bit");
   constexpr uintptr_t kFuncHashOff = 8;
   constexpr uintptr_t kNumCountersOff = 48;
+  constexpr uintptr_t kNumValueSitesOff = 52;
   // Sanity cap: a single function's edge counter array is never huge; a bogus
   // offset read (layout drift) would typically yield a wild NumCounters.
   constexpr uint32_t kMaxCountersPerFunc = 1u << 20;
@@ -67,6 +68,19 @@ std::string ejit::synthesizeProfileBuffer(ArrayRef<PgoCounterRef> counters) {
     for (uint32_t i = 0; i < NumCounters; ++i)
       Counts.push_back(__atomic_load_n(&CounterArray[i], __ATOMIC_RELAXED));
     NamedInstrProfRecord Rec(C.pgoName, FuncHash, std::move(Counts));
+    // PGO Gen records value-site counts in __profd_ even though this edge-only
+    // runtime intentionally discards their samples. Preserve an empty entry for
+    // each site so PGOUse sees the same inventory as the IR and does not report
+    // a stale-profile mismatch.
+    for (uint32_t Kind = IPVK_First; Kind <= IPVK_Last; ++Kind) {
+      const uint32_t NumSites = *reinterpret_cast<const uint16_t *>(
+          Data + kNumValueSitesOff + Kind * sizeof(uint16_t));
+      if (!NumSites)
+        continue;
+      Rec.reserveSites(Kind, NumSites);
+      for (uint32_t Site = 0; Site < NumSites; ++Site)
+        Rec.addValueData(Kind, Site, {}, nullptr);
+    }
     Writer.addRecord(std::move(Rec), 1, [](Error) {});
   }
 

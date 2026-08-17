@@ -135,8 +135,8 @@ void EJitOptimizer::runPipeline(Module &M,
     // on Linux aarch64 toolchains), which overrides the JIT's global target
     // features and makes the backend outline the atomicrmw into an
     // __aarch64_ldadd8_relax libcall that does not exist on SRE / freestanding.
-    // Drop just that feature so the counter increment becomes an inline
-    // ldxr/stxr loop, matching the AOT firmware's codegen.
+    // Replace either spelling with an explicit disable. Merely deleting
+    // -outline-atomics can re-enable the target-machine default.
     for (Function &F : M) {
       if (F.isDeclaration())
         continue;
@@ -148,8 +148,11 @@ void EJitOptimizer::runPipeline(Module &M,
       auto It = llvm::remove_if(Feats, [](StringRef S) {
         return S == "+outline-atomics" || S == "-outline-atomics";
       });
-      if (It != Feats.end())
+      if (It != Feats.end()) {
+        Feats.erase(It, Feats.end());
+        Feats.push_back("-outline-atomics");
         F.addFnAttr("target-features", join(Feats, ","));
+      }
     }
 
     // Tier-1 (PGO Gen): lightOpt then instrument. lightOpt is the shared

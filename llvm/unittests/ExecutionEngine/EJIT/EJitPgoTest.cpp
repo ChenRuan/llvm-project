@@ -811,6 +811,26 @@ TEST(EJitPgo, Tier1CountersUseAtomicRMW) {
       << "no plain (non-atomic) store to a __profc_ counter may remain";
 }
 
+TEST(EJitPgo, Tier1ExplicitlyDisablesOutlinedAtomics) {
+  LLVMContext Ctx;
+  auto M = makeFooModule(Ctx);
+  M->getFunction("foo")->addFnAttr("target-features",
+                                    "+v8a,+outline-atomics");
+  PeriodArrayRegistry Reg;
+  EJitOptimizer Opt(Reg);
+  SpecializationContext SC;
+  SC.fnName = "foo";
+  SC.tier = CompileTier::Instrumented;
+  Opt.runPipeline(*M, SC);
+
+  Function *Foo = M->getFunction("foo");
+  ASSERT_NE(Foo, nullptr);
+  StringRef Features =
+      Foo->getFnAttribute("target-features").getValueAsString();
+  EXPECT_TRUE(Features.contains("-outline-atomics"));
+  EXPECT_FALSE(Features.contains("+outline-atomics"));
+}
+
 // PGO (§5): EJitProfileMerge must read the live __profc_ counters with a
 // RELAXED atomic load (they are being updated by shared Tier-1 code with
 // atomicrmw). This test feeds synthesizeProfileBuffer a faked, 64-bit
@@ -850,4 +870,39 @@ TEST(EJitPgo, ProfileMergeReadsCountersAtomically) {
   EXPECT_EQ(Rec.Counts[0], 100u);
   EXPECT_EQ(Rec.Counts[1], 5u);
   EXPECT_EQ(Rec.Counts[2], 7u);
+}
+
+TEST(EJitPgo, ProfileMergePreservesEmptyValueSiteInventory) {
+  // __llvm_profile_data layout (64-bit, InstrProfData.inc): FuncHash @8,
+  // NumCounters @48, NumValueSites[IPVK_First] @52.
+  alignas(8) uint8_t Profd[64] = {};
+  const uint64_t FuncHash = 0xaabbccddeeff0011ull;
+  const uint32_t NumCounters = 1;
+  const uint16_t IndirectCallSites = 2;
+  const uint16_t MemOpSites = 1;
+  std::memcpy(&Profd[8], &FuncHash, sizeof(FuncHash));
+  std::memcpy(&Profd[48], &NumCounters, sizeof(NumCounters));
+  std::memcpy(&Profd[52 + IPVK_IndirectCallTarget * sizeof(uint16_t)],
+              &IndirectCallSites, sizeof(IndirectCallSites));
+  std::memcpy(&Profd[52 + IPVK_MemOPSize * sizeof(uint16_t)], &MemOpSites,
+              sizeof(MemOpSites));
+  alignas(8) uint64_t Counter = 42;
+
+  PgoCounterRef Ref;
+  Ref.pgoName = "foo";
+  Ref.profcAddr = reinterpret_cast<uintptr_t>(&Counter);
+  Ref.profdAddr = reinterpret_cast<uintptr_t>(&Profd[0]);
+  std::string Buf = synthesizeProfileBuffer({Ref});
+  ASSERT_FALSE(Buf.empty());
+
+  auto ReaderOrErr = IndexedInstrProfReader::create(MemoryBuffer::getMemBuffer(
+      Buf, "ejit.prof", /*RequiresNullTerminator=*/false));
+  ASSERT_TRUE(static_cast<bool>(ReaderOrErr));
+  auto RecOrErr = (*ReaderOrErr)->getInstrProfRecord("foo", FuncHash);
+  ASSERT_TRUE(static_cast<bool>(RecOrErr));
+  EXPECT_EQ(RecOrErr->getNumValueSites(IPVK_IndirectCallTarget), 2u);
+  EXPECT_EQ(RecOrErr->getNumValueSites(IPVK_MemOPSize), 1u);
+  EXPECT_TRUE(RecOrErr->getValueArrayForSite(IPVK_IndirectCallTarget, 0)
+                  .empty());
+  EXPECT_TRUE(RecOrErr->getValueArrayForSite(IPVK_MemOPSize, 0).empty());
 }
