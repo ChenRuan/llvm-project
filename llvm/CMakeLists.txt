@@ -567,8 +567,10 @@ endif()
 # Per-line delay for diagnostic dump loops (registry, active cells, compiled
 # list, captured IR/ASM, icache slots): after each printed line the producer
 # delays EJIT_DIAG_PRINT_THROTTLE_TICKS scheduler ticks (SRE_TaskDelay) so the
-# serial-log shell consumer (ring buffer ~7 lines, 100 ms drain period) keeps
-# up. Freestanding + EJIT_DIAG_ENABLE only; 0 disables. Consumed by
+# serial-log shell consumer (ring buffer ~7 lines, 10 ms drain period) keeps
+# up. Default 20 ticks = 2 drain periods per line: the first performs the
+# drain, the second is margin for consumer jitter and interleaved multi-core
+# logs. Freestanding + EJIT_DIAG_ENABLE only; 0 disables. Consumed by
 # ejitDiagPrintThrottle() in EJitDiag.h.
 set(EJIT_DIAG_PRINT_THROTTLE_TICKS "20" CACHE STRING
   "EmbeddedJIT diagnostic dump print delay: SRE_TaskDelay scheduler ticks per printed line (0 disables)")

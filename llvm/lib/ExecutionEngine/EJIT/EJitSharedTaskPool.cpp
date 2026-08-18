@@ -19,6 +19,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include <atomic>
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
 
@@ -259,9 +260,9 @@ void llvm::ejit::ejitIcacheClearAll() {
   }
 }
 
-void llvm::ejit::ejitDumpIcacheSlots() {
-  EJIT_DIAG("=== gIcacheSlots dump (%u slots) ===",
-            (unsigned)EJIT_ICACHE_FUNC_SLOTS);
+void llvm::ejit::ejitDumpIcacheSlots(const EJitModuleLoader *loader) {
+  EJIT_DIAG_RAW("=== gIcacheSlots dump (%u slots) ===",
+                (unsigned)EJIT_ICACHE_FUNC_SLOTS);
   uint32_t registered = 0;
   uint32_t filled = 0;
   for (uint32_t f = 0; f < EJIT_ICACHE_FUNC_SLOTS; ++f) {
@@ -275,13 +276,29 @@ void llvm::ejit::ejitDumpIcacheSlots() {
     const uintptr_t c0 = icacheCell(reg.base, 0).loadRelaxed();
     if (c0)
       filled++;
-    EJIT_DIAG("  [%2u] base=%p numDims=%u cell[0]=%p %s",
-              f, (void *)reg.base, reg.numDims, (void *)c0,
-              c0 ? "(filled)" : "(empty)");
+    // The slot index IS the funcIndex (a static_assert above guarantees
+    // EJIT_ICACHE_FUNC_SLOTS >= EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX), so a
+    // loader resolves the function name: "<unknown>" when the registry
+    // holds no name for it, "?" when no loader was handed in (unit tests /
+    // runtime not yet initialized).
+    const char *name = "?";
+    if (loader) {
+      const std::string &s = loader->getFuncNameByFuncIdx(f);
+      name = s.empty() ? "<unknown>" : s.c_str();
+    }
+    (void)name; // consumed by EJIT_DIAG_RAW only; silence DIAG-off builds
+    EJIT_DIAG_RAW("  [%2u] %.24s base=%p numDims=%u cells=%u cell[0]=%p %s",
+                  f, name, (void *)reg.base, reg.numDims,
+                  (unsigned)icacheCellCount(reg.numDims), (void *)c0,
+                  c0 ? "(filled)" : "(empty)");
     ejitDiagPrintThrottle();
   }
-  EJIT_DIAG("=== icache slots: %u registered, %u with cell[0] filled ===",
-            registered, filled);
+  EJIT_DIAG_RAW("=== icache slots: %u registered, %u with cell[0] filled ===",
+                registered, filled);
+  // Both counters are consumed by the RAW macro above only; silence
+  // DIAG-off builds (same for `name` inside the loop).
+  (void)registered;
+  (void)filled;
 }
 
 void EJitSharedTaskPool::icacheDrainAll(const char *reason) {
@@ -731,10 +748,11 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   }
 }
 
-void EJitSharedTaskPool::forEachCompiled(CompiledFuncCallback cb,
-                                         void *ctx) const {
+EJitSharedTaskPool::ForEachCompiledStats
+EJitSharedTaskPool::forEachCompiled(CompiledFuncCallback cb, void *ctx) const {
+  ForEachCompiledStats stats;
   if (!state_ || !cb)
-    return;
+    return stats;
   for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b) {
     EJitSharedCacheBucket &B = state_->buckets[b];
     // Acquire the per-bucket read lock; retry briefly if a writer is
@@ -748,18 +766,24 @@ void EJitSharedTaskPool::forEachCompiled(CompiledFuncCallback cb,
       }
       cpuRelax();
     }
-    if (!locked)
+    if (!locked) {
+      // Skipped, not silent: the caller reports it from the returned stats.
+      ++stats.skippedBuckets;
       continue;
+    }
     for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
       const EJitSharedCacheSlot &slot = B.slots[s];
       if (static_cast<EJitSharedSlotState>(slot.state.loadAcquire()) !=
           EJitSharedSlotState::Ready)
         continue;
-      void *fn = reinterpret_cast<void *>(slot.fnPtr.loadAcquire());
-      cb(slot.funcIndex, slot.dims, slot.numDims, fn, ctx);
+      // Pass the whole slot; the callback reads fnPtr with its own acquire
+      // load, per the publish protocol (state Ready acquire orders it).
+      cb(slot, ctx);
+      ++stats.visitedSlots;
     }
     bucketReadRelease(B);
   }
+  return stats;
 }
 
 bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,

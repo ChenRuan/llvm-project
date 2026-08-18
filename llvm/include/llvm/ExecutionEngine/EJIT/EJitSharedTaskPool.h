@@ -40,6 +40,8 @@
 namespace llvm {
 namespace ejit {
 
+class EJitModuleLoader;
+
 //===----------------------------------------------------------------------===//
 // Read-only diagnostics snapshot (spec §11 observability). Every field is a
 // plain copy of an atomic load; no field exposes a raw shared pointer.
@@ -226,12 +228,15 @@ EJitIcacheRegResult ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
                                            uint32_t numDims);
 
 /// Diagnostic: dump every registered icache slot to the diagnostic log.
-/// Shows funcIndex, base pointer, numDims, and cell[0] (the scalar or
-/// [0]...[0] cell) so the caller can quickly see which slots are wired,
-/// which are null, and whether the first cell has been filled.
+/// Shows funcIndex, base pointer, numDims, the per-slot cell capacity
+/// (16^numDims), and cell[0] (the scalar or [0]...[0] cell) so the caller
+/// can quickly see which slots are wired, which are null, and whether the
+/// first cell has been filled. When \p loader is given the slot's
+/// funcIndex is resolved to a function name ("<unknown>" when the registry
+/// has none; "?" without a loader).
 /// NOTE: dereferences base[0] of every registered slot — bases must be
 /// module-lifetime storage, never stack locals (see ejitIcacheClearAll).
-void ejitDumpIcacheSlots();
+void ejitDumpIcacheSlots(const EJitModuleLoader *loader = nullptr);
 
 /// Retire one in-flight drain that was announced under generation \p gen.
 ///
@@ -421,19 +426,29 @@ public:
   }
   EJitSharedTaskPoolState *state() const { return state_; }
 
-  /// Callback type for forEachCompiled: receives the funcIndex, its dim
-  /// identity (dimType:instanceId pairs, numDims entries), the compiled
-  /// function pointer, and the caller-provided context.
-  using CompiledFuncCallback = void (*)(uint32_t funcIndex,
-                                        const EJitDimPair *dims,
-                                        uint32_t numDims, void *fnPtr,
+  /// Callback type for forEachCompiled: receives the Ready cache slot itself
+  /// (funcIndex/dims/numDims/fnPtr plus publish metadata such as versions,
+  /// codeSize, poolId, generation) and the caller-provided context.
+  using CompiledFuncCallback = void (*)(const EJitSharedCacheSlot &slot,
                                         void *ctx);
+
+  /// Walk outcome of forEachCompiled, so diagnostics can report completeness
+  /// instead of silently missing contended buckets.
+  struct ForEachCompiledStats {
+    uint32_t visitedSlots = 0;   ///< Ready slots the callback ran for.
+    uint32_t skippedBuckets = 0; ///< Buckets skipped (write lock contention).
+  };
 
   /// Invoke \p cb once for every successfully compiled (Ready) cache entry.
   /// For diagnostics (e.g. ejit_taskpool_print_compiled). Best-effort: a slot
   /// mid-publish is skipped, and this is not a snapshot — concurrent publishes
-  /// may add entries during iteration.
-  void forEachCompiled(CompiledFuncCallback cb, void *ctx) const;
+  /// may add entries during iteration. A bucket whose write lock stays held
+  /// after a brief retry is skipped and reported in the returned stats. In a
+  /// NO_RECLAIM build the slot is read without the hit-path seqlock snapshot,
+  /// so a publish racing the write-flag check can tear a printed field;
+  /// diagnostics only, never a hit path.
+  ForEachCompiledStats forEachCompiled(CompiledFuncCallback cb,
+                                       void *ctx) const;
 
   //--- owner-only configuration (applied if this core wins election) ----------
   void setCompiler(CompileCallback fn, void *ctx) {

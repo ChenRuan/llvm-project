@@ -53,10 +53,14 @@ extern int gEJitDiagLevel;
 // Diagnostic dumps (registry, active cells, compiled list, captured IR/ASM,
 // icache slots) emit one line per item inside a loop. On SRE builds the
 // serial-log shell ring buffer is small (512 B default, ~7 aligned 64-byte
-// lines) and its consumer polls once per drain period (10 ticks = 100 ms),
-// so those loops call ejitDiagPrintThrottle() once per printed line: each
-// call delays the producer by EJIT_DIAG_PRINT_THROTTLE_TICKS scheduler
-// ticks (SRE_TaskDelay), letting the consumer drain between lines.
+// lines) and its consumer polls once per drain period (10 ticks; 1 tick =
+// 1 ms), so those loops call ejitDiagPrintThrottle() once per printed line:
+// each call delays the producer by EJIT_DIAG_PRINT_THROTTLE_TICKS scheduler
+// ticks (SRE_TaskDelay), letting the consumer drain between lines. The
+// default of 20 ticks buys 2 drain periods per printed line: the first
+// performs the drain, the second is margin for consumer jitter and
+// interleaved multi-core logs (measured: 2 ticks/line drops lines; 50
+// ticks/line is 5 drain periods and needlessly slow).
 // Compile-time configurable; 0 disables. Hosted builds do not delay;
 // diagnostics compiled out (no EJIT_DIAG_ENABLE) => pure no-op.
 
@@ -82,6 +86,13 @@ inline void ejitDiagPrintThrottle() {
 #endif
 }
 
+/// Integer permille (used / reserved * 1000) for diagnostic "usage"
+/// rendering: freestanding-safe (no FPU), 0 when reserved == 0, truncating
+/// (never rounds up). The caller prints it as permille/10 "." permille%10.
+inline uint64_t ejitDiagPermille(uint64_t used, uint64_t reserved) {
+  return reserved ? used * 1000 / reserved : 0;
+}
+
 #ifdef EJIT_DIAG_ENABLE
 
 #ifdef EJIT_SRE_DIAG
@@ -95,6 +106,18 @@ extern "C" int SRE_printf(const char *fmt, ...);
     if (gEJitDiagLevel >= EJIT_LOG_LVL_INFO)                                 \
       SRE_printf("[EJIT] %s:%d " fmt "\n", __func__, __LINE__,               \
                  ##__VA_ARGS__);                                             \
+  } while (0)
+// Same as EJIT_DIAG but WITHOUT the "[EJIT] func:line" prefix. ALL
+// diagnostic DUMP output prints through this macro - header and footer
+// lines as well as per-item entry lines - so a dump block carries no
+// per-line prefix and ring-buffer space goes to payload only. Grep
+// anchors are the blocks' own text labels ("registry:", "code pool:",
+// "stats_t:", "=== ... ===", "compiled:"). Normal-path (non-dump)
+// logging keeps EJIT_DIAG so the func:line origin stays attached.
+#define EJIT_DIAG_RAW(fmt, ...)                                              \
+  do {                                                                       \
+    if (gEJitDiagLevel >= EJIT_LOG_LVL_INFO)                                 \
+      SRE_printf(fmt "\n", ##__VA_ARGS__);                                   \
   } while (0)
 #define EJIT_DIAG_VERBOSE(fmt, ...)                                          \
   do {                                                                       \
@@ -117,6 +140,13 @@ extern "C" int SRE_printf(const char *fmt, ...);
       std::printf("[EJIT] %s:%d " fmt "\n", __func__, __LINE__,              \
                   ##__VA_ARGS__);                                            \
   } while (0)
+// See the SRE variant above: prefix-free lines for ALL diagnostic dump
+// output (headers and entry lines alike).
+#define EJIT_DIAG_RAW(fmt, ...)                                              \
+  do {                                                                       \
+    if (gEJitDiagLevel >= EJIT_LOG_LVL_INFO)                                 \
+      std::printf(fmt "\n", ##__VA_ARGS__);                                  \
+  } while (0)
 #define EJIT_DIAG_VERBOSE(fmt, ...)                                          \
   do {                                                                       \
     if (gEJitDiagLevel >= EJIT_LOG_LVL_VERBOSE)                              \
@@ -135,6 +165,7 @@ extern "C" int SRE_printf(const char *fmt, ...);
 
 // Expand to ((void)0) regardless of argument count by matching everything.
 #define EJIT_DIAG(...) ((void)0)
+#define EJIT_DIAG_RAW(...) ((void)0)
 #define EJIT_DIAG_VERBOSE(...) ((void)0)
 #define EJIT_DIAG_DEBUG(...) ((void)0)
 
