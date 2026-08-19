@@ -41,10 +41,8 @@ static_assert((EJIT_ICACHE_DIM_SIZE & (EJIT_ICACHE_DIM_SIZE - 1)) == 0,
               "EJIT_ICACHE_DIM_SIZE must be a power of 2 "
               "(the icache hit path uses shift-based indexing).");
 
-// The AOT wrapper emits [D]^numDims slot arrays up to EJIT_ICACHE_MAX_DIMS;
-// the shared cache identity stores dims up to kEJitSharedMaxDims. A drift
-// between the two would let the AOT emit 5+ dim wrappers whose identity the
-// runtime truncates — silently serving the wrong specialization.
+// Entry identities and the legacy multi-version table support the same number
+// of dimensions. Representative mode is registered with a separate sentinel.
 static_assert(EJIT_ICACHE_MAX_DIMS == llvm::ejit::kEJitSharedMaxDims,
               "EJIT_ICACHE_MAX_DIMS (AOT wrapper dim cap) must equal "
               "kEJitSharedMaxDims (shared cache identity cap).");
@@ -148,10 +146,10 @@ constexpr uint32_t kReady = static_cast<uint32_t>(EJitSharedInitState::Ready);
 /// cacheLookupNd block can also reference it.
 constexpr uint64_t kHashMul = 0x9e3779b97f4a7c15ULL;
 
-// Per-function inline-cache slot registry (multi-version direct-indexed). Each
-// entry records the wrapper's per-function @__ejit_icache_fn_<name> global base
-// (a uintptr_t cell, or a [D]^numDims array of them for a multi-version entry)
-// plus its dimensionality, registered by name at ejit_auto_register /
+// Per-function inline-cache slot registry. Legacy entries are multi-version
+// direct-indexed arrays; representative entries are {fnPtr, identityKey}
+// objects selected by EJIT_ICACHE_REPRESENTATIVE_DIMS. They are registered by
+// name at ejit_auto_register /
 // .ejit_period time via ejit_register_icache_slot (which calls
 // ejitIcacheRegisterSlot). The wrapper reads the cell directly (a GEP by the
 // ejit_dim arg values + one load + null-check + indirect call) with NO
@@ -194,8 +192,17 @@ inline EJitAtomicUPtr &icacheCell(uintptr_t *base, uintptr_t idx) {
   return reinterpret_cast<EJitAtomicUPtr *>(base)[idx];
 }
 
-// Cells in a [D]^numDims array. numDims is capped at registration.
+inline EJitAtomicU64 &icacheRepresentativeKey(uintptr_t *base) {
+  static_assert(sizeof(uintptr_t) == sizeof(uint64_t),
+                "representative inline cache requires a 64-bit target");
+  return reinterpret_cast<EJitAtomicU64 *>(base + 1)[0];
+}
+
+// Cells drained for one registration. A representative object has one pointer
+// cell; its adjacent admission key intentionally survives lifecycle drains.
 inline uintptr_t icacheCellCount(uint32_t numDims) {
+  if (numDims == EJIT_ICACHE_REPRESENTATIVE_DIMS)
+    return 1;
   uintptr_t n = 1;
   for (uint32_t i = 0; i < numDims; ++i)
     n *= EJIT_ICACHE_DIM_SIZE;
@@ -225,6 +232,22 @@ static uintptr_t icacheLinearize(const EJitDimPair *dims, uint32_t numDims) {
   return idx;
 }
 
+// Stable, non-zero identity used only on representative-cache misses/fills.
+// Instance ids are runtime-bounded to 8 bits; adding one reserves zero for an
+// invalid/unclaimed key. Four 0xff ids produce 0x100000000, which fits in i64.
+static uint64_t icacheRepresentativeIdentity(const EJitDimPair *dims,
+                                             uint32_t numDims) {
+  if (numDims > EJIT_ICACHE_MAX_DIMS || (numDims != 0 && !dims))
+    return 0;
+  uint64_t key = 0;
+  for (uint32_t i = 0; i < numDims; ++i) {
+    if (dims[i].instanceId >= 256u)
+      return 0;
+    key = (key << 8) | dims[i].instanceId;
+  }
+  return key + 1;
+}
+
 } // namespace
 
 EJitIcacheRegResult llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex,
@@ -235,7 +258,7 @@ EJitIcacheRegResult llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex,
   // numDims sizes the array the drain walks, so an out-of-cap value writes far
   // past the wrapper's global. The AOT pass never emits one, but numDims also
   // arrives from a uint64 registry field and the public C ABI -- don't trust it.
-  if (numDims > EJIT_ICACHE_MAX_DIMS)
+  if (numDims > EJIT_ICACHE_REPRESENTATIVE_DIMS)
     return EJitIcacheRegResult::Invalid;
   // Checked LAST so malformed data is still reported as malformed. Running out
   // of slots while the function registry holds 4096 is expected and degrades.
@@ -244,6 +267,19 @@ EJitIcacheRegResult llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex,
   gIcacheSlots[funcIndex].base = reinterpret_cast<uintptr_t *>(base);
   gIcacheSlots[funcIndex].numDims = numDims;
   return EJitIcacheRegResult::Ok;
+}
+
+bool llvm::ejit::ejitIcacheClaim(uint32_t funcIndex, uint64_t identityKey) {
+  if (identityKey == 0 || funcIndex >= EJIT_ICACHE_FUNC_SLOTS)
+    return false;
+  EJitIcacheSlotReg &reg = gIcacheSlots[funcIndex];
+  if (!reg.base || reg.numDims != EJIT_ICACHE_REPRESENTATIVE_DIMS)
+    return false;
+  EJitAtomicU64 &key = icacheRepresentativeKey(reg.base);
+  uint64_t expected = 0;
+  if (key.compareExchange(expected, identityKey))
+    return true;
+  return expected == identityKey;
 }
 
 void llvm::ejit::ejitIcacheClearAll() {
@@ -341,7 +377,7 @@ void EJitSharedTaskPool::icacheDrainAll(const char *reason) {
     const EJitIcacheSlotReg &reg = gIcacheSlots[f];
     if (!reg.base)
       continue;
-    if (reg.numDims > EJIT_ICACHE_MAX_DIMS)
+    if (reg.numDims > EJIT_ICACHE_REPRESENTATIVE_DIMS)
       continue; // defence in depth: never walk past a mis-sized array
     const uintptr_t cells = icacheCellCount(reg.numDims);
 #ifdef EJIT_DIAG_ENABLE
@@ -485,9 +521,12 @@ bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
   if (!state_ || funcIndex >= EJIT_ICACHE_FUNC_SLOTS)
     return false;
   EJitIcacheSlotReg &reg = gIcacheSlots[funcIndex];
-  // Unregistered function, or shape mismatch (caller's numDims != registered):
-  // miss.
-  if (!reg.base || numDims != reg.numDims)
+  const bool representative =
+      reg.numDims == EJIT_ICACHE_REPRESENTATIVE_DIMS;
+  // A representative object accepts every legal caller shape; legacy tables
+  // retain exact shape matching.
+  if (!reg.base || (representative ? numDims > EJIT_ICACHE_MAX_DIMS
+                                   : numDims != reg.numDims))
     return false;
   // The cache is only meaningful once the pool is Ready.
   if (state_->initState.loadAcquire() != kReady)
@@ -504,13 +543,13 @@ bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
 #endif
   if (!mayReadPtr)
     return false;
-  if (!icacheDimsInRange(dims, numDims))
+  if (!representative && !icacheDimsInRange(dims, numDims))
     return false;
   // Read this identity's cell. Relaxed is enough, and is what the AOT probe
   // emits: the cell holds a self-contained pointer, the caller's indirect call
   // depends on the value loaded (data dependency), and the only cross-core
   // write is a drain storing 0 -- which yields a miss, never a bad pointer.
-  uintptr_t idx = icacheLinearize(dims, numDims);
+  uintptr_t idx = representative ? 0 : icacheLinearize(dims, numDims);
   uintptr_t p = icacheCell(reg.base, idx).loadRelaxed();
   if (p == 0)
     return false;
@@ -640,7 +679,10 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
     return;
   }
   EJitIcacheSlotReg &reg = gIcacheSlots[funcIndex];
-  if (!reg.base || numDims != reg.numDims) {
+  const bool representative =
+      reg.numDims == EJIT_ICACHE_REPRESENTATIVE_DIMS;
+  if (!reg.base || (representative ? numDims > EJIT_ICACHE_MAX_DIMS
+                                   : numDims != reg.numDims)) {
     // Unregistered, or shape mismatch: nowhere to write. A null base means this
     // core never ran ejit_register_icache_slot for this function -- the AOT
     // .ejit_period entry is missing, or the name did not resolve to funcIndex.
@@ -666,18 +708,19 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   // per-core preparation -- serves every call. The AOT side still emits the
   // probe for 0D entries; it is the fill, not the code, that is platform
   // dependent.
-  if (numDims == 0 && !icacheCrossCoreExecutable()) {
+  if ((numDims == 0 || representative) && !icacheCrossCoreExecutable()) {
     if (!gIcacheFillRejectLogged[kFillRejectScalarShared]) {
       gIcacheFillRejectLogged[kFillRejectScalarShared] = true;
-      EJIT_DIAG("icacheFill DECLINE func=%u: 0-dim entry shares one cell across "
-                "cores and this platform prepares execute permission per core, "
+      EJIT_DIAG("icacheFill DECLINE func=%u: scalar/representative entry "
+                "shares one cell across cores and this platform prepares "
+                "execute permission per core, "
                 "so a peer could branch to code it has not sealed",
                 funcIndex);
     }
     return;
   }
   // No cell for this identity. The taskpool serves it; never index anyway.
-  if (!icacheDimsInRange(dims, numDims)) {
+  if (!representative && !icacheDimsInRange(dims, numDims)) {
     if (!gIcacheFillRejectLogged[kFillRejectDimRange]) {
       gIcacheFillRejectLogged[kFillRejectDimRange] = true;
       EJIT_DIAG("icacheFill DECLINE func=%u: an instance id is >= the table's "
@@ -685,6 +728,18 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
                 funcIndex, EJIT_ICACHE_DIM_SIZE);
     }
     return;
+  }
+  if (representative) {
+    const uint64_t key = icacheRepresentativeIdentity(dims, numDims);
+    if (!ejitIcacheClaim(funcIndex, key)) {
+      if (!gIcacheFillRejectLogged[kFillRejectDimRange]) {
+        gIcacheFillRejectLogged[kFillRejectDimRange] = true;
+        EJIT_DIAG("icacheFill DECLINE func=%u: identity does not own the "
+                  "representative specialization",
+                  funcIndex);
+      }
+      return;
+    }
   }
   // Drop the fill if any drain overlapped this resolve: fnPtr may be specialized
   // for the period values the toggle just replaced, and restoring a cell the
@@ -717,9 +772,16 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   // non-null is guaranteed to see the flag set and therefore walk. Setting it
   // after the store would let a drain read 0, skip, and leave the cell behind.
   state_->icacheArmed.storeRelease(1);
-  const uintptr_t idx = icacheLinearize(dims, numDims);
+  const uintptr_t idx = representative ? 0 : icacheLinearize(dims, numDims);
   EJitAtomicUPtr &cell = icacheCell(reg.base, idx);
-  cell.storeRelaxed(reinterpret_cast<uintptr_t>(fnPtr));
+  const uintptr_t desired = reinterpret_cast<uintptr_t>(fnPtr);
+  if (representative) {
+    uintptr_t expected = 0;
+    if (!cell.compareExchange(expected, desired))
+      return; // Sticky first fill: never replace the representative version.
+  } else {
+    cell.storeRelaxed(desired);
+  }
 
   // Re-validate AFTER the store and retract on conflict. The checks above only
   // PRECEDE the store: a drain can begin after they pass, zero this cell, and
@@ -730,7 +792,12 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   // fill (disjointness), and a null cell is always safe.
   if (state_->icacheDrainsInFlight.loadAcquire() != 0 ||
       static_cast<uint32_t>(token) != state_->icacheDrainSeq.loadAcquire()) {
-    cell.storeRelaxed(0);
+    if (representative) {
+      uintptr_t expected = desired;
+      (void)cell.compareExchange(expected, 0);
+    } else {
+      cell.storeRelaxed(0);
+    }
     if (!gIcacheFillRejectLogged[kFillRejectRetracted]) {
       gIcacheFillRejectLogged[kFillRejectRetracted] = true;
       EJIT_DIAG("icacheFill RETRACT func=%u: a drain began after the fill was "

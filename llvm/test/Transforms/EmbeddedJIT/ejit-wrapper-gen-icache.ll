@@ -1,6 +1,6 @@
 ; -ejit-inline-cache (ON): emits an inline probe DIRECTLY in the ejit_entry
-; wrapper - the first dimension identity claims one cell in the per-function
-; @__ejit_icache_fn_<name> [D]^numDims table. Before that cell is filled, other
+; wrapper - the first dimension identity claims the per-function
+; @__ejit_icache_fn_<name> representative object. Before its pointer is filled, other
 ; identities reach AOT without compile_or_get. Once filled, every identity loads
 ; and calls the representative specialization from that same cell. The hit path
 ; (jit_icache_dispatch) calls the cached specialization directly with NO
@@ -29,53 +29,46 @@
 ;     other core probes. Nothing else about the wrapper changes. ---
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section=.mc_shared -S %s | FileCheck %s --check-prefix=SECTION
 
-; --- icache globals: [D]^numDims, D=8 (EJIT_ICACHE_DIM_SIZE). 0D is scalar. ---
-; ICACHE-DAG: @__ejit_icache_fn_zero_dim_entry = internal global ptr null, align 8
-; ICACHE-DAG: @__ejit_icache_fn_one_dim_entry = internal global [16 x ptr] zeroinitializer, align 8
-; ICACHE-DAG: @__ejit_icache_fn_two_dim_entry = internal global [16 x [16 x ptr]] zeroinitializer, align 8
-; ICACHE-DAG: @__ejit_icache_version_zero_dim_entry = internal global i32 0, align 4
-; ICACHE-DAG: @__ejit_icache_version_one_dim_entry = internal global i32 0, align 4
-; ICACHE-DAG: @__ejit_icache_version_two_dim_entry = internal global i32 0, align 4
+; --- icache globals: fixed {fnPtr, miss-only identity key} objects. ---
+; ICACHE-DAG: @__ejit_icache_fn_zero_dim_entry = internal global { ptr, i64 } zeroinitializer, align 8
+; ICACHE-DAG: @__ejit_icache_fn_one_dim_entry = internal global { ptr, i64 } zeroinitializer, align 8
+; ICACHE-DAG: @__ejit_icache_fn_two_dim_entry = internal global { ptr, i64 } zeroinitializer, align 8
+; ICACHE-NOT: __ejit_icache_version_
 
 ; --- 0D entry: scalar slot, direct plain load (NO GEP).  Without extra flags
 ;     the dispatcher stays in default .text (no section attribute). ---
 ; ICACHE-LABEL: define i32 @zero_dim_entry(
 ; ICACHE-NOT: section
 ; ICACHE-NOT: ejit_icache_try
-; ICACHE-NOT: getelementptr
-; ICACHE: load atomic ptr, ptr @__ejit_icache_fn_zero_dim_entry monotonic, align 8
+; ICACHE: getelementptr inbounds { ptr, i64 }, ptr @__ejit_icache_fn_zero_dim_entry, i32 0, i32 0
+; ICACHE-NEXT: load atomic ptr, ptr %ejit_ic_slot monotonic, align 8
 ; ICACHE-LABEL: jit_icache_dispatch:
 ; ICACHE-NOT: call void @ejit_taskpool_release_read
 ; ICACHE: call {{.*}} %ejit_ic_fn
 ; ICACHE: ret
 
-; --- 1D entry: use the admitted version key, not the current dim argument, to
-;     select the representative slot. Every identity therefore reads one cell. ---
+; --- 1D entry: hit path ignores the current dim and reads the fixed slot. ---
 ; ICACHE-LABEL: define i32 @one_dim_entry(
 ; ICACHE-NOT: section
 ; ICACHE-NOT: ejit_icache_try
-; ICACHE: load atomic i32, ptr @__ejit_icache_version_one_dim_entry monotonic, align 4
-; ICACHE: icmp ne i32 %ejit_icache_stored_version, 0
-; ICACHE-LABEL: jit_icache_probe:
-; ICACHE: %ejit_icache_slot_index = sub i32 %ejit_icache_stored_version, 1
-; ICACHE: getelementptr inbounds ptr, ptr @__ejit_icache_fn_one_dim_entry, i32 %ejit_icache_slot_index
+; ICACHE-NOT: ejit_icache_stored_version
+; ICACHE: getelementptr inbounds { ptr, i64 }, ptr @__ejit_icache_fn_one_dim_entry, i32 0, i32 0
 ; ICACHE: load atomic ptr, ptr %ejit_ic_slot monotonic, align 8
 ; ICACHE-LABEL: jit_icache_dispatch:
 ; ICACHE-NOT: call void @ejit_taskpool_release_read
 ; ICACHE: call {{.*}} %ejit_ic_fn
 ; ICACHE: ret
 
-; --- 2D entry: the row-major admitted key is likewise a single flattened GEP. ---
+; --- 2D entry: same fixed-slot load; no dimension-dependent GEP. ---
 ; ICACHE-LABEL: define i32 @two_dim_entry(
 ; ICACHE-NOT: section
-; ICACHE: getelementptr inbounds ptr, ptr @__ejit_icache_fn_two_dim_entry, i32 %ejit_icache_slot_index
+; ICACHE: getelementptr inbounds { ptr, i64 }, ptr @__ejit_icache_fn_two_dim_entry, i32 0, i32 0
 
-; --- Slow path atomically admits the first version. A different version
-;     branches to miss_fallback before compile_or_get. ---
+; --- Slow path asks the runtime to admit the first identity. A different
+;     identity branches to miss_fallback before compile_or_get. ---
 ; ICACHE-LABEL: define internal i32 @one_dim_entry_miss(
-; ICACHE: cmpxchg ptr @__ejit_icache_version_one_dim_entry, i32 0, i32 %ejit_icache_version monotonic monotonic, align 4
-; ICACHE: br i1 %ejit_icache_version_ok, label %miss_version_ok, label %miss_fallback
-; ICACHE-LABEL: miss_version_ok:
+; ICACHE: call i32 @ejit_icache_claim(i32 %ejit_funcidx, i64 %ejit_icache_claim_key)
+; ICACHE: br i1 {{.*}}, label %miss_call, label %miss_fallback
 ; ICACHE: call i32 @ejit_taskpool_compile_or_get_1d
 
 ; --- OPT (dispatcher-cluster + missfn-cold ON): section and cold present ---
@@ -93,22 +86,19 @@
 ; OPT-SAME: #[[MISS_ATTRS]]
 ; OPT-DAG: attributes #[[MISS_ATTRS]] = { cold noinline }
 
-; --- registration carries numDims (3rd arg): 0 / 1 / 2 (DAG: order-independent). ---
-; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_zero_dim_entry, i32 0)
-; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_one_dim_entry, i32 1)
-; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_two_dim_entry, i32 2)
+; --- registration uses representative-mode discriminator 5. ---
+; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_zero_dim_entry, i32 5)
+; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_one_dim_entry, i32 5)
+; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_two_dim_entry, i32 5)
 
 ; --- -ejit-icache-section (default .mc_shared, pinned here so the test does not
 ;     depend on the CMake value): every cell table lands in the inter-core
 ;     shared section and the probe is unchanged (one monotonic load + null
 ;     check, no freshness compare). The other RUN lines pin it EMPTY to check
 ;     the plain-.bss shape. ---
-; SECTION-DAG: @__ejit_icache_fn_zero_dim_entry = internal global ptr null, section ".mc_shared", align 8
-; SECTION-DAG: @__ejit_icache_fn_one_dim_entry = internal global [16 x ptr] zeroinitializer, section ".mc_shared", align 8
-; SECTION-DAG: @__ejit_icache_fn_two_dim_entry = internal global [16 x [16 x ptr]] zeroinitializer, section ".mc_shared", align 8
-; SECTION-DAG: @__ejit_icache_version_zero_dim_entry = internal global i32 0, section ".mc_shared", align 4
-; SECTION-DAG: @__ejit_icache_version_one_dim_entry = internal global i32 0, section ".mc_shared", align 4
-; SECTION-DAG: @__ejit_icache_version_two_dim_entry = internal global i32 0, section ".mc_shared", align 4
+; SECTION-DAG: @__ejit_icache_fn_zero_dim_entry = internal global { ptr, i64 } zeroinitializer, section ".mc_shared", align 8
+; SECTION-DAG: @__ejit_icache_fn_one_dim_entry = internal global { ptr, i64 } zeroinitializer, section ".mc_shared", align 8
+; SECTION-DAG: @__ejit_icache_fn_two_dim_entry = internal global { ptr, i64 } zeroinitializer, section ".mc_shared", align 8
 ; SECTION-LABEL: define i32 @one_dim_entry(
 ; SECTION: load atomic ptr, ptr {{.*}} monotonic, align 8
 ; SECTION-LABEL: jit_icache_dispatch:
@@ -123,7 +113,7 @@
 
 ; --- Idempotent: two passes emit each probe exactly once. ---
 ; IDEM-LABEL: define i32 @one_dim_entry(
-; IDEM-COUNT-1: getelementptr {{.*}} @__ejit_icache_fn_one_dim_entry, i32 %ejit_icache_slot_index
+; IDEM-COUNT-1: load atomic ptr, ptr %ejit_ic_slot monotonic, align 8
 
 ; --- timing hit path: plain call (NOT musttail) + trace + ret. The miss path
 ;     stays musttail (no trailing calls), so we only forbid musttail within the
@@ -161,9 +151,5 @@ entry:
 !0 = distinct !{!{!"ejit_entry"}}
 !1 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
 !2 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}, !{!"ejit_period_arr_ind", !"trp", i32 1}}
-; Both arrays must declare no more entries than EJIT_ICACHE_DIM_SIZE (16), or
-; dimsProvablyInRange() declines the probe for any entry indexed by them and the
-; ICACHE checks below have nothing to match. `trp` used to say 32, which
-; silently turned two_dim_entry into a no-probe entry.
 !10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}}
 !11 = distinct !{!{!"ejit_period_arr", !"trp", i32 16}}

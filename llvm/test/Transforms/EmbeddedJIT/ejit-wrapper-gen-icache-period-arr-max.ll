@@ -1,51 +1,28 @@
-; A period may own SEVERAL ejit_period_arr globals, activated as a group, so its
-; valid instance ids run up to the LARGEST of them. collectPeriodArraySizes()
-; must therefore aggregate a maximum, not keep whichever global the module
-; happens to list last.
-;
-; If it keeps the last one, the answer depends on declaration order: with sizes
-; 32 and 8 under one period, visiting 8 last records 8, dimsProvablyInRange()
-; approves the entry, and the wrapper emits a probe whose GEP is bounded by
-; EJIT_ICACHE_DIM_SIZE (16) even though the lifecycle can legally produce
-; identity 31. That GEP is inbounds on a 16-cell table and lands outside it --
-; in the shared section, in whatever object comes next -- and the probe branches
-; through it before the slow path's range check is ever reachable.
-;
-; Both orders must therefore decline the probe. The entry is still wrapped; the
-; taskpool serves it, which is the documented degradation.
-;
-; The two orders catch different wrong implementations: BIG-first (this file)
-; catches last-wins, SMALL-first (the Inputs sibling) catches first-wins.
-;
-; --implicit-check-not spans the whole module, so the over-cap cell table must
-; not appear anywhere -- as a global, a GEP operand, or a registration argument.
+; Representative mode no longer indexes a [D]^numDims table on the hit path.
+; Period arrays larger than the former D=16 limit are therefore safe and still
+; receive the fixed {fnPtr, identityKey} object, independent of declaration
+; order. This keeps the old regression input to prove that the size-based
+; all-or-nothing degradation is gone.
 
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -S %s \
-; RUN:   | FileCheck %s --check-prefix=BIGFIRST \
-; RUN:       --implicit-check-not=__ejit_icache_fn_over_cap_entry
+; RUN:   | FileCheck %s --check-prefix=BIGFIRST
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -S \
 ; RUN:       %S/Inputs/ejit-icache-period-arr-max-smallfirst.ll \
-; RUN:   | FileCheck %s --check-prefix=SMALLFIRST \
-; RUN:       --implicit-check-not=__ejit_icache_fn_over_cap_entry
+; RUN:   | FileCheck %s --check-prefix=SMALLFIRST
 
-; --- Declared 32 then 8: the order that made a last-wins implementation record
-; --- 8 and emit the probe. An entry under a period whose arrays ALL fit still
-; --- gets its table, so the max aggregation does not just disable everything. ---
-; BIGFIRST: @__ejit_icache_fn_in_cap_entry = internal global [16 x ptr] zeroinitializer
+; BIGFIRST-DAG: @__ejit_icache_fn_over_cap_entry = internal global { ptr, i64 } zeroinitializer
+; BIGFIRST-DAG: @__ejit_icache_fn_in_cap_entry = internal global { ptr, i64 } zeroinitializer
 
-; --- over_cap_entry: no probe, straight to the taskpool. ---
 ; BIGFIRST-LABEL: define i32 @over_cap_entry(
-; BIGFIRST-NOT: jit_icache_dispatch
-; BIGFIRST: call {{.*}}@ejit_taskpool_compile_or_get
+; BIGFIRST: load atomic ptr, ptr %ejit_ic_slot monotonic, align 8
+; BIGFIRST-LABEL: jit_icache_dispatch:
 
-; --- in_cap_entry: probe present, indexing its own 16-cell table. ---
 ; BIGFIRST-LABEL: define i32 @in_cap_entry(
-; BIGFIRST: getelementptr {{.*}} ptr @__ejit_icache_fn_in_cap_entry, i32 0, i32 {{.*}}
+; BIGFIRST: load atomic ptr, ptr %ejit_ic_slot monotonic, align 8
 
 ; --- Declared 8 then 32: identical outcome. ---
 ; SMALLFIRST-LABEL: define i32 @over_cap_entry(
-; SMALLFIRST-NOT: jit_icache_dispatch
-; SMALLFIRST: call {{.*}}@ejit_taskpool_compile_or_get
+; SMALLFIRST: load atomic ptr, ptr %ejit_ic_slot monotonic, align 8
 
 define i32 @over_cap_entry(i32 %idx) !ejit.metadata !1 {
 entry:

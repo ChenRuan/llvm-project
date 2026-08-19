@@ -504,11 +504,15 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
   case EJitIcacheRegResult::Invalid:
     EJitRegistrationStore::instance().recordError(
         EJIT_ERR_INVALID_PARAM,
-        "icache slot invalid: null base or numDims above the cap", funcName);
-    EJIT_DIAG("register_icache_slot FAIL name=%s: numDims=%u above the cap %u",
-              funcName, numDims, EJIT_ICACHE_MAX_DIMS);
+        "icache slot invalid: null base or unknown registration mode", funcName);
+    EJIT_DIAG("register_icache_slot FAIL name=%s: invalid mode/dims=%u",
+              funcName, numDims);
     break;
   }
+}
+
+uint32_t ejit_icache_claim(uint32_t funcIndex, uint64_t identityKey) {
+  return ejitIcacheClaim(funcIndex, identityKey) ? 1u : 0u;
 }
 
 ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx) {

@@ -3042,7 +3042,8 @@ TEST_F(SharedTaskPoolTest, InlineCacheRegistrationRejectsAnOverCapShape) {
   EJitSharedTaskPool pool;
   bringUpOwner(pool);
   uintptr_t cells[EJIT_ICACHE_DIM_SIZE] = {};
-  EXPECT_EQ(ejitIcacheRegisterSlot(3, &cells[0], EJIT_ICACHE_MAX_DIMS + 1),
+  EXPECT_EQ(ejitIcacheRegisterSlot(3, &cells[0],
+                                   EJIT_ICACHE_REPRESENTATIVE_DIMS + 1),
             EJitIcacheRegResult::Invalid);
   EXPECT_EQ(ejitIcacheRegisterSlot(3, nullptr, 1),
             EJitIcacheRegResult::Invalid);
@@ -3058,6 +3059,83 @@ TEST_F(SharedTaskPoolTest, InlineCacheRegistrationRejectsAnOverCapShape) {
 
   // A shape at the cap is accepted.
   EXPECT_EQ(ejitIcacheRegisterSlot(3, &cells[0], 1), EJitIcacheRegResult::Ok);
+}
+
+struct alignas(8) RepresentativeIcacheSlot {
+  uintptr_t fn = 0;
+  uint64_t identityKey = 0;
+};
+
+TEST_F(SharedTaskPoolTest, InlineCacheRepresentativeServesEveryIdentity) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  RepresentativeIcacheSlot slot;
+  registerSlot(kFunc, &slot, EJIT_ICACHE_REPRESENTATIVE_DIMS);
+  EJitDimPair cell1[1] = {{0, 1}};
+  EJitDimPair cell2[1] = {{0, 2}};
+  void *fn1 = codeFor(kFunc);
+  void *fn2 = codeFor(kFunc + 1);
+
+  EXPECT_TRUE(ejitIcacheClaim(kFunc, 2));
+  EXPECT_TRUE(ejitIcacheClaim(kFunc, 2));
+  EXPECT_FALSE(ejitIcacheClaim(kFunc, 3));
+
+  pool.icacheFill(kFunc, fn1, cell1, 1, pool.icacheBeginResolve());
+  ASSERT_EQ(slot.fn, reinterpret_cast<uintptr_t>(fn1));
+
+  // The production wrapper performs exactly this fixed scalar read. Its
+  // arguments no longer participate in the hit path, so cell2 gets cell1's
+  // representative specialization.
+  void *out = nullptr;
+  EXPECT_TRUE(pool.icacheTry(kFunc, cell2, 1, &out));
+  EXPECT_EQ(out, fn1);
+
+  // A slow-path attempt by cell2 cannot replace the representative pointer.
+  pool.icacheFill(kFunc, fn2, cell2, 1, pool.icacheBeginResolve());
+  EXPECT_EQ(slot.fn, reinterpret_cast<uintptr_t>(fn1));
+}
+
+TEST_F(SharedTaskPoolTest, InlineCacheRepresentativeDrainPreservesOwner) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  RepresentativeIcacheSlot slot;
+  registerSlot(kFunc, &slot, EJIT_ICACHE_REPRESENTATIVE_DIMS);
+  EJitDimPair cell1[1] = {{0, 1}};
+  EJitDimPair cell2[1] = {{0, 2}};
+  void *fn = codeFor(kFunc);
+
+  ASSERT_TRUE(ejitIcacheClaim(kFunc, 2));
+  pool.icacheFill(kFunc, fn, cell1, 1, pool.icacheBeginResolve());
+  ASSERT_NE(slot.fn, 0u);
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
+  EXPECT_EQ(slot.fn, 0u);
+  EXPECT_EQ(slot.identityKey, 2u);
+
+  // A different identity keeps using AOT while the representative is empty;
+  // only the original owner may rebuild it for the new lifecycle values.
+  EXPECT_FALSE(ejitIcacheClaim(kFunc, 3));
+  pool.icacheFill(kFunc, codeFor(kFunc + 1), cell2, 1,
+                  pool.icacheBeginResolve());
+  EXPECT_EQ(slot.fn, 0u);
+  pool.icacheFill(kFunc, fn, cell1, 1, pool.icacheBeginResolve());
+  EXPECT_EQ(slot.fn, reinterpret_cast<uintptr_t>(fn));
+}
+
+TEST_F(SharedTaskPoolTest, InlineCacheRepresentativeRejectsInvalidIdentity) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  RepresentativeIcacheSlot slot;
+  registerSlot(kFunc, &slot, EJIT_ICACHE_REPRESENTATIVE_DIMS);
+  EJitDimPair invalid[1] = {{0, 256}};
+
+  EXPECT_FALSE(ejitIcacheClaim(kFunc, 0));
+  pool.icacheFill(kFunc, codeFor(kFunc), invalid, 1,
+                  pool.icacheBeginResolve());
+  EXPECT_EQ(slot.fn, 0u);
+  EXPECT_EQ(slot.identityKey, 0u);
 }
 
 // Cross-core executability gate. A shared cell publishes the pointer to every

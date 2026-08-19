@@ -187,6 +187,9 @@ enum class EJitWorkerStep : uint32_t {
 #ifndef EJIT_ICACHE_MAX_DIMS
 #define EJIT_ICACHE_MAX_DIMS 4u
 #endif
+#ifndef EJIT_ICACHE_REPRESENTATIVE_DIMS
+#define EJIT_ICACHE_REPRESENTATIVE_DIMS (EJIT_ICACHE_MAX_DIMS + 1u)
+#endif
 
 /// Resolve token (see EJitSharedTaskPool::icacheBeginResolve): bit 32 marks a
 /// usable token, the low 32 bits carry the drain sequence it was taken at. A
@@ -226,6 +229,11 @@ enum class EJitIcacheRegResult { Ok, CapacityMiss, Invalid };
 
 EJitIcacheRegResult ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
                                            uint32_t numDims);
+
+/// Atomically admit the first identity for a representative inline-cache
+/// slot. Repeated claims by that identity succeed; every other identity is
+/// rejected. identityKey 0 is reserved for invalid input.
+bool ejitIcacheClaim(uint32_t funcIndex, uint64_t identityKey);
 
 /// Diagnostic: dump every registered icache slot to the diagnostic log.
 /// Shows funcIndex, base pointer, numDims, the per-slot cell capacity

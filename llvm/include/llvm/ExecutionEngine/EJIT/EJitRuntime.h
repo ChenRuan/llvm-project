@@ -176,6 +176,10 @@ void ejit_register_funcindex(const char *funcName, uint32_t *slotOut);
 void ejit_register_icache_slot(const char *funcName, void *slot,
                                uint32_t numDims);
 
+// Miss-only representative-version admission. The wrapper's hit path never
+// calls this function; it directly loads the cached function pointer.
+uint32_t ejit_icache_claim(uint32_t funcIndex, uint64_t identityKey);
+
 // Lifecycle. Activation is keyed by lifecycle/period name + instance index
 // only; there is no array-pointer dimension in the active state (a period name
 // with multiple arrays is activated as a whole for that instance).

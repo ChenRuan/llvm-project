@@ -45,7 +45,9 @@
 #ifndef EJIT_ICACHE_MAX_DIMS
 #define EJIT_ICACHE_MAX_DIMS 4u
 #endif
-
+#ifndef EJIT_ICACHE_REPRESENTATIVE_DIMS
+#define EJIT_ICACHE_REPRESENTATIVE_DIMS (EJIT_ICACHE_MAX_DIMS + 1u)
+#endif
 namespace llvm {
 namespace ejit {
 
@@ -96,6 +98,9 @@ constexpr const char *FN_REGISTER_FUNCINDEX = "ejit_register_funcindex";
 // ejit_icache_try call - so the hit path is one load + null-check + indirect
 // call. Signature: void ejit_register_icache_slot(const char *name, void *slot).
 constexpr const char *FN_REGISTER_ICACHE_SLOT = "ejit_register_icache_slot";
+// Miss-only admission for the representative inline-cache mode. Returns 1
+// when this identity owns the function's single specialization, 0 otherwise.
+constexpr const char *FN_ICACHE_CLAIM = "ejit_icache_claim";
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET =
     "ejit_taskpool_compile_or_get";
 // Fixed-dimension fast-path C ABI entries (0-4 dims), emitted by the wrapper

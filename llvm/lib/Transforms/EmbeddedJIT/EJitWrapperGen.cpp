@@ -271,139 +271,28 @@ static GlobalVariable *getOrCreateFuncIndexGlobal(Module &M,
       ConstantInt::get(I32Ty, kEJitInvalidFuncIndex), GVName);
 }
 
-// A per-function inline-cache global plus its dimensionality (number of
-// ejit_dim params). The runtime needs NumDims to linearize the [D]^NumDims
-// array on fill, and the hit-path emitter needs it to build the GEP.
+// A per-function representative inline-cache object.
 struct IcacheSlotInfo {
   GlobalVariable *GV = nullptr;
-  GlobalVariable *VersionGV = nullptr;
-  unsigned NumDims = 0;
 };
 
-// A period whose bound this module cannot prove. Larger than any legal
-// EJIT_ICACHE_DIM_SIZE, so dimsProvablyInRange() declines on it without needing
-// a second lookup structure.
-static constexpr uint32_t kUnprovablePeriodArraySize = ~0u;
-
-// Map periodName -> the largest declared ejit_period_arr element count, from
-// this module's globals. Used to decide whether an entry's dim arguments can be
-// trusted to index the cell table.
-//
-// The MAXIMUM matters, and taking the last one visited is a bug: the runtime
-// permits SEVERAL arrays under one period and activates them as a group, so a
-// lifecycle's valid identities run up to the largest sibling. Recording an 8
-// because it happened to be declared after a 32 would let dimsProvablyInRange()
-// approve a 16-cell probe for a period that legally produces identity 31, and
-// the wrapper would form an inbounds GEP past its own table -- into whatever
-// shares the section -- before the slow-path range check is ever reachable.
-// Aggregating the max makes the answer independent of module order.
-static std::map<std::string, uint32_t> collectPeriodArraySizes(const Module &M) {
-  std::map<std::string, uint32_t> Sizes;
-  for (const GlobalVariable &GV : M.globals()) {
-    const MDNode *MD = GV.getMetadata(MD_EJIT_METADATA);
-    if (!MD || !hasMDStringEntry(MD, TAG_EJIT_PERIOD_ARR))
-      continue;
-    StringRef PeriodName = getMDStringValue(MD, TAG_EJIT_PERIOD_ARR);
-    if (PeriodName.empty())
-      continue;
-    // A count of 0 is "this global does not state one". That is an unknown
-    // bound, not a small one, so it must survive being maxed against a sibling
-    // that does state one -- otherwise the order of the two decides the answer
-    // again, which is the bug being fixed.
-    const uint32_t Declared = getMDIntValue(MD, TAG_EJIT_PERIOD_ARR);
-    const uint32_t Effective = Declared ? Declared : kUnprovablePeriodArraySize;
-    auto It = Sizes.find(PeriodName.str());
-    if (It == Sizes.end())
-      Sizes.emplace(PeriodName.str(), Effective);
-    else
-      It->second = std::max(It->second, Effective);
-  }
-  return Sizes;
-}
-
-// Whether every ejit_dim argument of \p F provably lands inside the
-// [D]^numDims cell table.
-//
-// The accepted ranges do not agree: the taskpool takes instance ids up to
-// MAX_INSTANCES (256) and a period array may declare MAX_PERIOD_ARR_SIZE (100)
-// entries, against a D of 16. The probe indexes with the raw argument and has
-// no room to check, so an id of 16 would read past the wrapper's global into
-// its neighbour in the shared section and branch there.
-//
-// Rather than spend hit-path instructions, the probe is not emitted unless the
-// bound is provable: the function is still wrapped and the taskpool serves it,
-// the same degradation as running out of slots. An array declared in another
-// TU is not provable here and so also declines.
-static bool dimsProvablyInRange(const Function &F,
-                                const std::map<std::string, uint32_t> &Sizes) {
-  for (const PeriodArrIndInfo &Info : getPeriodArrIndInfo(F)) {
-    auto It = Sizes.find(Info.PeriodName);
-    if (It == Sizes.end())
-      return false; // size not visible in this module
-    // A count of 0 never reaches here: collectPeriodArraySizes() maps
-    // "not stated" to kUnprovablePeriodArraySize, which fails this same test.
-    if (It->second > EJIT_ICACHE_DIM_SIZE)
-      return false;
-  }
-  return true;
-}
-
-// Per-function pointer-typed global holding the inline-cache cell table: the
-// specialization pointer for each dim identity once resolved, null until then
-// and null again after a period toggle drains it. Internal linkage (each
-// module's copy is wired into the runtime slot-pointer table by name at
-// registration). 8-byte aligned so each cell is one naturally-aligned,
-// tear-free access: a drain on another core zeroing a cell under a reading
-// probe yields the old pointer or 0, never a torn value.
-//
-// Placed in EJitIcacheSection when set - SHARED across cores, partitioned by
-// dim identity so writers never collide.
-//
-// The pointer table keeps its [D]^NumDims runtime ABI, but the wrapper admits
-// only one identity and therefore only one cell can ever become non-null. Every
-// identity reads that representative cell once it has been filled.
-// NumDims=0 is a scalar ptr (one cell).
+// One shared representative cache object per function. Field 0 is deliberately
+// first and pointer-aligned: the hot wrapper reads it directly, matching the v2
+// one-load probe. Field 1 is the miss-only identity claim key used by the
+// runtime. Drains clear only field 0, preserving the admitted identity.
 static GlobalVariable *getOrCreateIcacheFnGlobal(Module &M,
-                                                 StringRef FuncName,
-                                                 unsigned NumDims) {
+                                                 StringRef FuncName) {
   std::string GVName = ("__ejit_icache_fn_" + FuncName).str();
   if (auto *Existing = M.getGlobalVariable(GVName))
     return Existing;
   LLVMContext &Ctx = M.getContext();
   auto *PtrTy = PointerType::getUnqual(Ctx);
-  // Build [D]^NumDims (row-major); scalar ptr for NumDims==0.
-  Type *SlotTy = PtrTy;
-  const uint64_t D = EJIT_ICACHE_DIM_SIZE;
-  for (unsigned I = 0; I < NumDims; ++I)
-    SlotTy = ArrayType::get(SlotTy, D);
-  Constant *Init = nullptr;
-  if (NumDims == 0)
-    Init = ConstantPointerNull::get(PtrTy);
-  else
-    Init = ConstantAggregateZero::get(SlotTy);
-  auto *GV = new GlobalVariable(M, SlotTy, /*isConstant=*/false,
-                                GlobalValue::InternalLinkage, Init, GVName);
-  GV->setAlignment(Align(8));
-  if (!EJitIcacheSection.empty())
-    GV->setSection(EJitIcacheSection);
-  return GV;
-}
-
-// The inline cache deliberately admits one dimension identity per function.
-// Zero means unclaimed; the stored value is the row-major slot index plus one.
-// It lives beside the pointer table in shared memory so all cores agree on the
-// admitted identity. Lifecycle drains clear the pointer, but not this key, so
-// the same identity rebuilds the representative version after invalidation.
-static GlobalVariable *getOrCreateIcacheVersionGlobal(Module &M,
-                                                       StringRef FuncName) {
-  std::string GVName = ("__ejit_icache_version_" + FuncName).str();
-  if (auto *Existing = M.getGlobalVariable(GVName))
-    return Existing;
-  auto *I32Ty = Type::getInt32Ty(M.getContext());
+  auto *I64Ty = Type::getInt64Ty(Ctx);
+  StructType *SlotTy = StructType::get(Ctx, {PtrTy, I64Ty});
   auto *GV = new GlobalVariable(
-      M, I32Ty, /*isConstant=*/false, GlobalValue::InternalLinkage,
-      ConstantInt::get(I32Ty, 0), GVName);
-  GV->setAlignment(Align(4));
+      M, SlotTy, /*isConstant=*/false, GlobalValue::InternalLinkage,
+      ConstantAggregateZero::get(SlotTy), GVName);
+  GV->setAlignment(Align(8));
   if (!EJitIcacheSection.empty())
     GV->setSection(EJitIcacheSection);
   return GV;
@@ -524,8 +413,9 @@ emitIcacheSlotRegistration(Module &M,
   for (auto &KV : Fns) {
     IRBuilder<> Builder(Ret);
     Value *Name = Builder.CreateGlobalString(KV.first);
-    Builder.CreateCall(FnReg, {Name, Builder.CreateBitCast(KV.second.GV, PtrTy),
-                               ConstantInt::get(I32Ty, KV.second.NumDims)});
+    Builder.CreateCall(
+        FnReg, {Name, Builder.CreateBitCast(KV.second.GV, PtrTy),
+                ConstantInt::get(I32Ty, EJIT_ICACHE_REPRESENTATIVE_DIMS)});
   }
 
   if (EnableEJitGlobalCtors && CreatedAutoReg)
@@ -549,7 +439,8 @@ emitIcacheSlotRegistration(Module &M,
         EntryTy, {ConstantInt::get(I32Ty, EJIT_REG_ICACHE_SLOT),
                   makeStrGV(KV.first), ConstantPointerNull::get(PtrTy),
                   ConstantExpr::getBitCast(KV.second.GV, PtrTy),
-                  ConstantInt::get(I64Ty, KV.second.NumDims)}));
+                  ConstantInt::get(I64Ty,
+                                   EJIT_ICACHE_REPRESENTATIVE_DIMS)}));
   }
   if (Entries.empty())
     return;
@@ -676,20 +567,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   // callable on any core.
   std::map<std::string, IcacheSlotInfo> IcacheFnGlobals;
   if (EJitInlineCache) {
-    const std::map<std::string, uint32_t> PeriodArraySizes =
-        collectPeriodArraySizes(M);
     for (Function *F : EntryFuncs) {
       unsigned NumDims = getPeriodArrIndInfo(*F).size();
-      // Skip functions whose dim arguments could index outside the table. The
-      // probe cannot bounds-check without giving up its shape, so it is not
-      // emitted at all; the taskpool serves the function instead.
-      if (!dimsProvablyInRange(*F, PeriodArraySizes)) {
-        LLVM_DEBUG(dbgs() << "ejit-wrapper-gen: no inline cache for "
-                          << F->getName()
-                          << ": dim range not provably < " << EJIT_ICACHE_DIM_SIZE
-                          << "\n");
-        continue;
-      }
       // Skip functions exceeding the cache dimensionality cap from the icache
       // map. They are still wrapped (taskpool path) but without an icache probe;
       // the per-function DimCount > EJIT_ICACHE_MAX_DIMS check below emits the
@@ -697,9 +576,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       if (NumDims > EJIT_ICACHE_MAX_DIMS)
         continue;
       IcacheSlotInfo Info;
-      Info.GV = getOrCreateIcacheFnGlobal(M, F->getName(), NumDims);
-      Info.VersionGV = getOrCreateIcacheVersionGlobal(M, F->getName());
-      Info.NumDims = NumDims;
+      Info.GV = getOrCreateIcacheFnGlobal(M, F->getName());
       IcacheFnGlobals.emplace(F->getName().str(), Info);
     }
     emitIcacheSlotRegistration(M, IcacheFnGlobals);
@@ -792,27 +669,33 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     bool EmitIcacheProbe =
         EJitInlineCache && IcacheIt != IcacheFnGlobals.end();
 
+    auto *I64Ty = Type::getInt64Ty(Ctx);
     auto emitIcacheVersion = [&](IRBuilder<> &B, Function &Fn) -> Value * {
-      Value *Version = ConstantInt::get(I32Ty, 0);
+      Value *Version = ConstantInt::get(I64Ty, 0);
+      Value *Valid = ConstantInt::getTrue(Ctx);
       for (unsigned I = 0; I < DimCount; ++I) {
         Value *ArgVal = Fn.getArg(PeriodInds[I].ArgIndex);
         unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
         Value *Idx = ArgVal;
-        if (BW > 32)
-          Idx = B.CreateTrunc(ArgVal, I32Ty);
-        else if (BW < 32)
-          Idx = B.CreateZExt(ArgVal, I32Ty);
-        Version = B.CreateAdd(
-            B.CreateMul(Version, ConstantInt::get(I32Ty,
-                                                   EJIT_ICACHE_DIM_SIZE)),
-            Idx, "ejit_icache_linear");
+        if (BW > 64)
+          Idx = B.CreateTrunc(ArgVal, I64Ty);
+        else if (BW < 64)
+          Idx = B.CreateZExt(ArgVal, I64Ty);
+        Valid = B.CreateAnd(
+            Valid,
+            B.CreateICmpULT(Idx, ConstantInt::get(I64Ty, 256)),
+            "ejit_icache_identity_valid");
+        Version = B.CreateOr(
+            B.CreateShl(Version, ConstantInt::get(I64Ty, 8)), Idx,
+            "ejit_icache_identity");
       }
-      return B.CreateAdd(Version, ConstantInt::get(I32Ty, 1),
-                         "ejit_icache_version");
+      Version = B.CreateAdd(Version, ConstantInt::get(I64Ty, 1),
+                            "ejit_icache_version");
+      return B.CreateSelect(Valid, Version, ConstantInt::get(I64Ty, 0),
+                            "ejit_icache_claim_key");
     };
 
     auto *DimPairTy = StructType::get(I32Ty, I32Ty);
-    auto *I64Ty = Type::getInt64Ty(Ctx);
     bool UseFixed = EJitWrapperFixedDimEntry && DimCount <= 2;
 
     // Timing callees (shared by hit and slow paths).
@@ -847,28 +730,24 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       Value *OutFnArg = B.CreatePointerCast(OutFnAlloca, PtrTy);
       Value *OutBucketArg = B.CreatePointerCast(OutBucketAlloca, PtrTy);
 
-      if (EmitIcacheProbe) {
-        Value *Version = emitIcacheVersion(B, Fn);
-        AtomicCmpXchgInst *Claim = B.CreateAtomicCmpXchg(
-            IcacheIt->second.VersionGV, ConstantInt::get(I32Ty, 0), Version,
-            Align(4), AtomicOrdering::Monotonic, AtomicOrdering::Monotonic);
-        Claim->setWeak(false);
-        Value *OldVersion = B.CreateExtractValue(Claim, 0);
-        Value *Claimed = B.CreateExtractValue(Claim, 1);
-        Value *SameVersion = B.CreateICmpEQ(OldVersion, Version);
-        Value *VersionAccepted = B.CreateOr(Claimed, SameVersion,
-                                            "ejit_icache_version_ok");
-        BasicBlock *VersionOKBB = BasicBlock::Create(
-            Ctx, "miss_version_ok", &Fn, CallBB);
-        B.CreateCondBr(VersionAccepted, VersionOKBB, FallbackBB);
-        B.SetInsertPoint(VersionOKBB);
-      }
-
       Value *FuncIdx = B.CreateLoad(
           I32Ty, FuncIndexGlobals[F->getName().str()], "ejit_funcidx");
       Value *IdxValid = B.CreateICmpNE(
           FuncIdx, ConstantInt::get(I32Ty, kEJitInvalidFuncIndex), "ejit_idx_ok");
-      B.CreateCondBr(IdxValid, CallBB, FallbackBB);
+      if (EmitIcacheProbe) {
+        FunctionCallee ClaimFn = M.getOrInsertFunction(
+            FN_ICACHE_CLAIM,
+            FunctionType::get(I32Ty, {I32Ty, I64Ty}, false));
+        Value *Version = emitIcacheVersion(B, Fn);
+        Value *Claimed = B.CreateCall(ClaimFn, {FuncIdx, Version},
+                                      "ejit_icache_claimed");
+        Value *VersionAccepted = B.CreateICmpNE(
+            Claimed, ConstantInt::get(I32Ty, 0), "ejit_icache_version_ok");
+        B.CreateCondBr(B.CreateAnd(IdxValid, VersionAccepted), CallBB,
+                       FallbackBB);
+      } else {
+        B.CreateCondBr(IdxValid, CallBB, FallbackBB);
+      }
 
       B.SetInsertPoint(CallBB);
       auto emitDimTypeVal = [&](unsigned I) {
@@ -1029,7 +908,6 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
       // Wrapper (F): frame-less probe + tail calls.
       auto *JitEntry = BasicBlock::Create(Ctx, "jit_entry", F);
-      auto *JitIcacheProbe = BasicBlock::Create(Ctx, "jit_icache_probe", F);
       auto *JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
       auto *JitMiss = BasicBlock::Create(Ctx, "jit_miss", F);
       IRBuilder<> B(JitEntry);
@@ -1041,26 +919,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
                                         "ejit_funcidx_t");
       }
       GlobalVariable *IcacheSlot = IcacheIt->second.GV;
-      GlobalVariable *IcacheVersion = IcacheIt->second.VersionGV;
-      unsigned NumDims = IcacheIt->second.NumDims;
-      LoadInst *StoredVersion =
-          B.CreateLoad(I32Ty, IcacheVersion, "ejit_icache_stored_version");
-      StoredVersion->setAlignment(Align(4));
-      StoredVersion->setAtomic(AtomicOrdering::Monotonic);
-      Value *HasVersion = B.CreateICmpNE(
-          StoredVersion, ConstantInt::get(I32Ty, 0), "ejit_icache_has_version");
-      HasVersion = B.CreateIntrinsic(Intrinsic::expect, {HasVersion->getType()},
-                                     {HasVersion, ConstantInt::getTrue(Ctx)});
-      B.CreateCondBr(HasVersion, JitIcacheProbe, JitMiss);
-
-      B.SetInsertPoint(JitIcacheProbe);
-      Value *SlotPtr = IcacheSlot;
-      if (NumDims > 0) {
-        Value *SlotIndex = B.CreateSub(
-            StoredVersion, ConstantInt::get(I32Ty, 1), "ejit_icache_slot_index");
-        SlotPtr = B.CreateInBoundsGEP(PtrTy, IcacheSlot, SlotIndex,
-                                      "ejit_ic_slot");
-      }
+      Value *SlotPtr = B.CreateStructGEP(IcacheSlot->getValueType(), IcacheSlot,
+                                         0, "ejit_ic_slot");
       LoadInst *ICSlotLoad = B.CreateLoad(PtrTy, SlotPtr, "ejit_ic_fn");
       ICSlotLoad->setAlignment(Align(8));
       // Monotonic, nothing stronger: the cell is shared, so a peer's drain can
