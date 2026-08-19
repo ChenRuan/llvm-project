@@ -92,3 +92,17 @@ After compilation, check these LLVM IR features:
 - [SPEC4.md](../jit_design_doc/SPEC4.md) — requirements specification
 - [PLAN4.md](../jit_design_doc/PLAN4.md) — architecture and pass design
 - [CLANG_ATTR_DESIGN.md](../jit_design_doc/CLANG_ATTR_DESIGN.md) — Clang attribute implementation
+
+## SRE Multicore Dump Demo
+
+`ejit_dump_sre_multicore_test.c` is a board-only `test_ejit_period` demo for
+the worker-local dump APIs. Build it into the board test image with
+`EJIT_DUMP_ASM=ON`, reset the board, then run:
+
+1. Core 8: `test_ejit_period` starts the shared worker and enables dump-all.
+2. Core 18: `test_ejit_period` compiles three independent entry functions.
+3. Core 8: `test_ejit_period` prints all three function-only views and the
+   complete specialization module for `dump_demo_func_b`.
+
+In the `FUNCTION VIEW B` section, `dump_demo_helper` should only be referenced.
+In `COMPLETE MODULE VIEW B`, its definition/body should also be present.
