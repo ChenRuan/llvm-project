@@ -1,7 +1,8 @@
 ; -ejit-inline-cache (ON): emits an inline probe DIRECTLY in the ejit_entry
 ; wrapper - a GEP into the per-function @__ejit_icache_fn_<name> [D]^numDims
 ; cell table (D = EJIT_ICACHE_DIM_SIZE, power-of-2) by the ejit_dim argument
-; values, then ONE monotonic load + null-check; the hit path
+; values, then monotonic pointer/version loads. The first identity is admitted;
+; any different identity reaches the AOT body without compile_or_get. The hit path
 ; (jit_icache_dispatch) calls the cached specialization directly with NO
 ; ejit_icache_try call and NO ejit_taskpool_release_read. The load is atomic
 ; because the table is shared across cores (a peer's period toggle zeroes cells
@@ -32,6 +33,9 @@
 ; ICACHE-DAG: @__ejit_icache_fn_zero_dim_entry = internal global ptr null, align 8
 ; ICACHE-DAG: @__ejit_icache_fn_one_dim_entry = internal global [16 x ptr] zeroinitializer, align 8
 ; ICACHE-DAG: @__ejit_icache_fn_two_dim_entry = internal global [16 x [16 x ptr]] zeroinitializer, align 8
+; ICACHE-DAG: @__ejit_icache_version_zero_dim_entry = internal global i32 0, align 4
+; ICACHE-DAG: @__ejit_icache_version_one_dim_entry = internal global i32 0, align 4
+; ICACHE-DAG: @__ejit_icache_version_two_dim_entry = internal global i32 0, align 4
 
 ; --- 0D entry: scalar slot, direct plain load (NO GEP).  Without extra flags
 ;     the dispatcher stays in default .text (no section attribute). ---
@@ -51,6 +55,8 @@
 ; ICACHE-NOT: ejit_icache_try
 ; ICACHE: getelementptr {{.*}} ptr @__ejit_icache_fn_one_dim_entry, i32 0, i32 {{.*}}
 ; ICACHE: load atomic ptr, ptr {{.*}} monotonic, align 8
+; ICACHE: load atomic i32, ptr @__ejit_icache_version_one_dim_entry monotonic, align 4
+; ICACHE: icmp eq i32 %ejit_icache_stored_version, %ejit_icache_version
 ; ICACHE-LABEL: jit_icache_dispatch:
 ; ICACHE-NOT: call void @ejit_taskpool_release_read
 ; ICACHE: call {{.*}} %ejit_ic_fn
@@ -60,6 +66,14 @@
 ; ICACHE-LABEL: define i32 @two_dim_entry(
 ; ICACHE-NOT: section
 ; ICACHE: getelementptr {{.*}} ptr @__ejit_icache_fn_two_dim_entry, i32 0, i32 {{.*}}, i32 {{.*}}
+
+; --- Slow path atomically admits the first version. A different version
+;     branches to miss_fallback before compile_or_get. ---
+; ICACHE-LABEL: define internal i32 @one_dim_entry_miss(
+; ICACHE: cmpxchg ptr @__ejit_icache_version_one_dim_entry, i32 0, i32 %ejit_icache_version monotonic monotonic, align 4
+; ICACHE: br i1 %ejit_icache_version_ok, label %miss_version_ok, label %miss_fallback
+; ICACHE-LABEL: miss_version_ok:
+; ICACHE: call i32 @ejit_taskpool_compile_or_get_1d
 
 ; --- OPT (dispatcher-cluster + missfn-cold ON): section and cold present ---
 ; OPT-LABEL: define i32 @zero_dim_entry(
@@ -89,6 +103,9 @@
 ; SECTION-DAG: @__ejit_icache_fn_zero_dim_entry = internal global ptr null, section ".mc_shared", align 8
 ; SECTION-DAG: @__ejit_icache_fn_one_dim_entry = internal global [16 x ptr] zeroinitializer, section ".mc_shared", align 8
 ; SECTION-DAG: @__ejit_icache_fn_two_dim_entry = internal global [16 x [16 x ptr]] zeroinitializer, section ".mc_shared", align 8
+; SECTION-DAG: @__ejit_icache_version_zero_dim_entry = internal global i32 0, section ".mc_shared", align 4
+; SECTION-DAG: @__ejit_icache_version_one_dim_entry = internal global i32 0, section ".mc_shared", align 4
+; SECTION-DAG: @__ejit_icache_version_two_dim_entry = internal global i32 0, section ".mc_shared", align 4
 ; SECTION-LABEL: define i32 @one_dim_entry(
 ; SECTION: load atomic ptr, ptr {{.*}} monotonic, align 8
 ; SECTION-LABEL: jit_icache_dispatch:
