@@ -56,3 +56,15 @@ cl::opt<unsigned> EJitWarnFewMayConst(
     cl::desc("Warn when an ejit_entry's specialization closure has fewer than "
              "N ejit_may_const reads (0 = off). Example: "
              "-ejit-warn-few-mayconst=4 warns on 0..3 may-const reads."));
+
+// Closure-slimming threshold (PASS1): non-entry closure helpers with at
+// least this many raw-IR instructions are externalized from the extracted
+// bitcode (declaration only, resolved via the AOT-side registration). Below
+// it, the body is smaller than the ~190-byte registration record that
+// replaces it. 0 removes the size floor (externalize every surviving
+// helper). See jit_design_doc/EJIT_BITCODE_SLIMMING.md.
+cl::opt<unsigned> EJitExternalizeMinInsts(
+    "ejit-externalize-min-insts", cl::init(16), cl::Hidden,
+    cl::desc("Externalize non-entry closure helpers with at least this many "
+             "raw-IR instructions from the extracted bitcode (0 = no size "
+             "floor; see jit_design_doc/EJIT_BITCODE_SLIMMING.md)"));
