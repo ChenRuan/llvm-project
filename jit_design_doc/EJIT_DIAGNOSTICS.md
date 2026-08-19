@@ -6,7 +6,7 @@
 
 EJIT 的诊断手段按“何时用到”分两类：
 
-- **运行时**（上版调试期）：二进制运行过程中，通过 C API 动态调整日志级别、读取统计、转储 IR/ASM、内省注册表。这是上板排障的主要手段（§1–§8）。
+- **运行时**（上板调试期）：二进制运行过程中，通过 C API 动态调整日志级别、读取统计、转储 IR/ASM、内省注册表。这是上板排障的主要手段（§1–§8）。
 - **编译期**（开发构建期）：`clang` 编译你标注了 ejit 属性的源码时发出的告警 / 报告（§9）。它们在你构建含 `ejit_entry` 的代码时就已产出，帮你提前发现“特化没收益”“维度声明错”等问题。
 
 ### 现象 -> 先看哪里
@@ -340,7 +340,7 @@ void ejit_invalidate(const char *periodName, uint32_t cellIdx);
 
 **INFO 级输出**（每个链接的 graph，带 `[EJIT]` 前缀）：
 
-- **relax 汇总**：`relaxAArch64BranchStubs: graph=<g> Branch26PCRel: <n> total, <n> stubbed (chain-mismatch=<n> unresolved=<n> out-of-range=<n>), <n> relaxed` -- stub 化边的跳过原因分解。
+- **relax 汇总**：`relaxAArch64BranchStubs: graph=<g> Branch26PCRel: <n> total, <n> stubbed (chain-mismatch=<n> unresolved=<n> out-of-range=<n>), <n> relaxed`，并给出 stub 化边的跳过原因分解。
 - **`[STUBBED]` 审计**：每条被 stub 化的分支重定位一行（带两空格缩进），`  [STUBBED] <bl/b/...> @0x<addr> -> stub@0x<addr> (ADRP x16; LDR x16,[x16]; BR x16) -> $__GOT -> <target> @0x<addr> | direct dist=<n> (<EXCEEDS/within> +-128MB)`。
 - **linkdiag 汇总**：`linkdiag: graph=<g> summary: <n> stubbed (<n> exceed +-128MB), <n> direct`。
 
@@ -352,7 +352,7 @@ void ejit_invalidate(const char *periodName, uint32_t cellIdx);
 
 ## 9. 编译 ejit 代码时的诊断
 
-以下诊断在你用 `clang -fembed-bitcode` 编译标注了 ejit 属性的源码时发出，走 `stderr` 或 clang 诊断通道，经 `-mllvm` 标志或 `-W` 诊断组控制。**不受运行时日志级别影响**--它们在编译期即完成。lit 测试用 `2>&1` 捕获（输出在 stderr，不在 IR `.ll` 里）。
+以下诊断在你用 `clang -fembed-bitcode` 编译标注了 ejit 属性的源码时发出，走 `stderr` 或 clang 诊断通道，经 `-mllvm` 标志或 `-W` 诊断组控制。**不受运行时日志级别影响**，它们在编译期即完成。lit 测试用 `2>&1` 捕获（输出在 stderr，不在 IR `.ll` 里）。
 
 ### 9.1 Sema 诊断
 
@@ -375,7 +375,7 @@ clang Sema 阶段默认启用以下告警，归入诊断组 `embedded-jit`（即
 
 由 EJIT 的 AOT 位码提取 pass（PASS1）在提取位码上运行 `runSpecializationDiagnostic` 发出，经 `-mllvm` 标志控制。
 
-**特化闭包**（诊断推理的范围）：`ejit_entry` 自身 + 经**直接调用**可达的全部已定义非 intrinsic 函数（不动点传播）。**外部声明调用与间接调用（函数指针）不计入**--JIT 无法内联它们，故其 `may_const` 读不会进入该 entry 的特化。这使 #1 是 sound 的（无误报）。
+**特化闭包**（诊断推理的范围）：`ejit_entry` 自身 + 经**直接调用**可达的全部已定义非 intrinsic 函数（不动点传播）。**外部声明调用与间接调用（函数指针）不计入**，因为 JIT 无法内联它们，其 `may_const` 读取不会进入该 entry 的特化。因此 #1 不会产生误报。
 
 | 标志 | 默认 | 类别 | 触发条件 |
 |------|------|------|----------|
@@ -394,7 +394,7 @@ few   EJit warning: ejit_entry function '<name>' has only <K> ejit_may_const rea
 ```
 
 - **关闭默认 on 的告警**：`-mllvm -ejit-warn-no-specialization=false`（同理 `-ejit-warn-unused-dim=false`）。
-- **info 报告**仅报告、不 gating。理由：`may_const` 个数是特化价值的 poor proxy--单次 `may_const` 读若在热循环或喂给分支即为高收益，故唯一 sound 的默认阈值是 0（即 #1），N>0 会误报最高价值场景；判断权留给用户。
+- **info 报告**只提供信息，不控制编译流程。`may_const` 数量并不能可靠衡量特化价值：单次读取若位于热循环中或直接控制分支，也可能带来很高收益。因此唯一不会误报的默认阈值是 0（即 #1）；N>0 时需要用户结合场景判断。
 - **`-ejit-warn-few-mayconst=N`** 是 opt-in 的个数阈值告警，默认关闭。只要闭包中存在循环内 `may_const` 读取就不会触发，避免把单个但位于热循环中的高价值读取误报为“特化面较窄”。它不与 #1 冲突：#1（零=确定无价值）是默认 sound 基线；N>0 时仍需结合这些读取控制的分支或计算人工判断。
 - “引用 period 但未声明依赖”的检查现位于 Clang Sema，且默认关闭；需要时启用 §9.1 的 `-Wembedded-jit-undeclared-period-dep`。它与 #2（声明但不用）方向相反、互补。
 
