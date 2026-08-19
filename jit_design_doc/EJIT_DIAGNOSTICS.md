@@ -97,7 +97,38 @@ unsigned      ejit_taskpool_pending_count(void); // 在途数量
 
 **作用**：定位“为何没编译 / 为何编译慢 / 队列是否拥塞”。看 `cacheHits` 判断命中率，`alreadyPending` 判断重复提交合并，`queueFull`/`queueApproxSize` 判断拥塞，`compileFailed`/`publishFailed` 判断编译失败。
 
+**结构体解读**：前九个 `uint64_t` 是从 taskpool 建立以来的累计事件计数，后三个有效 `uint32_t` 是读取瞬间的存量快照。常见组合含义如下：
+
+| 字段 / 组合 | 含义与判断 |
+|-------------|------------|
+| `cacheHits` | 已发布特化被复用的次数；应结合总调用量看趋势，不能单独当作命中率百分比。 |
+| `asyncEnqueues` / `asyncCompiles` | 前者是进入异步队列的请求，后者是 worker 成功编译并发布的结果。两者短时不相等是正常的；长期差距扩大时结合 pending、失败和队列满计数排查。 |
+| `alreadyPending` | 相同函数和维度组合已在编译，当前请求被去重合并；高值不等于失败，但持续快速增长通常表示热点在等待同一个编译。 |
+| `queueFull` | 请求因异步队列无空位而未入队；非零即说明出现过瞬时或持续拥塞。 |
+| `compileFailed` | 编译失败，以及编译期间版本 / generation 变化而被取消或丢弃的结果总数。 |
+| `publishFailed` | 编译已经产出，但无法写入 taskpool cache；与 `compileFailed` 分开看可区分“没编出来”和“编出后没发布”。 |
+| `instanceDisabled` | 请求命中了未激活实例的快速返回路径；`instanceDisabledPreActivate` 是其中发生在首次 activate 前的子集。 |
+| `readyEntries` | 当前可命中的已发布特化数，不是累计编译数。 |
+| `pendingEntries` / `queueApproxSize` | 前者是正在去重跟踪的编译身份数，后者是队列近似深度；两者长期不回落通常表示 worker 阻塞或处理能力不足。 |
+
+`ejit_taskpool_print_stats()` 除上述 C 结构体外，还会直接打印 shared taskpool 快照：
+
+| 输出字段 | 含义 |
+|----------|------|
+| `initState` | 初始化状态：0 未初始化、1 初始化中、2 可用、3 失败、4 正在停止。 |
+| `ownerCore` / `workerTaskId` | 赢得 owner 选举的核与其 worker 任务 ID；Ready 时 task ID 应非 0。 |
+| `gen` | shared taskpool 每次重新初始化递增的代数，用于识别是否发生过重建。 |
+| `lastInitErr` | 初始化失败原因：0 无错误、1 worker 启动失败、2 owner 创建 JIT engine 失败。 |
+| `initAttempts` | owner 选举累计尝试次数；异常增长通常意味着多核反复初始化。 |
+| `share` | 是否允许非 owner 核直接使用共享代码指针。 |
+| `regFingerprint` | owner 发布的 funcIndex / dimType 映射摘要；各核 attach 时用它拒绝不一致的注册表。 |
+| `execPrepFailed` | 已找到共享代码，但当前核执行前准备失败而回退的次数。 |
+
+同一接口随后打印 inline-cache slot 注册表，用于把“taskpool cache 已命中但 wrapper inline cache 始终不命中”进一步定位到未注册、维度形状不一致或填充失败。
+
 > 若 `cacheHits` 等逐调用计数全为零，说明运行库未启用逐调用统计（这些计数有热点路径开销，默认关闭）；`print_compiled()`、`get_worker_core()`、`pending_count()` 不受此影响，始终可用。
+
+`ejit_taskpool_print_compiled()` 的摘要中，`entries` 是本次尽力遍历到的 Ready 特化数，`slots` 是 cache 占用，`buckets skipped` 表示遍历时因并发竞争而跳过的 bucket；因此它不是强一致快照。明细中的 `dims=[d:i,...]` 表示 `dimType:instanceId`。VERBOSE 级额外显示各维度版本 `ver`、代码大小 `size`、代码池 `pool` 和发布代数 `gen`。
 
 ### 2.3 代码池统计
 
@@ -119,6 +150,18 @@ void          ejit_print_code_pool_stats(void);
 ```
 
 **作用**：监控 JIT 代码内存占用与是否趋近耗尽（`usedBytes` vs `reservedBytes`）。返回值：`EJIT_OK` 成功；`EJIT_ERR_NOT_ACTIVE` 运行时未初始化；`EJIT_ERR_INVALID_PARAM` 入参为空；`EJIT_ERR_DISABLED` 运行库未含代码池支持。
+
+**结构体解读**：
+
+| 字段 / 组合 | 含义与判断 |
+|-------------|------------|
+| `poolCount` / `reservedBytes` | 已经实际划出的 2 MiB pool 数及其容量总和；固定区域中尚未划出的空间不计入。 |
+| `activeCount` / `sealedCount` | 当前仍可写的 RW pool 与已封固的 RX pool 数。两者描述页状态，不等同于“有用 / 无用代码”。 |
+| `usedBytes` | bump cursor 已消耗空间之和；4K 封固模式会按页对齐，可能略高于有效机器码字节数。 |
+| `wastedBytes` | 已封固 pool 尾部未使用且不能继续分配的空间，可用于判断封固粒度带来的碎片。 |
+| `sealInvocations` | 成功切换为可执行状态的次数；4K 模式按页计，不能直接当成编译函数数。 |
+| `splitInvocations` | 成功将 2 MiB 映射拆成 4K 页的次数，仅 4K 模式有意义。 |
+| `finalizedRangeCount` | 已记录的可执行代码区间数，通常比 pool 数更接近已完成的代码分配批次数。 |
 
 > **固定代码段模式**：若你的运行库使用固定代码段模式（代码池位于链接脚本固定的 `.text.ejit` 区域，给 JIT 稳定地址），每次页状态转换会在 **INFO 级**打印 `enableRwRange` 系列日志（`begin` / `OK` / `FAIL`（未归属 / 跨池 / `enable_rw` 失败）/ `rollback`（部分失败时回退 RW->RX）），用于诊断 W^X 页状态转换。封固粒度（4K 页 vs 整 2MiB 池）影响 `sealInvocations` / `splitInvocations` 的计数粒度。
 
@@ -185,6 +228,19 @@ void ejit_print_version(void);              // 打印运行库构建标识
 | `ejit_print_active` | 列出每个注册 period 下当前激活的 (period, cell)。静态变量视为恒激活。用于诊断“某 period 实例为何编译 / 为何没编译”。 |
 | `ejit_print_version` | 打印运行库构建标识：LLVM 发行版本号与 llvm-project 源码的 git commit + 分支。**无需初始化运行时、不受日志级别门控**，便于将现场设备行为与确切源码版本对应。 |
 
+这些接口直接展开内部注册记录，字段含义如下：
+
+| 输出 | 字段含义 |
+|------|----------|
+| `registry: funcIndexes / lifecycles` | 已分配的函数索引数与 lifecycle（`dimType`）数，用于快速发现容量或跨核注册数量不一致。 |
+| `bitcodes: idx / name / size` | `idx` 是 wrapper 与 taskpool 共同使用的 `funcIndex`；`size` 是注册 bitcode 字节数，0 通常表示该索引没有可读取的位码。 |
+| `period arrays: period / var / base / size` | lifecycle 名、数组变量名、运行时基址和元素数量；`base` / `size` 错误会直接导致维度取值或常量替换错误。 |
+| `static vars: var / addr` | 恒激活静态变量名及运行时地址。 |
+| `func_meta: funcIdx / found` | 查到的函数索引，以及注册 bitcode 中是否存在该函数定义。`found=0` 表示只有声明或没有定义。 |
+| `func_meta: ejit_entry` | metadata 是否把该定义标为 JIT entry。 |
+| `func_meta: op / tag / vals` | `op` 是 `!ejit.metadata` 的原始 operand 序号；`tag` 是元数据类别，`vals` 是 period、参数槽或字段偏移等原始值。 |
+| `active: period / active / cell` | `active` 是该 period 当前激活 cell 数，随后每行 `cell` 给出具体实例索引；这是 JIT gate 实际查询的同一份状态。 |
+
 ```c
 ejit_init(&cfg);
 ejit_print_registry();                // 确认注册表
@@ -219,6 +275,8 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
 
 > 仅当 wrapper 以 `-mllvm -ejit-wrapper-timing` 构建时才会产生计时；时间戳单位由平台决定。
 
+汇总行 `wrapper_timing_agg` 的字段含义：`func` 为 `funcIndex`，`status` 为本次聚合槽记录的 taskpool 返回状态，`fn` 为调用目标地址，`bucket` 为 cache bucket，`count` 为本窗口样本数；`get_fn_avg`、`fn_call_avg`、`release_avg` 和 `total_avg` 分别是查找目标、执行 JIT 函数、释放读令牌及 wrapper 总路径的平均耗时。先比较 `fn_call_avg` 与其余三段，才能区分业务函数变慢和分发框架开销。
+
 ---
 
 ## 6. 错误报告
@@ -234,6 +292,14 @@ const ejit_error_t *ejit_get_last_error(void);
 ```
 
 返回最近一次错误的指针（code / message / funcName），底层为预分配环形缓冲（最多 32 条），无动态分配。
+
+| 字段 | 含义 |
+|------|------|
+| `code` | 对应附录中的 `ejit_status_t` 错误码。 |
+| `message` | 最近一次被记录错误的简短原因，不保证包含底层编译器的完整诊断。 |
+| `funcName` | 与错误关联的函数或注册项名称；错误不属于特定函数时可能为空。 |
+
+返回指针由 EJIT 内部环形缓冲持有，后续错误记录可能覆盖其内容；需要长期保留时应由调用方立即复制这三个字段。
 
 配套配置项 `enableLogger`（`ejit_config_t` 的 `bool` 字段）控制错误环形缓冲是否启用；它与 §1 的运行时日志等级是两套独立机制。注意该 C 结构体字段**无默认值**：零初始化的 `ejit_config_t` 会得到 `enableLogger = false`，需显式置 `true` 才会记录错误。freestanding 构建会强制关闭该错误记录器：
 
