@@ -1,8 +1,8 @@
 # EJIT 诊断与调试指南
 
-> 面向已将 EJIT 集成进自己二进制的集成方。说明上版调试时如何用 EJIT 提供的诊断手段定位问题。
+> 面向已将 EJIT 集成进自己二进制的集成方，说明上板调试时如何用 EJIT 提供的诊断手段定位问题。
 >
-> 本文不涉及如何构建 EJIT 运行库本身。若某诊断能力调用后无输出或返回 `EJIT_ERR_DISABLED`，说明你链接的 EJIT 运行库未启用该能力--向 EJIT 提供方确认即可。
+> 本文不涉及如何构建 EJIT 运行库本身。若某诊断能力调用后无输出或返回 `EJIT_ERR_DISABLED`，说明你链接的 EJIT 运行库未启用该能力，请向 EJIT 提供方确认。
 
 EJIT 的诊断手段按“何时用到”分两类：
 
@@ -52,7 +52,7 @@ ejit_set_log_level(EJIT_LOG_VERBOSE);  // 排查问题时提升到细节级
 
 ## 2. 运行时统计
 
-### 2.1 旧版 LRU cache 统计
+### 2.1 旧版 LRU cache 统计（兼容接口）
 
 ```c
 typedef struct {
@@ -67,7 +67,7 @@ typedef struct {
 ejit_status_t ejit_get_stats(ejit_stats_t *stats);
 ```
 
-**作用**：查询旧版 LRU `EJitCache` 的命中 / 未命中 / 淘汰与内存占用。
+该接口仅为旧版 LRU `EJitCache` 保留 ABI 兼容性。当前 taskpool 运行时不再维护这组统计；初始化成功后调用会返回 `EJIT_OK`，并将各字段清零。请使用 §2.2 的 taskpool 统计和 §2.3 的代码池统计定位当前实现的问题。
 
 ### 2.2 SRE taskpool 统计
 
@@ -130,7 +130,7 @@ void          ejit_print_code_pool_stats(void);
 
 ### 3.1 文件式 IR 转储（`dumpJITDir`）
 
-把每个特化的 JIT 优化后 LLVM IR（`.ll`）落盘，文件名 `<funcName>_<cacheKey>.ll`，便于离线 diff / 审查。通过 `ejit_init()` 配置项启用：
+把每个特化的优化前、优化后 LLVM IR（`.ll`）分别落盘，文件名为 `<funcName>_<cacheKey>_pre.ll` 和 `<funcName>_<cacheKey>_opt.ll`，便于离线 diff / 审查。通过 `ejit_init()` 配置项启用：
 
 ```c
 ejit_config_t cfg = {};
@@ -146,19 +146,23 @@ ejit_init(&cfg);
 ```c
 void ejit_dump_func(const char *name);  // 按名开启捕获；name="*" 捕获全部；NULL/"" 关闭后续捕获
 void ejit_dump_all(bool enable);        // 等价于 ejit_dump_func("*")（enable=true 时）
-void ejit_print_dumped(const char *name);// 经日志打印已保存的 IR+ASM；NULL/"" 打印本核全部
+void ejit_print_dumped(const char *name);// 打印 entry 函数视图；NULL/"" 打印本核全部
+void ejit_print_dumped_module(const char *name); // 打印完整特化模块视图
 ```
 
-运行时按函数名过滤捕获下一次 JIT 编译产生的**优化后 IR 与汇编**，再经日志逐行回读。适合现场定位某个函数的特化结果。
+运行时按函数名过滤捕获后续 JIT 编译产生的**优化后 IR 与汇编**，再通过 RAW 诊断输出逐行回读。`ejit_print_dumped(name)` 只显示指定 entry 函数，便于聚焦单函数；`ejit_print_dumped_module(name)` 显示该 entry 对应的完整特化模块，包括模块中保留的被调函数。
 
 > - 捕获为**精确名匹配**，`"*"` 例外（捕获全部）。
-> - 完整 IR/ASM 负载保留在 worker 核本地，不拷入共享 taskpool 内存。
+> - 每次捕获同时保存单函数视图和完整模块视图；同名函数重新编译时替换旧记录。
+> - 完整 IR/ASM 负载保留在 worker 核本地，不拷入共享 taskpool 内存；回读不会跨核查找，需在执行编译的 worker 核调用打印接口。
+> - RAW 转储输出不受普通运行时日志等级阈值抑制。
 > - 若回读内容只有 IR、没有汇编，说明运行库未启用汇编发射，向提供方确认。
 
 ```c
 ejit_dump_func("process_cell");   // 只捕获感兴趣函数的下一次特化
 // ... 触发该函数的 JIT 编译 ...
 ejit_print_dumped("process_cell"); // 回读 IR+ASM
+ejit_print_dumped_module("process_cell"); // 回读该 entry 的完整特化模块
 
 ejit_dump_all(true);              // 捕获所有特化
 ```
@@ -231,7 +235,7 @@ const ejit_error_t *ejit_get_last_error(void);
 
 返回最近一次错误的指针（code / message / funcName），底层为预分配环形缓冲（最多 32 条），无动态分配。
 
-配套配置项 `enableLogger`（`ejit_config_t` 的 `bool` 字段）控制错误日志器是否启用。注意该 C 结构体字段**无默认值**：零初始化的 `ejit_config_t` 会得到 `enableLogger = false`，需显式置 `true` 才会记录错误：
+配套配置项 `enableLogger`（`ejit_config_t` 的 `bool` 字段）控制错误环形缓冲是否启用；它与 §1 的运行时日志等级是两套独立机制。注意该 C 结构体字段**无默认值**：零初始化的 `ejit_config_t` 会得到 `enableLogger = false`，需显式置 `true` 才会记录错误。freestanding 构建会强制关闭该错误记录器：
 
 ```c
 ejit_config_t cfg = {};
@@ -252,11 +256,13 @@ if (ejit_taskpool_compile_or_get(...) != EJIT_OK) {
 
 ```c
 void ejit_clear_cache(void);
-void ejit_invalidate(const char *periodName, uint8_t cellIdx);
+void ejit_invalidate(const char *periodName, uint32_t cellIdx);
 ```
 
-- `ejit_clear_cache`：清空整个 JIT cache，强制后续调用全部重新编译。用于验证可重现性或释放代码内存。
-- `ejit_invalidate`：仅失效指定 period / cell 实例的缓存条目，用于定向重编译。
+- `ejit_clear_cache`：在 shared-taskpool 构建中淘汰各核 L0 dispatch cache，并清空共享 inline cache。旧版 LRU 清理路径已经退役，因此该接口**不会释放已生成的 JIT 代码内存，也不保证触发重新编译**。
+- `ejit_invalidate`：校验 `cellIdx` 范围后执行旧版按 period 失效路径，并在 shared-taskpool 构建中同样淘汰 dispatch / inline cache。当前实现不会定向删除 taskpool 中已发布的编译结果或释放代码内存。
+
+这两个接口当前主要用于避免外部状态变化后继续命中陈旧的快速分发指针，不应作为代码内存回收接口使用。
 
 ---
 
@@ -282,14 +288,22 @@ void ejit_invalidate(const char *periodName, uint8_t cellIdx);
 
 以下诊断在你用 `clang -fembed-bitcode` 编译标注了 ejit 属性的源码时发出，走 `stderr` 或 clang 诊断通道，经 `-mllvm` 标志或 `-W` 诊断组控制。**不受运行时日志级别影响**--它们在编译期即完成。lit 测试用 `2>&1` 捕获（输出在 stderr，不在 IR `.ll` 里）。
 
-### 9.1 Sema 诊断（`-Wembedded-jit`）
+### 9.1 Sema 诊断
 
-clang Sema 阶段发出以下告警，归入诊断组 `embedded-jit`（即 `-Wembedded-jit`，可用 `-Wno-embedded-jit` 整组关闭）：
+clang Sema 阶段默认启用以下告警，归入诊断组 `embedded-jit`（即 `-Wembedded-jit`，可用 `-Wno-embedded-jit` 整组关闭）：
 
 | 告警 | 触发条件 | 文本 |
 |------|----------|------|
+| `warn_ejit_attr_missing_on_definition` | 函数声明带 `ejit_entry` 或 `ejit_period_lc`，但定义未重复该属性。Sema 会禁用该定义的 EmbeddedJIT 特化，并指向原声明。可单独用 `-Wno-embedded-jit-attr-missing-on-def` 关闭。 | `function %0 is declared with '%1' but defined without it; EmbeddedJIT specialization is disabled for this definition` |
 | `warn_ejit_always_inline_conflict` | 对 `ejit_entry` / `ejit_period_lc` 函数标注 `always_inline`。这些函数必须保持非内联才能在内联器中存活供 JIT 特化，用户 `always_inline` 与之冲突，Sema 告警并忽略 `always_inline`。 | `'always_inline' is incompatible with %0, which must remain out-of-line so it survives the inliner for JIT specialization; ignoring 'always_inline'`（`%0` = `ejit_entry` 或 `ejit_period_lc`） |
 | `warn_ejit_may_const_modified_without_lc` | 在**未**标注 `ejit_period_lc` 的函数中写 `ejit_may_const` 字段。`may_const` 字段只允许在时间窗切换（lifecycle）时变更，普通函数写入会破坏特化一致性。 | `modifying ejit_may_const field %0 of %1 without ejit_period_lc attribute`（`%0` = 字段名，`%1` = 持有该结构体的变量或其父记录） |
+
+以下 Sema 告警默认关闭，需按需显式开启：
+
+| 诊断组 | 触发条件 | 文本 |
+|--------|----------|------|
+| `-Wembedded-jit-addr-of-may-const` | 对 `ejit_may_const` 字段取地址，但所得指针不带 `const`，可能绕过 lifecycle 写入约束。 | `taking address of ejit_may_const field %0 of %1 without const qualifier; a non-const pointer allows the field to be written outside ejit_period_lc, breaking the JIT's time-window constancy assumption` |
+| `-Wembedded-jit-undeclared-period-dep` | 函数引用 `ejit_period_arr("P")`，但未通过 `ejit_period_arr_ind("P")` 声明依赖。 | `function %0 references ejit_period_arr '%1' but does not declare a dependency on it via ejit_period_arr_ind` |
 
 ### 9.2 特化价值诊断
 
@@ -302,7 +316,7 @@ clang Sema 阶段发出以下告警，归入诊断组 `embedded-jit`（即 `-Wem
 | `-mllvm -ejit-warn-no-specialization` | **on** | #1 告警 | entry 的特化闭包内**无任何** `!ejit.may_const` load（特化无收益，考虑移除 `ejit_entry`） |
 | `-mllvm -ejit-warn-unused-dim` | **on** | #2 告警 | 声明了 `ejit_period_arr_ind("P")` 但闭包**从不索引** `ejit_period_arr("P")`（死维度） |
 | `-mllvm -ejit-report-mayconst` | **off** | info 报告 | 报告每个 entry 闭包内 `may_const` 读总数 K 及其中在循环内的 J |
-| `-mllvm -ejit-warn-few-mayconst=<N>` | `0`（off） | opt-in 告警 | entry 闭包内 `may_const` 读数 **< N** 时告警（如 `=4` 告警 0..3 读）。默认关闭 |
+| `-mllvm -ejit-warn-few-mayconst=<N>` | `0`（off） | opt-in 告警 | entry 闭包内 `may_const` 读数 **< N**，且其中**没有任何循环内读取**时告警。默认关闭 |
 
 **输出文本**（走 `stderr`）：
 
@@ -315,15 +329,8 @@ few   EJit warning: ejit_entry function '<name>' has only <K> ejit_may_const rea
 
 - **关闭默认 on 的告警**：`-mllvm -ejit-warn-no-specialization=false`（同理 `-ejit-warn-unused-dim=false`）。
 - **info 报告**仅报告、不 gating。理由：`may_const` 个数是特化价值的 poor proxy--单次 `may_const` 读若在热循环或喂给分支即为高收益，故唯一 sound 的默认阈值是 0（即 #1），N>0 会误报最高价值场景；判断权留给用户。
-- **`-ejit-warn-few-mayconst=N`** 是 opt-in 的个数阈值告警，默认关闭。它不与 #1 冲突：#1（零=确定无价值）是默认 sound 基线，本标志供想对“特化面较窄”做更严格审查的用户按需开启（低计数只表示可折入的少，是否真的配置不当取决于这些读 gate 了什么，需人工判断）。
-
-**PASS5 对称检查（始终开启，无标志）**：AOT 后期 pass 在 entry 函数体**引用**了 `ejit_period_arr("P")` 但**未声明** `ejit_period_arr_ind("P")` 时告警，与 #2（声明但不用）反向对称：
-
-```
-EJit warning: function '<name>' references ejit_period_arr '<P>' but it is not declared via ejit_period_arr_ind
-```
-
-> #2 在**特化闭包**上传播（含被调函数）；PASS5 只看 **entry 自身函数体**。两者方向相反、互补。
+- **`-ejit-warn-few-mayconst=N`** 是 opt-in 的个数阈值告警，默认关闭。只要闭包中存在循环内 `may_const` 读取就不会触发，避免把单个但位于热循环中的高价值读取误报为“特化面较窄”。它不与 #1 冲突：#1（零=确定无价值）是默认 sound 基线；N>0 时仍需结合这些读取控制的分支或计算人工判断。
+- “引用 period 但未声明依赖”的检查现位于 Clang Sema，且默认关闭；需要时启用 §9.1 的 `-Wembedded-jit-undeclared-period-dep`。它与 #2（声明但不用）方向相反、互补。
 
 ### 9.3 提取位码转储
 
@@ -346,8 +353,9 @@ clang -fembed-bitcode ... -mllvm -ejit-dump-bitcode-dir=/tmp/ejit_bc process.c
 ### 10.2 某个 `ejit_entry` 没收益 / 没被特化
 
 1. 编译期先看 §9.2：#1 告警（闭包无 `may_const`）说明该 entry 特化无收益，应移除 `ejit_entry` 或补 `may_const` 标注；`-mllvm -ejit-report-mayconst` 看 `may_const` 读总数及循环内占比，评估收益。
-2. 运行时 `ejit_print_func_meta(name)` 确认特化参数绑定与 `may_const` 资格。
-3. `ejit_print_active()` 确认相关 period 实例是否处于激活态。
+2. 若声明和定义分离，确认没有 §9.1 的 `-Wembedded-jit-attr-missing-on-def` 告警；该告警出现时定义已被禁用特化。
+3. 运行时 `ejit_print_func_meta(name)` 确认特化参数绑定与 `may_const` 资格。
+4. `ejit_print_active()` 确认相关 period 实例是否处于激活态。
 
 ### 10.3 该编译的没编译 / 编译失败
 
@@ -360,13 +368,13 @@ clang -fembed-bitcode ... -mllvm -ejit-dump-bitcode-dir=/tmp/ejit_bc process.c
 
 1. `ejit_taskpool_get_stats()` 读 `cacheHits` / `asyncCompiles` / `alreadyPending`。
 2. 若 wrapper 开销可疑，对 ejit 代码加 `-mllvm -ejit-wrapper-timing`，观察周期汇总中查找 / 调用 / 释放各段耗时。
-3. `ejit_get_stats()` 看旧版 LRU 的命中 / 淘汰。
+3. `ejit_get_stats()` 是已退役 LRU 的兼容接口，当前恒返回零，不能用于分析 taskpool 命中率。
 
 ### 10.5 代码内存趋紧 / 耗尽
 
 1. `ejit_get_code_pool_stats()` 看 `usedBytes` vs `reservedBytes`、`wastedBytes`、`poolCount`。
 2. 固定代码段模式下观察 §2.3 的 `enableRwRange` 日志是否有 `FAIL` / `rollback`。
-3. 必要时 `ejit_clear_cache()` 释放代码内存（会强制重编译）。
+3. `ejit_clear_cache()` 不释放已生成的代码内存；若代码池接近耗尽，应调整代码池配置或由 EJIT 提供方确认当前版本支持的回收方案。
 
 ### 10.6 AArch64 分支超范围
 
@@ -374,7 +382,7 @@ clang -fembed-bitcode ... -mllvm -ejit-dump-bitcode-dir=/tmp/ejit_bc process.c
 
 ### 10.7 想看某函数特化结果
 
-`ejit_dump_func(name)` 捕获下一次特化，`ejit_print_dumped(name)` 回读 IR+ASM，对照预期。
+`ejit_dump_func(name)` 捕获后续特化，`ejit_print_dumped(name)` 回读该 entry 的单函数 IR+ASM；需要查看其被调函数及完整模块时改用 `ejit_print_dumped_module(name)`。捕获与回读必须位于执行编译的同一 worker 核。
 
 ---
 
