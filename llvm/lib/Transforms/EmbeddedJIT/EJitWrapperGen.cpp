@@ -69,10 +69,9 @@ static cl::opt<bool> EJitWrapperTiming(
 
 // Emit a per-function inline-cache probe DIRECTLY in the ejit_entry wrapper
 // (not a call). On a hit the wrapper loads its cell out of the per-function
-// @__ejit_icache_fn_<name> table, verifies that the call matches the one
-// admitted dimension identity, null-checks the cell, and tail-calls the cached
-// specialization. A different identity tail-calls the AOT fallback without
-// entering the taskpool.
+// @__ejit_icache_fn_<name> table using the first admitted dimension identity,
+// null-checks that cell, and tail-calls the cached specialization. Once the
+// representative version is available, every identity calls that same version.
 // On a miss it falls through to jit_slow -> ejit_taskpool_compile_or_get, which
 // fills the cell on success (icacheFill). The probe carries NO freshness check:
 // the table is SHARED across cores (EJitIcacheSection), so an activate or
@@ -361,7 +360,8 @@ static bool dimsProvablyInRange(const Function &F,
 // dim identity so writers never collide.
 //
 // The pointer table keeps its [D]^NumDims runtime ABI, but the wrapper admits
-// only one identity and therefore only one cell can ever become non-null.
+// only one identity and therefore only one cell can ever become non-null. Every
+// identity reads that representative cell once it has been filled.
 // NumDims=0 is a scalar ptr (one cell).
 static GlobalVariable *getOrCreateIcacheFnGlobal(Module &M,
                                                  StringRef FuncName,
@@ -393,7 +393,7 @@ static GlobalVariable *getOrCreateIcacheFnGlobal(Module &M,
 // Zero means unclaimed; the stored value is the row-major slot index plus one.
 // It lives beside the pointer table in shared memory so all cores agree on the
 // admitted identity. Lifecycle drains clear the pointer, but not this key, so
-// the same identity may be rebuilt while every other identity stays on AOT.
+// the same identity rebuilds the representative version after invalidation.
 static GlobalVariable *getOrCreateIcacheVersionGlobal(Module &M,
                                                        StringRef FuncName) {
   std::string GVName = ("__ejit_icache_version_" + FuncName).str();
@@ -1029,6 +1029,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
       // Wrapper (F): frame-less probe + tail calls.
       auto *JitEntry = BasicBlock::Create(Ctx, "jit_entry", F);
+      auto *JitIcacheProbe = BasicBlock::Create(Ctx, "jit_icache_probe", F);
       auto *JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
       auto *JitMiss = BasicBlock::Create(Ctx, "jit_miss", F);
       IRBuilder<> B(JitEntry);
@@ -1042,20 +1043,23 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       GlobalVariable *IcacheSlot = IcacheIt->second.GV;
       GlobalVariable *IcacheVersion = IcacheIt->second.VersionGV;
       unsigned NumDims = IcacheIt->second.NumDims;
+      LoadInst *StoredVersion =
+          B.CreateLoad(I32Ty, IcacheVersion, "ejit_icache_stored_version");
+      StoredVersion->setAlignment(Align(4));
+      StoredVersion->setAtomic(AtomicOrdering::Monotonic);
+      Value *HasVersion = B.CreateICmpNE(
+          StoredVersion, ConstantInt::get(I32Ty, 0), "ejit_icache_has_version");
+      HasVersion = B.CreateIntrinsic(Intrinsic::expect, {HasVersion->getType()},
+                                     {HasVersion, ConstantInt::getTrue(Ctx)});
+      B.CreateCondBr(HasVersion, JitIcacheProbe, JitMiss);
+
+      B.SetInsertPoint(JitIcacheProbe);
       Value *SlotPtr = IcacheSlot;
       if (NumDims > 0) {
-        SmallVector<Value *, 5> Indices;
-        Indices.push_back(ConstantInt::get(I32Ty, 0));
-        for (unsigned I = 0; I < NumDims; ++I) {
-          Value *ArgVal = F->getArg(PeriodInds[I].ArgIndex);
-          unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
-          Value *Idx = ArgVal;
-          if (BW > 32) Idx = B.CreateTrunc(ArgVal, I32Ty);
-          else if (BW < 32) Idx = B.CreateZExt(ArgVal, I32Ty);
-          Indices.push_back(Idx);
-        }
-        SlotPtr = B.CreateInBoundsGEP(IcacheSlot->getValueType(), IcacheSlot,
-                                      Indices, "ejit_ic_slot");
+        Value *SlotIndex = B.CreateSub(
+            StoredVersion, ConstantInt::get(I32Ty, 1), "ejit_icache_slot_index");
+        SlotPtr = B.CreateInBoundsGEP(PtrTy, IcacheSlot, SlotIndex,
+                                      "ejit_ic_slot");
       }
       LoadInst *ICSlotLoad = B.CreateLoad(PtrTy, SlotPtr, "ejit_ic_fn");
       ICSlotLoad->setAlignment(Align(8));
@@ -1065,19 +1069,10 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // below carries a data dependency on it, so acquire would buy nothing and
       // cost an LDAR per hit. Lowers to the same LDR on AArch64.
       ICSlotLoad->setAtomic(AtomicOrdering::Monotonic);
-      Value *CurrentVersion = emitIcacheVersion(B, *F);
-      LoadInst *StoredVersion =
-          B.CreateLoad(I32Ty, IcacheVersion, "ejit_icache_stored_version");
-      StoredVersion->setAlignment(Align(4));
-      StoredVersion->setAtomic(AtomicOrdering::Monotonic);
       Value *TAfterIcache = nullptr;
       if (EJitWrapperTiming)
         TAfterIcache = B.CreateCall(TraceNow, {}, "ejit_t_after_icache");
-      Value *VersionMatches =
-          B.CreateICmpEQ(StoredVersion, CurrentVersion,
-                         "ejit_icache_version_match");
-      Value *IHit = B.CreateAnd(VersionMatches, B.CreateIsNotNull(ICSlotLoad),
-                                "ejit_icache_hit");
+      Value *IHit = B.CreateIsNotNull(ICSlotLoad, "ejit_icache_hit");
       IHit = B.CreateIntrinsic(Intrinsic::expect, {IHit->getType()},
                                {IHit, ConstantInt::getTrue(Ctx)});
       B.CreateCondBr(IHit, JitIcacheDispatch, JitMiss);
