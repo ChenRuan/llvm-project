@@ -290,17 +290,24 @@ uint32_t ejit_taskpool_get_worker_core();
 
 /// Enable name-filtered JIT IR+ASM capture. When \p name is non-null and
 /// non-empty, the next time a specialization whose entry name exactly matches
-/// \p name is JIT-compiled, the engine saves (in memory) its post-optimization
-/// IR and emitted assembly for later printing. Pass NULL or "" to disable
-/// further capture (already-saved entries are retained). Capture is exact-name
-/// unless name is "*", which captures every specialization. Full payloads stay
-/// on the worker core and are never copied into shared taskpool memory.
+/// \p name is JIT-compiled, the engine saves (in memory) post-optimization IR
+/// and emitted assembly for both the entry function and its complete
+/// specialization module. Pass NULL or "" to disable further capture
+/// (already-saved entries are retained). Capture is exact-name unless name is
+/// "*", which captures every specialization. Full payloads stay on the worker
+/// core and are never copied into shared taskpool memory.
 void ejit_dump_func(const char *name);
 
 /// Print the saved worker-local IR+ASM for \p name through the platform log.
 /// Passing NULL or "" prints every entry saved on the calling core. A
 /// non-worker core reports which worker owns the latest matching capture.
 void ejit_print_dumped(const char *name);
+
+/// Print the complete specialization module captured for \p name, including
+/// all retained function definitions in that module. Passing NULL or ""
+/// prints every module saved on the calling core. This is worker-local and
+/// does not perform cross-core lookup.
+void ejit_print_dumped_module(const char *name);
 
 /// Enable or disable capture of every JIT-compiled specialization. Equivalent
 /// to ejit_dump_func("*") when enabled. Captures are keyed by function name in

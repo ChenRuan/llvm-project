@@ -9,6 +9,7 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITORCENGINE_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITORCENGINE_H
 
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/Support/Error.h"
@@ -20,18 +21,29 @@
 #endif
 
 namespace llvm {
+class Module;
+
 namespace ejit {
 
 class PeriodArrayRegistry;
 class EJitRuntimeState;
 struct EJitSharedTaskPoolState;
 
+namespace detail {
+/// Render one function definition without the rest of its specialization
+/// module. Exposed for focused dump-path testing; callers should use the
+/// ejit_dump_* APIs.
+bool renderDumpFunctionIR(const Module &M, StringRef fnName, std::string &out);
+void renderDumpModuleIR(const Module &M, std::string &out);
+} // namespace detail
+
 /// Set a function-name filter for JIT IR+ASM diagnostic capture. When non-
 /// empty, the engine captures (saves in memory) the post-optimization IR and
-/// the emitted assembly of any specialization whose entry name matches, the
-/// next time it is compiled. "*" matches every specialization. Empty/null
-/// disables further capture (already-captured entries are retained). Captured
-/// entries are printed on demand via printDumped().
+/// emitted assembly for both the matching entry function and its complete
+/// specialization module, the next time it is compiled. "*" matches every
+/// specialization. Empty/null disables further capture (already-captured
+/// entries are retained). Use printDumped() for the entry-only view and
+/// printDumpedModule() for the complete module.
 void setDumpFuncFilter(const std::string &name);
 
 /// Bind the optional shared taskpool dump state. In a shared-taskpool build
@@ -44,7 +56,14 @@ void setDumpSharedState(EJitSharedTaskPoolState *state);
 /// null/empty) through EJIT_DIAG, one line per IR/ASM line. Names with no
 /// saved capture are reported as missing. Paired with setDumpFuncFilter():
 /// capture at compile time, print selectively later.
-void printDumped(const char *name);
+/// Returns true when a local payload was printed or matching remote-owner
+/// metadata was found.
+bool printDumped(const char *name);
+
+/// Print the complete specialization module captured for \p name (or every
+/// saved module when \p name is null/empty). Payloads are worker-local; unlike
+/// printDumped(), this function does not consult cross-core metadata.
+bool printDumpedModule(const char *name);
 
 struct SpecializationContext {
   std::string fnName;
