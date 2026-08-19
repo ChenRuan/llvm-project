@@ -141,9 +141,10 @@ entry:
 !0 = distinct !{!{!"ejit_entry"}}
 !1 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
 !2 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}, !{!"ejit_period_arr_ind", !"trp", i32 1}}
-; Both arrays must declare no more entries than EJIT_ICACHE_DIM_SIZE (16), or
-; dimsProvablyInRange() declines the probe for any entry indexed by them and the
-; ICACHE checks below have nothing to match. `trp` used to say 32, which
-; silently turned two_dim_entry into a no-probe entry.
+; `trp` declares MORE entries than EJIT_ICACHE_DIM_SIZE (16) on purpose: the
+; declared element count does not gate probe emission, so two_dim_entry still
+; gets its [16 x [16 x ptr]] table and its probe. The ICACHE checks above pin
+; that. Ids at or above the per-dim bound have no cell, and the runtime declines
+; to fill one for them (icacheDimsInRange in icacheFill / icacheTry).
 !10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}}
-!11 = distinct !{!{!"ejit_period_arr", !"trp", i32 16}}
+!11 = distinct !{!{!"ejit_period_arr", !"trp", i32 32}}
