@@ -111,7 +111,8 @@ struct EJitOrcEngine::Impl {
   /// TargetMachine used for the name-filtered ASM diagnostic dump (created
   /// once from the same JITTargetMachineBuilder the JIT compiles with, so the
   /// emitted assembly matches the real JIT output). Null if creation failed.
-  std::unique_ptr<TargetMachine> dumpTM;
+  std::unique_ptr<TargetMachine> dumpFunctionTM;
+  std::unique_ptr<TargetMachine> dumpModuleTM;
 };
 
 namespace llvm {
@@ -255,8 +256,10 @@ static bool getActiveDumpFilter(std::string &out) {
 /// Saved IR+ASM for a captured specialization (latest per function name).
 struct DumpEntry {
   uint64_t cacheKey = 0;
-  std::string IR;
-  std::string ASM;
+  std::string FunctionIR;
+  std::string FunctionASM;
+  std::string ModuleIR;
+  std::string ModuleASM;
 };
 
 // Process-wide store of captured IR+ASM, filled by the IR transform layer
@@ -402,19 +405,75 @@ static bool printSharedDumpHint(const char *name) {
 /// Called from the IR transform layer when the filter matches: save the
 /// post-optimization IR and emitted ASM for later selective printing.
 static void captureDump(const std::string &fnName, uint64_t cacheKey,
-                        std::string IR, std::string ASM) {
-  EJIT_DIAG_DEBUG("capture enter func=%s ir_size=%u asm_size=%u &store=%p",
-            fnName.c_str(), (unsigned)IR.size(), (unsigned)ASM.size(),
-            (void *)&gDumpStore);
+                        std::string FunctionIR, std::string FunctionASM,
+                        std::string ModuleIR, std::string ModuleASM) {
+  EJIT_DIAG_DEBUG(
+      "capture enter func=%s func_ir=%u func_asm=%u module_ir=%u "
+      "module_asm=%u &store=%p",
+      fnName.c_str(), (unsigned)FunctionIR.size(),
+      (unsigned)FunctionASM.size(), (unsigned)ModuleIR.size(),
+      (unsigned)ModuleASM.size(), (void *)&gDumpStore);
   std::lock_guard<DumpMutexType> lock(gDumpMutex);
   EJIT_DIAG_DEBUG("capture store_size before=%u", (unsigned)gDumpStore.size());
-  gDumpStore[fnName] = DumpEntry{cacheKey, std::move(IR), std::move(ASM)};
+  gDumpStore[fnName] =
+      DumpEntry{cacheKey, std::move(FunctionIR), std::move(FunctionASM),
+                std::move(ModuleIR), std::move(ModuleASM)};
   EJIT_DIAG_DEBUG("capture store_size after=%u", (unsigned)gDumpStore.size());
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   // Publish only small metadata. Full text remains in the worker-local map.
   const DumpEntry &E = gDumpStore[fnName];
-  captureSharedDumpMetadata(fnName, cacheKey, E.IR.size(), E.ASM.size());
+  captureSharedDumpMetadata(fnName, cacheKey, E.FunctionIR.size(),
+                            E.FunctionASM.size());
 #endif
+}
+
+/// Render only the requested entry definition. A specialization module may
+/// contain the entry's entire transitive call closure; printing the Module here
+/// makes ejit_print_dumped("foo") indistinguishable from a dump-all operation.
+bool detail::renderDumpFunctionIR(const Module &M, StringRef fnName,
+                                  std::string &out) {
+  const Function *F = M.getFunction(fnName);
+  if (!F || F->isDeclaration())
+    return false;
+
+  raw_string_ostream OS(out);
+  F->print(OS);
+  OS << '\n';
+  OS.flush();
+  return true;
+}
+
+void detail::renderDumpModuleIR(const Module &M, std::string &out) {
+  raw_string_ostream OS(out);
+  M.print(OS, nullptr);
+  OS.flush();
+}
+
+/// Clone a diagnostic codegen module with only the requested function body.
+/// Other function definitions become declarations, preserving the target
+/// function's calls while avoiding a second codegen of its whole closure.
+/// Global definitions stay intact so addressing and constant-pool decisions
+/// match the real JIT module as closely as possible.
+static std::unique_ptr<Module>
+cloneDumpFunctionModule(const Module &M, StringRef fnName) {
+  ValueToValueMapTy VMap;
+  return CloneModule(M, VMap, [fnName](const GlobalValue *GV) {
+    const auto *F = dyn_cast<Function>(GV);
+    return !F || F->getName() == fnName;
+  });
+}
+
+static bool renderDumpAssembly(TargetMachine &TM, std::unique_ptr<Module> M,
+                               std::string &out) {
+  SmallVector<char, 0> AsmBuf;
+  raw_svector_ostream AOS(AsmBuf);
+  legacy::PassManager PM;
+  if (TM.addPassesToEmitFile(PM, AOS, /*DwoOut=*/nullptr,
+                             CodeGenFileType::AssemblyFile))
+    return false;
+  PM.run(*M);
+  out.assign(AsmBuf.begin(), AsmBuf.end());
+  return true;
 }
 
 /// Print one stored entry: header (name, key hi/lo, IR/ASM sizes) followed by
@@ -429,16 +488,35 @@ static void printOneDumpSafe(const char *requestedName,
   EJIT_DIAG_RAW("print_dumped hit requested=%s stored=%s key_hi=0x%08x "
                 "key_lo=0x%08x ir_size=%u asm_size=%u",
                 requestedName ? requestedName : "(list)", storedName.c_str(),
-                keyHi, keyLo, (unsigned)e.IR.size(), (unsigned)e.ASM.size());
-  if (!e.IR.empty())
-    dumpLinesSafe("dump IR", e.IR);
-  if (!e.ASM.empty())
-    dumpLinesSafe("dump ASM", e.ASM);
+                keyHi, keyLo, (unsigned)e.FunctionIR.size(),
+                (unsigned)e.FunctionASM.size());
+  if (!e.FunctionIR.empty())
+    dumpLinesSafe("dump IR", e.FunctionIR);
+  if (!e.FunctionASM.empty())
+    dumpLinesSafe("dump ASM", e.FunctionASM);
+}
+
+static void printOneModuleDumpSafe(const char *requestedName,
+                                   const std::string &storedName,
+                                   const DumpEntry &e) {
+  uint32_t keyHi = (uint32_t)(e.cacheKey >> 32);
+  uint32_t keyLo = (uint32_t)(e.cacheKey & 0xffffffffu);
+  (void)keyHi;
+  (void)keyLo;
+  EJIT_DIAG_RAW("print_dumped_module hit requested=%s stored=%s "
+                "key_hi=0x%08x key_lo=0x%08x ir_size=%u asm_size=%u",
+                requestedName ? requestedName : "(list)", storedName.c_str(),
+                keyHi, keyLo, (unsigned)e.ModuleIR.size(),
+                (unsigned)e.ModuleASM.size());
+  if (!e.ModuleIR.empty())
+    dumpLinesSafe("dump module IR", e.ModuleIR);
+  if (!e.ModuleASM.empty())
+    dumpLinesSafe("dump module ASM", e.ModuleASM);
 }
 
 /// Print saved IR+ASM through EJIT_DIAG, one line per IR/ASM line. A null/empty
 /// name prints all payloads available on this core.
-void printDumped(const char *name) {
+bool printDumped(const char *name) {
   EJIT_DIAG_DEBUG("print_dumped enter name=%s &filter=%p &store=%p",
                   (name && name[0]) ? name : "(all)", (void *)&gDumpFuncFilter,
                   (void *)&gDumpStore);
@@ -451,7 +529,7 @@ void printDumped(const char *name) {
       auto it = gDumpStore.find(name);
       if (it != gDumpStore.end()) {
         printOneDumpSafe(name, it->first, it->second);
-        return;
+        return true;
       }
     } else if (!gDumpStore.empty()) {
       EJIT_DIAG_RAW("print_dumped saved entries=%u", (unsigned)gDumpStore.size());
@@ -459,20 +537,47 @@ void printDumped(const char *name) {
         printOneDumpSafe(nullptr, kv.first, kv.second);
         ejitDiagPrintThrottle();
       }
-      return;
+      return true;
     }
   }
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   // A non-worker core cannot read the worker-private payload. Shared state
   // carries only enough metadata to direct the caller to the owning core.
   if (printSharedDumpHint(name))
-    return;
+    return true;
 #endif
   if (hasName)
     EJIT_DIAG_DEBUG("print_dumped miss name=%s store_size=%u", name,
                     (unsigned)gDumpStore.size());
   else
     EJIT_DIAG_RAW("print_dumped: nothing saved");
+  return false;
+}
+
+bool printDumpedModule(const char *name) {
+  bool hasName = name && name[0];
+  std::lock_guard<DumpMutexType> lock(gDumpMutex);
+  if (hasName) {
+    auto it = gDumpStore.find(name);
+    if (it != gDumpStore.end()) {
+      printOneModuleDumpSafe(name, it->first, it->second);
+      return true;
+    }
+    EJIT_DIAG_DEBUG("print_dumped_module miss name=%s store_size=%u", name,
+                    (unsigned)gDumpStore.size());
+    return false;
+  }
+  if (gDumpStore.empty()) {
+    EJIT_DIAG_RAW("print_dumped_module: nothing saved");
+    return false;
+  }
+  EJIT_DIAG_RAW("print_dumped_module saved entries=%u",
+                (unsigned)gDumpStore.size());
+  for (auto &kv : gDumpStore) {
+    printOneModuleDumpSafe(nullptr, kv.first, kv.second);
+    ejitDiagPrintThrottle();
+  }
+  return true;
 }
 
 } // namespace ejit
@@ -524,7 +629,11 @@ EJitOrcEngine::Create(const Config &config,
   // name-filtered ASM diagnostic dump. Failure is non-fatal — the dump is
   // simply unavailable.
   if (auto TMOrErr = JTMBOrErr->createTargetMachine())
-    engine->P->dumpTM = std::move(*TMOrErr);
+    engine->P->dumpFunctionTM = std::move(*TMOrErr);
+  else
+    consumeError(TMOrErr.takeError());
+  if (auto TMOrErr = JTMBOrErr->createTargetMachine())
+    engine->P->dumpModuleTM = std::move(*TMOrErr);
   else
     consumeError(TMOrErr.takeError());
 
@@ -689,13 +798,17 @@ EJitOrcEngine::Create(const Config &config,
                             (void *)&gDumpFuncFilter);
             if (match) {
               // IR capture always runs first so it succeeds even if the ASM
-              // diagnostic path is disabled or fails.
-              std::string IR;
-              raw_string_ostream IOS(IR);
-              M.print(IOS, nullptr);
-              IOS.flush();
+              // diagnostic path is disabled or fails. Capture only the entry
+              // definition: M also contains its full direct-call closure.
+              std::string FunctionIR;
+              if (!detail::renderDumpFunctionIR(M, ctx->fnName, FunctionIR))
+                EJIT_DIAG("dump capture: function not found fn=%s",
+                          ctx->fnName.c_str());
+              std::string ModuleIR;
+              detail::renderDumpModuleIR(M, ModuleIR);
 
-              std::string Asm;
+              std::string FunctionAsm;
+              std::string ModuleAsm;
               // Textual ASM emit goes through addPassesToEmitFile ->
               // addAsmPrinter -> createMCStreamer(AssemblyFile). Under
               // EJIT_TRIM_LLVM_BACKEND that path is compile-time removed and
@@ -712,38 +825,30 @@ EJitOrcEngine::Create(const Config &config,
               // path of the emit does not call errs(), so once the path is
               // compiled in it is SRE-safe.
 #if !defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM)
-              if (engine->P->dumpTM) {
+              if (engine->P->dumpFunctionTM && engine->P->dumpModuleTM) {
                 EJIT_DIAG_DEBUG("dump asm begin fn=%s", ctx->fnName.c_str());
-                SmallVector<char, 0> AsmBuf;
-                raw_svector_ostream AOS(AsmBuf);
-                legacy::PassManager PM;
-                if (!engine->P->dumpTM->addPassesToEmitFile(
-                        PM, AOS, /*DwoOut=*/nullptr,
-                        CodeGenFileType::AssemblyFile)) {
-                  EJIT_DIAG_DEBUG("dump asm PM.run begin fn=%s", ctx->fnName.c_str());
-                  // Clone M before running codegen so this diagnostic ASM emit
-                  // path cannot perturb the live module handed back to the JIT
-                  // for real compilation (codegen is IR-read-only in theory,
-                  // but target passes are not guaranteed to never touch IR).
-                  // The clone is local to this diagnostic path and discarded.
-                  std::unique_ptr<Module> MClone = CloneModule(M);
-                  PM.run(*MClone);
-                  EJIT_DIAG_DEBUG("dump asm PM.run end fn=%s", ctx->fnName.c_str());
-                  Asm.assign(AsmBuf.begin(), AsmBuf.end());
-                  EJIT_DIAG_DEBUG("dump asm size=%u fn=%s", (unsigned)Asm.size(),
-                            ctx->fnName.c_str());
-                } else {
+                bool FunctionOK = renderDumpAssembly(
+                    *engine->P->dumpFunctionTM,
+                    cloneDumpFunctionModule(M, ctx->fnName), FunctionAsm);
+                bool ModuleOK = renderDumpAssembly(
+                    *engine->P->dumpModuleTM, CloneModule(M), ModuleAsm);
+                if (!FunctionOK || !ModuleOK) {
                   EJIT_DIAG_DEBUG("dump asm addPassesToEmitFile failed fn=%s",
-                            ctx->fnName.c_str());
+                                  ctx->fnName.c_str());
                 }
+                EJIT_DIAG_DEBUG(
+                    "dump asm sizes function=%u module=%u fn=%s",
+                    (unsigned)FunctionAsm.size(), (unsigned)ModuleAsm.size(),
+                    ctx->fnName.c_str());
               }
 #else
               EJIT_DIAG_DEBUG("dump asm skipped (EJIT_TRIM_LLVM_BACKEND, "
                               "EJIT_DUMP_ASM off) fn=%s; IR captured",
                               ctx->fnName.c_str());
 #endif
-              captureDump(ctx->fnName, ctx->cacheKey, std::move(IR),
-                          std::move(Asm));
+              captureDump(ctx->fnName, ctx->cacheKey,
+                          std::move(FunctionIR), std::move(FunctionAsm),
+                          std::move(ModuleIR), std::move(ModuleAsm));
             }
           }
         });

@@ -20,6 +20,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
+#include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #ifdef EJIT_SRE_SHARED_TASKPOOL
@@ -30,6 +31,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
 #endif
 #include "llvm/AsmParser/Parser.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
@@ -37,6 +39,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
 #ifndef EJIT_FREESTANDING
@@ -45,6 +48,80 @@
 
 using namespace llvm;
 using namespace llvm::ejit;
+
+TEST(EJitDump, FunctionAndModuleViewsHaveDifferentScopes) {
+  LLVMContext Ctx;
+  Module M("dump_selective", Ctx);
+  auto *I32 = Type::getInt32Ty(Ctx);
+  auto *FT = FunctionType::get(I32, {I32}, false);
+  auto *Helper = Function::Create(FT, Function::InternalLinkage,
+                                  "dump_helper", &M);
+  IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Helper));
+  B.CreateRet(B.CreateAdd(Helper->getArg(0), B.getInt32(1)));
+
+  auto *Entry =
+      Function::Create(FT, Function::ExternalLinkage, "dump_entry", &M);
+  B.SetInsertPoint(BasicBlock::Create(Ctx, "entry", Entry));
+  B.CreateRet(B.CreateCall(Helper, {Entry->getArg(0)}));
+
+  std::string Output;
+  ASSERT_TRUE(
+      llvm::ejit::detail::renderDumpFunctionIR(M, "dump_entry", Output));
+  EXPECT_NE(Output.find("@dump_entry("), std::string::npos) << Output;
+  EXPECT_EQ(Output.find("define internal"), std::string::npos) << Output;
+  EXPECT_NE(Output.find("@dump_helper("), std::string::npos) << Output;
+
+  Output.clear();
+  llvm::ejit::detail::renderDumpModuleIR(M, Output);
+  EXPECT_NE(Output.find("define internal"), std::string::npos) << Output;
+  EXPECT_NE(Output.find("@dump_helper("), std::string::npos) << Output;
+}
+
+TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
+  std::string Bitcode;
+  {
+    LLVMContext Ctx;
+    Module M("dump_all_entries", Ctx);
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *FT = FunctionType::get(I32, {I32}, false);
+    for (StringRef Name : {"dump_a", "dump_b", "dump_c"}) {
+      auto *F = Function::Create(FT, Function::ExternalLinkage, Name, &M);
+      IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
+      B.CreateRet(B.CreateAdd(F->getArg(0), B.getInt32(Name.back())));
+    }
+    raw_string_ostream OS(Bitcode);
+    WriteBitcodeToFile(M, OS);
+    OS.flush();
+  }
+
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  EJitRuntimeState State;
+  Config Cfg;
+  auto EngineOrErr = EJitOrcEngine::Create(Cfg, State.getRegistry(), State);
+  ASSERT_TRUE(static_cast<bool>(EngineOrErr));
+  auto Engine = std::move(*EngineOrErr);
+
+  setDumpFuncFilter("*");
+  for (auto [Name, Key] :
+       {std::pair<const char *, uint64_t>{"dump_a", 0xda},
+        {"dump_b", 0xdb}, {"dump_c", 0xdc}}) {
+    SpecializationContext Ctx;
+    Ctx.fnName = Name;
+    Ctx.cacheKey = Key;
+    Engine->setActiveContext(&Ctx);
+    ASSERT_FALSE(errorToBool(Engine->loadBitcodeModule(Bitcode, Key, Name)));
+    auto FnOrErr = Engine->lookup(Key, Name);
+    ASSERT_TRUE(static_cast<bool>(FnOrErr));
+  }
+  Engine->setActiveContext(nullptr);
+  setDumpFuncFilter("");
+
+  for (const char *Name : {"dump_a", "dump_b", "dump_c"}) {
+    EXPECT_TRUE(printDumped(Name)) << Name;
+    EXPECT_TRUE(printDumpedModule(Name)) << Name;
+  }
+}
 
 namespace llvm {
 namespace ejit {

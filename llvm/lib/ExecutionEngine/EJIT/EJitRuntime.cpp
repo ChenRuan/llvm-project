@@ -1518,7 +1518,13 @@ void ejit_dump_func(const char *name) {
 void ejit_print_dumped(const char *name) {
   // gDumpSharedState is bound once in ejit_init; no per-call rebind needed.
   EJIT_DIAG_RAW("print_dumped name=%s", (name && name[0]) ? name : "(all)");
-  printDumped(name);
+  (void)printDumped(name);
+}
+
+void ejit_print_dumped_module(const char *name) {
+  EJIT_DIAG_RAW("print_dumped_module name=%s",
+                (name && name[0]) ? name : "(all)");
+  (void)printDumpedModule(name);
 }
 
 void ejit_dump_all(bool enable) {
