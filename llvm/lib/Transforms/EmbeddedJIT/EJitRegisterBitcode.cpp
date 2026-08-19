@@ -28,7 +28,9 @@
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar/EarlyCSE.h"
+#include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
@@ -216,7 +218,27 @@ static void preOptimizeBitcode(Module &M) {
   PB.registerModuleAnalyses(MAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-  // 1. Inline: AlwaysInline + cost-based inliner for small functions
+  // 1. Frontend-IR cleanup BEFORE inlining, mirroring the host O2 pipeline
+  //    (EarlyFPM + GlobalCleanupPM both precede its inliner). Raw CodeGen IR
+  //    keeps every C local as an alloca + store/load pair, which inflates the
+  //    inliner's computed callee cost ~4x; without this round the embedded
+  //    bitcode inlines far less than the same module compiled AOT - and the
+  //    JIT pipeline runs no inliner of its own (EJitOptimizer relies on this
+  //    AOT-time inlining), so every missed inline is a permanent call.
+  {
+    FunctionPassManager FPM;
+    FPM.addPass(LowerExpectIntrinsicPass());
+    FPM.addPass(SimplifyCFGPass());
+    FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
+    FPM.addPass(EarlyCSEPass());
+    FPM.addPass(InstCombinePass());
+    FPM.addPass(SimplifyCFGPass());
+    for (Function &F : M.functions())
+      if (!F.isDeclaration())
+        FPM.run(F, FAM);
+  }
+
+  // 2. Inline: AlwaysInline + cost-based inliner for small functions
   {
     ModulePassManager MPM;
     MPM.addPass(AlwaysInlinerPass());
@@ -225,7 +247,8 @@ static void preOptimizeBitcode(Module &M) {
     MPM.run(M, MAM);
   }
 
-  // 2. Mem2Reg: promote allocas from inlined code to SSA
+  // 3. Mem2Reg: promote any allocas left after inlining (AlwaysInliner can
+  // still emit fresh ones around inlined code) to SSA
   {
     FunctionPassManager FPM;
     FPM.addPass(PromotePass());
@@ -234,7 +257,7 @@ static void preOptimizeBitcode(Module &M) {
         FPM.run(F, FAM);
   }
 
-  // 3. EarlyCSE + InstCombine: simplify and fold redundant computations
+  // 4. EarlyCSE + InstCombine: simplify and fold redundant computations
   {
     FunctionPassManager FPM;
     FPM.addPass(EarlyCSEPass());
@@ -244,7 +267,7 @@ static void preOptimizeBitcode(Module &M) {
         FPM.run(F, FAM);
   }
 
-  // 4. SimplifyCFG: flatten branches, merge blocks
+  // 5. SimplifyCFG: flatten branches, merge blocks
   {
     FunctionPassManager FPM;
     FPM.addPass(SimplifyCFGPass());
@@ -253,7 +276,7 @@ static void preOptimizeBitcode(Module &M) {
         FPM.run(F, FAM);
   }
 
-  // 5. Restore !ejit.may_const metadata that passes may have dropped
+  // 6. Restore !ejit.may_const metadata that passes may have dropped
   reAnnotateMayConst(M);
 }
 #else
