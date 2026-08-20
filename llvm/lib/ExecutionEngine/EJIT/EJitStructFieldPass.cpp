@@ -3,6 +3,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
@@ -222,6 +223,86 @@ static Constant *createConstantFromMemory(const void *addr, Type *Ty,
   return nullptr;
 }
 
+/// Replace a load of a pointer-valued period global with the registered
+/// pointee address. Pointer-form ejit_period/ejit_period_arr globals are
+/// registered by the address of their pointer slot, so resolveBase() returns
+/// the slot and createConstantFromMemory() performs the required dereference.
+///
+/// This load is intentionally not required to carry !ejit.may_const: the
+/// pointer is the address root of the period object, while the annotation
+/// belongs to fields inside that object. Materializing the root lets IPSCCP
+/// propagate it through a non-inlined helper, after which the normal
+/// may_const-field replacement can resolve the field load.
+static Constant *
+tryReplacePeriodPointerBase(LoadInst *LI, const GVPeriodMap &gvMap,
+                            PeriodArrayRegistry &reg, const DataLayout &DL) {
+  if (LI->isVolatile() || LI->isAtomic() || !LI->getType()->isPointerTy())
+    return nullptr;
+
+  auto *GV = dyn_cast<GlobalVariable>(
+      LI->getPointerOperand()->stripPointerCasts());
+  if (!GV || !GV->getValueType()->isPointerTy())
+    return nullptr;
+
+  auto It = gvMap.find(GV);
+  if (It == gvMap.end())
+    return nullptr;
+
+  void *PointerSlot = resolveBase(GV, It->second, reg);
+  if (!PointerSlot)
+    return nullptr;
+  return createConstantFromMemory(PointerSlot, LI->getType(), DL);
+}
+
+/// Resolve a may_const load after IPSCCP/InstCombine has propagated a period
+/// pointer into a callee and folded its GEP into an absolute address. Accept
+/// the address only when it matches a declared may_const field of a registered
+/// pointer-form period object; arbitrary inttoptr loads must remain untouched.
+static Constant *tryReplacePeriodAbsoluteAddress(
+    LoadInst *LI, const GVPeriodMap &gvMap,
+    const MayConstOffsetMap &mayConstFieldMap, PeriodArrayRegistry &reg,
+    const DataLayout &DL) {
+  const Value *Ptr = LI->getPointerOperand();
+  APInt ExtraOffset(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
+  const Value *Base = Ptr->stripAndAccumulateConstantOffsets(
+      DL, ExtraOffset, /*AllowNonInbounds=*/true);
+
+  auto *IntToPtr = dyn_cast<ConstantExpr>(Base);
+  if (!IntToPtr || IntToPtr->getOpcode() != Instruction::IntToPtr)
+    return nullptr;
+  auto *AddressInt = dyn_cast<ConstantInt>(IntToPtr->getOperand(0));
+  if (!AddressInt)
+    return nullptr;
+
+  APInt Absolute = AddressInt->getValue().zextOrTrunc(ExtraOffset.getBitWidth());
+  Absolute += ExtraOffset;
+  uintptr_t Target = static_cast<uintptr_t>(Absolute.getZExtValue());
+
+  for (const auto &[GV, Info] : gvMap) {
+    if (!GV->getValueType()->isPointerTy())
+      continue;
+    auto FieldIt = mayConstFieldMap.find(GV);
+    if (FieldIt == mayConstFieldMap.end())
+      continue;
+
+    void *PointerSlot = resolveBase(GV, Info, reg);
+    if (!PointerSlot)
+      continue;
+    void *Pointee = nullptr;
+    std::memcpy(&Pointee, PointerSlot, sizeof(Pointee));
+    uintptr_t ObjectBase = reinterpret_cast<uintptr_t>(Pointee);
+    if (!ObjectBase || Target < ObjectBase)
+      continue;
+
+    uint64_t FieldOffset = Target - ObjectBase;
+    if (!llvm::is_contained(FieldIt->second, FieldOffset))
+      continue;
+    return createConstantFromMemory(reinterpret_cast<const void *>(Target),
+                                    LI->getType(), DL);
+  }
+  return nullptr;
+}
+
 //===----------------------------------------------------------------------===//
 // Load replacement helpers — one per access pattern
 //===----------------------------------------------------------------------===//
@@ -423,6 +504,16 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       ++totalLoads;
 #endif
 
+      // A pointer-form period global is itself the root needed to reach nested
+      // may_const fields. It has no may_const marker of its own, but replacing
+      // it here exposes a concrete address to IPSCCP and later StructFieldPass
+      // rounds, including when the field access lives in a non-inlined helper.
+      if (Constant *C = tryReplacePeriodPointerBase(
+              LI, gvPeriodMap_, registry_, DL)) {
+        replacements.push_back({LI, C});
+        continue;
+      }
+
       if (!isMayConstLoad(LI, mayConstFieldMap_, DL))
         continue;
 #ifdef EJIT_DIAG_ENABLE
@@ -432,11 +523,14 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       Value *PtrOp = LI->getPointerOperand();
 
       // Try each access pattern in order.
-      Constant *C = nullptr;
+      Constant *C = tryReplacePeriodAbsoluteAddress(
+          LI, gvPeriodMap_, mayConstFieldMap_, registry_, DL);
 
       // Pattern 1: direct GlobalVariable load (scalar static variable).
-      if (auto *GV = dyn_cast<GlobalVariable>(PtrOp->stripPointerCasts()))
-        C = tryReplaceDirectGV(LI, GV, gvPeriodMap_, registry_, DL);
+      if (!C) {
+        if (auto *GV = dyn_cast<GlobalVariable>(PtrOp->stripPointerCasts()))
+          C = tryReplaceDirectGV(LI, GV, gvPeriodMap_, registry_, DL);
+      }
 
       // Pattern 2: GEP-based access (array or struct field).
       if (!C)

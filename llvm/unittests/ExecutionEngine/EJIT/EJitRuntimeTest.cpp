@@ -2050,6 +2050,97 @@ TEST(EJitStructFieldPass, MissingPerLoadMetadataGVOffsetFallback) {
   EXPECT_EQ(RetVal->getSExtValue(), 30);
 }
 
+// A pointer-form period array is registered by the address of its pointer
+// slot. The root pointer load has no !ejit.may_const marker: only the nested
+// BBB field does. Specializing the root address is nevertheless required when
+// the field access sits behind a non-inlined helper, because the field pass
+// cannot otherwise trace the helper argument back to @aaa.
+TEST(EJitStructFieldPass, PointerPeriodRootFeedsNestedMayConstHelper) {
+  LLVMContext Ctx;
+  auto M = std::make_unique<Module>("pointer_period_nested", Ctx);
+  M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  M->setDataLayout("e-p:64:64");
+
+  IRBuilder<> B(Ctx);
+  Type *I32Ty = B.getInt32Ty();
+  auto *BBBTy = StructType::create(Ctx, {I32Ty, I32Ty}, "BBB");
+  auto *CCCTy = StructType::create(Ctx, {I32Ty}, "CCC");
+  auto *AAATy = StructType::create(
+      Ctx, {BBBTy, ArrayType::get(CCCTy, 10)}, "AAA");
+
+  auto *AAA = new GlobalVariable(
+      *M, B.getPtrTy(), false, GlobalValue::ExternalLinkage,
+      ConstantPointerNull::get(B.getPtrTy()), "aaa");
+  Metadata *PeriodOps[] = {
+      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR), MDString::get(Ctx, "xxx"),
+      ConstantAsMetadata::get(ConstantInt::get(I32Ty, 0))};
+  // Offset zero belongs to BBB::mayConstValue. AAA and AAA::bbb themselves are
+  // deliberately not may_const.
+  Metadata *FieldOps[] = {
+      MDString::get(Ctx, TAG_EJIT_MAY_CONST_FIELD),
+      ConstantAsMetadata::get(ConstantInt::get(I32Ty, 0))};
+  AAA->setMetadata(
+      MD_EJIT_METADATA,
+      MDNode::get(Ctx,
+                  {MDNode::get(Ctx, PeriodOps), MDNode::get(Ctx, FieldOps)}));
+
+  auto *HelperTy = FunctionType::get(I32Ty, {B.getPtrTy()}, false);
+  auto *Helper = Function::Create(HelperTy, GlobalValue::InternalLinkage,
+                                  "read_bbb_may_const", M.get());
+  Helper->addFnAttr(Attribute::NoInline);
+  BasicBlock *HelperEntry = BasicBlock::Create(Ctx, "entry", Helper);
+  B.SetInsertPoint(HelperEntry);
+  Value *NestedField = B.CreateStructGEP(AAATy, Helper->getArg(0), 0,
+                                         "bbb");
+  NestedField = B.CreateStructGEP(BBBTy, NestedField, 0, "may_const");
+  auto *NestedLoad = B.CreateLoad(I32Ty, NestedField, "value");
+  NestedLoad->setMetadata(MD_EJIT_MAY_CONST, MDNode::get(Ctx, {}));
+  B.CreateRet(NestedLoad);
+
+  auto *EntryTy = FunctionType::get(I32Ty, {}, false);
+  auto *Entry = Function::Create(EntryTy, GlobalValue::ExternalLinkage,
+                                 "read_aaa", M.get());
+  BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", Entry);
+  B.SetInsertPoint(EntryBB);
+  // This load has no may_const metadata. It is the address root that must be
+  // materialized before interprocedural propagation can expose the field GEP.
+  Value *Base = B.CreateLoad(B.getPtrTy(), AAA, "aaa.base");
+  B.CreateRet(B.CreateCall(Helper, {Base}));
+
+  struct MockAAA {
+    struct {
+      int32_t mayConstValue;
+      int32_t mutableValue;
+    } bbb;
+    struct {
+      int32_t value;
+    } ccc[10];
+  } Mock = {{73, 9}, {}};
+  MockAAA *CurrentAAA = &Mock;
+
+  PeriodArrayRegistry Reg;
+  // Pointer-form period arrays are registered with &aaa, not aaa.
+  Reg.registerArray("xxx", "aaa", &CurrentAAA, 0);
+  EJitOptimizerTestAccess Opt(Reg);
+
+  Opt.runStructFieldPass(*M);
+  EXPECT_EQ(countLoads(*Entry), 0u)
+      << "the unannotated period pointer root should become an address";
+
+  Opt.runInterproceduralPropagation(*M);
+  Opt.runInstCombine(*M);
+  Opt.runStructFieldPass(*M);
+  Opt.runInstCombine(*M);
+
+  EXPECT_EQ(countLoads(*Helper), 0u)
+      << "the nested BBB may_const load should be specialized";
+  auto *Ret = dyn_cast_or_null<ReturnInst>(&Helper->back().back());
+  ASSERT_NE(Ret, nullptr);
+  auto *RetValue = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(RetValue, nullptr);
+  EXPECT_EQ(RetValue->getSExtValue(), 73);
+}
+
 // 3. A load WITHOUT per-load metadata whose offset is NOT in the GV offset list
 //    must be left alone. Confirms the fallback does not over-fire.
 TEST(EJitStructFieldPass, MissingPerLoadMetadataWrongOffsetNoReplace) {
