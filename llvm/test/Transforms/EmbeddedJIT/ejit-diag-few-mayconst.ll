@@ -4,14 +4,14 @@
 ; RUN: opt -passes=ejit-register-bitcode -ejit-warn-few-mayconst=0 -S %s 2>&1 \
 ; RUN:     | FileCheck %s --check-prefix=OFF
 
-; #3: warn when the specialization closure has fewer than N ejit_may_const
+; #3: warn when the post-inline entry body has fewer than N ejit_may_const
 ; reads. N=4 means 0..3 reads trigger the warning.
 
 ; 1 read → warn (below threshold 4).
 ; CHECK: EJit warning: ejit_entry function 'entry_one' has only 1 ejit_may_const read
 
-; 3 reads in the closure (direct + callee) → warn.
-; CHECK: EJit warning: ejit_entry function 'entry_three_via_helper' has only 3 ejit_may_const reads
+; The noinline AOT callee's 2 reads do not count; only 1 entry-body read → warn.
+; CHECK: EJit warning: ejit_entry function 'entry_three_via_helper' has only 1 ejit_may_const read
 
 ; 0 reads → warn (below threshold 4).
 ; CHECK: EJit warning: ejit_entry function 'entry_zero' has only 0 ejit_may_const reads
@@ -79,7 +79,7 @@ define i32 @entry_five(i32 %c) !ejit.metadata !20 {
   ret i32 %s3
 }
 
-; ── 3 reads in closure (1 direct + 2 in callee) → below threshold → warn ──
+; ── 1 entry-body read; 2 noinline AOT-callee reads do not count → warn ──
 define i32 @entry_three_via_helper(i32 %c) !ejit.metadata !20 {
   %v = call i32 @helper_two(i32 %c)
   %p = getelementptr [16 x i32], ptr @cell_data, i32 0, i32 %c
@@ -87,7 +87,7 @@ define i32 @entry_three_via_helper(i32 %c) !ejit.metadata !20 {
   %sum = add i32 %v, %direct
   ret i32 %sum
 }
-define internal i32 @helper_two(i32 %c) {
+define internal i32 @helper_two(i32 %c) #0 {
   %p0 = getelementptr [16 x i32], ptr @cell_data, i32 0, i32 0
   %v0 = load i32, ptr %p0, !ejit.may_const !{}
   %p1 = getelementptr [16 x i32], ptr @cell_data, i32 0, i32 1
@@ -117,3 +117,5 @@ exit:
 
 !10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}, !{!"ejit_may_const_field", i32 0}}
 !20 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
+
+attributes #0 = { noinline }

@@ -1,15 +1,15 @@
 ; RUN: opt -passes=ejit-register-bitcode -S %s 2>&1 | FileCheck %s
 
-; #1: ejit_entry whose specialization closure reads no ejit_may_const field
+; #1: ejit_entry whose post-inline body reads no ejit_may_const field
 ; has no JIT specialization value -> warn.
 
-; CHECK: EJit warning: ejit_entry function 'entry_plain' reads no ejit_may_const field in its specialization closure
-; CHECK: EJit warning: ejit_entry function 'entry_external_only' reads no ejit_may_const field in its specialization closure
+; CHECK: EJit warning: ejit_entry function 'entry_plain' reads no ejit_may_const field in its post-inline body
+; CHECK: EJit warning: ejit_entry function 'entry_via_helper' reads no ejit_may_const field in its post-inline body
+; CHECK: EJit warning: ejit_entry function 'entry_external_only' reads no ejit_may_const field in its post-inline body
 
-; #1 must NOT fire for entries that do read ejit_may_const, whether directly or
-; via an internal helper that the closure covers.
+; #1 must NOT fire for entries that read ejit_may_const directly or through a
+; helper that AOT pre-inlining places in the entry body.
 ; CHECK-NOT: EJit warning: ejit_entry function 'entry_direct' reads no ejit_may_const
-; CHECK-NOT: EJit warning: ejit_entry function 'entry_via_helper' reads no ejit_may_const
 
 @cell_data = global [16 x i32] zeroinitializer, !ejit.metadata !10
 
@@ -26,13 +26,13 @@ define i32 @entry_direct(i32 %c) !ejit.metadata !20 {
   ret i32 %v
 }
 
-; ejit_may_const read hidden in an internal helper. The closure covers it, so
-; the entry still has specialization value -> no warning.
+; A noinline helper executes through its AOT fallback. Its may_const read does
+; not give the JIT entry body specialization value -> warn.
 define i32 @entry_via_helper(i32 %c) !ejit.metadata !20 {
   %r = call i32 @helper_reads_mc(i32 %c)
   ret i32 %r
 }
-define internal i32 @helper_reads_mc(i32 %c) {
+define internal i32 @helper_reads_mc(i32 %c) #0 {
   %p = getelementptr [16 x i32], ptr @cell_data, i32 0, i32 %c
   %v = load i32, ptr %p, !ejit.may_const !{}
   ret i32 %v
@@ -49,3 +49,5 @@ declare void @external_fn(i32)
 !10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}, !{!"ejit_may_const_field", i32 0}}
 !20 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
 !30 = distinct !{!{!"ejit_entry"}}
+
+attributes #0 = { noinline }

@@ -4,6 +4,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLinkDiagPlugin.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLinkOptimizationPlugin.h"
@@ -871,6 +872,19 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
   if (!ModuleOrErr) {
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: parse bitcode error", cacheKey);
     return ModuleOrErr.takeError();
+  }
+
+  // AOT pre-optimization has already made every permitted inline decision.
+  // From this point onward specialization is strictly function-local: retain
+  // only the requested entry body and resolve every residual call to the
+  // TU-unique AOT fallback symbol registered for that definition.
+  if (!detail::isolateFunctionForSpecialization(**ModuleOrErr, origFnName)) {
+    EJIT_DIAG("loadBitcode FAIL key=0x%016lx: function isolation metadata "
+              "invalid func=%s",
+              cacheKey, origFnName.c_str());
+    return make_error<StringError>("Function-only specialization metadata "
+                                   "missing or invalid: " + origFnName,
+                                   inconvertibleErrorCode());
   }
 
   Triple TT((*ModuleOrErr)->getTargetTriple());

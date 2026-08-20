@@ -30,6 +30,13 @@ class EJitRuntimeState;
 struct EJitSharedTaskPoolState;
 
 namespace detail {
+/// Keep only \p fnName as a definition. Every other definition is renamed to
+/// its registered AOT fallback symbol and converted to a declaration, so the
+/// JIT optimizer and code generator operate on exactly one function body.
+/// Returns false without modifying \p M if the entry or fallback metadata is
+/// missing or invalid.
+bool isolateFunctionForSpecialization(Module &M, StringRef fnName);
+
 /// Render one function definition without the rest of its specialization
 /// module. Exposed for focused dump-path testing; callers should use the
 /// ejit_dump_* APIs.

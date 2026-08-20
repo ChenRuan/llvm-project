@@ -13,7 +13,6 @@
 // pipeline (PassBuilder::buildFunctionSimplificationPipeline); only the light
 // cleanupFPM_ and the LowerExpect prefix are hand-added below.
 #include "llvm/Transforms/InstCombine/InstCombine.h"
-#include "llvm/Transforms/IPO/SCCP.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
 #include "llvm/Transforms/Scalar/SCCP.h"
@@ -97,26 +96,14 @@ void EJitOptimizer::runPipeline(Module &M,
   runInstCombine(M);
   EJIT_DIAG_DEBUG("pipeline phase1b done: InstCombine");
   // Inlining is intentionally not run here: the AOT pre-optimization
-  // (EJitRegisterBitcodePass: AlwaysInline + ModuleInliner(O2)) already expanded
-  // callee bodies in the embedded bitcode, so their may_const GEP chains are
-  // already traceable to the global.
+  // (EJitRegisterBitcodePass: AlwaysInline + ModuleInliner(O2)) already made
+  // the permitted inline decisions. Only the resulting entry body is present.
   //   (c) Replace the may_const loads with their runtime constant values.
   runStructFieldPass(M);
   EJIT_DIAG_DEBUG("pipeline phase1c done: StructFieldPass");
-  //   (d) Push the constants across call edges. Wherever the AOT inliner kept
-  //       a call, the callee still re-derives cell addressing and re-tests
-  //       guards from its arguments — which phases 1a-1c just made constant at
-  //       every call site. IPSCCP propagates them into the callee bodies (and
-  //       constant returns back out).
-  runInterproceduralPropagation(M);
-  EJIT_DIAG_DEBUG("pipeline phase1d done: IPSCCP");
-  //   (e,f) The propagated arguments expose callee GEP chains exactly as 1a
-  //       did for the entry: fold them, then substitute the callee may_const
-  //       loads they root, so phases 2-4 exploit the constants in every
-  //       function, not just the entry.
-  runInstCombine(M);
-  runStructFieldPass(M);
-  EJIT_DIAG_DEBUG("pipeline phase1ef done: callee InstCombine+StructFieldPass");
+  // Every non-inlined callee is an external declaration bound to its AOT
+  // address before this transform runs. No interprocedural propagation is
+  // allowed here: the current entry is the only function body in the module.
 
   // Phases 2-4 — exploit those constants (scalar fixed point → loops →
   // re-specialize → cleanup). ctx.optLevel is accepted for ABI compatibility
@@ -172,30 +159,6 @@ void EJitOptimizer::runInstCombine(Module &M) {
   for (Function &F : M.functions())
     if (!F.isDeclaration())
       FPM.run(F, FAM_);
-}
-
-void EJitOptimizer::runInterproceduralPropagation(Module &M) {
-  // IPSCCP only reasons about a function's arguments when it can enumerate
-  // every call site: local linkage and no address-taken uses. The
-  // specialization module is self-contained — the JIT looks up only the
-  // ejit_entry symbols; every other definition is called module-internally and
-  // external references resolve to AOT symbols — so all non-entry definitions
-  // can be internalized. (Address-taken callees are internalized too; IPSCCP
-  // itself skips their arguments, and their symbols are still resolved
-  // module-internally.)
-  for (Function &F : M.functions()) {
-    if (F.isDeclaration() || F.hasLocalLinkage())
-      continue;
-    if (hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY))
-      continue;
-    // The IR verifier requires default visibility with local linkage.
-    F.setVisibility(GlobalValue::DefaultVisibility);
-    F.setLinkage(GlobalValue::InternalLinkage);
-  }
-
-  ModulePassManager MPM;
-  MPM.addPass(IPSCCPPass());
-  MPM.run(M, MAM_);
 }
 
 void EJitOptimizer::runStructFieldPass(Module &M) {

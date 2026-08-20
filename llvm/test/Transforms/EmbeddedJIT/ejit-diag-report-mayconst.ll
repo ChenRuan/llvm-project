@@ -4,7 +4,7 @@
 ; RUN:     -S %s 2>&1 | FileCheck %s
 
 ; Option A: an info-level (non-gating) report of per-ejit_entry ejit_may_const
-; read counts over the specialization closure: K total, J inside loops.
+; read counts in the post-inline body: K total, J inside loops.
 
 ; A single may_const read inside a self-loop -> 1 total, 1 in loops.
 ; CHECK: EJit info: ejit_entry function 'entry_loop': 1 ejit_may_const read (1 in loops)

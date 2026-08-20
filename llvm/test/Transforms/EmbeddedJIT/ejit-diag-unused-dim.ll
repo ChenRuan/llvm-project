@@ -1,10 +1,10 @@
 ; RUN: opt -passes=ejit-register-bitcode -S %s 2>&1 | FileCheck %s
 ; RUN: opt -passes=ejit-register-bitcode -ejit-warn-unused-dim=false -S %s 2>&1 | FileCheck %s --check-prefix=OFF
 
-; #2: an ejit_entry that declares ejit_period_arr_ind(P) but whose closure
+; #2: an ejit_entry that declares ejit_period_arr_ind(P) but whose post-inline body
 ; never indexes an ejit_period_arr(P) has an unused specialization dimension.
 
-; CHECK: EJit warning: ejit_entry function 'entry_unused_cell' declares ejit_period_arr_ind('cell') but its specialization closure never indexes an ejit_period_arr('cell')
+; CHECK: EJit warning: ejit_entry function 'entry_unused_cell' declares ejit_period_arr_ind('cell') but its post-inline body never indexes an ejit_period_arr('cell')
 
 ; The used dim (trp) on the same function must NOT warn, and an entry that does
 ; index its declared dim must NOT warn.

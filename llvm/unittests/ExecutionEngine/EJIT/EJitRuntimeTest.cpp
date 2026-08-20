@@ -36,11 +36,14 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "gtest/gtest.h"
 #ifndef EJIT_FREESTANDING
 #include <thread>
@@ -86,6 +89,10 @@ TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
     auto *FT = FunctionType::get(I32, {I32}, false);
     for (StringRef Name : {"dump_a", "dump_b", "dump_c"}) {
       auto *F = Function::Create(FT, Function::ExternalLinkage, Name, &M);
+      F->setMetadata(MD_EJIT_AOT_SYMBOL,
+                     MDNode::get(Ctx, MDString::get(
+                                          Ctx, (Twine("__ejit_aot_test_") +
+                                                Name).str())));
       IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
       B.CreateRet(B.CreateAdd(F->getArg(0), B.getInt32(Name.back())));
     }
@@ -123,6 +130,56 @@ TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
   }
 }
 
+static int functionOnlyAotHelper(int X) { return X + 1000; }
+
+TEST(EJitFunctionIsolation, OrcCallsAotForResidualCall) {
+  std::string Bitcode;
+  {
+    LLVMContext Ctx;
+    SMDiagnostic Err;
+    auto M = parseAssemblyString(R"(
+      define internal i32 @module_helper(i32 %x) !ejit.aot_symbol !0 {
+        %r = add i32 %x, 1
+        ret i32 %r
+      }
+      define i32 @function_only_entry(i32 %x) {
+        %r = call i32 @module_helper(i32 %x)
+        ret i32 %r
+      }
+      !0 = !{!"__ejit_aot_function_only_test"}
+    )",
+                                 Err, Ctx);
+    ASSERT_NE(M, nullptr);
+    raw_string_ostream OS(Bitcode);
+    WriteBitcodeToFile(*M, OS);
+    OS.flush();
+  }
+
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  EJitRuntimeState State;
+  Config Cfg;
+  auto EngineOrErr = EJitOrcEngine::Create(Cfg, State.getRegistry(), State);
+  ASSERT_TRUE(static_cast<bool>(EngineOrErr));
+  auto Engine = std::move(*EngineOrErr);
+  Engine->addUserSymbol("__ejit_aot_function_only_test",
+                        reinterpret_cast<void *>(&functionOnlyAotHelper));
+
+  constexpr uint64_t Key = 0xf001;
+  SpecializationContext SpecCtx;
+  SpecCtx.fnName = "function_only_entry";
+  SpecCtx.cacheKey = Key;
+  Engine->setActiveContext(&SpecCtx);
+  ASSERT_FALSE(errorToBool(
+      Engine->loadBitcodeModule(Bitcode, Key, SpecCtx.fnName)));
+  auto FnOrErr = Engine->lookup(Key, SpecCtx.fnName);
+  ASSERT_TRUE(static_cast<bool>(FnOrErr));
+  using FnTy = int (*)(int);
+  auto Fn = reinterpret_cast<FnTy>(*FnOrErr);
+  EXPECT_EQ(Fn(5), 1005) << "residual call executed the JIT helper body";
+  Engine->setActiveContext(nullptr);
+}
+
 namespace llvm {
 namespace ejit {
 // Test-only accessor. EJitOptimizer deliberately keeps its individual pipeline
@@ -135,7 +192,6 @@ struct EJitOptimizerTestAccess : EJitOptimizer {
   using EJitOptimizer::EJitOptimizer;
   using EJitOptimizer::preReplacePeriodIndices;
   using EJitOptimizer::runInstCombine;
-  using EJitOptimizer::runInterproceduralPropagation;
   using EJitOptimizer::runOptimizationPipeline;
   using EJitOptimizer::runStructFieldPass;
 };
@@ -2571,137 +2627,130 @@ TEST(EJitEndToEnd, PipelineFoldsMayConstBranchAtAllLevels) {
 }
 
 //===----------------------------------------------------------------------===//
-// Interprocedural propagation (phase 1d)
+// Function-only specialization boundary
 //===----------------------------------------------------------------------===//
 
-// The AOT inliner keeps a call edge wherever it chose not to inline, so a
-// specialization used to stop at every such edge: the entry's substituted
-// dims arrive at the callee as ordinary constant arguments, but the callee
-// body still indexes the period array with a runtime value and re-tests
-// guards. These tests pin phase 1d (internalize + IPSCCP): the constants
-// cross the edge, the callee's may_const load becomes substitutable, and the
-// callee folds to a constant return like the entry does.
-namespace {
-
-/// Entry (has ejit_entry metadata) calls a callee with a constant cell index
-/// — the shape phase 1a leaves behind. The callee loads field 1 of
-/// g_ipcfg[cell] (may_const) and branches on it.
-std::unique_ptr<Module> parseInterprocModule(LLVMContext &Ctx) {
+TEST(EJitFunctionIsolation, NonInlineCalleeBecomesUniqueAotDeclaration) {
+  LLVMContext Ctx;
   SMDiagnostic Err;
   auto M = parseAssemblyString(R"(
-    target datalayout = "e-m:e-i64:64-i128:128-n32:64-S128"
-    %S = type { i32, i32 }
-    @g_ipcfg = external global [4 x %S], !ejit.metadata !0
-
-    define i32 @ip_callee(i8 noundef %cell) {
-      %idx = zext i8 %cell to i64
-      %gep = getelementptr inbounds [4 x %S], ptr @g_ipcfg, i64 0, i64 %idx, i32 1
-      %v = load i32, ptr %gep, align 4, !ejit.may_const !2
-      %c = icmp eq i32 %v, 7
-      br i1 %c, label %then, label %else
-    then:
-      ret i32 100
-    else:
-      ret i32 200
-    }
-
-    define i32 @ip_entry() !ejit.metadata !3 {
-      %r = call i32 @ip_callee(i8 noundef 2)
+    define internal i32 @slow_helper(i32 %x) !ejit.aot_symbol !0 {
+      %r = mul i32 %x, 9
       ret i32 %r
     }
 
-    !0 = !{!1}
-    !1 = !{!"ejit_period_arr", !"cell", i32 4}
-    !2 = !{}
-    !3 = !{!4}
-    !4 = !{!"ejit_entry"}
+    define i32 @active_entry(i32 %x) !ejit.metadata !1 !ejit.aot_symbol !4 {
+      %inlined = add i32 %x, 7
+      %r = call i32 @slow_helper(i32 %inlined)
+      ret i32 %r
+    }
+
+    define i32 @other_entry(i32 %x) !ejit.metadata !1 !ejit.aot_symbol !2 {
+      %r = sub i32 %x, 1
+      ret i32 %r
+    }
+
+    !0 = !{!"__ejit_aot_tu_slow_helper"}
+    !1 = !{!3}
+    !2 = !{!"__ejit_aot_tu_other_entry"}
+    !3 = !{!"ejit_entry"}
+    !4 = !{!"__ejit_aot_tu_active_entry"}
   )",
                               Err, Ctx);
   if (!M)
-    Err.print("parseInterprocModule", errs());
-  return M;
-}
-
-/// Per-cell mock backing for @g_ipcfg; cell 2 has field 1 == 7 → callee
-/// returns 100 when specialized for cell 2.
-struct IpMockElem {
-  int32_t a, b;
-};
-
-unsigned countLoadsIn(const Function &F) {
-  unsigned n = 0;
-  for (const BasicBlock &BB : F)
-    for (const Instruction &I : BB)
-      n += isa<LoadInst>(&I);
-  return n;
-}
-
-} // anonymous namespace
-
-// Without phase 1d the callee is untouched: its load survives the whole
-// pipeline because the cell index stays a runtime argument inside it. This is
-// the baseline that motivates the pass.
-TEST(EJitInterprocedural, ConstantsStopAtCallEdgeWithoutIPSCCP) {
-  LLVMContext Ctx;
-  auto M = parseInterprocModule(Ctx);
+    Err.print("EJitFunctionIsolation", errs());
   ASSERT_NE(M, nullptr);
+  auto OtherModule = CloneModule(*M);
+  auto InvalidModule = CloneModule(*M);
 
-  IpMockElem mock[4] = {{0, 1}, {0, 3}, {0, 7}, {0, 9}};
-  PeriodArrayRegistry reg;
-  reg.registerArray("cell", "g_ipcfg", mock, 4);
-
-  EJitOptimizerTestAccess opt(reg);
-  opt.runInstCombine(*M);
-  opt.runStructFieldPass(*M);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
-
-  Function *Callee = M->getFunction("ip_callee");
-  ASSERT_NE(Callee, nullptr);
-  EXPECT_EQ(countLoadsIn(*Callee), 1u)
-      << "callee folded without IPSCCP — baseline assumption changed";
-}
-
-// With phase 1d in its pipeline position (after 1c, before the 1e/1f
-// re-fold), the constant argument crosses the edge, the callee's may_const
-// load folds against cell 2's runtime value, and the guard collapses: the
-// callee body becomes `ret i32 100`.
-TEST(EJitInterprocedural, IPSCCPPropagatesDimsIntoCallee) {
-  LLVMContext Ctx;
-  auto M = parseInterprocModule(Ctx);
-  ASSERT_NE(M, nullptr);
-
-  IpMockElem mock[4] = {{0, 1}, {0, 3}, {0, 7}, {0, 9}};
-  PeriodArrayRegistry reg;
-  reg.registerArray("cell", "g_ipcfg", mock, 4);
-
-  EJitOptimizerTestAccess opt(reg);
-  // Same order as runPipeline: 1b InstCombine, 1c StructField, 1d IPSCCP,
-  // 1e/1f re-fold, phases 2-4.
-  opt.runInstCombine(*M);
-  opt.runStructFieldPass(*M);
-  opt.runInterproceduralPropagation(*M);
-  opt.runInstCombine(*M);
-  opt.runStructFieldPass(*M);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
-
-  Function *Callee = M->getFunction("ip_callee");
-  Function *Entry = M->getFunction("ip_entry");
-  ASSERT_NE(Callee, nullptr);
+  ASSERT_TRUE(llvm::ejit::detail::isolateFunctionForSpecialization(
+      *M, "active_entry"));
+  Function *Entry = M->getFunction("active_entry");
+  Function *Helper = M->getFunction("__ejit_aot_tu_slow_helper");
+  Function *Other = M->getFunction("__ejit_aot_tu_other_entry");
   ASSERT_NE(Entry, nullptr);
+  ASSERT_NE(Helper, nullptr);
+  ASSERT_NE(Other, nullptr);
+  EXPECT_FALSE(Entry->isDeclaration());
+  EXPECT_TRUE(Helper->isDeclaration());
+  EXPECT_TRUE(Other->isDeclaration());
+  EXPECT_TRUE(Helper->hasExternalLinkage());
+  EXPECT_TRUE(Other->hasExternalLinkage());
 
-  // The callee was internalized so IPSCCP could trust its call-site set; the
-  // entry must stay externally visible — it is the symbol the JIT looks up.
-  EXPECT_TRUE(Callee->hasLocalLinkage());
-  EXPECT_FALSE(Entry->hasLocalLinkage());
+  auto *Call = dyn_cast<CallInst>(&*std::next(Entry->front().begin()));
+  ASSERT_NE(Call, nullptr);
+  EXPECT_EQ(Call->getCalledFunction(), Helper);
+  EXPECT_FALSE(verifyModule(*M, &errs()));
 
-  // The callee's period load and guard folded to the constant return.
-  EXPECT_EQ(countLoadsIn(*Callee), 0u) << "callee may_const load survived";
-  ASSERT_EQ(Callee->size(), 1u) << "callee guard branch survived";
-  auto *Ret = dyn_cast<ReturnInst>(Callee->getEntryBlock().getTerminator());
-  ASSERT_NE(Ret, nullptr);
-  auto *RetVal = dyn_cast<ConstantInt>(Ret->getReturnValue());
-  ASSERT_NE(RetVal, nullptr) << "callee return did not fold";
-  EXPECT_EQ(RetVal->getSExtValue(), 100); // mock[2].b == 7 → then-branch
+  ASSERT_TRUE(llvm::ejit::detail::isolateFunctionForSpecialization(
+      *OtherModule, "other_entry"));
+  EXPECT_FALSE(OtherModule->getFunction("other_entry")->isDeclaration());
+  EXPECT_TRUE(OtherModule->getFunction("__ejit_aot_tu_active_entry")
+                  ->isDeclaration());
+  EXPECT_TRUE(OtherModule->getFunction("__ejit_aot_tu_slow_helper")
+                  ->isDeclaration());
+  EXPECT_FALSE(verifyModule(*OtherModule, &errs()));
+
+  Function *InvalidHelper = InvalidModule->getFunction("slow_helper");
+  InvalidHelper->setMetadata(MD_EJIT_AOT_SYMBOL, nullptr);
+  EXPECT_FALSE(llvm::ejit::detail::isolateFunctionForSpecialization(
+      *InvalidModule, "active_entry"));
+  EXPECT_FALSE(InvalidHelper->isDeclaration())
+      << "failed validation partially modified the module";
+  EXPECT_FALSE(llvm::ejit::detail::isolateFunctionForSpecialization(
+      *M, "missing"));
+}
+
+TEST(EJitFunctionIsolation, EntryFallbackBypassesDispatcherWrapper) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    define internal i32 @slow_helper(i32 %x) #0 {
+      %r = mul i32 %x, 9
+      ret i32 %r
+    }
+
+    define i32 @function_entry(i32 %x) #0 !ejit.metadata !0 {
+      %r = call i32 @slow_helper(i32 %x)
+      ret i32 %r
+    }
+
+    attributes #0 = { noinline }
+    !0 = distinct !{!{!"ejit_entry"}}
+  )",
+                               Err, Ctx);
+  if (!M)
+    Err.print("EntryFallbackBypassesDispatcherWrapper", errs());
+  ASSERT_NE(M, nullptr);
+
+  ModuleAnalysisManager MAM;
+  EJitRegisterBitcodePass().run(*M, MAM);
+
+  Function *AotBody = nullptr;
+  for (Function &F : *M)
+    if (F.getName().starts_with("__ejit_aot_") &&
+        F.getName().ends_with(".body")) {
+      ASSERT_EQ(AotBody, nullptr) << "multiple AOT entry bodies were emitted";
+      AotBody = &F;
+    }
+  ASSERT_NE(AotBody, nullptr);
+  EXPECT_TRUE(AotBody->hasLocalLinkage());
+  EXPECT_FALSE(AotBody->isDeclaration());
+  EXPECT_EQ(AotBody->getMetadata(MD_EJIT_METADATA), nullptr);
+
+  Function *AutoReg = M->getFunction(FN_AUTO_REGISTER);
+  ASSERT_NE(AutoReg, nullptr);
+  bool RegisteredDirectBody = false;
+  for (BasicBlock &BB : *AutoReg)
+    for (Instruction &I : BB)
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (Function *Callee = CB->getCalledFunction())
+          if (Callee->getName() == FN_REGISTER_SYMBOL &&
+              CB->getArgOperand(1)->stripPointerCasts() == AotBody)
+            RegisteredDirectBody = true;
+  EXPECT_TRUE(RegisteredDirectBody)
+      << "entry fallback still points at the function that PASS3 wraps";
+  EXPECT_FALSE(verifyModule(*M, &errs()));
 }
 
 //===----------------------------------------------------------------------===//

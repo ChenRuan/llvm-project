@@ -54,6 +54,10 @@ namespace ejit {
 //===----------------------------------------------------------------------===//
 constexpr const char *MD_EJIT_METADATA = "ejit.metadata";
 constexpr const char *MD_EJIT_MAY_CONST = "ejit.may_const";
+// Per-definition AOT fallback symbol emitted into extracted bitcode. The JIT
+// renames every non-active definition to this TU-unique symbol before turning
+// it into a declaration, so static helpers from different TUs cannot collide.
+constexpr const char *MD_EJIT_AOT_SYMBOL = "ejit.aot_symbol";
 
 //===----------------------------------------------------------------------===//
 // Metadata entry tags (first operand of sub-nodes in !ejit.metadata)

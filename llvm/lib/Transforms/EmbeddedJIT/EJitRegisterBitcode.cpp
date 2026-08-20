@@ -33,7 +33,9 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MD5.h"
 #include "llvm/Support/Process.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
@@ -334,7 +336,6 @@ struct EjitFuncDiagInfo {
   unsigned MayConstCount = 0;        // # of !ejit.may_const loads (direct)
   unsigned MayConstInLoopCount = 0;  // subset sitting inside a loop
   SetVector<StringRef> RefsPeriodArr; // deduped period names referenced
-  SmallVector<const Function *, 4> Callees;  // direct, defined, non-intrinsic
 };
 
 /// One ejit_entry's declared dimensions, parsed from the original module's
@@ -376,7 +377,7 @@ static void computeLoopBBs(Function &F,
       LoopBBs.insert(&BB);
 }
 
-/// Compute direct (pre-propagation) diagnostic info for \p F. \p LoopBBs is
+/// Compute function-local diagnostic info for \p F. \p LoopBBs is
 /// optional (non-null only when the may_const count report is enabled).
 static void
 computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKind,
@@ -393,10 +394,6 @@ computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKi
           if (InLoop)
             ++Info.MayConstInLoopCount;
         }
-      if (auto *CB = dyn_cast<CallBase>(&I))
-        if (Function *Callee = CB->getCalledFunction())
-          if (!Callee->isDeclaration() && !Callee->isIntrinsic())
-            Info.Callees.push_back(Callee);
       // Collect referenced GVs for period-arr lookup in the same traversal.
       for (Value *Op : I.operands())
         if (auto *GV = rootGlobal(Op, DL))
@@ -423,13 +420,11 @@ computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKi
 
 /// AOT specialization diagnostics on the extracted bitcode (post-preOptimize),
 /// which is exactly what the JIT will specialize.
-///   #1: ejit_entry whose specialization closure reads no ejit_may_const field.
-///   #2: ejit_entry that declares ejit_period_arr_ind(P) but its closure never
+///   #1: ejit_entry whose post-inline body reads no ejit_may_const field.
+///   #2: ejit_entry that declares ejit_period_arr_ind(P) but its body never
 ///       indexes an ejit_period_arr(P).
-/// The closure is the direct-call reachability within the extracted module.
-/// External calls (declarations) and indirect calls (function pointers) do NOT
-/// count: the JIT cannot inline them, so their may_const reads never enter this
-/// entry's specialization. This keeps #1 sound (no false positives).
+/// AOT pre-inlining has already run. Residual callees execute as AOT and must
+/// not contribute to the specialization-value report.
 static void
 runSpecializationDiagnostic(Module &Extracted,
                             const SmallVectorImpl<Function *> &EntryFuncs) {
@@ -472,87 +467,45 @@ runSpecializationDiagnostic(Module &Extracted,
                             NeedLoops ? &LoopBBs : nullptr);
   }
 
-  // Fixpoint: propagate HasMayConstLoad and RefsPeriodArr up the call graph.
-  // The extracted module holds only the closure, so every function is reachable
-  // from some entry; the monotonic fixpoint converges quickly.
-  DenseMap<const Function *, bool> ClosureMC;
-  DenseMap<const Function *, SetVector<StringRef>> ClosureRefs;
-  for (auto &KV : Info) {
-    ClosureMC[KV.first] = KV.second.HasMayConstLoad;
-    ClosureRefs[KV.first] = KV.second.RefsPeriodArr;
-  }
-  bool Changed = true;
-  while (Changed) {
-    Changed = false;
-    for (auto &KV : Info) {
-      const Function *F = KV.first;
-      for (const Function *Callee : KV.second.Callees) {
-        if (!Info.count(Callee))
-          continue;
-        if (ClosureMC[Callee] && !ClosureMC[F]) {
-          ClosureMC[F] = true;
-          Changed = true;
-        }
-        for (StringRef P : ClosureRefs[Callee])
-          if (ClosureRefs[F].insert(P))
-            Changed = true;
-      }
-    }
-  }
-
   // Emit diagnostics per entry (locate in the extracted module by name).
   for (const EjitEntryDiag &ED : Entries) {
     const Function *EF = Extracted.getFunction(ED.Name);
     if (!EF || EF->isDeclaration())
       continue;
-    auto MCIt = ClosureMC.find(EF);
-    auto RefIt = ClosureRefs.find(EF);
-    if (MCIt == ClosureMC.end() || RefIt == ClosureRefs.end())
+    auto It = Info.find(EF);
+    if (It == Info.end())
       continue;
 
-    // #1: no ejit_may_const read in the specialization closure.
-    if (EJitWarnNoSpecialization && !MCIt->second)
+    // #1: no ejit_may_const read in the post-inline entry body.
+    if (EJitWarnNoSpecialization && !It->second.HasMayConstLoad)
       errs() << "EJit warning: ejit_entry function '" << EF->getName()
-             << "' reads no ejit_may_const field in its specialization "
-                "closure; no JIT specialization value, consider removing "
+             << "' reads no ejit_may_const field in its post-inline body; "
+                "no JIT specialization value, consider removing "
                 "ejit_entry\n";
 
-    // #2: declared dimension never referenced by the closure.
+    // #2: declared dimension never referenced by the post-inline body.
     if (EJitWarnUnusedDim)
       for (const std::string &P : ED.DeclaredDims)
-        if (RefIt->second.count(P) == 0)
+        if (It->second.RefsPeriodArr.count(P) == 0)
           errs() << "EJit warning: ejit_entry function '" << EF->getName()
                  << "' declares ejit_period_arr_ind('" << P
-                 << "') but its specialization closure never indexes an "
+                 << "') but its post-inline body never indexes an "
                     "ejit_period_arr('"
                  << P << "'); unused specialization dimension, consider "
                         "removing it\n";
   }
 
-  // Per-entry may_const read counts over the specialization closure (BFS).
-  // Used by the info report and the few-may-const warning; both share the
-  // same closure walk so they share one gated loop.
+  // Per-entry may_const read counts in the post-inline body.
   if (EJitReportMayConst || EJitWarnFewMayConst > 0) {
     for (const EjitEntryDiag &ED : Entries) {
       const Function *EF = Extracted.getFunction(ED.Name);
       if (!EF || EF->isDeclaration())
         continue;
-      // BFS the entry's direct-call closure within the extracted module.
-      DenseSet<const Function *> Seen;
-      SmallVector<const Function *, 8> WL{EF};
-      unsigned K = 0, J = 0;
-      while (!WL.empty()) {
-        const Function *F = WL.pop_back_val();
-        if (!Seen.insert(F).second)
-          continue;
-        auto It = Info.find(F);
-        if (It == Info.end())
-          continue;
-        K += It->second.MayConstCount;
-        J += It->second.MayConstInLoopCount;
-        for (const Function *Callee : It->second.Callees)
-          WL.push_back(Callee);
-      }
+      auto It = Info.find(EF);
+      if (It == Info.end())
+        continue;
+      unsigned K = It->second.MayConstCount;
+      unsigned J = It->second.MayConstInLoopCount;
 
       // Info report (not a warning): summary of all may-const reads.
       if (EJitReportMayConst)
@@ -570,7 +523,7 @@ runSpecializationDiagnostic(Module &Extracted,
       if (EJitWarnFewMayConst > 0 && K < EJitWarnFewMayConst && J == 0)
         errs() << "EJit warning: ejit_entry function '" << EF->getName()
                << "' has only " << K << " ejit_may_const read"
-               << (K == 1 ? "" : "s") << " in its specialization closure"
+               << (K == 1 ? "" : "s") << " in its post-inline body"
                << " (threshold: " << EJitWarnFewMayConst
                << "); low specialization surface, consider adding more"
                   " may-const fields\n";
@@ -578,7 +531,54 @@ runSpecializationDiagnostic(Module &Extracted,
   }
 }
 
-static std::string extractAndSerialize(Module &M,
+struct AotFallbackSymbol {
+  std::string JitName;
+  Function *AotFunction = nullptr;
+};
+
+struct ExtractedBitcode {
+  std::string Data;
+  SmallVector<AotFallbackSymbol, 16> AotFallbacks;
+};
+
+static std::string makeAotFallbackName(const Module &M, StringRef FuncName) {
+  MD5 Hash;
+  Hash.update(M.getModuleIdentifier());
+  Hash.update(StringRef("\0", 1));
+  Hash.update(FuncName);
+  MD5::MD5Result Result;
+  Hash.final(Result);
+  return ("__ejit_aot_" + utohexstr(Result.high(), true, 16) +
+          utohexstr(Result.low(), true, 16));
+}
+
+static Function *createEntryAotFallback(Function &F, StringRef AotName) {
+  Function *Clone = Function::Create(
+      F.getFunctionType(), GlobalValue::InternalLinkage,
+      AotName + ".body", F.getParent());
+  Clone->copyAttributesFrom(&F);
+
+  ValueToValueMapTy VMap;
+  VMap[&F] = Clone;
+  auto DestArg = Clone->arg_begin();
+  for (Argument &Arg : F.args()) {
+    DestArg->setName(Arg.getName());
+    VMap[&Arg] = &*DestArg++;
+  }
+  SmallVector<ReturnInst *, 8> Returns;
+  CloneFunctionInto(Clone, &F, VMap, CloneFunctionChangeType::GlobalChanges,
+                    Returns);
+
+  // The copy is a direct AOT body, not another public specialization entry.
+  // Clearing EJIT function metadata prevents the later wrapper pass from
+  // turning it into a dispatcher while retaining ordinary LLVM attributes.
+  Clone->setMetadata(MD_EJIT_METADATA, nullptr);
+  Clone->setVisibility(GlobalValue::DefaultVisibility);
+  Clone->setDSOLocal(true);
+  return Clone;
+}
+
+static ExtractedBitcode extractAndSerialize(Module &M,
     const SetVector<Function *> &Funcs,
     const SetVector<GlobalVariable *> &Globals,
     const SmallVectorImpl<Function *> &EntryFuncs) {
@@ -622,6 +622,24 @@ static std::string extractAndSerialize(Module &M,
   preOptimizeBitcode(*Extracted);
   logEJitGlobalMeta("extract-after-preOpt", *Extracted);
 
+  ExtractedBitcode Result;
+  for (Function &F : Extracted->functions()) {
+    if (F.isDeclaration() || F.isIntrinsic())
+      continue;
+    Function *AotF = M.getFunction(F.getName());
+    if (!AotF)
+      continue;
+    std::string AotName = makeAotFallbackName(M, F.getName());
+    F.setMetadata(MD_EJIT_AOT_SYMBOL,
+                  MDNode::get(F.getContext(), MDString::get(F.getContext(),
+                                                            AotName)));
+    Function *Fallback = AotF;
+    if (hasMDStringEntry(AotF->getMetadata(MD_EJIT_METADATA),
+                         TAG_EJIT_ENTRY))
+      Fallback = createEntryAotFallback(*AotF, AotName);
+    Result.AotFallbacks.push_back({std::move(AotName), Fallback});
+  }
+
   // Specialization diagnostics on the post-preOptimize extracted module (the
   // exact bitcode the JIT will specialize). Must run before the extern
   // conversion below so GV definitions (and their !ejit.metadata) are intact.
@@ -637,29 +655,6 @@ static std::string extractAndSerialize(Module &M,
     GV.setInitializer(nullptr);
     GV.setLinkage(GlobalValue::ExternalLinkage);
   }
-  // Pre-internalize non-entry definitions so the JIT's IRMaterializationUnit
-  // does not advertise them in MR->getSymbols().  The JIT-side
-  // runInterproceduralPropagation also internalizes them (for IPSCCP), but
-  // that runs inside the IR transform callback — after the MU has already
-  // been created with the original symbol claim set.  If a helper is
-  // advertised as an external definition in the MU but codegen emits it as
-  // STB_LOCAL (because the JIT-side internalize ran after the MU was fixed),
-  // JITLink maps STB_LOCAL to Scope::Local and excludes it from
-  // InternedResult, breaking the ORC invariant that every claimed symbol has
-  // a matching definition.  Doing it here, before serialization, makes the
-  // embedded bitcode self-consistent: the MU only claims entry-point symbols
-  // (which still have external linkage), and the JIT-side internalize pass
-  // becomes a no-op for helpers (they already have local linkage).
-  for (Function &F : Extracted->functions()) {
-    if (F.isDeclaration() || F.hasLocalLinkage())
-      continue;
-    if (hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY))
-      continue;
-    F.setVisibility(GlobalValue::DefaultVisibility);
-    F.setLinkage(GlobalValue::InternalLinkage);
-  }
-
-
   logEJitGlobalMeta("extract-after-extern", *Extracted);
 
   // Optionally dump the extracted module for debugging (e.g. to confirm an
@@ -668,11 +663,10 @@ static std::string extractAndSerialize(Module &M,
   if (!EJitDumpBitcodeDir.empty())
     dumpExtractedBitcode(*Extracted, EJitDumpBitcodeDir);
 
-  std::string Bitcode;
-  raw_string_ostream OS(Bitcode);
+  raw_string_ostream OS(Result.Data);
   WriteBitcodeToFile(*Extracted, OS);
   OS.flush();
-  return Bitcode;
+  return Result;
 }
 
 static GlobalVariable *embedBitcode(Module &M, const std::string &Bitcode) {
@@ -702,6 +696,7 @@ static void generateSymbolRegisters(
     Module &M,
     const SetVector<Function *> &ClosureFuncs,
     const SetVector<GlobalVariable *> &ClosureGlobals,
+    const SmallVectorImpl<AotFallbackSymbol> &AotFallbacks,
     Function *AutoReg) {
   LLVMContext &Ctx = M.getContext();
   const DataLayout &DL = M.getDataLayout();
@@ -719,6 +714,18 @@ static void generateSymbolRegisters(
 
   BasicBlock *BB = &AutoReg->getEntryBlock();
   Instruction *InsertBefore = BB->getTerminator();
+
+  // Every definition that survived AOT inlining may become a declaration when
+  // another entry is specialized. Register it under its TU-unique fallback
+  // name, including static helpers and other ejit_entry functions.
+  for (const AotFallbackSymbol &Sym : AotFallbacks) {
+    if (!Sym.AotFunction || !registered.insert(Sym.JitName).second)
+      continue;
+    IRBuilder<> Builder(InsertBefore);
+    Builder.CreateCall(M.getFunction(FN_REGISTER_SYMBOL),
+                       {Builder.CreateGlobalString(Sym.JitName),
+                        Builder.CreateBitCast(Sym.AotFunction, PtrTy)});
+  }
 
   for (Function *F : ClosureFuncs) {
     for (BasicBlock &Blk : *F) {
@@ -812,12 +819,14 @@ static void
 generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
                       const SetVector<Function *> &ClosureFuncs,
                       const SetVector<GlobalVariable *> &ClosureGlobals,
+                      const SmallVectorImpl<AotFallbackSymbol> &AotFallbacks,
                       GlobalVariable *BitcodeGV);
 
 static void generateRegisterCall(Module &M, GlobalVariable *BitcodeGV,
                                  const SmallVectorImpl<Function *> &EntryFuncs,
                                  const SetVector<Function *> &ClosureFuncs,
-                                 const SetVector<GlobalVariable *> &ClosureGlobals) {
+                                 const SetVector<GlobalVariable *> &ClosureGlobals,
+                                 const SmallVectorImpl<AotFallbackSymbol> &AotFallbacks) {
   LLVMContext &Ctx = M.getContext();
   auto *VoidTy = Type::getVoidTy(Ctx);
   auto *PtrTy = PointerType::getUnqual(Ctx);
@@ -850,13 +859,15 @@ static void generateRegisterCall(Module &M, GlobalVariable *BitcodeGV,
 
   // Auto-register external symbols referenced by the closure so the JIT
   // can resolve them without manual ejit_register_symbol calls.
-  generateSymbolRegisters(M, ClosureFuncs, ClosureGlobals, AutoReg);
+  generateSymbolRegisters(M, ClosureFuncs, ClosureGlobals, AotFallbacks,
+                          AutoReg);
 
   if (EnableEJitGlobalCtors)
     appendToGlobalCtors(M, AutoReg, EJIT_CTOR_PRIORITY);
 
   // Always build the static registry table for bare-metal / testing fallback.
-  generateRegistryTable(M, EntryFuncs, ClosureFuncs, ClosureGlobals, BitcodeGV);
+  generateRegistryTable(M, EntryFuncs, ClosureFuncs, ClosureGlobals,
+                        AotFallbacks, BitcodeGV);
 }
 
 /// Emit this translation unit's bitcode registry entries as a private array in
@@ -868,6 +879,7 @@ static void
 generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
                       const SetVector<Function *> &ClosureFuncs,
                       const SetVector<GlobalVariable *> &ClosureGlobals,
+                      const SmallVectorImpl<AotFallbackSymbol> &AotFallbacks,
                       GlobalVariable *BitcodeGV) {
   LLVMContext &Ctx = M.getContext();
   auto *I32Ty = Type::getInt32Ty(Ctx);
@@ -896,30 +908,36 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
     }));
   }
 
-  // Symbol entries for external references
-  SmallPtrSet<const Function *, 8> SymbolsDone;
-  auto addSymbol = [&](const Function *F) {
-    if (!F->isIntrinsic() && F->isDeclaration()) {
-      if (SymbolsDone.insert(F).second) {
-        Constant *NameStr = ConstantDataArray::getString(Ctx, F->getName(), true);
-        auto *NameGV = new GlobalVariable(M, NameStr->getType(), true,
-            GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
-        Entries.push_back(ConstantStruct::get(EntryTy, {
-            ConstantInt::get(I32Ty, EJIT_REG_SYMBOL),                      // EJIT_REG_SYMBOL
-            ConstantExpr::getBitCast(NameGV, PtrTy),         // name1 string
-            ConstantPointerNull::get(PtrTy),
-            ConstantExpr::getBitCast(const_cast<Function *>(F), PtrTy),
-            ConstantInt::get(I64Ty, 0),
-        }));
-      }
-    }
+  // Function symbols: TU-unique AOT fallbacks for retained definitions, plus
+  // ordinary names for pre-existing external declarations.
+  std::set<std::string> SymbolsDone;
+  auto addNamedSymbol = [&](StringRef Name, const Function *F) {
+    if (!F || F->isIntrinsic() || Name.empty() ||
+        !SymbolsDone.insert(Name.str()).second)
+      return;
+    Constant *NameStr = ConstantDataArray::getString(Ctx, Name, true);
+    auto *NameGV = new GlobalVariable(M, NameStr->getType(), true,
+        GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
+    Entries.push_back(ConstantStruct::get(EntryTy, {
+        ConstantInt::get(I32Ty, EJIT_REG_SYMBOL),
+        ConstantExpr::getBitCast(NameGV, PtrTy),
+        ConstantPointerNull::get(PtrTy),
+        ConstantExpr::getBitCast(const_cast<Function *>(F), PtrTy),
+        ConstantInt::get(I64Ty, 0),
+    }));
   };
+  auto addExternalSymbol = [&](const Function *F) {
+    if (F && F->isDeclaration())
+      addNamedSymbol(F->getName(), F);
+  };
+  for (const AotFallbackSymbol &Sym : AotFallbacks)
+    addNamedSymbol(Sym.JitName, Sym.AotFunction);
   for (Function *F : ClosureFuncs) {
     for (const BasicBlock &BB : *F) {
       for (const Instruction &I : BB) {
         if (const CallBase *CB = dyn_cast<CallBase>(&I))
           if (Function *Callee = CB->getCalledFunction())
-            addSymbol(Callee);
+            addExternalSymbol(Callee);
       }
     }
   }
@@ -934,7 +952,7 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
     SmallPtrSet<Function *, 8> FuncsInInit;
     collectFunctionsFromConstant(GV->getInitializer(), FuncsInInit);
     for (Function *F : FuncsInInit)
-      addSymbol(F);
+      addExternalSymbol(F);
   }
 
   // Global variable symbol entries. Resolve through bitcasts/GEPs via
@@ -1015,10 +1033,11 @@ EJitRegisterBitcodePass::run(Module &M, ModuleAnalysisManager &) {
   if (ClosureFuncs.empty())
     return PreservedAnalyses::all();
 
-  std::string Bitcode =
+  ExtractedBitcode Bitcode =
       extractAndSerialize(M, ClosureFuncs, ClosureGlobals, EntryFuncs);
-  GlobalVariable *BitcodeGV = embedBitcode(M, Bitcode);
-  generateRegisterCall(M, BitcodeGV, EntryFuncs, ClosureFuncs, ClosureGlobals);
+  GlobalVariable *BitcodeGV = embedBitcode(M, Bitcode.Data);
+  generateRegisterCall(M, BitcodeGV, EntryFuncs, ClosureFuncs, ClosureGlobals,
+                       Bitcode.AotFallbacks);
 
   return PreservedAnalyses::none();
 }

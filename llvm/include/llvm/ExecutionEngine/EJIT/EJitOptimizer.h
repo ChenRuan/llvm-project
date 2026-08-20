@@ -32,9 +32,8 @@ public:
   /// Run the full JIT specialization pipeline:
   ///   1. Parameter substitution (ejit_period_arr_ind → constants)
   ///   2. InstCombine (fold GEP chains from substituted params)
-  ///   3. Inline (L2+: expand callee bodies so may_const GEPs are traceable)
-  ///   4. StructFieldPass (may_const loads → runtime constants)
-  ///   5. Core optimization pipeline (L1/L2/L3)
+  ///   3. StructFieldPass (may_const loads → runtime constants)
+  ///   4. Function-local optimization pipeline (L1/L2/L3)
   void runPipeline(Module &M, const SpecializationContext &ctx);
 
   /// Clear all cached analysis results. Must be called between compilations
@@ -50,17 +49,6 @@ private:
 
   /// Run EJitStructFieldPass on all functions.
   void runStructFieldPass(Module &M);
-
-  /// Push the specialized constants across call edges. The AOT inliner keeps a
-  /// call edge wherever it chose not to inline, so after phase 1 every call
-  /// site passes the period dims (and values derived from them) as ordinary
-  /// constant arguments — but the callee bodies still re-derive cell addressing
-  /// and re-test guards the entry already resolved. Internalizes every defined
-  /// non-ejit_entry function (IPSCCP only reasons about arguments of functions
-  /// whose call sites it can enumerate: local linkage, not address-taken), then
-  /// runs IPSCCP to propagate constant arguments into callee bodies and
-  /// constant returns back to call sites.
-  void runInterproceduralPropagation(Module &M);
 
   /// Run the EJIT optimization pipeline: a single fused sequence that exploits
   /// the just-substituted period-index / may_const constants to their fixed
