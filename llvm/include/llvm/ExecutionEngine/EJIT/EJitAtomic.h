@@ -80,6 +80,9 @@ public:
   /// Relaxed store — no ordering.
   void storeRelaxed(T v) { __atomic_store_n(&value_, v, __ATOMIC_RELAXED); }
 
+  /// Atomic exchange, returning the previous value (acq_rel).
+  T exchange(T v) { return __atomic_exchange_n(&value_, v, __ATOMIC_ACQ_REL); }
+
   /// Strong compare-exchange. On success the cell becomes \p desired and the
   /// call returns true (acq_rel). On failure \p expected is updated with the
   /// observed value and the call returns false (acquire).

@@ -390,6 +390,9 @@ public:
   /// Owner-only teardown hook (see setOwnerReleasedCallback). Runs on the core
   /// giving up ownership, inside ownerShutdown().
   using OwnerReleasedFn = void (*)(void *ctx);
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  using TestHookFn = void (*)(void *ctx);
+#endif
 
   enum class InitResult : uint32_t {
     BecameOwner =
@@ -710,6 +713,13 @@ public:
     // PGO is enabled so calls continue through the Tier-2 trigger path.
     state_->dispatchEpoch.fetchAdd(1);
   }
+
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  void setPgoAdmissionTestHook(TestHookFn fn, void *ctx) {
+    pgoAdmissionTestHook_ = fn;
+    pgoAdmissionTestHookCtx_ = ctx;
+  }
+#endif
 
   /// True when the shared PGO auto-trigger is armed.
   bool isPgoEnabled() const {
@@ -1242,6 +1252,10 @@ private:
   void *workerCtx_ = nullptr;
   WorkerIdleFn workerIdle_ = nullptr;
   void *workerIdleCtx_ = nullptr;
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  TestHookFn pgoAdmissionTestHook_ = nullptr;
+  void *pgoAdmissionTestHookCtx_ = nullptr;
+#endif
   OwnerElectedFn ownerElected_ = nullptr;
   void *ownerElectedCtx_ = nullptr;
   OwnerReleasedFn ownerReleased_ = nullptr;
