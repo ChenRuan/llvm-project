@@ -9,6 +9,8 @@
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/Hashing.h"
+#include "llvm/Support/Format.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -28,7 +30,9 @@
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar/EarlyCSE.h"
+#include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
@@ -37,6 +41,8 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
+#include "llvm/Support/Path.h"
+#include <cctype>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -47,16 +53,55 @@ extern cl::opt<bool> EJitWarnNoSpecialization;
 extern cl::opt<bool> EJitWarnUnusedDim;
 extern cl::opt<bool> EJitReportMayConst;
 extern cl::opt<unsigned> EJitWarnFewMayConst;
+extern cl::opt<unsigned> EJitExternalizeMinInsts;
 
 #define DEBUG_TYPE "ejit-register-bitcode"
 
+/// Deterministic process-wide unique registration key for an internal
+/// closure helper. Internal names are unique per module only — two TUs can
+/// both define `static int helper()`. Prefix the sanitized module BASENAME
+/// so the runtime's flat symbol table never binds a JIT'd helper to the
+/// wrong TU, plus the full 64-bit hash of the RAW module path: the sanitized
+/// basename alone can collide (`a-b.c` vs `a_b.c` both sanitize to `a_b_c`),
+/// and distinct build variants of one path (-D variations) are not
+/// distinguished (see the design doc threat model). The rename and the
+/// registration are generated in the same pass run, so run-local
+/// determinism is all the key requires. The extracted-bitcode rename and
+/// the AOT-side registration both derive the key from this one function.
+static std::string ejitStaticHelperKey(StringRef ModuleName,
+                                       StringRef FuncName) {
+  std::string Key = "ejit_static.";
+  for (char C : sys::path::filename(ModuleName))
+    Key.push_back(isalnum(static_cast<unsigned char>(C)) || C == '_' ? C : '_');
+  Key += '.';
+  raw_string_ostream OS(Key);
+  OS << format_hex(static_cast<uint64_t>(hash_value(ModuleName)), 16,
+                   /*Upper=*/false);
+  OS.flush();
+  Key += '.';
+  Key += FuncName;
+  return Key;
+}
+
+/// Registration key for an externalized closure helper: internal helpers
+/// get their deterministic unique key, externally-linked helpers keep their
+/// (already process-unique) name. Single source of truth shared by the
+/// extracted-bitcode rename and both registration emitters, so the three
+/// sites can never disagree.
+static std::string ejitRegistrationKey(const Module &M, const Function &F) {
+  return F.hasLocalLinkage() ? ejitStaticHelperKey(M.getName(), F.getName())
+                             : F.getName().str();
+}
+
+static bool isEjitEntryFunction(const Function &F) {
+  return hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY);
+}
+
 static void collectEntryFunctions(Module &M,
                                   SmallVectorImpl<Function *> &EntryFuncs) {
-  for (Function &F : M.functions()) {
-    MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
-    if (hasMDStringEntry(MD, TAG_EJIT_ENTRY))
+  for (Function &F : M.functions())
+    if (isEjitEntryFunction(F))
       EntryFuncs.push_back(&F);
-  }
 }
 
 static const GlobalVariable *findRootGV(const Value *V, APInt &Offset,
@@ -216,7 +261,27 @@ static void preOptimizeBitcode(Module &M) {
   PB.registerModuleAnalyses(MAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-  // 1. Inline: AlwaysInline + cost-based inliner for small functions
+  // 1. Frontend-IR cleanup BEFORE inlining, mirroring the host O2 pipeline
+  //    (EarlyFPM + GlobalCleanupPM both precede its inliner). Raw CodeGen IR
+  //    keeps every C local as an alloca + store/load pair, which inflates the
+  //    inliner's computed callee cost ~4x; without this round the embedded
+  //    bitcode inlines far less than the same module compiled AOT - and the
+  //    JIT pipeline runs no inliner of its own (EJitOptimizer relies on this
+  //    AOT-time inlining), so every missed inline is a permanent call.
+  {
+    FunctionPassManager FPM;
+    FPM.addPass(LowerExpectIntrinsicPass());
+    FPM.addPass(SimplifyCFGPass());
+    FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
+    FPM.addPass(EarlyCSEPass());
+    FPM.addPass(InstCombinePass());
+    FPM.addPass(SimplifyCFGPass());
+    for (Function &F : M.functions())
+      if (!F.isDeclaration())
+        FPM.run(F, FAM);
+  }
+
+  // 2. Inline: AlwaysInline + cost-based inliner for small functions
   {
     ModulePassManager MPM;
     MPM.addPass(AlwaysInlinerPass());
@@ -225,7 +290,8 @@ static void preOptimizeBitcode(Module &M) {
     MPM.run(M, MAM);
   }
 
-  // 2. Mem2Reg: promote allocas from inlined code to SSA
+  // 3. Mem2Reg: promote any allocas left after inlining (AlwaysInliner can
+  // still emit fresh ones around inlined code) to SSA
   {
     FunctionPassManager FPM;
     FPM.addPass(PromotePass());
@@ -234,7 +300,7 @@ static void preOptimizeBitcode(Module &M) {
         FPM.run(F, FAM);
   }
 
-  // 3. EarlyCSE + InstCombine: simplify and fold redundant computations
+  // 4. EarlyCSE + InstCombine: simplify and fold redundant computations
   {
     FunctionPassManager FPM;
     FPM.addPass(EarlyCSEPass());
@@ -244,7 +310,7 @@ static void preOptimizeBitcode(Module &M) {
         FPM.run(F, FAM);
   }
 
-  // 4. SimplifyCFG: flatten branches, merge blocks
+  // 5. SimplifyCFG: flatten branches, merge blocks
   {
     FunctionPassManager FPM;
     FPM.addPass(SimplifyCFGPass());
@@ -253,7 +319,7 @@ static void preOptimizeBitcode(Module &M) {
         FPM.run(F, FAM);
   }
 
-  // 5. Restore !ejit.may_const metadata that passes may have dropped
+  // 6. Restore !ejit.may_const metadata that passes may have dropped
   reAnnotateMayConst(M);
 }
 #else
@@ -581,7 +647,8 @@ runSpecializationDiagnostic(Module &Extracted,
 static std::string extractAndSerialize(Module &M,
     const SetVector<Function *> &Funcs,
     const SetVector<GlobalVariable *> &Globals,
-    const SmallVectorImpl<Function *> &EntryFuncs) {
+    const SmallVectorImpl<Function *> &EntryFuncs,
+    const SetVector<Function *> &ToExternalize) {
 
   auto Extracted = CloneModule(M);
   DenseSet<StringRef> FuncNames;
@@ -626,6 +693,35 @@ static std::string extractAndSerialize(Module &M,
   // exact bitcode the JIT will specialize). Must run before the extern
   // conversion below so GV definitions (and their !ejit.metadata) are intact.
   runSpecializationDiagnostic(*Extracted, EntryFuncs);
+
+  // Externalize the closure helpers that generateSymbolRegisters /
+  // generateRegistryTable register on the AOT side: turn each surviving
+  // (i.e. not fully preopt-inlined) helper into an external declaration so
+  // its body is not serialized into the bitcode. Internal helpers are
+  // renamed to their deterministic registration key (their AOT symbol is
+  // invisible to the JIT linker); externally-linked helpers keep their
+  // already process-unique name. Runs before the internalize step below so
+  // the original linkage is still visible here.
+  unsigned Externalized = 0;
+  for (Function *F : ToExternalize) {
+    Function *Cur = Extracted->getFunction(F->getName());
+    if (!Cur || Cur->isDeclaration())
+      continue; // fully inlined by preOptimizeBitcode
+    bool WasLocal = Cur->hasLocalLinkage();
+    Cur->deleteBody();
+    Cur->setVisibility(GlobalValue::DefaultVisibility);
+    Cur->setLinkage(GlobalValue::ExternalLinkage);
+    // The declaration is now resolved from outside the module (AOT-side
+    // registration), so it must not be marked dso_local. InternalLinkage
+    // implies dso_local and changing the linkage does not clear it.
+    Cur->setDSOLocal(false);
+    if (WasLocal)
+      Cur->setName(ejitRegistrationKey(M, *F));
+    ++Externalized;
+  }
+  LLVM_DEBUG(dbgs() << "ejit-register-bitcode: externalized " << Externalized
+                    << " of " << ToExternalize.size()
+                    << " closure helper(s) in bitcode\n");
 
   // Convert kept non-constant global definitions to external declarations
   // so the JIT linker resolves them from the host process. Constants (e.g.
@@ -702,6 +798,7 @@ static void generateSymbolRegisters(
     Module &M,
     const SetVector<Function *> &ClosureFuncs,
     const SetVector<GlobalVariable *> &ClosureGlobals,
+    const SetVector<Function *> &ToExternalize,
     Function *AutoReg) {
   LLVMContext &Ctx = M.getContext();
   const DataLayout &DL = M.getDataLayout();
@@ -787,6 +884,19 @@ static void generateSymbolRegisters(
       }
     }
   }
+
+  // Register externalized closure helpers under the same deterministic keys
+  // extractAndSerialize renamed them to in the bitcode. The address is the
+  // AOT original — taking it also keeps the body alive under --gc-sections.
+  for (Function *F : ToExternalize) {
+    std::string Key = ejitRegistrationKey(M, *F);
+    if (registered.insert(Key).second) {
+      IRBuilder<> Builder(InsertBefore);
+      Builder.CreateCall(M.getFunction(FN_REGISTER_SYMBOL),
+                         {Builder.CreateGlobalString(Key),
+                          Builder.CreateBitCast(F, PtrTy)});
+    }
+  }
 }
 
 /// Recursively walk a Constant (initializer of a GlobalVariable) and
@@ -812,12 +922,14 @@ static void
 generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
                       const SetVector<Function *> &ClosureFuncs,
                       const SetVector<GlobalVariable *> &ClosureGlobals,
+                      const SetVector<Function *> &ToExternalize,
                       GlobalVariable *BitcodeGV);
 
 static void generateRegisterCall(Module &M, GlobalVariable *BitcodeGV,
                                  const SmallVectorImpl<Function *> &EntryFuncs,
                                  const SetVector<Function *> &ClosureFuncs,
-                                 const SetVector<GlobalVariable *> &ClosureGlobals) {
+                                 const SetVector<GlobalVariable *> &ClosureGlobals,
+                                 const SetVector<Function *> &ToExternalize) {
   LLVMContext &Ctx = M.getContext();
   auto *VoidTy = Type::getVoidTy(Ctx);
   auto *PtrTy = PointerType::getUnqual(Ctx);
@@ -850,13 +962,15 @@ static void generateRegisterCall(Module &M, GlobalVariable *BitcodeGV,
 
   // Auto-register external symbols referenced by the closure so the JIT
   // can resolve them without manual ejit_register_symbol calls.
-  generateSymbolRegisters(M, ClosureFuncs, ClosureGlobals, AutoReg);
+  generateSymbolRegisters(M, ClosureFuncs, ClosureGlobals, ToExternalize,
+                          AutoReg);
 
   if (EnableEJitGlobalCtors)
     appendToGlobalCtors(M, AutoReg, EJIT_CTOR_PRIORITY);
 
   // Always build the static registry table for bare-metal / testing fallback.
-  generateRegistryTable(M, EntryFuncs, ClosureFuncs, ClosureGlobals, BitcodeGV);
+  generateRegistryTable(M, EntryFuncs, ClosureFuncs, ClosureGlobals,
+                        ToExternalize, BitcodeGV);
 }
 
 /// Emit this translation unit's bitcode registry entries as a private array in
@@ -868,6 +982,7 @@ static void
 generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
                       const SetVector<Function *> &ClosureFuncs,
                       const SetVector<GlobalVariable *> &ClosureGlobals,
+                      const SetVector<Function *> &ToExternalize,
                       GlobalVariable *BitcodeGV) {
   LLVMContext &Ctx = M.getContext();
   auto *I32Ty = Type::getInt32Ty(Ctx);
@@ -972,6 +1087,22 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
     }
   }
 
+  // Externalized closure helpers: same keys as generateSymbolRegisters, so
+  // the bare-metal section walk (no ctors) resolves them identically.
+  for (Function *F : ToExternalize) {
+    std::string Key = ejitRegistrationKey(M, *F);
+    Constant *NameStr = ConstantDataArray::getString(Ctx, Key, true);
+    auto *NameGV = new GlobalVariable(M, NameStr->getType(), true,
+        GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
+    Entries.push_back(ConstantStruct::get(EntryTy, {
+        ConstantInt::get(I32Ty, EJIT_REG_SYMBOL),            // EJIT_REG_SYMBOL
+        ConstantExpr::getBitCast(NameGV, PtrTy),             // name1: key
+        ConstantPointerNull::get(PtrTy),
+        ConstantExpr::getBitCast(F, PtrTy),                  // AOT original
+        ConstantInt::get(I64Ty, 0),
+    }));
+  }
+
   // No sentinel entry: the runtime iterates the linker-provided
   // [__start_ejit_bitcode, __stop_ejit_bitcode) range over the dedicated
   // section, so each translation unit contributes only its own entries.
@@ -1015,10 +1146,22 @@ EJitRegisterBitcodePass::run(Module &M, ModuleAnalysisManager &) {
   if (ClosureFuncs.empty())
     return PreservedAnalyses::all();
 
+  // Helpers to externalize: non-entry closure functions whose bodies cost
+  // more than the AOT registration record that replaces them. Computed on
+  // the raw module so extractAndSerialize and generateSymbolRegisters /
+  // generateRegistryTable all agree on the same set.
+  SetVector<Function *> ToExternalize;
+  for (Function *F : ClosureFuncs)
+    if (!isEjitEntryFunction(*F) &&
+        F->getInstructionCount() >= EJitExternalizeMinInsts)
+      ToExternalize.insert(F);
+
   std::string Bitcode =
-      extractAndSerialize(M, ClosureFuncs, ClosureGlobals, EntryFuncs);
+      extractAndSerialize(M, ClosureFuncs, ClosureGlobals, EntryFuncs,
+                          ToExternalize);
   GlobalVariable *BitcodeGV = embedBitcode(M, Bitcode);
-  generateRegisterCall(M, BitcodeGV, EntryFuncs, ClosureFuncs, ClosureGlobals);
+  generateRegisterCall(M, BitcodeGV, EntryFuncs, ClosureFuncs, ClosureGlobals,
+                       ToExternalize);
 
   return PreservedAnalyses::none();
 }

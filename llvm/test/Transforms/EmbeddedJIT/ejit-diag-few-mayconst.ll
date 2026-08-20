@@ -10,11 +10,13 @@
 ; 1 read → warn (below threshold 4).
 ; CHECK: EJit warning: ejit_entry function 'entry_one' has only 1 ejit_may_const read
 
-; 3 reads in the closure (direct + callee) → warn.
-; CHECK: EJit warning: ejit_entry function 'entry_three_via_helper' has only 3 ejit_may_const reads
-
 ; 0 reads → warn (below threshold 4).
 ; CHECK: EJit warning: ejit_entry function 'entry_zero' has only 0 ejit_may_const reads
+
+; 3 reads in the closure (direct + callee) → warn.
+; Warnings are emitted in module order (entry_one, entry_zero, then
+; entry_three_via_helper).
+; CHECK: EJit warning: ejit_entry function 'entry_three_via_helper' has only 3 ejit_may_const reads
 
 ; 4 reads → at threshold → no warning.
 ; CHECK-NOT: EJit warning: ejit_entry function 'entry_four'
