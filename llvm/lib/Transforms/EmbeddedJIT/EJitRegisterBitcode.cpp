@@ -796,6 +796,7 @@ static void collectFunctionsFromConstant(Constant *C,
 /// them without dlsym — suitable for bare-metal embedded environments.
 static void generateSymbolRegisters(
     Module &M,
+    const SmallVectorImpl<Function *> &EntryFuncs,
     const SetVector<Function *> &ClosureFuncs,
     const SetVector<GlobalVariable *> &ClosureGlobals,
     const SetVector<Function *> &ToExternalize,
@@ -816,6 +817,21 @@ static void generateSymbolRegisters(
 
   BasicBlock *BB = &AutoReg->getEntryBlock();
   Instruction *InsertBefore = BB->getTerminator();
+
+  // Nested ejit_entry calls are specialization boundaries. PASS3 rewrites
+  // these Function objects in place into their AOT wrappers after this pass,
+  // so the addresses recorded here ultimately point at the wrappers. The JIT
+  // externalizes every entry except the one currently being specialized and
+  // resolves calls to those declarations through this table.
+  for (Function *F : EntryFuncs) {
+    std::string Name = F->getName().str();
+    if (registered.insert(Name).second) {
+      IRBuilder<> Builder(InsertBefore);
+      Builder.CreateCall(M.getFunction(FN_REGISTER_SYMBOL),
+                         {Builder.CreateGlobalString(Name),
+                          Builder.CreateBitCast(F, PtrTy)});
+    }
+  }
 
   for (Function *F : ClosureFuncs) {
     for (BasicBlock &Blk : *F) {
@@ -962,8 +978,8 @@ static void generateRegisterCall(Module &M, GlobalVariable *BitcodeGV,
 
   // Auto-register external symbols referenced by the closure so the JIT
   // can resolve them without manual ejit_register_symbol calls.
-  generateSymbolRegisters(M, ClosureFuncs, ClosureGlobals, ToExternalize,
-                          AutoReg);
+  generateSymbolRegisters(M, EntryFuncs, ClosureFuncs, ClosureGlobals,
+                          ToExternalize, AutoReg);
 
   if (EnableEJitGlobalCtors)
     appendToGlobalCtors(M, AutoReg, EJIT_CTOR_PRIORITY);
@@ -1013,8 +1029,8 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
 
   // Symbol entries for external references
   SmallPtrSet<const Function *, 8> SymbolsDone;
-  auto addSymbol = [&](const Function *F) {
-    if (!F->isIntrinsic() && F->isDeclaration()) {
+  auto addSymbol = [&](const Function *F, bool RequireDeclaration = true) {
+    if (!F->isIntrinsic() && (!RequireDeclaration || F->isDeclaration())) {
       if (SymbolsDone.insert(F).second) {
         Constant *NameStr = ConstantDataArray::getString(Ctx, F->getName(), true);
         auto *NameGV = new GlobalVariable(M, NameStr->getType(), true,
@@ -1029,6 +1045,11 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
       }
     }
   };
+
+  // PASS3 later turns these functions into wrappers in place, so these
+  // constants resolve to wrapper addresses in the final AOT object.
+  for (Function *F : EntryFuncs)
+    addSymbol(F, /*RequireDeclaration=*/false);
   for (Function *F : ClosureFuncs) {
     for (const BasicBlock &BB : *F) {
       for (const Instruction &I : BB) {
