@@ -18,6 +18,7 @@
 #include "gtest/gtest.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <thread>
@@ -4935,6 +4936,23 @@ bool mockCompileFailTier2(void * /*ctx*/, const EJitCompileRequest &req,
   return true;
 }
 
+struct CapturedFailingCompile {
+  uint32_t funcIndex = 0;
+  uint32_t calls = 0;
+};
+
+bool mockCompileCaptureAndFail(void *ctx, const EJitCompileRequest &req,
+                               void ** /*outFn*/) {
+  auto *capture = static_cast<CapturedFailingCompile *>(ctx);
+  capture->funcIndex = req.funcIndex;
+  ++capture->calls;
+  return false;
+}
+
+void disablePgoHook(void *ctx) {
+  static_cast<EJitSharedTaskPool *>(ctx)->setPgoEnabled(false, 0);
+}
+
 // Mirror of EJitSharedTaskPool::hashIdentity's bucket selection so a test can
 // deterministically construct two identities that collide into one bucket.
 uint32_t bucketOfIdentity(uint32_t funcIndex, const EJitDimPair *dims,
@@ -4979,6 +4997,78 @@ TEST_F(SharedTaskPoolTest, PgoControlIsSharedAcrossFacades) {
   EJitCoreId::setCurrentForTest(1);
   EXPECT_FALSE(peer.isPgoEnabled());
   EXPECT_EQ(state_->tier2Threshold.loadAcquire(), 0u);
+}
+
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+TEST_F(SharedTaskPoolTest, PgoTier2PublishWaitsForExistingWriter) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setPgoEnabled(true, 1);
+
+  ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne()); // Publish Tier-1.
+  auto hit = pool.tryCacheHit0D(5);
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  if (hit.hasReadToken)
+    pool.releaseRead(hit.bucketIndex);
+  ASSERT_EQ(pool.pendingCount(), 1u); // Tier-2 is queued.
+
+  uint32_t bucket = bucketOfIdentity(5, nullptr, 0);
+  state_->buckets[bucket].writeFlag.storeRelease(1);
+
+  std::atomic<bool> ready{false};
+  std::atomic<bool> start{false};
+  std::atomic<bool> done{false};
+  bool consumed = false;
+  std::thread publisher([&] {
+    ready.store(true, std::memory_order_release);
+    while (!start.load(std::memory_order_acquire))
+      std::this_thread::yield();
+    consumed = pool.pollOne();
+    done.store(true, std::memory_order_release);
+  });
+
+  while (!ready.load(std::memory_order_acquire))
+    std::this_thread::yield();
+  start.store(true, std::memory_order_release);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_FALSE(done.load(std::memory_order_acquire))
+      << "Tier-2 publish entered while another writer held writeFlag";
+
+  state_->buckets[bucket].writeFlag.storeRelease(0);
+  publisher.join();
+  EXPECT_TRUE(consumed);
+  EXPECT_EQ(pool.pendingCount(), 0u);
+  EJitSharedCacheSlot *slot = findReadySlot(5);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->tier.loadRelaxed(),
+            static_cast<uint8_t>(kEJitTierPgoUse));
+}
+#endif
+
+TEST_F(SharedTaskPoolTest, PgoAdmissionSnapshotSelectsInstrumentedTier) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  CapturedFailingCompile capture;
+  pool.setCompiler(&mockCompileCaptureAndFail, &capture);
+  pool.setPgoEnabled(true, 2);
+  pool.setPgoAdmissionTestHook(&disablePgoHook, &pool);
+
+  ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  pool.setPgoAdmissionTestHook(nullptr, nullptr);
+
+  ASSERT_TRUE(pool.pollOne());
+  ASSERT_EQ(capture.calls, 1u);
+  EXPECT_EQ(stripReqTier(capture.funcIndex), 5u);
+  EXPECT_EQ(decodeReqTier(capture.funcIndex), kEJitTierInstrumented)
+      << "admission and queued tier must use the same PGO snapshot";
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u)
+      << "Tier-1 failure must roll back the admission taken for this request";
+  EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 0u);
 }
 
 // (1) A peer core crosses the Tier-2 threshold; the request travels the shared

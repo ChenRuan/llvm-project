@@ -124,21 +124,21 @@ static inline bool bucketSeqStable(EJitSharedCacheBucket &b, uint32_t seq0) {
 #endif
 void bucketWrite(EJitSharedCacheBucket &b, bool pgoClearExclusive = false) {
   // PGO (§6 shared trigger): after a cacheLookupSeq (seqlock read) on this
-  // bucket, both the writeFlag CAS and the readers spin below livelock on
-  // aarch64 — ldaxr fails to acquire the exclusive monitor after the prior
-  // ldar instructions.  When the PGO path signals this, bypass both loops
-  // with direct atomic stores/loads.  Safe because pollOne is the sole
-  // writer and there are no concurrent readers in the NO_RECLAIM build.
+  // bucket, the writeFlag CAS loop below can livelock on aarch64: the prior
+  // acquire loads in the seqlock read leave the subsequent CAS unable to make
+  // forward progress with the target's exclusive monitor sequence. The PGO
+  // path therefore uses an atomic exchange for the writer word in NO_RECLAIM.
+  // Unlike the former direct store, exchange remains an indivisible lock
+  // acquisition and preserves writer/writer exclusion. Its target lowering and
+  // forward progress are platform properties that must be checked on the SRE
+  // board; readers remain load-only in this build, so no reader drain is needed
+  // after the writer is acquired.
   if (pgoClearExclusive) {
-    // PGO fast-path for NO_RECLAIM builds only.  Bypasses the writeFlag
-    // CAS (livelocks on aarch64 after seqlock read on the same cache line).
-    // Safe because pollOne is the sole writer and readers is always 0.
-    // In non-NO_RECLAIM builds the CAS is required for correctness (readers
-    // may be non-zero); the aarch64 livelock does not reproduce there.
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-    b.writeFlag.storeRelease(1);
+    while (b.writeFlag.exchange(1) != 0)
+      cpuRelax();
     b.publishSeq.fetchAdd(1);
-    return; // readers is always 0 — skip the spin
+    return;
 #endif
     // (non-NO_RECLAIM: fall through to the normal CAS path below)
   }
@@ -2904,16 +2904,20 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   }
   // Dedup + enqueue (§5.2 step 3) — Async path.
   bool newlyAdmitted = false;
-  if (state_->pgoEnabled.loadAcquire() &&
-      !admitPgoFunction(funcIndex, newlyAdmitted)) {
+  const bool pgoForRequest = state_->pgoEnabled.loadAcquire() != 0;
+  if (pgoForRequest && !admitPgoFunction(funcIndex, newlyAdmitted)) {
     // All profiling slots are occupied. Keep this miss on the AOT fallback
     // and do not add work to the compiler queue.
     R.status = EJitCompileOrGetStatus::AlreadyPending;
     return R;
   }
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  if (pgoForRequest && pgoAdmissionTestHook_)
+    pgoAdmissionTestHook_(pgoAdmissionTestHookCtx_);
+#endif
   uint32_t gen = state_->generation.loadAcquire();
   EJitCompileRequest Req{};
-  Req.funcIndex = state_->pgoEnabled.loadAcquire()
+  Req.funcIndex = pgoForRequest
                       ? encodeReqTier(funcIndex, kEJitTierInstrumented)
                       : funcIndex;
   Req.numDims = numDims;
