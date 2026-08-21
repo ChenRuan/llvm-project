@@ -24,6 +24,49 @@ uint64_t floorPercent(uint64_t Total, uint32_t Percent) {
 
 } // namespace
 
+EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
+    ArrayRef<EJitMayConstBenefitSample> Samples) {
+  EJitMayConstBenefitSummary Summary;
+  Summary.versions = Samples.size();
+  if (Samples.empty())
+    return Summary;
+
+  bool First = true;
+  for (const EJitMayConstBenefitSample &Sample : Samples) {
+    Summary.inputMayConstLoads += Sample.inputMayConstLoads;
+    Summary.specializedMayConstLoads += Sample.specializedMayConstLoads;
+    Summary.finalMayConstLoads += Sample.finalMayConstLoads;
+    Summary.runtimeHits += Sample.runtimeHits;
+    Summary.hitSites += Sample.hitSites;
+    const int64_t Removed = static_cast<int64_t>(Sample.inputMayConstLoads) -
+                            static_cast<int64_t>(Sample.finalMayConstLoads);
+    if (First) {
+      Summary.minimumRemoved = Removed;
+      Summary.maximumRemoved = Removed;
+      First = false;
+    } else {
+      Summary.minimumRemoved = std::min(Summary.minimumRemoved, Removed);
+      Summary.maximumRemoved = std::max(Summary.maximumRemoved, Removed);
+    }
+  }
+
+  Summary.totalRemoved = static_cast<int64_t>(Summary.inputMayConstLoads) -
+                         static_cast<int64_t>(Summary.finalMayConstLoads);
+  Summary.directRemoved =
+      static_cast<int64_t>(Summary.inputMayConstLoads) -
+      static_cast<int64_t>(Summary.specializedMayConstLoads);
+  Summary.pipelineRemoved =
+      static_cast<int64_t>(Summary.specializedMayConstLoads) -
+      static_cast<int64_t>(Summary.finalMayConstLoads);
+  Summary.averageRemoved =
+      Summary.totalRemoved / static_cast<int64_t>(Summary.versions);
+  if (Summary.inputMayConstLoads != 0)
+    Summary.weightedRemovedPermille =
+        Summary.totalRemoved * 1000 /
+        static_cast<int64_t>(Summary.inputMayConstLoads);
+  return Summary;
+}
+
 std::vector<EJitBranchProfileSummary>
 llvm::ejit::analyzeBranchProfiles(const Module &M,
                                   const std::string &rootName) {

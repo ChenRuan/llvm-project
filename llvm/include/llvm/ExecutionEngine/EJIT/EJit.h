@@ -165,6 +165,10 @@ public:
   /// Print every active (period, cell) through EJIT_DIAG. For ejit_print_active().
   void printActive() const;
 
+  /// Print completed per-entry may_const benefit samples in descending order.
+  /// The samples are local to the compile-owner worker.
+  bool printMayConstRanking();
+
 private:
   Config config_;
   std::unique_ptr<EJitRuntimeState> runtimeState_;

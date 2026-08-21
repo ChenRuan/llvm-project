@@ -82,4 +82,25 @@ TEST(EJitBranchProfile, ClassifiesBranchShapeWithoutChangingIR) {
   EXPECT_EQ(Missing.profiledSites, 0u);
 }
 
+TEST(EJitBranchProfile, AggregatesMayConstSpecializations) {
+  const EJitMayConstBenefitSample Samples[] = {
+      {1, 100, 70, 40, 1000, 10},
+      {2, 120, 90, 50, 2000, 20},
+      {3, 80, 75, 85, 3000, 30}};
+  EJitMayConstBenefitSummary Summary = summarizeMayConstBenefits(Samples);
+  EXPECT_EQ(Summary.versions, 3u);
+  EXPECT_EQ(Summary.inputMayConstLoads, 300u);
+  EXPECT_EQ(Summary.specializedMayConstLoads, 235u);
+  EXPECT_EQ(Summary.finalMayConstLoads, 175u);
+  EXPECT_EQ(Summary.totalRemoved, 125);
+  EXPECT_EQ(Summary.directRemoved, 65);
+  EXPECT_EQ(Summary.pipelineRemoved, 60);
+  EXPECT_EQ(Summary.averageRemoved, 41);
+  EXPECT_EQ(Summary.weightedRemovedPermille, 416);
+  EXPECT_EQ(Summary.minimumRemoved, -5);
+  EXPECT_EQ(Summary.maximumRemoved, 70);
+  EXPECT_EQ(Summary.runtimeHits, 6000u);
+  EXPECT_EQ(Summary.hitSites, 60u);
+}
+
 } // namespace

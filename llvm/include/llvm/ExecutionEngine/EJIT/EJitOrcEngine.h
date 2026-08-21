@@ -12,6 +12,9 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+#include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
+#endif
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/Support/Error.h"
 #include <memory>
@@ -71,9 +74,9 @@ bool printDumpedModule(const char *name);
 /// Compile tier for online PGO (EJIT_ONLINE_PGO.md §3). Baseline is the
 /// existing no-PGO pipeline; the other two are opt-in via Config::enablePgo.
 enum class CompileTier : uint8_t {
-  Baseline = 0,      ///< No PGO: specialize + opt pipeline (current behavior).
-  Instrumented = 1,  ///< Tier-1: specialize + PGOInstrumentationGen + Lowering.
-  PGOUse = 2,        ///< Tier-2: specialize + PGOInstrumentationUse(profile) + opts.
+  Baseline = 0,     ///< No PGO: specialize + opt pipeline (current behavior).
+  Instrumented = 1, ///< Tier-1: specialize + PGOInstrumentationGen + Lowering.
+  PGOUse = 2, ///< Tier-2: specialize + PGOInstrumentationUse(profile) + opts.
 };
 
 struct SpecializationContext {
@@ -96,6 +99,14 @@ struct SpecializationContext {
   /// site (min samples + confidence thresholds applied by the driver). Empty
   /// for Baseline/Instrumented and when value profiling is not built.
   std::vector<PgoScalarSite> scalarValueSites;
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+  /// Runtime hit snapshot from the temporary Instrumented tier. Populated by
+  /// the compile driver before the final compile starts.
+  std::vector<EJitMayConstLoadSite> mayConstLoadSites;
+  /// True when profile data is collected for diagnostics only. The optimizer
+  /// restores weights for reporting but must publish ordinary Baseline code.
+  bool profileAuditOnly = false;
+#endif
 };
 
 /// Wraps an LLJIT instance with EmbeddedJIT-specific configuration:
@@ -136,6 +147,14 @@ public:
   /// EJitOptimizer::getLastVpFunctions). Empty unless the Tier-1 compile ran
   /// with EJIT_SRE_PGO_VALUE_PROFILE.
   ArrayRef<EJitVpFunctionInfo> getLastVpFunctions() const;
+
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  ArrayRef<EJitMayConstLoadSite> getLastMayConstLoadSites() const;
+#endif
+
+  /// Print the completed per-entry may_const benefit samples, sorted by the
+  /// average number of loads removed per specialization.
+  bool printMayConstRanking() const;
 
   /// Register a user-defined external symbol (function or global) that the
   /// JIT can resolve when compiling bitcode modules. Required for bare-metal

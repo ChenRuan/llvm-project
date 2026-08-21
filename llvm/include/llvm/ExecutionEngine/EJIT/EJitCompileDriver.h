@@ -13,6 +13,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+#include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
+#endif
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 #include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
 #endif
@@ -187,6 +190,13 @@ private:
     uintptr_t profdAddr = 0;
   };
   std::unordered_map<uint64_t, std::vector<Tier1CounterInfo>> tier1Counters_;
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  struct Tier1MayConstState {
+    uintptr_t counterBase = 0;
+    std::vector<EJitMayConstLoadSite> sites;
+  };
+  std::unordered_map<uint64_t, Tier1MayConstState> tier1MayConst_;
+#endif
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
   /// Value-profile capture per cacheKey (EJIT_VALUE_PROFILE.md §5.1): the
   /// verified target table (runtime address -> IR-PGO-name MD5) and the

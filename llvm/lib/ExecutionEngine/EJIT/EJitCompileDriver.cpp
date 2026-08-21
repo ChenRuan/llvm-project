@@ -4,6 +4,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include <cassert>
@@ -463,9 +464,29 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   // (Instrumented); a Tier-2 (PGOUse) recompile synthesizes the in-memory
   // profile from Tier-1's captured counters BEFORE loadBitcode (§5.3: PGOUse
   // consumes ctx.profileData during the JIT transform).
-  if (config_.enablePgo) {
+  const bool RunProfileStages =
+      config_.enablePgo ||
+      (config_.enableProfileAudit &&
+       config_.compileMode == CompileMode::Async);
+  if (RunProfileStages) {
     if (static_cast<CompileTier>(tier) == CompileTier::PGOUse) {
       ctx.tier = CompileTier::PGOUse;
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+      ctx.profileAuditOnly = !config_.enablePgo;
+      auto mayConstIt = tier1MayConst_.find(cacheKey);
+      if (mayConstIt != tier1MayConst_.end()) {
+        ctx.mayConstLoadSites = mayConstIt->second.sites;
+        const auto *Counters = reinterpret_cast<const EJitAtomicU64 *>(
+            mayConstIt->second.counterBase);
+        if (Counters) {
+          for (size_t I = 0; I < ctx.mayConstLoadSites.size(); ++I)
+            mayConstIt->second.sites[I].runtimeHits =
+                Counters[I].loadAcquire();
+          mayConstIt->second.counterBase = 0;
+          ctx.mayConstLoadSites = mayConstIt->second.sites;
+        }
+      }
+#endif
       auto it = tier1Counters_.find(cacheKey);
       if (it != tier1Counters_.end() && !it->second.empty()) {
         std::vector<PgoCounterRef> refs;
@@ -558,6 +579,9 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       }
     } else {
       ctx.tier = CompileTier::Instrumented;
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+      ctx.profileAuditOnly = !config_.enablePgo;
+#endif
     }
   }
 
@@ -630,6 +654,21 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     EJIT_DIAG("compileCold Tier-1 key=0x%016lx: captured %zu counter set(s)",
               cacheKey, counters.size());
 
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+    Tier1MayConstState &MayConst = tier1MayConst_[cacheKey];
+    MayConst.counterBase = 0;
+    MayConst.sites.assign(jitEngine_->getLastMayConstLoadSites().begin(),
+                          jitEngine_->getLastMayConstLoadSites().end());
+    if (!MayConst.sites.empty()) {
+      if (auto Addr = jitEngine_->lookup(cacheKey, "__ejit_mayconst_hits"))
+        MayConst.counterBase = reinterpret_cast<uintptr_t>(*Addr);
+      else
+        consumeError(Addr.takeError());
+    }
+    EJIT_DIAG("mayconst T0 published key=0x%016lx func=%s sites=%zu", cacheKey,
+              funcName.c_str(), MayConst.sites.size());
+#endif
+
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
     // Value-profile capture (EJIT_VALUE_PROFILE.md §5.1): build the verified
     // target table from the module's function list - each function's runtime
@@ -678,9 +717,11 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         }
       }
     }
-    ejitVpEnsureInitialized();
-    ejitVpSetArmed(true);
-    ++vpRoundsActive_;
+    if (config_.enablePgo) {
+      ejitVpEnsureInitialized();
+      ejitVpSetArmed(true);
+      ++vpRoundsActive_;
+    }
     EJIT_DIAG_DEBUG("VP capture key=0x%016lx: %zu function(s), %zu verified "
                     "target(s)",
                     cacheKey, vp.functions.size(), vp.targets.size());

@@ -6,12 +6,16 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include <cassert>
@@ -137,7 +141,7 @@ accumulateFullOffset(const DataLayout &DL, const Value *PtrOp) {
 
 /// Check whether a load is (or can be treated as) a may_const access.
 static bool
-isMayConstLoad(LoadInst *LI, const MayConstOffsetMap &mayConstFieldMap,
+isMayConstLoad(const LoadInst *LI, const MayConstOffsetMap &mayConstFieldMap,
                const DataLayout &DL) {
   // Never substituted. Checked ahead of the metadata, not just ahead of the
   // fallback, so that a pass which copies !ejit.may_const onto a volatile or
@@ -166,6 +170,107 @@ isMayConstLoad(LoadInst *LI, const MayConstOffsetMap &mayConstFieldMap,
   }
   return false;
 }
+
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+std::vector<EJitMayConstLoadSite>
+EJitStructFieldPass::collectMayConstLoadSites(const Module &M) const {
+  assert(mapsBuilt_ && "initFromModule() must precede may_const audit");
+  std::vector<EJitMayConstLoadSite> Sites;
+  const DataLayout &DL = M.getDataLayout();
+  for (const Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (const BasicBlock &BB : F) {
+      for (const Instruction &I : BB) {
+        const auto *LI = dyn_cast<LoadInst>(&I);
+        if (!LI || !isMayConstLoad(LI, mayConstFieldMap_, DL))
+          continue;
+
+        EJitMayConstLoadSite Site;
+        Site.functionName = F.getName().str();
+        const GlobalVariable *RootGV = nullptr;
+        if (auto Offset =
+                ejitMayConstFieldOffset(LI->getPointerOperand(), DL, RootGV)) {
+          Site.fieldOffset = *Offset;
+          Site.hasFieldOffset = true;
+        }
+        if (RootGV)
+          Site.globalName = RootGV->getName().str();
+        if (DebugLoc Loc = LI->getDebugLoc()) {
+          Site.sourceFile = Loc->getFilename().str();
+          Site.sourceLine = Loc.getLine();
+          Site.sourceColumn = Loc.getCol();
+        }
+        Sites.push_back(std::move(Site));
+      }
+    }
+  }
+  return Sites;
+}
+
+std::vector<EJitMayConstLoadSite>
+EJitStructFieldPass::instrumentMayConstLoadSites(Module &M) {
+  std::vector<EJitMayConstLoadSite> Sites = collectMayConstLoadSites(M);
+  if (Sites.empty())
+    return Sites;
+
+  LLVMContext &Ctx = M.getContext();
+  Type *I64 = Type::getInt64Ty(Ctx);
+  ArrayType *CounterTy = ArrayType::get(I64, Sites.size());
+  auto *Counters = new GlobalVariable(
+      M, CounterTy, false, GlobalValue::ExternalLinkage,
+      ConstantAggregateZero::get(CounterTy), MayConstCounterName);
+  Counters->setAlignment(Align(8));
+
+  const DataLayout &DL = M.getDataLayout();
+  uint64_t SiteIndex = 0;
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        auto *LI = dyn_cast<LoadInst>(&I);
+        if (!LI || !isMayConstLoad(LI, mayConstFieldMap_, DL))
+          continue;
+
+        IRBuilder<> Builder(LI);
+        Value *Counter = Builder.CreateInBoundsGEP(
+            CounterTy, Counters,
+            {Builder.getInt32(0), Builder.getInt64(SiteIndex)});
+        Builder.CreateAtomicRMW(AtomicRMWInst::Add, Counter,
+                                Builder.getInt64(1), Align(8),
+                                AtomicOrdering::Monotonic);
+        ++SiteIndex;
+      }
+    }
+  }
+  assert(SiteIndex == Sites.size() && "may_const site inventory changed");
+  return Sites;
+}
+
+void EJitStructFieldPass::removeMayConstLoadInstrumentation(Module &M) {
+  GlobalVariable *Counters = M.getGlobalVariable(MayConstCounterName);
+  if (!Counters)
+    return;
+
+  SmallVector<AtomicRMWInst *, 16> Increments;
+  for (Function &F : M)
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *RMW = dyn_cast<AtomicRMWInst>(&I))
+          if (getUnderlyingObject(RMW->getPointerOperand()) == Counters)
+            Increments.push_back(RMW);
+
+  for (AtomicRMWInst *RMW : Increments) {
+    auto *Address = dyn_cast<Instruction>(RMW->getPointerOperand());
+    RMW->eraseFromParent();
+    if (Address)
+      RecursivelyDeleteTriviallyDeadInstructions(Address);
+  }
+  assert(Counters->use_empty() && "may_const counter still has users");
+  Counters->eraseFromParent();
+}
+#endif
 
 //===----------------------------------------------------------------------===//
 // Runtime value helpers
