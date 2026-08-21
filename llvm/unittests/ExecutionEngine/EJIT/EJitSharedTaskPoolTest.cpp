@@ -75,6 +75,29 @@ bool mockPrepareCode(void *ctx, const void * /*fnPtr*/) {
   return log->succeed;
 }
 
+struct RankingLog {
+  uint32_t calls = 0;
+  uint32_t callbackCore = kEJitInvalidCoreId;
+  bool succeed = true;
+};
+bool mockMayConstRanking(void *ctx) {
+  auto *log = static_cast<RankingLog *>(ctx);
+  ++log->calls;
+  log->callbackCore = EJitCoreId::current();
+  return log->succeed;
+}
+
+struct DriveOwnerCtx {
+  EJitSharedTaskPool *owner = nullptr;
+  uint32_t requesterCore = 1;
+};
+void driveOwnerOnRequesterIdle(void *ctx, uint32_t /*ticks*/) {
+  auto *drive = static_cast<DriveOwnerCtx *>(ctx);
+  EJitCoreId::setCurrentForTest(0);
+  (void)drive->owner->workerPollOnce();
+  EJitCoreId::setCurrentForTest(drive->requesterCore);
+}
+
 //===----------------------------------------------------------------------===//
 // 4K page-seal mocks: a per-core split + per-page seal that log which core ran
 // them and (optionally) fail or inject a concurrent slot/generation change at a
@@ -379,6 +402,28 @@ TEST_F(SharedTaskPoolTest, ExactlyOneOwnerAcrossCores) {
   // Idempotency: the owner re-observing init() stays Ready, no re-election.
   EJitCoreId::setCurrentForTest(0);
   EXPECT_EQ(c0.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+}
+
+TEST_F(SharedTaskPoolTest, PeerRequestsMayConstRankingFromOwnerWorker) {
+  EJitSharedTaskPool owner;
+  RankingLog log;
+  owner.setMayConstRankingCallback(&mockMayConstRanking, &log);
+  bringUpOwner(owner);
+
+  EJitSharedTaskPool peer;
+  DriveOwnerCtx drive{&owner, 1};
+  peer.bind(state_.get());
+  peer.setMode(EJitCompileMode::Async);
+  peer.setWorkerIdleHook(&driveOwnerOnRequesterIdle, &drive);
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+
+  EXPECT_TRUE(peer.requestMayConstRanking());
+  EXPECT_EQ(log.calls, 1u);
+  EXPECT_EQ(log.callbackCore, 0u);
+  EXPECT_EQ(state_->mayConstRankingRequest.loadAcquire(), 1u);
+  EXPECT_EQ(state_->mayConstRankingComplete.loadAcquire(), 1u);
+  EXPECT_EQ(state_->mayConstRankingResult.loadAcquire(), 1u);
 }
 
 //===----------------------------------------------------------------------===//

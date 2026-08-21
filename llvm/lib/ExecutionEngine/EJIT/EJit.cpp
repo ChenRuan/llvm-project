@@ -1026,12 +1026,18 @@ void EJit::printCodePoolStats() const {
 }
 
 bool EJit::printMayConstRanking() {
-  if (!compileDriver_ || !compileDriver_->getJitEngine()) {
-    EJIT_DIAG_RAW("mayconst-ranking: no local compiler; call on the worker "
-                  "that owns compilation");
+  if (!compileDriver_) {
+    EJIT_DIAG_RAW("mayconst-ranking: no compile driver");
     return false;
   }
-  return compileDriver_->getJitEngine()->printMayConstRanking();
+  if (EJitOrcEngine *Engine = compileDriver_->getJitEngine())
+    return Engine->printMayConstRanking();
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (EJitSharedTaskPool *Pool = compileDriver_->sharedTaskPool())
+    return Pool->requestMayConstRanking();
+#endif
+  EJIT_DIAG_RAW("mayconst-ranking: no local or shared compiler");
+  return false;
 }
 
 void EJit::printActive() const {

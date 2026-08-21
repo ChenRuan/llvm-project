@@ -96,7 +96,9 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// v12: staged PGO admission has a configurable fixed-capacity slot table, so
 /// one or more functions may profile concurrently with independent progress;
 /// the shared blob also records completed-function and deferred-miss counts.
-constexpr uint32_t kEJitSharedAbiVersion = 12u;
+/// v13: non-owner cores can post a may_const-ranking diagnostic request to the
+/// owner worker and wait for its completion without sharing optimizer objects.
+constexpr uint32_t kEJitSharedAbiVersion = 13u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

@@ -2304,6 +2304,9 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   // starting value is arbitrary, which is harmless: the L0 tables are zeroed
   // BSS and l0Key() never returns 0, so no entry can match anyway.
   st->dispatchEpoch.fetchAdd(1);
+  st->mayConstRankingRequest.storeRelaxed(0);
+  st->mayConstRankingComplete.storeRelaxed(0);
+  st->mayConstRankingResult.storeRelaxed(0);
   // icacheDrainSeq is likewise BUMPED, never reset: a core that snapshotted it
   // before this (re)initialization must not find its snapshot still current
   // afterwards and fill a cell with a pointer from the previous generation.
@@ -3187,6 +3190,19 @@ bool EJitSharedTaskPool::pollOne() {
   return true;
 }
 
+bool EJitSharedTaskPool::serviceMayConstRankingRequest() {
+  if (!state_ || !isOwner_)
+    return false;
+  const uint32_t Request = state_->mayConstRankingRequest.loadAcquire();
+  if (Request == state_->mayConstRankingComplete.loadAcquire())
+    return false;
+
+  const bool Ok = mayConstRankingFn_ && mayConstRankingFn_(mayConstRankingCtx_);
+  state_->mayConstRankingResult.storeRelaxed(Ok ? 1u : 0u);
+  state_->mayConstRankingComplete.storeRelease(Request);
+  return true;
+}
+
 unsigned EJitSharedTaskPool::pollBudget(unsigned maxItems) {
   unsigned n = 0;
   while (n < maxItems && pollOne())
@@ -3201,6 +3217,8 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
   switch (static_cast<EJitSharedInitState>(st)) {
   case EJitSharedInitState::Ready:
     workerConsumeLoops_.fetchAdd(1);
+    if (serviceMayConstRankingRequest())
+      return EJitWorkerStep::Consumed;
     return pollOne() ? EJitWorkerStep::Consumed : EJitWorkerStep::Idle;
   case EJitSharedInitState::Initializing:
     // The owner is still arming the pool. The SRE task may have been scheduled
@@ -3271,6 +3289,29 @@ uint32_t EJitSharedTaskPool::pendingCount() const {
     if (state_->inFlight[i].loadRelaxed() != 0)
       ++pending;
   return pending;
+}
+
+bool EJitSharedTaskPool::requestMayConstRanking() {
+  if (!state_ || state_->initState.loadAcquire() !=
+                     static_cast<uint32_t>(EJitSharedInitState::Ready)) {
+    EJIT_DIAG("mayconst-ranking request rejected: shared worker not ready");
+    return false;
+  }
+
+  const uint32_t Generation = state_->generation.loadAcquire();
+  const uint32_t Ticket = state_->mayConstRankingRequest.fetchAdd(1) + 1;
+  constexpr uint32_t kMaxWaitRounds = 1u << 20;
+  for (uint32_t Round = 0; Round < kMaxWaitRounds; ++Round) {
+    if (state_->generation.loadAcquire() != Generation)
+      break;
+    const uint32_t Complete = state_->mayConstRankingComplete.loadAcquire();
+    if (static_cast<int32_t>(Complete - Ticket) >= 0)
+      return state_->mayConstRankingResult.loadAcquire() != 0;
+    workerIdle(1);
+  }
+  EJIT_DIAG("mayconst-ranking request timed out ticket=%u owner=%u", Ticket,
+            state_->ownerCoreId.loadAcquire());
+  return false;
 }
 
 void EJitSharedTaskPool::getDiagnostics(EJitSharedDiagnostics &out) const {

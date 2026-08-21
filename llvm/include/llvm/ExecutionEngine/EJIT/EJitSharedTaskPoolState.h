@@ -403,6 +403,12 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   /// the line stays Shared in every core's L1 rather than bouncing. Sits in
   /// this cache line's padding, so sizeof() and later offsets are unchanged.
   EJitAtomicU32 dispatchEpoch;
+  /// Cross-core diagnostic rendezvous. A producer increments request; the
+  /// owner worker prints its local may_const ranking, publishes result, then
+  /// advances complete. These fields are cold and stay in existing padding.
+  EJitAtomicU32 mayConstRankingRequest;
+  EJitAtomicU32 mayConstRankingComplete;
+  EJitAtomicU32 mayConstRankingResult;
 
   //--- SwitchController state (own cache line)
   alignas(kEJitSharedCacheLine)

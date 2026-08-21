@@ -421,8 +421,9 @@ void ejit_print_code_pool_stats(void);
 
 /// Print a ranking for every sampled ejit_entry function. The ranking is
 /// ordered by the average number of may_const loads removed across its JIT
-/// specializations. Call this explicitly on the compile-owner worker after the
-/// audit sampling windows have completed.
+/// specializations. Call this explicitly after the audit sampling windows have
+/// completed. In a shared-taskpool build, a non-owner core forwards the request
+/// to the compile-owner worker and waits for printing to finish.
 void ejit_print_mayconst_ranking(void);
 
 /// Print the currently-active time-window instances through the platform log:

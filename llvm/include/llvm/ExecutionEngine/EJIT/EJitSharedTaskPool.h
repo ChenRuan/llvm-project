@@ -390,6 +390,9 @@ public:
   /// Owner-only teardown hook (see setOwnerReleasedCallback). Runs on the core
   /// giving up ownership, inside ownerShutdown().
   using OwnerReleasedFn = void (*)(void *ctx);
+  /// Owner-private diagnostic callback. It runs only on the owner worker and
+  /// may access owner-local optimizer state.
+  using MayConstRankingCallback = bool (*)(void *ctx);
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   using TestHookFn = void (*)(void *ctx);
 #endif
@@ -492,6 +495,10 @@ public:
   void setPublishCallback(PublishCallback fn, void *ctx) {
     publishFn_ = fn;
     publishCtx_ = ctx;
+  }
+  void setMayConstRankingCallback(MayConstRankingCallback fn, void *ctx) {
+    mayConstRankingFn_ = fn;
+    mayConstRankingCtx_ = ctx;
   }
   void setReleaser(ReleaseCallback fn, void *ctx) {
     const bool had = (releaseFn_ != nullptr);
@@ -1024,6 +1031,11 @@ public:
   /// In-flight dedup count (used by the taskpool C ABI pending_count).
   uint32_t pendingCount() const;
 
+  /// Ask the owner worker to print its owner-local may_const ranking. Any
+  /// attached core may call this; concurrent callers coalesce. The call waits
+  /// for the owner to complete the diagnostic and returns its success status.
+  bool requestMayConstRanking();
+
   /// The worker loop body: poll until the shared state leaves Ready. Public so
   /// an injected task entry can forward to it; normally reached via
   /// WorkerEntry.
@@ -1054,6 +1066,7 @@ private:
   /// is a single yield (idle/wait); \p ticks=MULT*DELAY_TICKS is the post-task
   /// throttle delay. Bumps workerIdleYields_ either way.
   void workerIdle(uint32_t ticks);
+  bool serviceMayConstRankingRequest();
 
   /// Result of a shared-cache lookup, including the cross-core fnPtr gate.
   struct SharedLookup {
@@ -1240,6 +1253,8 @@ private:
   void *codeRangeCtx_ = nullptr;
   CodePoolStatsCallback codePoolStatsFn_ = nullptr;
   void *codePoolStatsCtx_ = nullptr;
+  MayConstRankingCallback mayConstRankingFn_ = nullptr;
+  void *mayConstRankingCtx_ = nullptr;
   SplitPoolCallback splitPoolFn_ = nullptr;
   void *splitPoolCtx_ = nullptr;
   SealPageCallback sealPageFn_ = nullptr;

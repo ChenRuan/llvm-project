@@ -83,15 +83,17 @@ needed. Audit sampling requires Async mode; Sync and Off keep their normal
 Baseline/off behavior because there is no later hit-triggered publication.
 
 After the sampling windows and final compilations have completed, explicitly
-print the per-`ejit_entry` ranking on the worker that owns compilation:
+print the per-`ejit_entry` ranking from any attached core:
 
 ```c
 ejit_print_mayconst_ranking();
 ```
 
-The call is read-only and does not start profiling or compilation. It prints
-one row per entry, ordered by the average number of may-const loads removed
-across that entry's unique JIT cache keys:
+The call is read-only and does not start profiling or compilation. In a shared
+taskpool build, a non-owner core posts a diagnostic request and waits while the
+owner worker prints its local optimizer data. It prints one row per entry,
+ordered by the average number of may-const loads removed across that entry's
+unique JIT cache keys:
 
 ```text
 [EJIT] mayconst-ranking entries=2 sort=avg_removed_desc
@@ -102,9 +104,9 @@ across that entry's unique JIT cache keys:
 `runtime_hits` is the sum of dynamic T0 executions of recognized may-const
 load sites; `hit_sites` is the sum of sites that executed at least once in each
 sampled version. An entry appears only after at least one specialization has
-completed its audit window and final compilation. The aggregation state is
-local to the compile-owner worker, so calling from another core reports that
-there is no local compiler instead of printing a misleading empty table.
+completed its audit window and final compilation. The aggregation state stays
+local to the compile-owner worker; only a request/completion sequence and a
+boolean result cross shared memory.
 
 ## Coverage boundary
 

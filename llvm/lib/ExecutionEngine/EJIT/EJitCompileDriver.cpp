@@ -108,6 +108,12 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
 #endif
 }
 
+bool sharedMayConstRankingThunk(void *ctx) {
+  auto *drv = static_cast<EJitCompileDriver *>(ctx);
+  EJitOrcEngine *engine = drv->getJitEngine();
+  return engine && engine->printMayConstRanking();
+}
+
 // Per-core platform primitives wrapped so the shared taskpool core never names
 // an SRE symbol directly (spec §7). Both are no-ops returning false when the
 // code pool / seal support is not built.
@@ -191,6 +197,7 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   sharedPool_.bind(&gEJitSharedTaskPoolState);
   sharedPool_.setCompiler(&taskpoolCompileThunk, this);
   sharedPool_.setPublishCallback(&taskpoolPublishThunk, this);
+  sharedPool_.setMayConstRankingCallback(&sharedMayConstRankingThunk, this);
   sharedPool_.setWorkerHooks(&EJitCompileDriver::sharedWorkerStart,
                              &EJitCompileDriver::sharedWorkerStop, this);
   // Inject the platform yield so the worker never busy-spins while waiting for

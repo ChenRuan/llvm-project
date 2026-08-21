@@ -166,7 +166,7 @@ public:
   void printActive() const;
 
   /// Print completed per-entry may_const benefit samples in descending order.
-  /// The samples are local to the compile-owner worker.
+  /// A non-owner facade forwards the request to the compile-owner worker.
   bool printMayConstRanking();
 
 private:
