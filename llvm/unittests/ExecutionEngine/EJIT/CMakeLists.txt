@@ -264,6 +264,25 @@ add_custom_target(check-ejit-value-profile
   USES_TERMINAL
   )
 
+# Branch-audit tests are independent of LLVMEJIT and always compile the small
+# read-only analyzer, even though production inclusion is default-off.
+set(EJIT_BRANCH_AUDIT_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
+set(LLVM_LINK_COMPONENTS Core Support)
+add_llvm_unittest(EJITBranchProfileTests
+  EJitBranchProfileTest.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitBranchProfile.cpp
+
+  PARTIAL_SOURCES_INTENDED
+  )
+set(LLVM_LINK_COMPONENTS "${EJIT_BRANCH_AUDIT_LINK_COMPONENTS_SAVED}")
+
+add_custom_target(check-ejit-branch-profile
+  COMMAND $<TARGET_FILE:EJITBranchProfileTests>
+  DEPENDS EJITBranchProfileTests
+  COMMENT "Running EmbeddedJIT branch-profile audit unit tests"
+  USES_TERMINAL
+  )
+
 # Optional cache-query microbenchmark (NOT a gtest binary: standalone main()).
 # Off by default so it never bloats normal test builds. Enable with
 # -DEJIT_BUILD_CACHE_QUERY_BENCH=ON to build a host-runnable binary that prints a
