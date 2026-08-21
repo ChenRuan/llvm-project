@@ -1671,6 +1671,14 @@ void ejit_print_code_pool_stats(void) {
   gEJIT->printCodePoolStats();
 }
 
+void ejit_print_mayconst_ranking(void) {
+  if (!gEJIT) {
+    EJIT_DIAG_RAW("mayconst-ranking: not initialized");
+    return;
+  }
+  (void)gEJIT->printMayConstRanking();
+}
+
 void ejit_print_active(void) {
   if (!gEJIT) {
     EJIT_DIAG_RAW("print_active: not initialized");

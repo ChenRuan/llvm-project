@@ -393,8 +393,10 @@ EJit::EJit(const Config &config) : config_(config) {
 #endif
       else {
         EJIT_DIAG("taskpool async init complete: worker running");
-        // PGO opt-in: arm the Tier-2 auto-trigger when Config::enablePgo is set.
-        if (config_.enablePgo) {
+        // PGO and the default-off profile audit share the temporary
+        // Instrumented-tier hit window. Audit-only mode publishes ordinary
+        // Baseline code after collecting the window.
+        if (config_.enablePgo || config_.enableProfileAudit) {
           constexpr uint32_t kDefaultPgoThreshold = 64;
 #ifdef EJIT_SRE_SHARED_TASKPOOL
           compileDriver_->sharedTaskPool()->setPgoEnabled(
@@ -1009,6 +1011,15 @@ void EJit::printCodePoolStats() const {
 #else
   EJIT_DIAG_RAW("code pool: EJIT_SRE_CODE_POOL not enabled");
 #endif
+}
+
+bool EJit::printMayConstRanking() {
+  if (!compileDriver_ || !compileDriver_->getJitEngine()) {
+    EJIT_DIAG_RAW("mayconst-ranking: no local compiler; call on the worker "
+                  "that owns compilation");
+    return false;
+  }
+  return compileDriver_->getJitEngine()->printMayConstRanking();
 }
 
 void EJit::printActive() const {

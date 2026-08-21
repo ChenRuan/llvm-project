@@ -41,6 +41,10 @@ if(EJIT_SRE_PGO_VALUE_PROFILE)
   )
 endif()
 
+if(EJIT_SRE_PGO_BRANCH_AUDIT)
+  target_compile_definitions(EJITTests PRIVATE EJIT_SRE_PGO_BRANCH_AUDIT)
+endif()
+
 # EJit.cpp calls InitializeAllAsmParsers(); a target's AsmParser lib is only
 # referenced at runtime (no CMake dependency edge), so when listed via
 # LLVM_LINK_COMPONENTS it can be ordered BEFORE LLVMEJIT on the static link

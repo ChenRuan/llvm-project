@@ -3,6 +3,8 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITBRANCHPROFILE_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITBRANCHPROFILE_H
 
+#include "llvm/ADT/ArrayRef.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -25,10 +27,53 @@ struct EJitBranchProfileSummary {
   bool isRoot = false;
 };
 
+/// Stable description of one source may_const load. Tier-1 records the same
+/// deterministic module-order inventory that Tier-2 uses to correlate runtime
+/// hits with the final specialized IR.
+struct EJitMayConstLoadSite {
+  std::string functionName;
+  std::string globalName;
+  std::string sourceFile;
+  uint64_t fieldOffset = 0;
+  uint64_t runtimeHits = 0;
+  uint32_t sourceLine = 0;
+  uint32_t sourceColumn = 0;
+  bool hasFieldOffset = false;
+};
+
+struct EJitMayConstBenefitSample {
+  uint64_t cacheKey = 0;
+  uint64_t inputMayConstLoads = 0;
+  uint64_t specializedMayConstLoads = 0;
+  uint64_t finalMayConstLoads = 0;
+  uint64_t runtimeHits = 0;
+  uint64_t hitSites = 0;
+};
+
+struct EJitMayConstBenefitSummary {
+  uint64_t versions = 0;
+  uint64_t inputMayConstLoads = 0;
+  uint64_t specializedMayConstLoads = 0;
+  uint64_t finalMayConstLoads = 0;
+  int64_t totalRemoved = 0;
+  int64_t directRemoved = 0;
+  int64_t pipelineRemoved = 0;
+  int64_t averageRemoved = 0;
+  int64_t weightedRemovedPermille = 0;
+  int64_t minimumRemoved = 0;
+  int64_t maximumRemoved = 0;
+  uint64_t runtimeHits = 0;
+  uint64_t hitSites = 0;
+};
+
 /// Summarize the branch weights attached by PGOInstrumentationUse. This is a
 /// read-only audit: it does not alter IR or add runtime instrumentation.
 std::vector<EJitBranchProfileSummary>
 analyzeBranchProfiles(const Module &M, const std::string &rootName);
+
+/// Aggregate unique specialization samples for one EJIT entry.
+EJitMayConstBenefitSummary
+summarizeMayConstBenefits(ArrayRef<EJitMayConstBenefitSample> Samples);
 
 } // namespace ejit
 } // namespace llvm

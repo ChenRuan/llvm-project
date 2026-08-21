@@ -866,6 +866,11 @@ EJitOrcEngine::Create(const Config &config,
             symFlags[engine->P->J->mangleAndIntern("__profd_" + name)] =
                 JITSymbolFlags::Exported;
           }
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+          if (!engine->P->optimizer->getLastMayConstLoadSites().empty())
+            symFlags[engine->P->J->mangleAndIntern(
+                "__ejit_mayconst_hits")] = JITSymbolFlags::Exported;
+#endif
           if (!symFlags.empty())
             if (auto Err = R.defineMaterializing(std::move(symFlags)))
               EJIT_DIAG("transform: defineMaterializing PGO counters "
@@ -1148,6 +1153,18 @@ ArrayRef<EJitVpFunctionInfo> EJitOrcEngine::getLastVpFunctions() const {
   return {};
 }
 
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+ArrayRef<EJitMayConstLoadSite>
+EJitOrcEngine::getLastMayConstLoadSites() const {
+  if (P->optimizer)
+    return P->optimizer->getLastMayConstLoadSites();
+  return {};
+}
+#endif
+
+bool EJitOrcEngine::printMayConstRanking() const {
+  return P->optimizer && P->optimizer->printMayConstRanking();
+}
 
 void EJitOrcEngine::addUserSymbol(const std::string &name, void *addr) {
   P->userSymbols[name] = addr;

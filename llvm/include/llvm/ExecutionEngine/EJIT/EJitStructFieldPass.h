@@ -14,6 +14,10 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+#include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
+#include <vector>
+#endif
 
 namespace llvm {
 namespace ejit {
@@ -38,6 +42,24 @@ public:
 
   /// Pre-build GV metadata maps from the Module (call once before run()).
   void initFromModule(Module &M);
+
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+  /// Identify loads using the same metadata and field-offset fallback as the
+  /// replacement pass. The returned sites are read-only audit data.
+  std::vector<EJitMayConstLoadSite>
+  collectMayConstLoadSites(const Module &M) const;
+
+  /// Add one monotonic i64 counter immediately before every may_const load.
+  /// The later specialization may remove the load, but the counter remains at
+  /// the original control-flow site in the temporary Tier-1 code.
+  std::vector<EJitMayConstLoadSite> instrumentMayConstLoadSites(Module &M);
+
+  /// Remove the temporary counter increments and backing global after profile
+  /// matching, before final code optimization/publication.
+  static void removeMayConstLoadInstrumentation(Module &M);
+
+  static constexpr const char *MayConstCounterName = "__ejit_mayconst_hits";
+#endif
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 

@@ -36,6 +36,7 @@
 #include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
 #include "llvm/Transforms/Scalar/SCCP.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 
@@ -43,6 +44,15 @@ using namespace llvm;
 using namespace llvm::ejit;
 
 #define DEBUG_TYPE "ejit-optimizer"
+
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+static std::vector<EJitMayConstLoadSite>
+collectMayConstSites(Module &M, PeriodArrayRegistry &Registry) {
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(M);
+  return Pass.collectMayConstLoadSites(M);
+}
+#endif
 
 EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg) : registry_(reg) {
   // Use the real llvm::PassBuilder to register the FULL analysis set. The O2
@@ -113,6 +123,29 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   lastCounterNames_.clear();
   lastVpFunctions_.clear();
   scalarSiteCountsByFunc_.clear();
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  lastMayConstLoadSites_.clear();
+#endif
+
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  std::vector<EJitMayConstLoadSite> AuditInputSites;
+  if (ctx.tier == CompileTier::Instrumented ||
+      ctx.tier == CompileTier::PGOUse) {
+    EJitStructFieldPass AuditPass(registry_);
+    AuditPass.initFromModule(M);
+    auto Sites = AuditPass.instrumentMayConstLoadSites(M);
+    if (ctx.tier == CompileTier::Instrumented)
+      lastMayConstLoadSites_.append(Sites.begin(), Sites.end());
+    else if (!ctx.mayConstLoadSites.empty())
+      AuditInputSites = ctx.mayConstLoadSites;
+    else
+      AuditInputSites = std::move(Sites);
+  } else if (!ctx.mayConstLoadSites.empty()) {
+    AuditInputSites = ctx.mayConstLoadSites;
+  } else {
+    AuditInputSites = collectMayConstSites(M, registry_);
+  }
+#endif
 
   // Phase 1 - specialize (common to all tiers): turn the period index and
   // every may_const field into a compile-time constant.
@@ -134,6 +167,13 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   runInstCombine(M);
   runStructFieldPass(M);
   EJIT_DIAG_DEBUG("pipeline phase1ef done: callee InstCombine+StructFieldPass");
+
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  const uint64_t AuditSpecializedMayConstLoads =
+      ctx.tier != CompileTier::Instrumented
+          ? collectMayConstSites(M, registry_).size()
+          : 0;
+#endif
 
   if (ctx.tier == CompileTier::Instrumented) {
     // The counter increment lowers to `atomicrmw add i64` (§5, InstrProfOpts
@@ -184,7 +224,11 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     // critical-edge splits the Tier-2 Use phase will reproduce - the site
     // numbering must agree) and BEFORE captureCounterGlobals (which merges the
     // per-function site counts into the capture the compile driver reads).
-    {
+    bool EnableValueProfile = true;
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+    EnableValueProfile = !ctx.profileAuditOnly;
+#endif
+    if (EnableValueProfile) {
       for (Function &F : M.functions())
         if (!F.isDeclaration())
           runValueProfileOnFunction(F, FAM_, EJitValueProfileMode::Instrument,
@@ -205,7 +249,15 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     // then annotate !prof from the in-memory profile, then the full
     // optimization pipeline (consumes !prof via BFI/BPI/PSI -> codegen block
     // placement). If profile synthesis failed (empty), fall back to Baseline.
-    runLightOptPipeline(M);
+    std::unique_ptr<Module> AuditModule;
+    Module *ProfileModule = &M;
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+    if (ctx.profileAuditOnly) {
+      AuditModule = CloneModule(M);
+      ProfileModule = AuditModule.get();
+    }
+#endif
+    runLightOptPipeline(*ProfileModule);
     if (!ctx.profileData.empty()) {
       auto InMemFS = IntrusiveRefCntPtr<vfs::InMemoryFileSystem>(
           new vfs::InMemoryFileSystem());
@@ -215,9 +267,9 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
       UseMPM.addPass(PGOInstrumentationUse(
           /*Filename=*/"/ejit.prof", /*Remap=*/"", /*IsCS=*/false,
           IntrusiveRefCntPtr<vfs::FileSystem>(InMemFS)));
-      UseMPM.run(M, MAM_);
+      UseMPM.run(*ProfileModule, MAM_);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-      auto Summaries = analyzeBranchProfiles(M, ctx.fnName);
+      auto Summaries = analyzeBranchProfiles(*ProfileModule, ctx.fnName);
       uint64_t Instructions = 0;
       uint32_t Branches = 0;
       uint32_t Profiled = 0;
@@ -254,6 +306,26 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
           Biased, Balanced, ZeroEdges);
 #endif
     }
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+    EJitStructFieldPass::removeMayConstLoadInstrumentation(M);
+#endif
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+    if (ctx.profileAuditOnly) {
+      // The clone consumed profile data solely for diagnostics. Keep the
+      // publish module profile-free so audit-only mode is behaviorally the
+      // same optimization pipeline as ejit_init() Baseline.
+      clearAnalyses();
+      runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline);
+#if defined(EJIT_DIAG_ENABLE)
+      recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
+                            collectMayConstSites(M, registry_).size());
+#endif
+      EJIT_DIAG_VERBOSE("pipeline done (audit-only Baseline) func=%s "
+                        "key=0x%016lx",
+                        ctx.fnName.c_str(), ctx.cacheKey);
+      return;
+    }
+#endif
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
     // Scalar/loop-bound sites (EJIT_VALUE_PROFILE.md §7.1): annotate with
     // !ejit.vp metadata AFTER the Use phase (same post-split CFG as Tier-1's
@@ -302,6 +374,10 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     }
 #endif
     runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+    recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
+                          collectMayConstSites(M, registry_).size());
+#endif
     EJIT_DIAG_VERBOSE("pipeline done (Tier-2) func=%s key=0x%016lx",
                       ctx.fnName.c_str(), ctx.cacheKey);
     return;
@@ -309,8 +385,150 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
 
   // Baseline (PGO off): the existing full specialization pipeline.
   runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
+                        collectMayConstSites(M, registry_).size());
+#endif
   EJIT_DIAG_VERBOSE("pipeline done func=%s key=0x%016lx", ctx.fnName.c_str(),
                     ctx.cacheKey);
+}
+
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+void EJitOptimizer::recordMayConstBenefit(
+    const SpecializationContext &ctx, ArrayRef<EJitMayConstLoadSite> InputSites,
+    uint64_t SpecializedMayConstLoads, uint64_t FinalMayConstLoads) {
+  const uint64_t InputMayConstLoads = InputSites.size();
+  uint64_t RuntimeHits = 0;
+  uint64_t HitSites = 0;
+  for (const EJitMayConstLoadSite &Site : InputSites) {
+    RuntimeHits += Site.runtimeHits;
+    HitSites += Site.runtimeHits != 0;
+  }
+
+  EJitMayConstBenefitSample Sample;
+  Sample.cacheKey = ctx.cacheKey;
+  Sample.inputMayConstLoads = InputMayConstLoads;
+  Sample.specializedMayConstLoads = SpecializedMayConstLoads;
+  Sample.finalMayConstLoads = FinalMayConstLoads;
+  Sample.runtimeHits = RuntimeHits;
+  Sample.hitSites = HitSites;
+
+  uint32_t Expected = 0;
+  while (!mayConstBenefitLock_.compareExchange(Expected, 1))
+    Expected = 0;
+  auto &ByKey = mayConstBenefitSamples_[ctx.fnName];
+  ByKey[ctx.cacheKey] = Sample;
+  SmallVector<EJitMayConstBenefitSample, 16> Samples;
+  Samples.reserve(ByKey.size());
+  for (const auto &Entry : ByKey)
+    Samples.push_back(Entry.second);
+  mayConstBenefitLock_.storeRelease(0);
+
+  EJitMayConstBenefitSummary Aggregate = summarizeMayConstBenefits(Samples);
+  const int64_t Removed = static_cast<int64_t>(InputMayConstLoads) -
+                          static_cast<int64_t>(FinalMayConstLoads);
+  const int64_t Direct = static_cast<int64_t>(InputMayConstLoads) -
+                         static_cast<int64_t>(SpecializedMayConstLoads);
+  const int64_t Pipeline = static_cast<int64_t>(SpecializedMayConstLoads) -
+                           static_cast<int64_t>(FinalMayConstLoads);
+  EJIT_DIAG("mayconst-audit entry=%s key=0x%016llx tier=%u versions=%llu "
+            "mayconst=%llu/%llu/%llu removed=%lld direct=%lld pipeline=%lld "
+            "runtime_hits=%llu hit_sites=%llu avg_removed=%lld "
+            "weighted_permille=%lld min=%lld max=%lld",
+            ctx.fnName.c_str(), static_cast<unsigned long long>(ctx.cacheKey),
+            static_cast<unsigned>(ctx.tier),
+            static_cast<unsigned long long>(Aggregate.versions),
+            static_cast<unsigned long long>(InputMayConstLoads),
+            static_cast<unsigned long long>(SpecializedMayConstLoads),
+            static_cast<unsigned long long>(FinalMayConstLoads),
+            static_cast<long long>(Removed), static_cast<long long>(Direct),
+            static_cast<long long>(Pipeline),
+            static_cast<unsigned long long>(RuntimeHits),
+            static_cast<unsigned long long>(HitSites),
+            static_cast<long long>(Aggregate.averageRemoved),
+            static_cast<long long>(Aggregate.weightedRemovedPermille),
+            static_cast<long long>(Aggregate.minimumRemoved),
+            static_cast<long long>(Aggregate.maximumRemoved));
+
+  for (const EJitMayConstLoadSite &Site : InputSites) {
+    if (Site.hasFieldOffset)
+      EJIT_DIAG_DEBUG(
+          "mayconst-site entry=%s fn=%s gv=%s offset=%llu hits=%llu "
+          "src=%s:%u:%u",
+          ctx.fnName.c_str(), Site.functionName.c_str(),
+          Site.globalName.empty() ? "<unknown>" : Site.globalName.c_str(),
+          static_cast<unsigned long long>(Site.fieldOffset),
+          static_cast<unsigned long long>(Site.runtimeHits),
+          Site.sourceFile.empty() ? "<unknown>" : Site.sourceFile.c_str(),
+          Site.sourceLine, Site.sourceColumn);
+    else
+      EJIT_DIAG_DEBUG(
+          "mayconst-site entry=%s fn=%s gv=%s offset=unknown hits=%llu "
+          "src=%s:%u:%u",
+          ctx.fnName.c_str(), Site.functionName.c_str(),
+          Site.globalName.empty() ? "<unknown>" : Site.globalName.c_str(),
+          static_cast<unsigned long long>(Site.runtimeHits),
+          Site.sourceFile.empty() ? "<unknown>" : Site.sourceFile.c_str(),
+          Site.sourceLine, Site.sourceColumn);
+  }
+}
+#endif
+
+bool EJitOptimizer::printMayConstRanking() const {
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  struct RankingRow {
+    std::string entry;
+    EJitMayConstBenefitSummary summary;
+  };
+  SmallVector<RankingRow, 32> Rows;
+
+  uint32_t Expected = 0;
+  while (!mayConstBenefitLock_.compareExchange(Expected, 1))
+    Expected = 0;
+  Rows.reserve(mayConstBenefitSamples_.size());
+  for (const auto &Entry : mayConstBenefitSamples_) {
+    SmallVector<EJitMayConstBenefitSample, 16> Samples;
+    Samples.reserve(Entry.second.size());
+    for (const auto &Version : Entry.second)
+      Samples.push_back(Version.second);
+    Rows.push_back({Entry.first().str(), summarizeMayConstBenefits(Samples)});
+  }
+  mayConstBenefitLock_.storeRelease(0);
+
+  if (Rows.empty()) {
+    EJIT_DIAG_RAW("mayconst-ranking: no completed samples");
+    return false;
+  }
+  llvm::sort(Rows, [](const RankingRow &L, const RankingRow &R) {
+    if (L.summary.averageRemoved != R.summary.averageRemoved)
+      return L.summary.averageRemoved > R.summary.averageRemoved;
+    if (L.summary.runtimeHits != R.summary.runtimeHits)
+      return L.summary.runtimeHits > R.summary.runtimeHits;
+    return L.entry < R.entry;
+  });
+
+  EJIT_DIAG_RAW("mayconst-ranking entries=%u sort=avg_removed_desc",
+                static_cast<unsigned>(Rows.size()));
+  for (size_t I = 0; I < Rows.size(); ++I) {
+    const RankingRow &Row = Rows[I];
+    EJIT_DIAG_RAW(
+        "rank=%u entry=%s versions=%llu avg_removed=%lld total_removed=%lld "
+        "runtime_hits=%llu hit_sites=%llu min=%lld max=%lld",
+        static_cast<unsigned>(I + 1), Row.entry.c_str(),
+        static_cast<unsigned long long>(Row.summary.versions),
+        static_cast<long long>(Row.summary.averageRemoved),
+        static_cast<long long>(Row.summary.totalRemoved),
+        static_cast<unsigned long long>(Row.summary.runtimeHits),
+        static_cast<unsigned long long>(Row.summary.hitSites),
+        static_cast<long long>(Row.summary.minimumRemoved),
+        static_cast<long long>(Row.summary.maximumRemoved));
+    ejitDiagPrintThrottle();
+  }
+  return true;
+#else
+  EJIT_DIAG_RAW("mayconst-ranking: branch audit not enabled in this build");
+  return false;
+#endif
 }
 
 void EJitOptimizer::runLightOptPipeline(Module &M) {
