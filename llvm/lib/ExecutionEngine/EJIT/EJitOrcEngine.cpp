@@ -97,10 +97,16 @@ static void isolateSpecializationEntry(Module &M, StringRef EntryName) {
     // bind A -> B directly inside the specialization module. Make every other
     // entry an external call instead; its registered AOT wrapper performs B's
     // own specialization lookup.
+    Attribute WrapperSymbol = F.getFnAttribute(ATTR_EJIT_WRAPPER_SYMBOL);
+    std::string WrapperName = WrapperSymbol.isValid()
+                                  ? WrapperSymbol.getValueAsString().str()
+                                  : std::string();
     F.deleteBody();
     F.setVisibility(GlobalValue::DefaultVisibility);
     F.setLinkage(GlobalValue::ExternalLinkage);
     F.setDSOLocal(false);
+    if (!WrapperName.empty())
+      F.setName(WrapperName);
   }
 }
 

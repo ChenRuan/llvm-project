@@ -651,6 +651,17 @@ static std::string extractAndSerialize(Module &M,
     const SetVector<Function *> &ToExternalize) {
 
   auto Extracted = CloneModule(M);
+
+  // Preserve the original entry name for its own funcIndex/bitcode lookup,
+  // but carry a process-unique wrapper key for local entries. The JIT applies
+  // this key only when another entry's specialization externalizes this one.
+  for (Function *F : EntryFuncs) {
+    if (!F->hasLocalLinkage())
+      continue;
+    if (Function *Cur = Extracted->getFunction(F->getName()))
+      Cur->addFnAttr(ATTR_EJIT_WRAPPER_SYMBOL, ejitRegistrationKey(M, *F));
+  }
+
   DenseSet<StringRef> FuncNames;
   for (Function *F : Funcs)
     FuncNames.insert(F->getName());
@@ -824,7 +835,7 @@ static void generateSymbolRegisters(
   // externalizes every entry except the one currently being specialized and
   // resolves calls to those declarations through this table.
   for (Function *F : EntryFuncs) {
-    std::string Name = F->getName().str();
+    std::string Name = ejitRegistrationKey(M, *F);
     if (registered.insert(Name).second) {
       IRBuilder<> Builder(InsertBefore);
       Builder.CreateCall(M.getFunction(FN_REGISTER_SYMBOL),
@@ -1029,10 +1040,13 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
 
   // Symbol entries for external references
   SmallPtrSet<const Function *, 8> SymbolsDone;
-  auto addSymbol = [&](const Function *F, bool RequireDeclaration = true) {
+  auto addSymbol = [&](const Function *F, bool RequireDeclaration = true,
+                       StringRef RegistrationName = {}) {
     if (!F->isIntrinsic() && (!RequireDeclaration || F->isDeclaration())) {
       if (SymbolsDone.insert(F).second) {
-        Constant *NameStr = ConstantDataArray::getString(Ctx, F->getName(), true);
+        StringRef Name = RegistrationName.empty() ? F->getName()
+                                                   : RegistrationName;
+        Constant *NameStr = ConstantDataArray::getString(Ctx, Name, true);
         auto *NameGV = new GlobalVariable(M, NameStr->getType(), true,
             GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
         Entries.push_back(ConstantStruct::get(EntryTy, {
@@ -1049,7 +1063,7 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
   // PASS3 later turns these functions into wrappers in place, so these
   // constants resolve to wrapper addresses in the final AOT object.
   for (Function *F : EntryFuncs)
-    addSymbol(F, /*RequireDeclaration=*/false);
+    addSymbol(F, /*RequireDeclaration=*/false, ejitRegistrationKey(M, *F));
   for (Function *F : ClosureFuncs) {
     for (const BasicBlock &BB : *F) {
       for (const Instruction &I : BB) {
