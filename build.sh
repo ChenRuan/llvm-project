@@ -30,6 +30,7 @@
 #   --sre-taskpool-worker-stack-size=<bytes>  shared worker task stack size (default: 1048576)
 #   --sre-shared-code-pointers / --no-sre-shared-code-pointers  allow non-owner cores to read shared cache fnPtrs (default OFF; needs platform same-VA + cache coherence)
 #   --sre-pgo-value-profile / --no-sre-pgo-value-profile  enable/disable Online-PGO value profiling (default OFF)
+#   --sre-pgo-branch-audit / --no-sre-pgo-branch-audit  report per-function Tier-2 branch profile shape (default OFF)
 #   --sre-pgo-max-concurrent-profiles=<n>  simultaneous profiling admissions, 1..16 (default: 1)
 #   --stats / --no-stats  embed EJIT taskpool statistics counters (default OFF; per-call atomic cost on the hot path)
 #   -h              show help
@@ -119,6 +120,8 @@ do_configure() {
         -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS} \
         -DEJIT_SRE_SHARED_CODE_POINTERS=${EJIT_SRE_SHARED_CODE_POINTERS} \
         -DEJIT_SRE_PGO_VALUE_PROFILE=${EJIT_SRE_PGO_VALUE_PROFILE} \
+        -DEJIT_SRE_PGO_BRANCH_AUDIT=${EJIT_SRE_PGO_BRANCH_AUDIT} \
+        ${EJIT_BRANCH_AUDIT_CMAKE_FLAGS} \
         -DEJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES} \
         -DEJIT_STATS_ENABLE=${EJIT_STATS_ENABLE} \
         "-DEJIT_DEFAULT_TARGET_TRIPLE=${EJIT_TARGET_TRIPLE:-${default_triple}}" \
@@ -148,6 +151,8 @@ do_configure() {
         -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS} \
         -DEJIT_SRE_SHARED_CODE_POINTERS=${EJIT_SRE_SHARED_CODE_POINTERS} \
         -DEJIT_SRE_PGO_VALUE_PROFILE=${EJIT_SRE_PGO_VALUE_PROFILE} \
+        -DEJIT_SRE_PGO_BRANCH_AUDIT=${EJIT_SRE_PGO_BRANCH_AUDIT} \
+        ${EJIT_BRANCH_AUDIT_CMAKE_FLAGS} \
         -DEJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES} \
         -DEJIT_STATS_ENABLE=${EJIT_STATS_ENABLE} \
         "-DEJIT_DEFAULT_TARGET_TRIPLE=${EJIT_TARGET_TRIPLE:-${default_triple}}" \
@@ -192,6 +197,8 @@ do_configure() {
       -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS}
       -DEJIT_SRE_SHARED_CODE_POINTERS=${EJIT_SRE_SHARED_CODE_POINTERS}
       -DEJIT_SRE_PGO_VALUE_PROFILE=${EJIT_SRE_PGO_VALUE_PROFILE}
+      -DEJIT_SRE_PGO_BRANCH_AUDIT=${EJIT_SRE_PGO_BRANCH_AUDIT}
+      ${EJIT_BRANCH_AUDIT_CMAKE_FLAGS}
       -DEJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES}
       -DEJIT_STATS_ENABLE=${EJIT_STATS_ENABLE}
     "
@@ -237,6 +244,8 @@ do_configure() {
       -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS}
       -DEJIT_SRE_SHARED_CODE_POINTERS=${EJIT_SRE_SHARED_CODE_POINTERS}
       -DEJIT_SRE_PGO_VALUE_PROFILE=${EJIT_SRE_PGO_VALUE_PROFILE}
+      -DEJIT_SRE_PGO_BRANCH_AUDIT=${EJIT_SRE_PGO_BRANCH_AUDIT}
+      ${EJIT_BRANCH_AUDIT_CMAKE_FLAGS}
       -DEJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES}
       -DEJIT_STATS_ENABLE=${EJIT_STATS_ENABLE}
     "
@@ -314,11 +323,13 @@ EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=1
 EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=100
 EJIT_SRE_SHARED_CODE_POINTERS=OFF
 EJIT_SRE_PGO_VALUE_PROFILE=OFF
+EJIT_SRE_PGO_BRANCH_AUDIT=OFF
+EJIT_BRANCH_AUDIT_CMAKE_FLAGS=""
 EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=1
 EJIT_STATS_ENABLE=OFF
 
 if [[ "${1:-}" = "-h" || "${1:-}" = "--help" ]]; then
-  sed -n '2,35p' "$0"
+  sed -n '2,36p' "$0"
   exit 0
 fi
 
@@ -351,17 +362,29 @@ while [[ $# -gt 0 ]]; do
     --no-sre-shared-code-pointers) EJIT_SRE_SHARED_CODE_POINTERS=OFF ;;
     --sre-pgo-value-profile) EJIT_SRE_PGO_VALUE_PROFILE=ON ;;
     --no-sre-pgo-value-profile) EJIT_SRE_PGO_VALUE_PROFILE=OFF ;;
+    --sre-pgo-branch-audit) EJIT_SRE_PGO_BRANCH_AUDIT=ON ;;
+    --no-sre-pgo-branch-audit) EJIT_SRE_PGO_BRANCH_AUDIT=OFF ;;
     --sre-pgo-max-concurrent-profiles=*) EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES="${1#--sre-pgo-max-concurrent-profiles=}" ;;
     --stats) EJIT_STATS_ENABLE=ON ;;
     --no-stats) EJIT_STATS_ENABLE=OFF ;;
     -h|--help)
-      sed -n '2,35p' "$0"
+      sed -n '2,36p' "$0"
       exit 0
       ;;
     *) err "Unknown argument: $1"; exit 1 ;;
   esac
   shift
 done
+
+# The audit is log-only. Enable the existing diagnostics when requested, and
+# route them through SRE_printf for freestanding builds. Leave diagnostic cache
+# settings untouched in every non-audit build.
+if [[ "${EJIT_SRE_PGO_BRANCH_AUDIT}" = "ON" ]]; then
+  EJIT_BRANCH_AUDIT_CMAKE_FLAGS="-DEJIT_DIAG_ENABLE=ON"
+  if [[ "${EJIT_FREESTANDING}" = "ON" ]]; then
+    EJIT_BRANCH_AUDIT_CMAKE_FLAGS+=" -DEJIT_SRE_DIAG=ON"
+  fi
+fi
 
 if ! [[ "${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES}" =~ ^[0-9]+$ ]] ||
    (( EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES < 1 ||

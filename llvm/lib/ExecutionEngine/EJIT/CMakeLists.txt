@@ -48,6 +48,12 @@ if(EJIT_SRE_PGO_VALUE_PROFILE)
                  "cores=${EJIT_SRE_VP_MAX_CORES})")
 endif()
 
+option(EJIT_SRE_PGO_BRANCH_AUDIT
+  "Report per-function branch-profile shape before Tier-2 inlining" OFF)
+if(EJIT_SRE_PGO_BRANCH_AUDIT)
+  message(STATUS "EmbeddedJIT: online-PGO branch audit enabled")
+endif()
+
 option(EJIT_FREESTANDING_MUTEX
   "Inject no-op <mutex>/<shared_mutex>/<condition_variable> headers \
 (for freestanding toolchains that lack these C++ standard headers). \
@@ -145,6 +151,10 @@ if(EJIT_SRE_PGO_VALUE_PROFILE)
   )
 endif()
 
+if(EJIT_SRE_PGO_BRANCH_AUDIT)
+  list(APPEND EJIT_SOURCES EJitBranchProfile.cpp)
+endif()
+
 # Async/sync compiler — excluded in freestanding mode (single-threaded, no std::thread)
 if(NOT EJIT_FREESTANDING)
   list(APPEND EJIT_SOURCES
@@ -208,6 +218,10 @@ if(EJIT_SRE_PGO_VALUE_PROFILE)
     EJIT_SRE_VP_MIN_SAMPLES=${EJIT_SRE_VP_MIN_SAMPLES}
     EJIT_SRE_VP_MIN_CONF_PERCENT=${EJIT_SRE_VP_MIN_CONF_PERCENT}
   )
+endif()
+
+if(EJIT_SRE_PGO_BRANCH_AUDIT)
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_SRE_PGO_BRANCH_AUDIT)
 endif()
 
 # 4K-granular code-pool sealing. The only user of this macro is the SRE adapter

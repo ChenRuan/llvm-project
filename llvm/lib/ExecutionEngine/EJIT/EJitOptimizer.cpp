@@ -1,10 +1,13 @@
 //===-- EJitOptimizer.cpp - JIT Optimization Pipeline ---------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
-#include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
-#include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+#include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
+#endif
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 #include "llvm/ExecutionEngine/EJIT/EJitValueProfile.h"
 #endif
@@ -213,6 +216,43 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
           /*Filename=*/"/ejit.prof", /*Remap=*/"", /*IsCS=*/false,
           IntrusiveRefCntPtr<vfs::FileSystem>(InMemFS)));
       UseMPM.run(M, MAM_);
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+      auto Summaries = analyzeBranchProfiles(M, ctx.fnName);
+      uint64_t Instructions = 0;
+      uint32_t Branches = 0;
+      uint32_t Profiled = 0;
+      uint32_t Biased = 0;
+      uint32_t Balanced = 0;
+      uint32_t ZeroEdges = 0;
+      uint64_t RootEntries = 0;
+      for (const auto &Summary : Summaries) {
+        Instructions += Summary.instructionCount;
+        Branches += Summary.branchSites;
+        Profiled += Summary.profiledSites;
+        Biased += Summary.biasedSites95;
+        Balanced += Summary.balancedSites60;
+        ZeroEdges += Summary.zeroCountEdges;
+        if (Summary.isRoot)
+          RootEntries = Summary.entryCount;
+        EJIT_DIAG_DEBUG(
+            "branch-audit-fn entry=%s fn=%s root=%u entries=%llu insts=%llu "
+            "branches=%u profiled=%u biased95=%u balanced60=%u zero_edges=%u",
+            ctx.fnName.c_str(), Summary.functionName.c_str(), Summary.isRoot,
+            static_cast<unsigned long long>(Summary.entryCount),
+            static_cast<unsigned long long>(Summary.instructionCount),
+            Summary.branchSites, Summary.profiledSites, Summary.biasedSites95,
+            Summary.balancedSites60, Summary.zeroCountEdges);
+      }
+      EJIT_DIAG(
+          "branch-audit entry=%s key=0x%016llx root_entries=%llu funcs=%u "
+          "insts=%llu branches=%u profiled=%u biased95=%u balanced60=%u "
+          "zero_edges=%u",
+          ctx.fnName.c_str(), static_cast<unsigned long long>(ctx.cacheKey),
+          static_cast<unsigned long long>(RootEntries),
+          static_cast<unsigned>(Summaries.size()),
+          static_cast<unsigned long long>(Instructions), Branches, Profiled,
+          Biased, Balanced, ZeroEdges);
+#endif
     }
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
     // Scalar/loop-bound sites (EJIT_VALUE_PROFILE.md §7.1): annotate with
