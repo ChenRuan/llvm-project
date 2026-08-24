@@ -13,8 +13,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -31,7 +34,6 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <map>
 #include <string>
-#include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 
 // Hard-lock the AOT-side contract constants against each other (the runtime
 // side locks its own copies in EJitRuntime.cpp / EJitSharedTaskPool.cpp):
@@ -66,6 +68,11 @@ static cl::opt<bool> EJitWrapperTiming(
     "ejit-wrapper-timing", cl::init(false), cl::Hidden,
     cl::desc("Emit diagnostic timing probes around taskpool lookup, indirect "
              "JIT call, and read-token release in ejit_entry wrappers"));
+
+static cl::opt<bool> EJitFunctionBodyTiming(
+    "ejit-function-body-timing", cl::init(false), cl::Hidden,
+    cl::desc("Measure only the selected AOT/JIT function body using the SRE "
+             "cycle counter, excluding wrapper lookup and dispatch overhead"));
 
 // Emit a per-function inline-cache probe DIRECTLY in the ejit_entry wrapper
 // (not a call). On a hit the wrapper loads its cell out of the per-function
@@ -692,18 +699,82 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     auto *I64Ty = Type::getInt64Ty(Ctx);
     bool UseFixed = EJitWrapperFixedDimEntry && DimCount <= 2;
 
+    SmallVector<ReturnInst *, 8> OriginalReturns;
+    for (BasicBlock &BB : *F)
+      if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+        OriginalReturns.push_back(RI);
+
     // Timing callees (shared by hit and slow paths).
     FunctionCallee TraceNow{};
     FunctionCallee TraceWrapper{};
-    if (EJitWrapperTiming) {
+    FunctionCallee TraceFunctionBody{};
+    Constant *FunctionName = nullptr;
+    if (EJitWrapperTiming || EJitFunctionBodyTiming) {
       TraceNow = M.getOrInsertFunction(FN_TASKPOOL_TRACE_NOW,
                                        FunctionType::get(I64Ty, false));
+    }
+    if (EJitWrapperTiming) {
       SmallVector<Type *, 8> TraceTys = {I32Ty, I32Ty, PtrTy, I32Ty, I64Ty,
                                          I64Ty, I64Ty, I64Ty};
       TraceWrapper = M.getOrInsertFunction(
           FN_TASKPOOL_TRACE_WRAPPER,
           FunctionType::get(Type::getVoidTy(Ctx), TraceTys, false));
     }
+    if (EJitFunctionBodyTiming) {
+      TraceFunctionBody = M.getOrInsertFunction(
+          FN_FUNCTION_BODY_CYCLES_RECORD,
+          FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, I32Ty, I64Ty, I64Ty},
+                            false));
+      IRBuilder<> NameBuilder(Ctx);
+      FunctionName = NameBuilder.CreateGlobalString(
+          F->getName(), ".ejit.function_body_name", 0, &M);
+    }
+
+    auto emitFunctionBodyRecord = [&](IRBuilder<> &B, uint32_t Path,
+                                      Value *Begin) {
+      if (!EJitFunctionBodyTiming)
+        return;
+      Value *End = B.CreateCall(TraceNow, {}, "ejit_body_end");
+      B.CreateCall(TraceFunctionBody,
+                   {FunctionName, ConstantInt::get(I32Ty, Path), Begin, End});
+    };
+
+    auto instrumentAotBody = [&](BasicBlock *FallbackEntry) {
+      if (!EJitFunctionBodyTiming)
+        return;
+
+      SmallPtrSet<BasicBlock *, 16> Reachable;
+      SmallVector<BasicBlock *, 16> Worklist{FallbackEntry};
+      while (!Worklist.empty()) {
+        BasicBlock *BB = Worklist.pop_back_val();
+        if (!Reachable.insert(BB).second)
+          continue;
+        llvm::append_range(Worklist, successors(BB));
+      }
+
+      SmallVector<ReturnInst *, 8> TimedReturns;
+      for (ReturnInst *RI : OriginalReturns) {
+        if (!Reachable.contains(RI->getParent()))
+          continue;
+        // A musttail call must remain immediately adjacent to its return. Keep
+        // such an uncommon AOT exit valid rather than changing its ABI/stack
+        // behaviour for a diagnostic option.
+        if (auto *CI = dyn_cast_or_null<CallInst>(RI->getPrevNode());
+            CI && CI->isMustTailCall())
+          continue;
+        TimedReturns.push_back(RI);
+      }
+      if (TimedReturns.empty())
+        return;
+
+      IRBuilder<> StartBuilder(&*FallbackEntry->getFirstInsertionPt());
+      Value *Begin =
+          StartBuilder.CreateCall(TraceNow, {}, "ejit_aot_body_begin");
+      for (ReturnInst *RI : TimedReturns) {
+        IRBuilder<> EndBuilder(RI);
+        emitFunctionBodyRecord(EndBuilder, kEJitFunctionBodyPathAOT, Begin);
+      }
+    };
 
     // emitSlowPath: emit the funcIndex guard (EntryBB) + compile_or_get
     // (CallBB) + dispatch (DispatchBB) into Fn, using Fn's args. FallbackBB
@@ -795,7 +866,11 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       SmallVector<Value *, 8> Args;
       for (auto &A : Fn.args())
         Args.push_back(&A);
+      Value *BodyBegin = nullptr;
+      if (EJitFunctionBodyTiming)
+        BodyBegin = B.CreateCall(TraceNow, {}, "ejit_jit_body_begin");
       auto releaseAndTrace = [&]() {
+        emitFunctionBodyRecord(B, kEJitFunctionBodyPathJIT, BodyBegin);
         if (EJitWrapperTiming) {
           Value *TAfterFn = B.CreateCall(TraceNow, {}, "ejit_t_after_fn");
           Value *Bucket = B.CreateLoad(I32Ty, OutBucketAlloca);
@@ -885,6 +960,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
           B.CreateRet(PoisonValue::get(F->getReturnType()));
       }
       emitSlowPath(*MissFn, MissEntry, MissCall, MissDispatch, MissFallback);
+      instrumentAotBody(MissFallback);
 
       // Wrapper (F): frame-less probe + tail calls.
       auto *JitEntry = BasicBlock::Create(Ctx, "jit_entry", F);
@@ -942,8 +1018,13 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       B.SetInsertPoint(JitIcacheDispatch);
       SmallVector<Value *, 8> ICArgs;
       for (auto &A : F->args()) ICArgs.push_back(&A);
+      Value *BodyBegin = nullptr;
+      if (EJitFunctionBodyTiming)
+        BodyBegin = B.CreateCall(TraceNow, {}, "ejit_jit_body_begin");
       auto emitHitTiming = [&]() {
-        if (!EJitWrapperTiming) return;
+        emitFunctionBodyRecord(B, kEJitFunctionBodyPathJIT, BodyBegin);
+        if (!EJitWrapperTiming)
+          return;
         Value *TAfterFn = B.CreateCall(TraceNow, {}, "ejit_t_after_fn");
         B.CreateCall(TraceWrapper,
                      {FuncIdxForTiming,
@@ -953,13 +1034,13 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       };
       if (F->getReturnType()->isVoidTy()) {
         CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
-        if (!EJitWrapperTiming)
+        if (!EJitWrapperTiming && !EJitFunctionBodyTiming)
           CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
         emitHitTiming();
         B.CreateRetVoid();
       } else {
         CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
-        if (!EJitWrapperTiming)
+        if (!EJitWrapperTiming && !EJitFunctionBodyTiming)
           CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
         emitHitTiming();
         B.CreateRet(CI);
@@ -999,6 +1080,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         else B.CreateRet(PoisonValue::get(F->getReturnType()));
       }
       emitSlowPath(*F, JitEntry, JitCall, JitDispatch, JitFallback);
+      instrumentAotBody(JitFallback);
     }
 
     Changed = true;

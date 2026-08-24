@@ -255,6 +255,32 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
                                  uint64_t tAfterFn,
                                  uint64_t tAfterRelease);
 
+// Function-body-only cycle profiler. AOT wrappers emit calls to the recorder
+// only when built with -ejit-function-body-timing. The two timestamps tightly
+// bracket the original AOT body or the selected JIT function call; taskpool
+// lookup, dispatch, read-token release, and aggregation are outside the
+// measured interval. SRE builds report SRE_CycleCountGet64() cycles; host tests
+// use steady_clock nanoseconds. Storage is fixed-capacity and allocation-free.
+typedef enum {
+  EJIT_FUNCTION_BODY_AOT = 0,
+  EJIT_FUNCTION_BODY_JIT = 1
+} ejit_function_body_path_t;
+
+typedef struct {
+  uint64_t count;
+  uint64_t total;
+  uint64_t min;
+  uint64_t max;
+} ejit_function_body_cycles_t;
+
+void ejit_function_body_cycles_record(const char *funcName, uint32_t path,
+                                      uint64_t begin, uint64_t end);
+// Returns 1 and copies a snapshot when samples exist, otherwise returns 0.
+unsigned ejit_function_body_cycles_get(const char *funcName, uint32_t path,
+                                       ejit_function_body_cycles_t *out);
+void ejit_function_body_cycles_print(void);
+void ejit_function_body_cycles_reset(void);
+
 #ifdef EJIT_SRE_TASKPOOL_TESTING
 unsigned ejit_taskpool_poll_one(void);
 unsigned ejit_taskpool_poll_budget(unsigned maxItems);
