@@ -1,5 +1,6 @@
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -ejit-icache-split-dispatch-1d=false -S %s | FileCheck %s --check-prefix=DEFAULT
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -ejit-icache-split-dispatch-1d=true -S %s | FileCheck %s --check-prefix=SPLIT
+; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -ejit-icache-split-dispatch-1d=true -ejit-icache-direct-dispatch-pads=true -S %s | FileCheck %s --check-prefix=DIRECT
 
 ; The default remains the compact, single indirect callsite.
 ; DEFAULT-NOT: jit_icache_probe_0:
@@ -27,6 +28,25 @@
 ; SPLIT-LABEL: define i32 @two_dim_entry(
 ; SPLIT-NOT: jit_icache_probe_0:
 ; SPLIT: jit_icache_dispatch:
+
+; Direct-pad mode removes the slot load and indirect call from eligible leaves.
+; The AOT pad symbols initially tail-call the common miss function; runtime
+; publication patches that one B instruction to the JIT body.
+; DIRECT-DAG: @__ejit_icache_pad_table_cell_entry = private constant [17 x ptr]
+; DIRECT-DAG: @__ejit_icache_pad_table_trp_entry = private constant [17 x ptr]
+; DIRECT-DAG: @.ejit.registry.icache_pads = private constant {{.*}} i32 8, {{.*}} ptr @__ejit_icache_pad_table_cell_entry, i64 16
+; DIRECT-LABEL: define i32 @cell_entry(
+; DIRECT: %ejit_split_in_range = icmp ult i32 %cell, 16
+; DIRECT-NOT: load atomic ptr
+; DIRECT-COUNT-16: musttail call i32 @__ejit_icache_pad_cell_entry_
+; DIRECT-LABEL: define i32 @trp_entry(
+; DIRECT-NOT: load atomic ptr
+; DIRECT-COUNT-16: musttail call i32 @__ejit_icache_pad_trp_entry_
+; DIRECT-LABEL: define i32 @two_dim_entry(
+; DIRECT: load atomic ptr
+; DIRECT: musttail call i32 %ejit_ic_fn
+; DIRECT-DAG: define internal i32 @__ejit_icache_pad_cell_entry_0({{.*}}) {{.*}}section ".text.ejit_pads" align 4
+; DIRECT-DAG: musttail call i32 @cell_entry_miss(
 
 ; Other one-dimensional lifecycle names also retain the compact dispatcher.
 ; SPLIT-LABEL: define i32 @other_entry(

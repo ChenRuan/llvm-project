@@ -32,3 +32,8 @@ if(EJIT_ICACHE_SPLIT_DISPATCH_1D)
   target_compile_definitions(LLVMEmbeddedJIT PRIVATE
     EJIT_ICACHE_SPLIT_DISPATCH_1D=1)
 endif()
+
+if(EJIT_ICACHE_DIRECT_DISPATCH_PADS)
+  target_compile_definitions(LLVMEmbeddedJIT PRIVATE
+    EJIT_ICACHE_DIRECT_DISPATCH_PADS=1)
+endif()
