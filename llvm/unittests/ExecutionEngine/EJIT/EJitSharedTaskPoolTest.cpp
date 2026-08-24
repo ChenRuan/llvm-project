@@ -382,6 +382,136 @@ TEST_F(SharedTaskPoolTest, InitializingExposesNoHalfState) {
 }
 
 //===----------------------------------------------------------------------===//
+// 3a/ Fixed worker core (build policy EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE).
+//
+// Compiled only in the opt-in fixed-core test config (-DEJIT_TEST_FIXED_WORKER_
+// CORE=ON pins the designated core to 0, matching every bringUpOwner in this
+// suite). The policy closes the open election: only the designated core may
+// claim the blob; a non-designated core waits bounded (yielding) for it, never
+// attempts the CAS, and never hangs.
+//===----------------------------------------------------------------------===//
+#ifdef EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE
+
+// The designated core wins and every other core attaches as a peer: same
+// observable outcome as the open election, but the owner identity is pinned.
+TEST_F(SharedTaskPoolTest, FixedWorkerCoreDesignatedCoreWinsAndPeerAttaches) {
+  EJitSharedTaskPool owner, peer;
+  for (auto *pool : {&owner, &peer}) {
+    pool->bind(state_.get());
+    pool->setCompiler(&mockCompile, nullptr);
+    pool->setMode(EJitCompileMode::Async);
+  }
+
+  EJitCoreId::setCurrentForTest(0); // the designated core
+  EXPECT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  EJitCoreId::setCurrentForTest(1);
+  EXPECT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+  EXPECT_EQ(state_->ownerCoreId.loadAcquire(), 0u);
+}
+
+// A non-designated core that activates FIRST must not claim the blob: it waits
+// bounded, the blob stays Uninitialized, no election attempt is ever counted,
+// and the designated core can still claim it afterwards. No idle hook is
+// injected here, so the wait budget burns cpuRelax iterations - fast enough
+// for a unit test (production always injects the yield hook, where the same
+// budget costs scheduler ticks instead).
+TEST_F(SharedTaskPoolTest, FixedWorkerCorePeerNeverClaimsTheBlob) {
+  EJitSharedTaskPool peer;
+  peer.bind(state_.get());
+  peer.setCompiler(&mockCompile, nullptr);
+  peer.setMode(EJitCompileMode::Async);
+
+  EJitCoreId::setCurrentForTest(5); // not the designated core (0)
+  EXPECT_EQ(peer.init(), EJitSharedTaskPool::InitResult::InitInProgress);
+  EXPECT_EQ(state_->initState.loadAcquire(),
+            static_cast<uint32_t>(EJitSharedInitState::Uninitialized));
+  EXPECT_EQ(state_->initAttempts.loadAcquire(), 0u)
+      << "a non-designated core must not count as an election attempt";
+
+  // The designated core can still claim the blob the peer left untouched.
+  EJitSharedTaskPool owner;
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  EJitCoreId::setCurrentForTest(0);
+  EXPECT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  EXPECT_EQ(state_->initAttempts.loadAcquire(), 1u);
+}
+
+// Bring-up order must not matter: a peer already WAITING when the designated
+// core initializes attaches as soon as Ready is published. Simulated
+// deterministically with the injectable idle hook - the peer's wait loop calls
+// it, and on its first invocation the designated core's init() runs to
+// completion (a second pool object on the same blob), modeling another core
+// coming up concurrently.
+TEST_F(SharedTaskPoolTest, FixedWorkerCorePeerWaitsThenAttaches) {
+  EJitSharedTaskPool designated;
+  designated.bind(state_.get());
+  designated.setCompiler(&mockCompile, nullptr);
+  designated.setMode(EJitCompileMode::Async);
+
+  struct WaitCtx {
+    EJitSharedTaskPool *designated;
+    bool ran;
+  } ctx{&designated, false};
+  auto idleHook = [](void *c, uint32_t) {
+    auto *w = static_cast<WaitCtx *>(c);
+    if (w->ran)
+      return; // one-shot: afterwards the loop re-observes Ready and exits
+    w->ran = true;
+    EJitCoreId::setCurrentForTest(0); // the designated core comes up now
+    EXPECT_EQ(w->designated->init(),
+              EJitSharedTaskPool::InitResult::BecameOwner);
+    EJitCoreId::setCurrentForTest(1); // back to the waiting peer's core
+  };
+
+  EJitSharedTaskPool peer;
+  peer.bind(state_.get());
+  peer.setCompiler(&mockCompile, nullptr);
+  peer.setMode(EJitCompileMode::Async);
+  peer.setWorkerIdleHook(idleHook, &ctx);
+
+  EJitCoreId::setCurrentForTest(1); // peer activates BEFORE the designated core
+  EXPECT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+  EXPECT_EQ(state_->ownerCoreId.loadAcquire(), 0u);
+  EXPECT_EQ(state_->initAttempts.loadAcquire(), 1u);
+}
+
+// After a shutdown the blob is Uninitialized again: a peer still cannot win
+// the re-election, only the designated core can.
+TEST_F(SharedTaskPoolTest, FixedWorkerCoreOnlyDesignatedCoreReelects) {
+  EJitSharedTaskPool owner, peer;
+  for (auto *pool : {&owner, &peer}) {
+    pool->bind(state_.get());
+    pool->setCompiler(&mockCompile, nullptr);
+    pool->setMode(EJitCompileMode::Async);
+  }
+
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  owner.ownerShutdown();
+  EXPECT_EQ(state_->initState.loadAcquire(),
+            static_cast<uint32_t>(EJitSharedInitState::Uninitialized));
+  // initAttempts is monotonic (a total, not a per-generation count): the first
+  // owner's attempt is still on the books after the shutdown.
+  ASSERT_EQ(state_->initAttempts.loadAcquire(), 1u);
+
+  // The peer (core 1) may not re-win the freed blob: bounded wait, no attempt.
+  EJitCoreId::setCurrentForTest(1);
+  EXPECT_EQ(peer.init(), EJitSharedTaskPool::InitResult::InitInProgress);
+  EXPECT_EQ(state_->initState.loadAcquire(),
+            static_cast<uint32_t>(EJitSharedInitState::Uninitialized));
+  EXPECT_EQ(state_->initAttempts.loadAcquire(), 1u);
+
+  // The designated core re-wins (its second attempt).
+  EJitCoreId::setCurrentForTest(0);
+  EXPECT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  EXPECT_EQ(state_->initAttempts.loadAcquire(), 2u);
+}
+
+#endif // EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE
+
+//===----------------------------------------------------------------------===//
 // 3b/ Compile mode is CROSS-CORE SHARED runtime state.
 //
 // Regression test for the shared compile-mode bug: setMode()/configuredMode_
@@ -1159,6 +1289,18 @@ TEST_F(SharedTaskPoolTest, PlatformCoreIdBuildSelection) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL_PLATFORM
   FAIL() << "host unit-test build must not define "
             "EJIT_SRE_SHARED_TASKPOOL_PLATFORM";
+#elif defined(EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE)
+  // Fixed worker core build: the election is closed to the designated core
+  // (0 in the test config), so a non-zero core id must NOT win - it waits and
+  // the blob stays Uninitialized.
+  EJitSharedTaskPool pool;
+  pool.bind(state_.get());
+  pool.setCompiler(&mockCompile, nullptr);
+  pool.setMode(EJitCompileMode::Async);
+  EJitCoreId::setCurrentForTest(7);
+  EXPECT_EQ(pool.init(), EJitSharedTaskPool::InitResult::InitInProgress);
+  EXPECT_EQ(state_->initState.loadAcquire(),
+            static_cast<uint32_t>(EJitSharedInitState::Uninitialized));
 #else
   EJitSharedTaskPool pool;
   pool.bind(state_.get());
@@ -3845,6 +3987,11 @@ TEST_F(SharedTaskPoolTest, L0CollidingIdentitiesNeverCrossServe) {
 // Winner-only, and BEFORE the worker exists and before Ready is published: the
 // worker can compile the instant it starts and a peer can enqueue the instant
 // it sees Ready, so an engine built after either would be too late.
+//
+// Excluded from the fixed-worker-core test config (EJIT_TEST_FIXED_WORKER_CORE
+// pins the worker to core 0): this test needs a NON-designated core (3) to win
+// the election, which the fixed-core policy forbids by design.
+#ifndef EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE
 TEST_F(SharedTaskPoolTest, OwnerSetupRunsOnTheWinnerBeforeWorkerAndReady) {
   WorkerHooks hooks;
   OwnerEngineLog winner, loser;
@@ -3879,6 +4026,7 @@ TEST_F(SharedTaskPoolTest, OwnerSetupRunsOnTheWinnerBeforeWorkerAndReady) {
   EXPECT_EQ(state_->initState.loadAcquire(),
             static_cast<uint32_t>(EJitSharedInitState::Ready));
 }
+#endif // !EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE
 
 // A failed engine build is a clean init failure: OwnerSetupFailed, no worker.
 TEST_F(SharedTaskPoolTest, OwnerSetupFailureStartsNoWorker) {
@@ -3906,6 +4054,12 @@ TEST_F(SharedTaskPoolTest, OwnerSetupFailureStartsNoWorker) {
 // The handoff: the old owner releases its engine and the new one builds its
 // own, so the system never holds two. Release lands after the worker join and
 // before the blob is up for election again.
+//
+// Excluded from the fixed-worker-core test config: the handoff here is to a
+// DIFFERENT core (the peer at core 1), which the fixed-core policy forbids -
+// under it only the designated core (0) may re-win, which the fixed-core tests
+// below cover directly.
+#ifndef EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE
 TEST_F(SharedTaskPoolTest, ReElectionReleasesTheOldEngineAndBuildsTheNew) {
   WorkerHooks ownerHooks, peerHooks;
   OwnerEngineLog ownerLog, peerLog;
@@ -3949,6 +4103,7 @@ TEST_F(SharedTaskPoolTest, ReElectionReleasesTheOldEngineAndBuildsTheNew) {
   EXPECT_EQ(ownerLog.released, 1);
   EXPECT_TRUE(peer.asyncServiceAvailable());
 }
+#endif // !EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE
 
 // A peer with no engine of its own can still flip the shared mode in both
 // directions, because the elected owner compiles for every core.

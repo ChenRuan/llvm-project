@@ -170,6 +170,19 @@ if(EJIT_SRE_SHARED_TASKPOOL)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS})
 endif()
 
+# Fixed worker core: close the shared taskpool's owner election to the
+# designated core (empty = open CAS election, the default). The consumers are
+# EJitSharedTaskPool.cpp (the election gate) and EJit.cpp (the init-failure
+# message), both inside LLVMEJIT, so scope the definition to this target like
+# EJIT_CODE_POOL_4K_SEAL above - toggling it does not recompile the tree.
+# Non-empty test, not truthiness: "0" is a valid core id (CMake if() treats
+# the string "0" as FALSE - see the trap note in llvm/CMakeLists.txt).
+if(EJIT_SRE_SHARED_TASKPOOL AND
+   NOT (EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE STREQUAL ""))
+  target_compile_definitions(LLVMEJIT PRIVATE
+    EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE})
+endif()
+
 # EJIT_FREESTANDING must be visible in LLVMJITLink headers so that
 # std::promise / std::future usage is guarded (bare-metal has no <future>).
 if(EJIT_FREESTANDING)

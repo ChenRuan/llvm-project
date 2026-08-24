@@ -133,6 +133,22 @@ if(EJIT_TEST_NO_RECLAIM)
     EJIT_SRE_SHARED_CODE_POINTERS)
 endif()
 
+# Opt-in: build the shared taskpool tests with the worker core PINNED (the
+# production CMake policy EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE), so the
+# fixed-core election path is exercised: a non-designated core never claims the
+# blob, and the designated core wins even when a peer called init() first.
+# Pinned to 0 (NOT the production cache var) because the whole suite's
+# bringUpOwner runs on core 0; the two open-election tests that rely on a
+# non-zero core winning are #ifndef-guarded in the test source. Configure a
+# separate build dir with -DEJIT_TEST_FIXED_WORKER_CORE=ON. Off by default so
+# the normal build tests the open-election path.
+option(EJIT_TEST_FIXED_WORKER_CORE
+  "Build EJITSharedTaskPoolTests with the shared worker core pinned to 0" OFF)
+if(EJIT_TEST_FIXED_WORKER_CORE)
+  target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
+    EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE=0)
+endif()
+
 # Convenience target: build + run only the cross-core shared taskpool tests.
 add_custom_target(check-ejit-shared-taskpool
   COMMAND $<TARGET_FILE:EJITSharedTaskPoolTests>
