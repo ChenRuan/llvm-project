@@ -87,6 +87,8 @@ struct SpecializationContext {
     uint8_t cellIdx;
   };
   SmallVector<DimInfo, 4> dimensions;
+  uint32_t boundArgIndex = 0;
+  SmallVector<uint8_t, 256> boundData;
   OptimizationLevel optLevel = OptimizationLevel::L2;
   /// PGO tier (Baseline when PGO is disabled or for the first compile).
   CompileTier tier = CompileTier::Baseline;

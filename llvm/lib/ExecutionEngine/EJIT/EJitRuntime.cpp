@@ -885,10 +885,11 @@ inline void ejitIcacheFillOnSuccess(uint32_t funcIndex, void *fnPtr,
 }
 } // namespace
 
-ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
-                                           const ejit_dim_pair_t *dims,
-                                           uint32_t numDims, void **outFn,
-                                           uint32_t *outBucket) {
+static ejit_status_t
+taskpoolCompileOrGetImpl(uint32_t funcIndex, const ejit_dim_pair_t *dims,
+                         uint32_t numDims, const void *snapshotData,
+                         uint32_t snapshotSize, uint32_t boundArgIndex,
+                         void **outFn, uint32_t *outBucket) {
   if (outFn)
     *outFn = nullptr;
   if (outBucket)
@@ -964,7 +965,8 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
   }
 
   auto r = tp->compileOrGet(funcIndex, dimsCast, numDims,
-                            /*fallback=*/nullptr);
+                            /*fallback=*/nullptr, snapshotData, snapshotSize,
+                            boundArgIndex);
   if (outFn)
     *outFn = r.fnPtr;
   if (outBucket)
@@ -975,6 +977,23 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
   if (r.fnPtr)
     tp->l0Fill(funcIndex, r.fnPtr, dimsCast, numDims);
   return taskpoolStatus(r.status);
+}
+
+ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
+                                           const ejit_dim_pair_t *dims,
+                                           uint32_t numDims, void **outFn,
+                                           uint32_t *outBucket) {
+  return taskpoolCompileOrGetImpl(funcIndex, dims, numDims, nullptr, 0, 0,
+                                  outFn, outBucket);
+}
+
+ejit_status_t ejit_taskpool_compile_or_get_bound(
+    uint32_t funcIndex, const ejit_dim_pair_t *dims, uint32_t numDims,
+    const void *snapshotData, uint32_t snapshotSize, uint32_t boundArgIndex,
+    void **outFn, uint32_t *outBucket) {
+  return taskpoolCompileOrGetImpl(funcIndex, dims, numDims, snapshotData,
+                                  snapshotSize, boundArgIndex, outFn,
+                                  outBucket);
 }
 
 //===----------------------------------------------------------------------===//

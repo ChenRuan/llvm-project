@@ -151,7 +151,13 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   // every may_const field into a compile-time constant.
   preReplacePeriodIndices(M, ctx);
   runInstCombine(M);
-  runStructFieldPass(M);
+  EJIT_DIAG_DEBUG("pipeline phase1b done: InstCombine");
+  // Inlining is intentionally not run here: the AOT pre-optimization
+  // (EJitRegisterBitcodePass: AlwaysInline + ModuleInliner(O2)) already expanded
+  // callee bodies in the embedded bitcode, so their may_const GEP chains are
+  // already traceable to the global.
+  //   (c) Replace the may_const loads with their runtime constant values.
+  runStructFieldPass(M, ctx);
   EJIT_DIAG_DEBUG("pipeline phase1c done: StructFieldPass");
   //   (d) Push the constants across call edges. Wherever the AOT inliner kept
   //       a call, the callee still re-derives cell addressing and re-tests
@@ -165,7 +171,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   //       loads they root, so phases 2-4 exploit the constants in every
   //       function, not just the entry.
   runInstCombine(M);
-  runStructFieldPass(M);
+  runStructFieldPass(M, ctx);
   EJIT_DIAG_DEBUG("pipeline phase1ef done: callee InstCombine+StructFieldPass");
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
@@ -674,12 +680,20 @@ void EJitOptimizer::runInterproceduralPropagation(Module &M) {
   MPM.run(M, MAM_);
 }
 
-void EJitOptimizer::runStructFieldPass(Module &M) {
-  EJitStructFieldPass structField(registry_);
+void EJitOptimizer::runStructFieldPass(Module &M,
+                                       const SpecializationContext &ctx) {
+  EJitStructFieldPass structField(
+      registry_, ctx.boundData.empty() ? nullptr : ctx.boundData.data(),
+      static_cast<uint32_t>(ctx.boundData.size()), ctx.boundArgIndex);
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration())
       structField.run(F, FAM_);
+}
+
+void EJitOptimizer::runStructFieldPass(Module &M) {
+  SpecializationContext Empty;
+  runStructFieldPass(M, Empty);
 }
 
 FunctionPassManager &

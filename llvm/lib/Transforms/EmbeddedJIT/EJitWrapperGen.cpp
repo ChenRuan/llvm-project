@@ -32,6 +32,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <limits>
 #include <map>
 #include <string>
 
@@ -145,6 +146,32 @@ struct PeriodArrIndInfo {
   unsigned ArgIndex;
   uint32_t DimType;
 };
+
+struct BoundPtrInfo {
+  std::string PeriodName;
+  unsigned ArgIndex;
+  uint64_t PointeeSize;
+};
+
+static std::optional<BoundPtrInfo> getBoundPtrInfo(const Function &F) {
+  MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
+  if (!MD)
+    return std::nullopt;
+  for (const MDOperand &Op : MD->operands()) {
+    auto *Sub = dyn_cast<MDNode>(Op.get());
+    if (!Sub || Sub->getNumOperands() < 4)
+      continue;
+    auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+    auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
+    auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+    auto *Size = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(3));
+    if (Tag && Tag->getString() == TAG_EJIT_BOUND_PTR && PN && Idx && Size)
+      return BoundPtrInfo{PN->getString().str(),
+                          static_cast<unsigned>(Idx->getZExtValue()),
+                          Size->getZExtValue()};
+  }
+  return std::nullopt;
+}
 
 static SmallVector<PeriodArrIndInfo, 4> getPeriodArrIndInfo(const Function &F) {
   SmallVector<PeriodArrIndInfo, 4> Result;
@@ -508,6 +535,15 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   M.getOrInsertFunction(
       FN_TASKPOOL_COMPILE_OR_GET,
       FunctionType::get(I32Ty, {I32Ty, PtrTy, I32Ty, PtrTy, PtrTy}, false));
+  bool HasBoundPtr = llvm::any_of(EntryFuncs, [](const Function *F) {
+    return getBoundPtrInfo(*F).has_value();
+  });
+  if (HasBoundPtr)
+    M.getOrInsertFunction(FN_TASKPOOL_COMPILE_OR_GET_BOUND,
+                          FunctionType::get(I32Ty,
+                                            {I32Ty, PtrTy, I32Ty, PtrTy, I32Ty,
+                                             I32Ty, PtrTy, PtrTy},
+                                            false));
   M.getOrInsertFunction(
       FN_TASKPOOL_RELEASE_READ,
       FunctionType::get(Type::getVoidTy(Ctx), {I32Ty}, false));
@@ -632,6 +668,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       F->addFnAttr(Attribute::NoInline);
 
     auto PeriodInds = getPeriodArrIndInfo(*F);
+    auto BoundPtr = getBoundPtrInfo(*F);
     unsigned DimCount = PeriodInds.size();
 
     if (DimCount > EJIT_ICACHE_MAX_DIMS) {
@@ -686,6 +723,22 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     if (Invalid)
       continue;
 
+    if (BoundPtr) {
+      unsigned MatchingDims =
+          llvm::count_if(PeriodInds, [&](const PeriodArrIndInfo &I) {
+            return I.PeriodName == BoundPtr->PeriodName;
+          });
+      if (BoundPtr->ArgIndex >= ArgCount ||
+          !F->getArg(BoundPtr->ArgIndex)->getType()->isPointerTy() ||
+          BoundPtr->PointeeSize == 0 ||
+          BoundPtr->PointeeSize > std::numeric_limits<uint32_t>::max() ||
+          MatchingDims != 1) {
+        F->getContext().emitError(
+            "ejit-wrapper-gen: invalid ejit_bound_ptr metadata");
+        continue;
+      }
+    }
+
     // Save original entry block
     BasicBlock &OrigEntry = F->getEntryBlock();
 
@@ -697,7 +750,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
     auto *DimPairTy = StructType::get(I32Ty, I32Ty);
     auto *I64Ty = Type::getInt64Ty(Ctx);
-    bool UseFixed = EJitWrapperFixedDimEntry && DimCount <= 2;
+    bool UseFixed = EJitWrapperFixedDimEntry && DimCount <= 2 && !BoundPtr;
 
     SmallVector<ReturnInst *, 8> OriginalReturns;
     for (BasicBlock &BB : *F)
@@ -880,10 +933,20 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         }
         Value *DimsPtr = DimCount > 0 ? B.CreatePointerCast(DimsAlloca, PtrTy)
                                       : ConstantPointerNull::get(PtrTy);
-        Status =
-            B.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET),
-                         {FuncIdx, DimsPtr, ConstantInt::get(I32Ty, DimCount),
-                          OutFnArg, OutBucketArg});
+        if (BoundPtr) {
+          Value *Snapshot = Fn.getArg(BoundPtr->ArgIndex);
+          Status = B.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET_BOUND),
+                                {FuncIdx, DimsPtr,
+                                 ConstantInt::get(I32Ty, DimCount), Snapshot,
+                                 ConstantInt::get(I32Ty, BoundPtr->PointeeSize),
+                                 ConstantInt::get(I32Ty, BoundPtr->ArgIndex),
+                                 OutFnArg, OutBucketArg});
+        } else {
+          Status = B.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET),
+                                {FuncIdx, DimsPtr,
+                                 ConstantInt::get(I32Ty, DimCount), OutFnArg,
+                                 OutBucketArg});
+        }
       }
       if (EJitWrapperTiming)
         TAfterLookup = B.CreateCall(TraceNow, {}, "ejit_t_after_lookup");

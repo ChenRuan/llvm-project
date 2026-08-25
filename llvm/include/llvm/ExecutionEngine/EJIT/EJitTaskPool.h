@@ -366,7 +366,10 @@ public:
   EJitTaskPoolCache &cache() { return cache_; }
 
   CompileOrGetResult compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
-                                  uint32_t numDims, void *fallback);
+                                  uint32_t numDims, void *fallback,
+                                  const void *boundData = nullptr,
+                                  uint32_t boundSize = 0,
+                                  uint32_t boundArgIndex = 0);
 
   /// Flattened fast cache-hit path (spec §5.2 steps 0-1). Performs ONLY the
   /// terminal front half of compileOrGet(): the instance-enabled check and the

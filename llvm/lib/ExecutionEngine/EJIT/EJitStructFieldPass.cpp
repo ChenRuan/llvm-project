@@ -99,6 +99,82 @@ static const GlobalVariable *findRootGV(const Value *V) {
   return nullptr;
 }
 
+static const Argument *findRootArgument(const Value *V) {
+  V = V->stripPointerCasts();
+  if (auto *Arg = dyn_cast<Argument>(V))
+    return Arg;
+  if (auto *GEP = dyn_cast<GEPOperator>(V))
+    return findRootArgument(GEP->getPointerOperand());
+  return nullptr;
+}
+
+static bool functionBindsArgument(const Function &F, unsigned ArgIndex) {
+  MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
+  if (!MD)
+    return false;
+  for (const MDOperand &Op : MD->operands()) {
+    auto *Sub = dyn_cast<MDNode>(Op.get());
+    if (!Sub || Sub->getNumOperands() < 3)
+      continue;
+    auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+    auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+    if (Tag && Tag->getString() == TAG_EJIT_BOUND_PTR && Idx &&
+        Idx->getZExtValue() == ArgIndex)
+      return true;
+  }
+  return false;
+}
+
+static std::optional<uint64_t> accumulateArgumentOffset(const DataLayout &DL,
+                                                        const Value *PtrOp,
+                                                        const Argument *Root);
+
+static bool isBoundMayConstLoad(LoadInst *LI, const Function &F,
+                                unsigned ArgIndex, const DataLayout &DL) {
+  if (LI->isVolatile() || LI->isAtomic() || ArgIndex >= F.arg_size())
+    return false;
+  const Argument *Root = findRootArgument(LI->getPointerOperand());
+  if (!Root || Root->getArgNo() != ArgIndex)
+    return false;
+  if (LI->hasMetadata(MD_EJIT_MAY_CONST))
+    return true;
+
+  auto Offset = accumulateArgumentOffset(DL, LI->getPointerOperand(), Root);
+  TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
+  if (!Offset || AccessSize.isScalable())
+    return false;
+
+  MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
+  if (!MD)
+    return false;
+  for (const MDOperand &Op : MD->operands()) {
+    auto *Sub = dyn_cast<MDNode>(Op.get());
+    if (!Sub || Sub->getNumOperands() < 4)
+      continue;
+    auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+    auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+    if (!Tag || Tag->getString() != TAG_EJIT_BOUND_PTR || !Idx ||
+        Idx->getZExtValue() != ArgIndex)
+      continue;
+    for (unsigned I = 4; I < Sub->getNumOperands(); ++I) {
+      auto *Field = dyn_cast<MDNode>(Sub->getOperand(I));
+      if (!Field || Field->getNumOperands() != 2)
+        continue;
+      auto *FieldOffset =
+          mdconst::dyn_extract<ConstantInt>(Field->getOperand(0));
+      auto *FieldSize = mdconst::dyn_extract<ConstantInt>(Field->getOperand(1));
+      if (FieldOffset && FieldSize) {
+        uint64_t Begin = FieldOffset->getZExtValue();
+        uint64_t Size = FieldSize->getZExtValue();
+        if (*Offset >= Begin && *Offset - Begin <= Size &&
+            AccessSize.getFixedValue() <= Size - (*Offset - Begin))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
 /// If all GEP indices are ConstantInt, compute the cumulative byte offset.
 /// Returns std::nullopt if any index is not constant.
 static std::optional<uint64_t>
@@ -137,6 +213,26 @@ accumulateFullOffset(const DataLayout &DL, const Value *PtrOp) {
   }
 
   return total.getZExtValue();
+}
+
+static std::optional<uint64_t> accumulateArgumentOffset(const DataLayout &DL,
+                                                        const Value *PtrOp,
+                                                        const Argument *Root) {
+  APInt Total(DL.getPointerSizeInBits(0), 0);
+  while (PtrOp) {
+    PtrOp = PtrOp->stripPointerCasts();
+    if (PtrOp == Root)
+      return Total.getZExtValue();
+    auto *GEP = dyn_cast<GEPOperator>(PtrOp);
+    if (!GEP)
+      return std::nullopt;
+    auto Off = computeGEPOffset(GEP, DL);
+    if (!Off)
+      return std::nullopt;
+    Total += APInt(Total.getBitWidth(), *Off);
+    PtrOp = GEP->getPointerOperand();
+  }
+  return std::nullopt;
 }
 
 /// Check whether a load is (or can be treated as) a may_const access.
@@ -408,6 +504,24 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   return nullptr;
 }
 
+static Constant *tryReplaceBoundPointer(LoadInst *LI, const Function &F,
+                                        const uint8_t *Data, uint32_t Size,
+                                        uint32_t ArgIndex,
+                                        const DataLayout &DL) {
+  if (!Data || !Size || ArgIndex >= F.arg_size() ||
+      !functionBindsArgument(F, ArgIndex))
+    return nullptr;
+  const Argument *Root = findRootArgument(LI->getPointerOperand());
+  if (!Root || Root->getArgNo() != ArgIndex)
+    return nullptr;
+  auto Offset = accumulateArgumentOffset(DL, LI->getPointerOperand(), Root);
+  TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
+  if (!Offset || AccessSize.isScalable() || *Offset > Size ||
+      AccessSize.getFixedValue() > Size - *Offset)
+    return nullptr;
+  return createConstantFromMemory(Data + *Offset, LI->getType(), DL);
+}
+
 //===----------------------------------------------------------------------===//
 // Load replacement helpers — one per access pattern
 //===----------------------------------------------------------------------===//
@@ -619,7 +733,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
         continue;
       }
 
-      if (!isMayConstLoad(LI, mayConstFieldMap_, DL))
+      bool BoundMayConst = isBoundMayConstLoad(LI, F, boundArgIndex_, DL);
+      if (!BoundMayConst && !isMayConstLoad(LI, mayConstFieldMap_, DL))
         continue;
 #ifdef EJIT_DIAG_ENABLE
       ++mayConstLoads;
@@ -630,6 +745,13 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       // Try each access pattern in order.
       Constant *C = tryReplacePeriodAbsoluteAddress(
           LI, gvPeriodMap_, mayConstFieldMap_, registry_, DL);
+
+      // Pattern 0: an ejit_bound_ptr parameter. Only the marked load is read
+      // from the owned snapshot; the pointer argument and all dynamic fields
+      // remain live inputs to the specialization.
+      if (!C)
+        C = tryReplaceBoundPointer(LI, F, boundData_, boundSize_,
+                                   boundArgIndex_, DL);
 
       // Pattern 1: direct GlobalVariable load (scalar static variable).
       if (!C) {

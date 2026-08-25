@@ -4,6 +4,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 using namespace llvm;
@@ -487,7 +488,9 @@ EJitTaskPool::tryCacheHit4D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
 
 EJitTaskPool::CompileOrGetResult
 EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
-                           uint32_t numDims, void *fallback) {
+                           uint32_t numDims, void *fallback,
+                           const void *boundData, uint32_t boundSize,
+                           uint32_t boundArgIndex) {
   EJIT_DIAG_VERBOSE("taskpool request func=%u dims=%u fallback=%p", funcIndex,
                     numDims, fallback);
 
@@ -525,6 +528,14 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   // True miss: continue the slow path with the caller's fallback.
   R.fnPtr = fallback;
 
+  if ((boundSize != 0 && !boundData) || boundSize > EJIT_BOUND_PTR_MAX_BYTES) {
+    EJIT_DIAG("taskpool bound snapshot reject func=%u size=%u max=%u",
+              funcIndex, boundSize,
+              static_cast<unsigned>(EJIT_BOUND_PTR_MAX_BYTES));
+    R.status = EJitCompileOrGetStatus::InvalidParam;
+    return R;
+  }
+
   // 3. Off mode (§5.2 step 2) — fall back, never enqueue/compile.
   if (switch_.getMode() == EJitCompileMode::Off) {
     EJIT_DIAG_VERBOSE("taskpool fallback func=%u: mode off", funcIndex);
@@ -548,6 +559,16 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
       Req.dims[i] = dims[i];
       Req.versions[i] =
           switch_.getInstanceVersion(dims[i].dimType, dims[i].instanceId);
+    }
+    Req.boundArgIndex = boundArgIndex;
+    Req.boundSize = boundSize;
+    if (boundSize)
+      std::memcpy(Req.boundData, boundData, boundSize);
+    if (!versionsMatch(Req)) {
+      EJIT_DIAG("taskpool sync snapshot drop func=%u: version changed",
+                funcIndex);
+      R.status = EJitCompileOrGetStatus::CompileFailed;
+      return R;
     }
     // Inline compile: checkpoint 1 + compile + checkpoint 2 + commit gate,
     // same logic as runCompile(), executed on the calling thread.
@@ -602,6 +623,16 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     Req.dims[i] = dims[i];
     Req.versions[i] =
         switch_.getInstanceVersion(dims[i].dimType, dims[i].instanceId);
+  }
+  Req.boundArgIndex = boundArgIndex;
+  Req.boundSize = boundSize;
+  if (boundSize)
+    std::memcpy(Req.boundData, boundData, boundSize);
+  if (!versionsMatch(Req)) {
+    EJIT_DIAG("taskpool async snapshot drop func=%u: version changed",
+              funcIndex);
+    R.status = EJitCompileOrGetStatus::CompileFailed;
+    return R;
   }
 
   EJitTaskQueue::EnqueueResult EQ = queue_.tryEnqueue(Req);

@@ -38,7 +38,11 @@ using MayConstOffsetMap =
 /// constants.
 class EJitStructFieldPass : public PassInfoMixin<EJitStructFieldPass> {
 public:
-  EJitStructFieldPass(PeriodArrayRegistry &reg) : registry_(reg) {}
+  EJitStructFieldPass(PeriodArrayRegistry &reg,
+                      const uint8_t *boundData = nullptr,
+                      uint32_t boundSize = 0, uint32_t boundArgIndex = 0)
+      : registry_(reg), boundData_(boundData), boundSize_(boundSize),
+        boundArgIndex_(boundArgIndex) {}
 
   /// Pre-build GV metadata maps from the Module (call once before run()).
   void initFromModule(Module &M);
@@ -65,6 +69,9 @@ public:
 
 private:
   PeriodArrayRegistry &registry_;
+  const uint8_t *boundData_ = nullptr;
+  uint32_t boundSize_ = 0;
+  uint32_t boundArgIndex_ = 0;
 
   // Cached metadata maps — built once per module, reused across functions.
   GVPeriodMap gvPeriodMap_;
