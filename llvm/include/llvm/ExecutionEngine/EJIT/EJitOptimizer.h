@@ -95,8 +95,8 @@ public:
     scalarSiteCountsByFunc_[funcName] = count;
   }
 
-  /// Print a descending per-entry ranking of average runtime-active may_const
-  /// sites per unique JIT version.
+  /// Print a descending per-entry ranking of dynamically removed may_const
+  /// loads per million sample ticks, with per-entry and active-site context.
   /// Returns false when no completed specialization sample is available.
   bool printMayConstRanking() const;
 
@@ -145,7 +145,8 @@ private:
   void recordMayConstBenefit(const SpecializationContext &ctx,
                              ArrayRef<EJitMayConstLoadSite> inputSites,
                              uint64_t specializedMayConstLoads,
-                             uint64_t finalMayConstLoads);
+                             ArrayRef<EJitMayConstLoadSite> finalSites,
+                             uint64_t sampledEntries);
 #endif
 
   /// Pick the cached function-simplification FPM for an EJIT optimization tier.

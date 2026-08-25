@@ -3,6 +3,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
+#include "llvm/ADT/DenseSet.h"
 #endif
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
@@ -39,6 +40,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
+#include <limits>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -51,6 +53,21 @@ collectMayConstSites(Module &M, PeriodArrayRegistry &Registry) {
   EJitStructFieldPass Pass(Registry);
   Pass.initFromModule(M);
   return Pass.collectMayConstLoadSites(M);
+}
+
+static uint64_t saturatingAuditAdd(uint64_t L, uint64_t R) {
+  const uint64_t Max = std::numeric_limits<uint64_t>::max();
+  return R > Max - L ? Max : L + R;
+}
+
+static bool mayConstSitesCorrespond(const EJitMayConstLoadSite &L,
+                                    const EJitMayConstLoadSite &R) {
+  if (L.hasFieldOffset && R.hasFieldOffset && !L.globalName.empty() &&
+      L.globalName == R.globalName && L.fieldOffset == R.fieldOffset)
+    return true;
+  return L.sourceLine != 0 && R.sourceLine != 0 && !L.sourceFile.empty() &&
+         L.sourceFile == R.sourceFile && L.sourceLine == R.sourceLine &&
+         L.sourceColumn == R.sourceColumn;
 }
 #endif
 
@@ -129,6 +146,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   std::vector<EJitMayConstLoadSite> AuditInputSites;
+  uint64_t AuditSampledEntries = 0;
   if (ctx.tier == CompileTier::Instrumented ||
       ctx.tier == CompileTier::PGOUse) {
     EJitStructFieldPass AuditPass(registry_);
@@ -284,8 +302,10 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
         Biased += Summary.biasedSites95;
         Balanced += Summary.balancedSites60;
         ZeroEdges += Summary.zeroCountEdges;
-        if (Summary.isRoot)
+        if (Summary.isRoot) {
           RootEntries = Summary.entryCount;
+          AuditSampledEntries = Summary.entryCount;
+        }
         EJIT_DIAG_DEBUG(
             "branch-audit-fn entry=%s fn=%s root=%u entries=%llu insts=%llu "
             "branches=%u profiled=%u biased95=%u balanced60=%u zero_edges=%u",
@@ -317,8 +337,9 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
       clearAnalyses();
       runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline);
 #if defined(EJIT_DIAG_ENABLE)
+      auto FinalSites = collectMayConstSites(M, registry_);
       recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
-                            collectMayConstSites(M, registry_).size());
+                            FinalSites, AuditSampledEntries);
 #endif
       EJIT_DIAG_VERBOSE("pipeline done (audit-only Baseline) func=%s "
                         "key=0x%016lx",
@@ -375,8 +396,9 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
 #endif
     runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+    auto FinalSites = collectMayConstSites(M, registry_);
     recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
-                          collectMayConstSites(M, registry_).size());
+                          FinalSites, AuditSampledEntries);
 #endif
     EJIT_DIAG_VERBOSE("pipeline done (Tier-2) func=%s key=0x%016lx",
                       ctx.fnName.c_str(), ctx.cacheKey);
@@ -386,8 +408,9 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   // Baseline (PGO off): the existing full specialization pipeline.
   runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  auto FinalSites = collectMayConstSites(M, registry_);
   recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
-                        collectMayConstSites(M, registry_).size());
+                        FinalSites, AuditSampledEntries);
 #endif
   EJIT_DIAG_VERBOSE("pipeline done func=%s key=0x%016lx", ctx.fnName.c_str(),
                     ctx.cacheKey);
@@ -396,13 +419,42 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
 void EJitOptimizer::recordMayConstBenefit(
     const SpecializationContext &ctx, ArrayRef<EJitMayConstLoadSite> InputSites,
-    uint64_t SpecializedMayConstLoads, uint64_t FinalMayConstLoads) {
+    uint64_t SpecializedMayConstLoads,
+    ArrayRef<EJitMayConstLoadSite> FinalSites, uint64_t SampledEntries) {
   const uint64_t InputMayConstLoads = InputSites.size();
+  const uint64_t FinalMayConstLoads = FinalSites.size();
   uint64_t RuntimeHits = 0;
   uint64_t HitSites = 0;
+  uint64_t RemovedRuntimeHits = 0;
+  uint64_t RemovedHitSites = 0;
+  DenseSet<uint64_t> SurvivingSiteIDs;
+  SmallVector<bool, 16> UnknownFinalMatched(FinalSites.size(), false);
+  for (const EJitMayConstLoadSite &Site : FinalSites)
+    if (Site.siteId != 0)
+      SurvivingSiteIDs.insert(Site.siteId);
   for (const EJitMayConstLoadSite &Site : InputSites) {
-    RuntimeHits += Site.runtimeHits;
+    RuntimeHits = saturatingAuditAdd(RuntimeHits, Site.runtimeHits);
     HitSites += Site.runtimeHits != 0;
+    // A surviving clone keeps the original ID, so count a site as removed only
+    // when every clone disappeared. If a transform rebuilt a load without
+    // copying metadata, consume one matching field/source identity before
+    // claiming removal. Completely unknown provenance is kept conservatively.
+    bool Survives = Site.siteId == 0 || SurvivingSiteIDs.contains(Site.siteId);
+    if (!Survives) {
+      for (size_t I = 0; I < FinalSites.size(); ++I) {
+        if (FinalSites[I].siteId != 0 || UnknownFinalMatched[I] ||
+            !mayConstSitesCorrespond(Site, FinalSites[I]))
+          continue;
+        UnknownFinalMatched[I] = true;
+        Survives = true;
+        break;
+      }
+    }
+    if (!Survives) {
+      RemovedRuntimeHits =
+          saturatingAuditAdd(RemovedRuntimeHits, Site.runtimeHits);
+      RemovedHitSites += Site.runtimeHits != 0;
+    }
   }
 
   EJitMayConstBenefitSample Sample;
@@ -412,6 +464,10 @@ void EJitOptimizer::recordMayConstBenefit(
   Sample.finalMayConstLoads = FinalMayConstLoads;
   Sample.runtimeHits = RuntimeHits;
   Sample.hitSites = HitSites;
+  Sample.removedRuntimeHits = RemovedRuntimeHits;
+  Sample.removedHitSites = RemovedHitSites;
+  Sample.sampledEntries = SampledEntries;
+  Sample.sampleCycles = ctx.mayConstSampleCycles;
 
   uint32_t Expected = 0;
   while (!mayConstBenefitLock_.compareExchange(Expected, 1))
@@ -433,7 +489,9 @@ void EJitOptimizer::recordMayConstBenefit(
                            static_cast<int64_t>(FinalMayConstLoads);
   EJIT_DIAG("mayconst-audit entry=%s key=0x%016llx tier=%u versions=%llu "
             "mayconst=%llu/%llu/%llu removed=%lld direct=%lld pipeline=%lld "
-            "runtime_hits=%llu hit_sites=%llu avg_removed=%lld "
+            "runtime_hits=%llu hit_sites=%llu removed_runtime_hits=%llu "
+            "removed_hit_sites=%llu sampled_entries=%llu sample_cycles=%llu "
+            "avg_removed=%lld "
             "weighted_permille=%lld min=%lld max=%lld",
             ctx.fnName.c_str(), static_cast<unsigned long long>(ctx.cacheKey),
             static_cast<unsigned>(ctx.tier),
@@ -445,6 +503,10 @@ void EJitOptimizer::recordMayConstBenefit(
             static_cast<long long>(Pipeline),
             static_cast<unsigned long long>(RuntimeHits),
             static_cast<unsigned long long>(HitSites),
+            static_cast<unsigned long long>(RemovedRuntimeHits),
+            static_cast<unsigned long long>(RemovedHitSites),
+            static_cast<unsigned long long>(SampledEntries),
+            static_cast<unsigned long long>(ctx.mayConstSampleCycles),
             static_cast<long long>(Aggregate.averageRemoved),
             static_cast<long long>(Aggregate.weightedRemovedPermille),
             static_cast<long long>(Aggregate.minimumRemoved),
@@ -500,6 +562,14 @@ bool EJitOptimizer::printMayConstRanking() const {
     return false;
   }
   llvm::sort(Rows, [](const RankingRow &L, const RankingRow &R) {
+    if (L.summary.benefitPerMillionCyclesMilli !=
+        R.summary.benefitPerMillionCyclesMilli)
+      return L.summary.benefitPerMillionCyclesMilli >
+             R.summary.benefitPerMillionCyclesMilli;
+    if (L.summary.removedHitsPerEntryPermille !=
+        R.summary.removedHitsPerEntryPermille)
+      return L.summary.removedHitsPerEntryPermille >
+             R.summary.removedHitsPerEntryPermille;
     if (L.summary.averageActiveSitesPermille !=
         R.summary.averageActiveSitesPermille)
       return L.summary.averageActiveSitesPermille >
@@ -511,18 +581,30 @@ bool EJitOptimizer::printMayConstRanking() const {
     return L.entry < R.entry;
   });
 
-  EJIT_DIAG_RAW("mayconst-ranking entries=%u sort=avg_active_sites_desc",
+  EJIT_DIAG_RAW("mayconst-ranking entries=%u sort=benefit_per_mcycle_desc",
                 static_cast<unsigned>(Rows.size()));
   for (size_t I = 0; I < Rows.size(); ++I) {
     const RankingRow &Row = Rows[I];
     const uint64_t AvgActiveSites =
         Row.summary.averageActiveSitesPermille;
+    const uint64_t RemovedPerEntry =
+        Row.summary.removedHitsPerEntryPermille;
+    const uint64_t Benefit = Row.summary.benefitPerMillionCyclesMilli;
     EJIT_DIAG_RAW(
-        "rank=%u entry=%s versions=%llu avg_active_sites=%llu.%03llu "
+        "rank=%u entry=%s versions=%llu benefit_per_mcycle=%llu.%03llu "
+        "removed_per_entry=%llu.%03llu removed_runtime_hits=%llu "
+        "sampled_entries=%llu sample_cycles=%llu avg_active_sites=%llu.%03llu "
         "hit_sites=%llu runtime_hits=%llu avg_removed=%lld "
         "total_removed=%lld min=%lld max=%lld",
         static_cast<unsigned>(I + 1), Row.entry.c_str(),
         static_cast<unsigned long long>(Row.summary.versions),
+        static_cast<unsigned long long>(Benefit / 1000),
+        static_cast<unsigned long long>(Benefit % 1000),
+        static_cast<unsigned long long>(RemovedPerEntry / 1000),
+        static_cast<unsigned long long>(RemovedPerEntry % 1000),
+        static_cast<unsigned long long>(Row.summary.removedRuntimeHits),
+        static_cast<unsigned long long>(Row.summary.sampledEntries),
+        static_cast<unsigned long long>(Row.summary.sampleCycles),
         static_cast<unsigned long long>(AvgActiveSites / 1000),
         static_cast<unsigned long long>(AvgActiveSites % 1000),
         static_cast<unsigned long long>(Row.summary.hitSites),

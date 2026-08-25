@@ -188,6 +188,11 @@ EJitStructFieldPass::collectMayConstLoadSites(const Module &M) const {
 
         EJitMayConstLoadSite Site;
         Site.functionName = F.getName().str();
+        if (MDNode *SiteMD = LI->getMetadata(MayConstAuditSiteMD))
+          if (SiteMD->getNumOperands() == 1)
+            if (auto *SiteID =
+                    mdconst::dyn_extract<ConstantInt>(SiteMD->getOperand(0)))
+              Site.siteId = SiteID->getZExtValue();
         const GlobalVariable *RootGV = nullptr;
         if (auto Offset =
                 ejitMayConstFieldOffset(LI->getPointerOperand(), DL, RootGV)) {
@@ -232,6 +237,13 @@ EJitStructFieldPass::instrumentMayConstLoadSites(Module &M) {
         auto *LI = dyn_cast<LoadInst>(&I);
         if (!LI || !isMayConstLoad(LI, mayConstFieldMap_, DL))
           continue;
+
+        const uint64_t SiteID = SiteIndex + 1;
+        LI->setMetadata(
+            MayConstAuditSiteMD,
+            MDNode::get(Ctx, ConstantAsMetadata::get(
+                                 ConstantInt::get(I64, SiteID))));
+        Sites[SiteIndex].siteId = SiteID;
 
         IRBuilder<> Builder(LI);
         Value *Counter = Builder.CreateInBoundsGEP(
