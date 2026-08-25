@@ -94,6 +94,8 @@ _set_min_libs() {
     ${_l}/libLLVMCore.a ${_l}/libLLVMSupport.a ${_l}/libLLVMDemangle.a
     ${_l}/libLLVMBinaryFormat.a ${_l}/libLLVMBitReader.a ${_l}/libLLVMBitstreamReader.a
     ${_l}/libLLVMAnalysis.a ${_l}/libLLVMScalarOpts.a ${_l}/libLLVMInstCombine.a
+    ${_l}/libLLVMPasses.a ${_l}/libLLVMAggressiveInstCombine.a
+    ${_l}/libLLVMCoroutines.a
     ${_l}/libLLVMipo.a ${_l}/libLLVMTransformUtils.a ${_l}/libLLVMVectorize.a
     ${_l}/libLLVMCodeGen.a
     ${_l}/libLLVMCodeGenTypes.a ${_l}/libLLVMTarget.a ${_l}/libLLVMTargetParser.a
@@ -113,7 +115,8 @@ _set_min_libs() {
   case "$1" in
     x86)
       MIN_LIBS="${MIN_LIBS_COMMON}
-        ${_l}/libLLVMX86CodeGen.a ${_l}/libLLVMX86Desc.a ${_l}/libLLVMX86Info.a"
+        ${_l}/libLLVMX86CodeGen.a ${_l}/libLLVMX86Desc.a ${_l}/libLLVMX86Info.a
+        ${_l}/libLLVMX86AsmParser.a"
       ;;
     aarch64)
       MIN_LIBS="${MIN_LIBS_COMMON}
@@ -160,7 +163,11 @@ else
   _set_min_libs "${ARCH}"
   OTHER_LIBS=$(echo "${MIN_LIBS}" | sed '/^$/d' | tr '\n' ' ')
 fi
-LINK_LIBS="-lz -lpthread -ldl"
+# EJitLibcallStubs references the stack-protector ABI symbol __stack_chk_guard
+# by address; host glibc on x86_64 (TLS canary) no longer exports it as data.
+# Define it at 0 for the static link - the test binaries themselves compile
+# without stack protector, so nothing ever loads the value.
+LINK_LIBS="-lz -lpthread -ldl -Wl,--defsym,__stack_chk_guard=0"
 STRIP_FLAG="-Wl,--strip-all"
 if ${NO_STRIP}; then STRIP_FLAG=""; fi
 
@@ -201,6 +208,7 @@ ALL_TESTS=(
   ejit_pgo_test
   ejit_pgo_sre_multicore_test
   ejit_vp_multicore_test
+  ejit_sentinel_smoke_test
 )
 
 # Per-test compile flags (e.g. for disabling global constructors)
@@ -210,6 +218,9 @@ COMPILE_FLAGS[ejit_manual_register_test]="-mllvm -enable-ejit-global-ctors=false
 # registry tables walked via linker-script-provided __start_/__stop_ symbols.
 COMPILE_FLAGS[ejit_baremetal_link_test]="-mllvm -enable-ejit-global-ctors=false"
 COMPILE_FLAGS[ejit_fixed_dim_test]=""
+# Sentinel-wrapper smoke: icache ON so the wrapper takes the branchless
+# (NumDims <= 2, cell table defined pre-filled with &MissFn) form.
+COMPILE_FLAGS[ejit_sentinel_smoke_test]="-mllvm -ejit-inline-cache"
 
 # Override the primary source file for a test (default: <name>.c). Lets a test
 # reuse existing sources under a different build/link recipe without copying.
@@ -233,6 +244,7 @@ LINKER_SCRIPT[ejit_manual_register_test]="ejit_baremetal.ld"
 declare -A EXTRA_SRCS
 EXTRA_SRCS[ejit_multi_tu_test]="ejit_multi_tu_test_b.c"
 EXTRA_SRCS[ejit_baremetal_link_test]="ejit_multi_tu_test_b.c"
+EXTRA_SRCS[ejit_sentinel_smoke_test]="ejit_sentinel_smoke_test_1d.c ejit_sentinel_smoke_test_3d.c"
 
 declare -A TEST_ARGS
 TEST_ARGS[ejit_complex_test]="0 1 2 3"

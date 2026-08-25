@@ -307,7 +307,10 @@ static GlobalVariable *getOrCreateFuncIndexGlobal(Module &M,
 
 // A per-function inline-cache global plus its dimensionality (number of
 // ejit_dim params). The runtime needs NumDims to linearize the [D]^NumDims
-// array on fill, and the hit-path emitter needs it to build the GEP.
+// array on fill, and the hit-path emitter needs it to build the GEP. The
+// slot's sentinel (when the table is defined pre-filled with &MissFn) is
+// derived from the table's initializer at registration-emission time, so no
+// bookkeeping is kept here.
 struct IcacheSlotInfo {
   GlobalVariable *GV = nullptr;
   unsigned NumDims = 0;
@@ -351,6 +354,24 @@ static GlobalVariable *getOrCreateIcacheFnGlobal(Module &M,
   if (!EJitIcacheSection.empty())
     GV->setSection(EJitIcacheSection);
   return GV;
+}
+
+// Sentinel initializer for an icache cell table: the [D]^NumDims shape (or the
+// scalar ptr for NumDims == 0) with every element set to &MissFn. This
+// definition-time value is what makes the branchless probe safe: before the
+// first fill, after a drain, or before registration has run, the load yields
+// MissFn and the tail call lands in the slow path instead of a null pointer.
+static Constant *buildIcacheSentinelInit(Type *SlotTy, Function *MissFn,
+                                          unsigned NumDims) {
+  Constant *MissFnC = MissFn;
+  if (NumDims == 0)
+    return MissFnC;
+  auto *ArrTy = cast<ArrayType>(SlotTy);
+  Constant *Inner =
+      buildIcacheSentinelInit(ArrTy->getElementType(), MissFn, NumDims - 1);
+  SmallVector<Constant *, EJIT_ICACHE_DIM_SIZE> Elems(
+      ArrTy->getNumElements(), Inner);
+  return ConstantArray::get(ArrTy, Elems);
 }
 
 // Emit registration that fills each per-function dense-funcIndex global with
@@ -447,11 +468,30 @@ emitIcacheSlotRegistration(Module &M,
   auto *I32Ty = Type::getInt32Ty(Ctx);
   auto *I64Ty = Type::getInt64Ty(Ctx);
 
-  // void ejit_register_icache_slot(const char *name, void *slot, uint32_t numDims)
+  // void ejit_register_icache_slot(const char *name, void *slot, uint32_t numDims,
+  //                                void *missFn)
   // numDims tells the runtime the [D]^numDims shape so icacheFill can linearize.
+  // missFn is non-null exactly for sentinel-form slots: the runtime writes it
+  // back into the cells on drain / fill-retract so the branchless probe never
+  // BLRs 0. Null for guarded (3D/4D, timing) slots, whose drain value stays 0.
   M.getOrInsertFunction(
       FN_REGISTER_ICACHE_SLOT,
-      FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, PtrTy, I32Ty}, false));
+      FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, PtrTy, I32Ty, PtrTy},
+                        false));
+
+  // Derive each slot's sentinel from its table's DEFINITION rather than from
+  // wrap-loop bookkeeping: a function skipped by the idempotency guard still
+  // carries its sentinel initializer from an earlier pass run, and registering
+  // it as guarded would let a later drain write 0 into a branchless table.
+  // A 0D table initializes to the MissFn pointer itself; a [D]^NumDims table
+  // splats it into every element, so element [0][0]...[0] carries it either
+  // way. Zero-init tables (3D/4D, timing) yield null.
+  auto missFnOf = [](const IcacheSlotInfo &Info) -> Constant * {
+    Constant *Elem = Info.GV->getInitializer();
+    while (Elem && Elem->getType()->isArrayTy())
+      Elem = Elem->getAggregateElement(0u);
+    return (Elem && !Elem->isNullValue()) ? Elem : nullptr;
+  };
 
   Function *AutoReg = M.getFunction(FN_AUTO_REGISTER);
   bool CreatedAutoReg = false;
@@ -468,8 +508,12 @@ emitIcacheSlotRegistration(Module &M,
   for (auto &KV : Fns) {
     IRBuilder<> Builder(Ret);
     Value *Name = Builder.CreateGlobalString(KV.first);
+    Constant *MissFnArg = missFnOf(KV.second);
+    if (!MissFnArg)
+      MissFnArg = ConstantPointerNull::get(PtrTy);
     Builder.CreateCall(FnReg, {Name, Builder.CreateBitCast(KV.second.GV, PtrTy),
-                               ConstantInt::get(I32Ty, KV.second.NumDims)});
+                               ConstantInt::get(I32Ty, KV.second.NumDims),
+                               MissFnArg});
   }
 
   if (EnableEJitGlobalCtors && CreatedAutoReg)
@@ -477,7 +521,8 @@ emitIcacheSlotRegistration(Module &M,
 
   // Static registry entries for bare-metal / testing fallback (same linker-
   // concatenated .ejit_period model as funcindex above). The `size` (i64) field
-  // carries NumDims; the ejit_init walker forwards it to ejitIcacheRegisterSlot.
+  // carries NumDims and the spare name2 ptr carries the sentinel MissFn; the
+  // ejit_init walker forwards both to ejitIcacheRegisterSlot.
   StructType *EntryTy = StructType::get(
       Ctx, {I32Ty, PtrTy, PtrTy, PtrTy, I64Ty}, /*isPacked=*/false);
   auto makeStrGV = [&](const std::string &S) -> Constant * {
@@ -489,9 +534,14 @@ emitIcacheSlotRegistration(Module &M,
   };
   SmallVector<Constant *, 16> Entries;
   for (auto &KV : Fns) {
+    // name2 (unused by icache entries until now) carries the sentinel MissFn
+    // pointer; null for guarded slots.
+    Constant *MissFnConst = missFnOf(KV.second);
+    if (!MissFnConst)
+      MissFnConst = ConstantPointerNull::get(PtrTy);
     Entries.push_back(ConstantStruct::get(
         EntryTy, {ConstantInt::get(I32Ty, EJIT_REG_ICACHE_SLOT),
-                  makeStrGV(KV.first), ConstantPointerNull::get(PtrTy),
+                  makeStrGV(KV.first), MissFnConst,
                   ConstantExpr::getBitCast(KV.second.GV, PtrTy),
                   ConstantInt::get(I64Ty, KV.second.NumDims)}));
   }
@@ -641,7 +691,9 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       Info.NumDims = NumDims;
       IcacheFnGlobals.emplace(F->getName().str(), Info);
     }
-    emitIcacheSlotRegistration(M, IcacheFnGlobals);
+    // The slot registration is emitted AFTER the wrap loop below: it now
+    // carries &MissFn for sentinel-form slots, and MissFn is created inside
+    // that loop.
   }
 
   LLVM_DEBUG(dbgs() << "ejit-wrapper-gen: " << EntryFuncs.size()
@@ -1086,11 +1138,13 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       if (!HasMustTailAotExit)
         instrumentAotBody(MissFallback, MissWrapperBegin);
 
-      // Wrapper (F): frame-less probe + tail calls.
+      // Wrapper (F): frame-less probe + tail calls. Sentinel-form tables
+      // (NumDims <= 2, timing off) are defined pre-filled with &MissFn, so
+      // their wrapper is ONE block - probe + musttail BLR, no guard; the
+      // dispatch/miss blocks below exist only for the guarded shapes.
       auto *JitEntry = BasicBlock::Create(Ctx, "jit_entry", F);
-      auto *JitIcacheDispatch =
-          BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
-      auto *JitMiss = BasicBlock::Create(Ctx, "jit_miss", F);
+      BasicBlock *JitIcacheDispatch = nullptr;
+      BasicBlock *JitMiss = nullptr;
       IRBuilder<> B(JitEntry);
       Value *WrapperBegin = nullptr;
       if (EJitFunctionBodyTiming)
@@ -1105,6 +1159,19 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       }
       GlobalVariable *IcacheSlot = IcacheIt->second.GV;
       unsigned NumDims = IcacheIt->second.NumDims;
+      // The sentinel initializer is a [D]^NumDims splat of &MissFn: at D=16
+      // that is 1/16/256 relocations for 0/1/2 dims, but 4096 and 65536 for
+      // 3 and 4 - so 3D/4D keep the zero-init table and the null guard.
+      // Function-body timing is also excluded: it threads an extra wrapper-
+      // begin argument into MissFn (changing its signature away from F's) and
+      // emits trace calls around the specialization call, neither of which
+      // survives a single-block musttail BLR.
+      const bool Sentinelize = !EJitWrapperTiming && !EJitFunctionBodyTiming &&
+                               NumDims <= 2;
+      if (!Sentinelize) {
+        JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
+        JitMiss = BasicBlock::Create(Ctx, "jit_miss", F);
+      }
       Value *SlotPtr = IcacheSlot;
       if (NumDims > 0) {
         SmallVector<Value *, 5> Indices;
@@ -1125,88 +1192,112 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       LoadInst *ICSlotLoad = B.CreateLoad(PtrTy, SlotPtr, "ejit_ic_fn");
       ICSlotLoad->setAlignment(Align(8));
       // Monotonic, nothing stronger: the cell is shared, so a peer's drain can
-      // store 0 concurrently and the atomic makes that a defined race (old
-      // pointer or 0) instead of UB. The value is self-contained and the call
-      // below carries a data dependency on it, so acquire would buy nothing and
-      // cost an LDAR per hit. Lowers to the same LDR on AArch64.
+      // store the drain value (the &MissFn sentinel for sentinel-form tables,
+      // 0 for guarded ones) concurrently and the atomic makes that a defined
+      // race (old pointer or drain value) instead of UB. The value is
+      // self-contained and the call below carries a data dependency on it, so
+      // acquire would buy nothing and cost an LDAR per hit. Lowers to the same
+      // LDR on AArch64.
       ICSlotLoad->setAtomic(AtomicOrdering::Monotonic);
       Value *TAfterIcache = nullptr;
       if (EJitWrapperTiming)
         TAfterIcache = B.CreateCall(TraceNow, {}, "ejit_t_after_icache");
-      Value *IHit = B.CreateIsNotNull(ICSlotLoad, "ejit_icache_hit");
-      IHit = B.CreateIntrinsic(Intrinsic::expect, {IHit->getType()},
-                               {IHit, ConstantInt::getTrue(Ctx)});
-      B.CreateCondBr(IHit, JitIcacheDispatch, JitMiss);
-
-      // Hit: tail-call the cached specialization directly (no release_read).
-      // With -ejit-wrapper-timing the wrapper is NOT frame-less (JitEntry emits
-      // bl @ejit_taskpool_trace_now), so the hit path cannot be a musttail tail
-      // call: emitHitTiming() inserts calls BETWEEN the call and the ret, which
-      // would violate the musttail rule ("musttail call must precede a ret")
-      // and yield broken IR -> codegen silently drops the function -> boot
-      // translation fault. Use a plain (framed) call + trace + ret instead; the
-      // frame-less musttail fast path is reserved for the no-timing case.
-      B.SetInsertPoint(JitIcacheDispatch);
-      SmallVector<Value *, 8> ICArgs;
-      for (auto &A : F->args())
-        ICArgs.push_back(&A);
-      Value *BodyBegin = nullptr;
-      if (EJitFunctionBodyTiming)
-        BodyBegin = B.CreateCall(TraceNow, {}, "ejit_jit_body_begin");
-      auto emitHitTiming = [&]() {
-        Value *BodyEnd = nullptr;
-        if (EJitFunctionBodyTiming)
-          BodyEnd = B.CreateCall(TraceNow, {}, "ejit_jit_body_end");
-        Value *WrapperEnd = nullptr;
-        if (EJitFunctionBodyTiming)
-          WrapperEnd = B.CreateCall(TraceNow, {}, "ejit_wrapper_end");
-        if (EJitWrapperTiming) {
-          Value *TAfterFn =
-              BodyEnd ? BodyEnd : B.CreateCall(TraceNow, {}, "ejit_t_after_fn");
-          B.CreateCall(TraceWrapper,
-                       {FuncIdxForTiming,
-                        ConstantInt::get(I32Ty, kEJitIcacheHitTimingStatus),
-                        ICSlotLoad, ConstantInt::get(I32Ty, 0), TBeforeIcache,
-                        TAfterIcache, TAfterFn, TAfterFn});
-        }
-        if (EJitFunctionBodyTiming) {
-          emitFunctionBodyRecord(B, kEJitFunctionBodyPathJIT, WrapperBegin,
-                                 BodyBegin, BodyEnd, WrapperEnd);
-        }
-      };
-      if (F->getReturnType()->isVoidTy()) {
+      if (Sentinelize) {
+        // Definition-time sentinel: every cell of the table is DEFINED as
+        // &MissFn, so the loaded value is always a callable pointer - the
+        // specialization on a hit, MissFn itself before the first fill, after
+        // a drain, or before registration has run (whose funcidx guard then
+        // falls to the AOT body, exactly like the guarded form). The wrapper
+        // is the probe plus one musttail BLR - no guard, no branch. The
+        // registration derives the sentinel from this initializer, so no
+        // per-slot bookkeeping is needed here.
+        IcacheSlot->setInitializer(buildIcacheSentinelInit(
+            IcacheSlot->getValueType(), MissFn, NumDims));
+        SmallVector<Value *, 8> ICArgs;
+        for (auto &A : F->args())
+          ICArgs.push_back(&A);
         CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
-        if (!EJitWrapperTiming && !EJitFunctionBodyTiming)
-          CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
-        emitHitTiming();
-        B.CreateRetVoid();
+        CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
+        if (F->getReturnType()->isVoidTy())
+          B.CreateRetVoid();
+        else
+          B.CreateRet(CI);
       } else {
-        CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
-        if (!EJitWrapperTiming && !EJitFunctionBodyTiming)
-          CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
-        emitHitTiming();
-        B.CreateRet(CI);
+        Value *IHit = B.CreateIsNotNull(ICSlotLoad, "ejit_icache_hit");
+        IHit = B.CreateIntrinsic(Intrinsic::expect, {IHit->getType()},
+                                 {IHit, ConstantInt::getTrue(Ctx)});
+        B.CreateCondBr(IHit, JitIcacheDispatch, JitMiss);
+
+        // Hit: tail-call the cached specialization directly (no release_read).
+        // With -ejit-wrapper-timing the wrapper is NOT frame-less (JitEntry emits
+        // bl @ejit_taskpool_trace_now), so the hit path cannot be a musttail tail
+        // call: emitHitTiming() inserts calls BETWEEN the call and the ret, which
+        // would violate the musttail rule ("musttail call must precede a ret")
+        // and yield broken IR -> codegen silently drops the function -> boot
+        // translation fault. Use a plain (framed) call + trace + ret instead; the
+        // frame-less musttail fast path is reserved for the no-timing case.
+        B.SetInsertPoint(JitIcacheDispatch);
+        SmallVector<Value *, 8> ICArgs;
+        for (auto &A : F->args())
+          ICArgs.push_back(&A);
+        Value *BodyBegin = nullptr;
+        if (EJitFunctionBodyTiming)
+          BodyBegin = B.CreateCall(TraceNow, {}, "ejit_jit_body_begin");
+        auto emitHitTiming = [&]() {
+          Value *BodyEnd = nullptr;
+          if (EJitFunctionBodyTiming)
+            BodyEnd = B.CreateCall(TraceNow, {}, "ejit_jit_body_end");
+          Value *WrapperEnd = nullptr;
+          if (EJitFunctionBodyTiming)
+            WrapperEnd = B.CreateCall(TraceNow, {}, "ejit_wrapper_end");
+          if (EJitWrapperTiming) {
+            Value *TAfterFn =
+                BodyEnd ? BodyEnd : B.CreateCall(TraceNow, {}, "ejit_t_after_fn");
+            B.CreateCall(TraceWrapper,
+                         {FuncIdxForTiming,
+                          ConstantInt::get(I32Ty, kEJitIcacheHitTimingStatus),
+                          ICSlotLoad, ConstantInt::get(I32Ty, 0), TBeforeIcache,
+                          TAfterIcache, TAfterFn, TAfterFn});
+          }
+          if (EJitFunctionBodyTiming) {
+            emitFunctionBodyRecord(B, kEJitFunctionBodyPathJIT, WrapperBegin,
+                                   BodyBegin, BodyEnd, WrapperEnd);
+          }
+        };
+        if (F->getReturnType()->isVoidTy()) {
+          CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
+          if (!EJitWrapperTiming && !EJitFunctionBodyTiming)
+            CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
+          emitHitTiming();
+          B.CreateRetVoid();
+        } else {
+          CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
+          if (!EJitWrapperTiming && !EJitFunctionBodyTiming)
+            CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
+          emitHitTiming();
+          B.CreateRet(CI);
+        }
+
+        // Miss: tail-call MissFn (which does compile_or_get + dispatch/fallback).
+        B.SetInsertPoint(JitMiss);
+        SmallVector<Value *, 8> MissArgs;
+        for (auto &A : F->args())
+          MissArgs.push_back(&A);
+        if (ThreadWrapperBegin)
+          MissArgs.push_back(WrapperBegin);
+        if (F->getReturnType()->isVoidTy()) {
+          CallInst *CI =
+              B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
+          if (!EJitFunctionBodyTiming)
+            CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
+          B.CreateRetVoid();
+        } else {
+          CallInst *CI =
+              B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
+          if (!EJitFunctionBodyTiming)
+            CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
+          B.CreateRet(CI);
       }
-
-      // Miss: tail-call MissFn (which does compile_or_get + dispatch/fallback).
-      B.SetInsertPoint(JitMiss);
-      SmallVector<Value *, 8> MissArgs;
-      for (auto &A : F->args())
-        MissArgs.push_back(&A);
-      if (ThreadWrapperBegin)
-        MissArgs.push_back(WrapperBegin);
-      if (F->getReturnType()->isVoidTy()) {
-        CallInst *CI =
-            B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
-        if (!EJitFunctionBodyTiming)
-          CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
-        B.CreateRetVoid();
-      } else {
-        CallInst *CI =
-            B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
-        if (!EJitFunctionBodyTiming)
-          CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
-        B.CreateRet(CI);
       }
 
       // Cluster all frame-less dispatchers into a dedicated section so they
@@ -1237,6 +1328,10 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
     Changed = true;
   }
+
+  // Icache-slot registration, emitted after wrapping so sentinel-form slots
+  // can carry their MissFn pointer (no-ops when the map is empty).
+  emitIcacheSlotRegistration(M, IcacheFnGlobals);
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

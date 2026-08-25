@@ -195,8 +195,9 @@ constexpr uint64_t kHashMul = 0x9e3779b97f4a7c15ULL;
 // ejit_dim arg values + one load + null-check + indirect call) with NO
 // ejit_icache_try call and NO per-call guards. icacheFill writes the
 // specialization pointer through the cell at [i0][i1]... (linearized from dims)
-// on a successful resolve; icacheDrainAll zeroes them on a period toggle;
-// icacheTry (test/diagnostic only) reads them.
+// on a successful resolve; icacheDrainAll writes every cell back to its empty
+// value on a period toggle (the &MissFn sentinel for sentinel-form tables, 0
+// for guarded ones); icacheTry (test/diagnostic only) reads them.
 //
 // The REGISTRY is core-private (default BSS); the CELLS it points at are not.
 // With EJIT_ICACHE_SECTION set @__ejit_icache_fn_<name> is one shared object,
@@ -212,6 +213,12 @@ constexpr uint64_t kHashMul = 0x9e3779b97f4a7c15ULL;
 struct EJitIcacheSlotReg {
   uintptr_t *base;
   uint32_t numDims;
+  // Non-null for SENTINEL-form slots: the wrapper's cell table is defined
+  // pre-filled with this MissFn pointer and the probe BLRs the cell without a
+  // null guard, so every value ever stored into a cell must be callable.
+  // icacheDrainAll and icacheFill's retract write this back instead of 0.
+  // Null for guarded slots (3D/4D, timing): their empty value stays 0.
+  const void *missFn;
 };
 EJitIcacheSlotReg gIcacheSlots[EJIT_ICACHE_FUNC_SLOTS];
 
@@ -265,9 +272,8 @@ static uintptr_t icacheLinearize(const EJitDimPair *dims, uint32_t numDims) {
 
 } // namespace
 
-EJitIcacheRegResult llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex,
-                                                       void *base,
-                                                       uint32_t numDims) {
+EJitIcacheRegResult llvm::ejit::ejitIcacheRegisterSlot(
+    uint32_t funcIndex, void *base, uint32_t numDims, const void *missFn) {
   if (!base)
     return EJitIcacheRegResult::Invalid;
   // numDims sizes the array the drain walks, so an out-of-cap value writes far
@@ -281,6 +287,27 @@ EJitIcacheRegResult llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex,
     return EJitIcacheRegResult::CapacityMiss;
   gIcacheSlots[funcIndex].base = reinterpret_cast<uintptr_t *>(base);
   gIcacheSlots[funcIndex].numDims = numDims;
+  gIcacheSlots[funcIndex].missFn = missFn;
+  // Sentinel deployment check: a branchless probe BLRs whatever its cell
+  // holds, so a table whose definition-time &MissFn initializer never made it
+  // into the placed image -- a linker script that maps the shared section
+  // NOLOAD/zero instead of carrying its initialized data -- crashes on the
+  // function's first call, and nothing downstream can catch that. Compare
+  // cell[0] (the scalar, or [0]...[0] of the splat) against the registered
+  // sentinel and say it loudly here, where the mis-deployment is still
+  // attributable. Bounded output: once per function per core.
+  if (missFn && icacheCell(reinterpret_cast<uintptr_t *>(base), 0)
+                       .loadRelaxed() !=
+                   reinterpret_cast<uintptr_t>(missFn)) {
+    EJIT_DIAG("icache slot %u: sentinel-form cell[0]=%p != &MissFn=%p -- the "
+              "image did not place the table's initializer (shared section "
+              "mapped NOLOAD/zero?); the branchless wrapper will crash on "
+              "the first call to this function",
+              funcIndex,
+              (void *)icacheCell(reinterpret_cast<uintptr_t *>(base), 0)
+                  .loadRelaxed(),
+              missFn);
+  }
   return EJitIcacheRegResult::Ok;
 }
 
@@ -295,6 +322,7 @@ void llvm::ejit::ejitIcacheClearAll() {
   for (uint32_t f = 0; f < EJIT_ICACHE_FUNC_SLOTS; ++f) {
     gIcacheSlots[f].base = nullptr;
     gIcacheSlots[f].numDims = 0;
+    gIcacheSlots[f].missFn = nullptr;
   }
 }
 
@@ -310,9 +338,11 @@ void llvm::ejit::ejitDumpIcacheSlots(const EJitModuleLoader *loader) {
     registered++;
     // For multi-dim arrays, cell[0] is the [0]...[0] element; for 0-dim,
     // it is the scalar cell. Either way it tells us whether the first
-    // identity has been resolved yet.
+    // identity has been resolved yet. A sentinel-form table's empty value is
+    // &MissFn, so "filled" must exclude it explicitly.
+    const uintptr_t empty = reinterpret_cast<uintptr_t>(reg.missFn);
     const uintptr_t c0 = icacheCell(reg.base, 0).loadRelaxed();
-    if (c0)
+    if (c0 != 0 && c0 != empty)
       filled++;
     // The slot index IS the funcIndex (a static_assert above guarantees
     // EJIT_ICACHE_FUNC_SLOTS >= EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX), so a
@@ -325,10 +355,11 @@ void llvm::ejit::ejitDumpIcacheSlots(const EJitModuleLoader *loader) {
       name = s.empty() ? "<unknown>" : s.c_str();
     }
     (void)name; // consumed by EJIT_DIAG_RAW only; silence DIAG-off builds
+    const char *state =
+        c0 == 0 ? "(empty)" : c0 == empty ? "(sentinel)" : "(filled)";
     EJIT_DIAG_RAW("  [%2u] %.24s base=%p numDims=%u cells=%u cell[0]=%p %s",
                   f, name, (void *)reg.base, reg.numDims,
-                  (unsigned)icacheCellCount(reg.numDims), (void *)c0,
-                  c0 ? "(filled)" : "(empty)");
+                  (unsigned)icacheCellCount(reg.numDims), (void *)c0, state);
     ejitDiagPrintThrottle();
   }
   EJIT_DIAG_RAW("=== icache slots: %u registered, %u with cell[0] filled ===",
@@ -381,16 +412,20 @@ void EJitSharedTaskPool::icacheDrainAll(const char *reason) {
       continue;
     if (reg.numDims > EJIT_ICACHE_MAX_DIMS)
       continue; // defence in depth: never walk past a mis-sized array
+    // Sentinel-form slots drain to &MissFn (their branchless probe BLRs the
+    // cell unconditionally, so 0 would be a crash, not a miss); guarded slots
+    // keep the historical 0.
+    const uintptr_t empty = reinterpret_cast<uintptr_t>(reg.missFn);
     const uintptr_t cells = icacheCellCount(reg.numDims);
 #ifdef EJIT_DIAG_ENABLE
     ++walkedSlots;
 #endif
     for (uintptr_t c = 0; c < cells; ++c) {
 #ifdef EJIT_DIAG_ENABLE
-      if (icacheCell(reg.base, c).loadRelaxed() != 0)
+      if (icacheCell(reg.base, c).loadRelaxed() != empty)
         ++clearedCells;
 #endif
-      icacheCell(reg.base, c).storeRelaxed(0);
+      icacheCell(reg.base, c).storeRelaxed(empty);
     }
   }
   // Only after a real walk: a skip cleared nothing, and clearing the flag it
@@ -547,10 +582,11 @@ bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
   // Read this identity's cell. Relaxed is enough, and is what the AOT probe
   // emits: the cell holds a self-contained pointer, the caller's indirect call
   // depends on the value loaded (data dependency), and the only cross-core
-  // write is a drain storing 0 -- which yields a miss, never a bad pointer.
+  // write is a drain storing the slot's empty value -- which yields a miss
+  // (the sentinel IS MissFn), never a bad pointer.
   uintptr_t idx = icacheLinearize(dims, numDims);
   uintptr_t p = icacheCell(reg.base, idx).loadRelaxed();
-  if (p == 0)
+  if (p == 0 || p == reinterpret_cast<uintptr_t>(reg.missFn))
     return false;
   *outFn = reinterpret_cast<void *>(p);
   return true;
@@ -769,22 +805,32 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   const uintptr_t idx = icacheLinearize(dims, numDims);
   EJitAtomicUPtr &cell = icacheCell(reg.base, idx);
   cell.storeRelaxed(reinterpret_cast<uintptr_t>(fnPtr));
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  // Test seam: the window between the store and the re-validation below is
+  // exactly where a preempting peer core's drain lands in production. A hook
+  // lets a single-threaded test fire a drain there deterministically and reach
+  // the retract, which the pre-store checks otherwise decline.
+  if (icacheFillMidpointHook_)
+    icacheFillMidpointHook_(icacheFillMidpointCtx_);
+#endif
 
   // Re-validate AFTER the store and retract on conflict. The checks above only
-  // PRECEDE the store: a drain can begin after they pass, zero this cell, and
+  // PRECEDE the store: a drain can begin after they pass, empty this cell, and
   // finish before the store lands, stranding a pre-toggle specialization that
   // nothing clears again -- and a preempted filler makes that gap unbounded.
   // If a drain overlapped, it has either bumped the sequence or is still in
-  // flight, and both are visible here. Writing 0 discards only this core's own
-  // fill (disjointness), and a null cell is always safe.
+  // flight, and both are visible here. Writing the slot's empty value (the
+  // &MissFn sentinel for sentinel-form tables, 0 for guarded ones) discards
+  // only this core's own fill (disjointness), and an empty cell is always
+  // safe: the sentinel is callable, and 0 is guarded.
   if (state_->icacheDrainsInFlight.loadAcquire() != 0 ||
       static_cast<uint32_t>(token) != state_->icacheDrainSeq.loadAcquire()) {
-    cell.storeRelaxed(0);
+    cell.storeRelaxed(reinterpret_cast<uintptr_t>(reg.missFn));
     if (!gIcacheFillRejectLogged[kFillRejectRetracted]) {
       gIcacheFillRejectLogged[kFillRejectRetracted] = true;
       EJIT_DIAG("icacheFill RETRACT func=%u: a drain began after the fill was "
-                "cleared to proceed; cell reset to 0",
-                funcIndex);
+                "cleared to proceed; cell reset to its empty value (%p)",
+                funcIndex, reg.missFn);
     }
     return;
   }

@@ -26,6 +26,12 @@
 ; above the threshold: preopt inlines it away, the extraction skips it, and
 ; the AOT side still registers it (harmless dead entry, by design).
 ;
+; NOTE: the EXT/HI assertions assume preOptimizeBitcode actually RUNS: it is
+; #ifdef NDEBUG-guarded (cyclic link dependency in debug/shared builds), so
+; a debug opt is a no-op there - no inlining, no tail markers - and this
+; test fails. Run the EJIT lit suite with a release/NDEBUG opt (see
+; CLAUDE.md's note on debug builds skipping optimizations).
+;
 ; NOTE: the pass mutates only its extraction clone; the -S output (MOD) is
 ; the ORIGINAL module plus the embedded bitcode, the ejit_auto_register
 ; calls, and the .ejit_bitcode registry section.

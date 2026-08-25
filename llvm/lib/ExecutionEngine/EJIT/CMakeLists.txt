@@ -81,11 +81,18 @@ endif()
 # Build target component list from LLVM_TARGETS_TO_BUILD.
 # Each target needs CodeGen, Desc, and Info for native target initialization.
 # AsmPrinter init lives in CodeGen, so no separate AsmPrinter component needed.
+# AsmParser is needed for AArch64 (EJit.cpp's trimmed AArch64 path calls it)
+# and for X86 (the untrimmed fallback calls InitializeAllAsmParsers(), which
+# references every built target's AsmParser - without the component, any host
+# binary linking LLVMEJIT on an X86 build fails to link).
 set(EJIT_TARGET_COMPONENTS "")
 foreach(_t ${LLVM_TARGETS_TO_BUILD})
   list(APPEND EJIT_TARGET_COMPONENTS ${_t}CodeGen ${_t}Desc ${_t}Info)
   if(_t STREQUAL "AArch64")
     list(APPEND EJIT_TARGET_COMPONENTS AArch64AsmParser)
+  endif()
+  if(_t STREQUAL "X86")
+    list(APPEND EJIT_TARGET_COMPONENTS X86AsmParser)
   endif()
 endforeach()
 

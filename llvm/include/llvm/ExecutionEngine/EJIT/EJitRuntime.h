@@ -173,18 +173,21 @@ void ejit_register_funcindex(const char *funcName, uint32_t *slotOut);
 
 // Register the wrapper's per-function inline-cache cell table
 // (@__ejit_icache_fn_<name> global address) by name, with its dimensionality
-// (number of ejit_dim params). The runtime writes the specialization pointer
+// (number of ejit_dim params) and, for sentinel-form slots, the MissFn pointer
+// the table is pre-filled with. The runtime writes the specialization pointer
 // through the [D]^numDims cell at [i0][i1]... on a successful resolve
-// (icacheFill) and zeroes every cell on a period toggle (icacheDrainAll); the
-// wrapper reads the cell directly on the hit path (GEP + one load + null-check
-// + indirect call, no ejit_icache_try call). Keys the slot by the SAME registry
-// funcIndex assigned by ejit_register_funcindex. Called by AOT auto-registration
-// on EVERY core: the table is one shared object, so each core records the same
-// base and a drain on any of them clears the cells all of them read. A null
-// slot, capacity exhaustion, or a numDims above the cap is recorded; the base
-// stays null and the probe misses.
+// (icacheFill) and writes every cell back to its empty value on a period
+// toggle (icacheDrainAll) -- the &MissFn sentinel when \p missFn is non-null
+// (the branchless probe BLRs the cell, so the empty value must be callable),
+// 0 otherwise. Keys the slot by the SAME registry funcIndex assigned by
+// ejit_register_funcindex. Called by AOT auto-registration on EVERY core: the
+// table is one shared object, so each core records the same base and a drain
+// on any of them clears the cells all of them read. A null slot, capacity
+// exhaustion, or a numDims above the cap is recorded; the base stays null and
+// the probe misses. \p missFn has no default: this header is shared with pure
+// C translation units (default arguments are C++-only).
 void ejit_register_icache_slot(const char *funcName, void *slot,
-                               uint32_t numDims);
+                               uint32_t numDims, void *missFn);
 
 // Lifecycle. Activation is keyed by lifecycle/period name + instance index
 // only; there is no array-pointer dimension in the active state (a period name
