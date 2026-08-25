@@ -14,6 +14,7 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
 #include <vector>
@@ -40,9 +41,11 @@ class EJitStructFieldPass : public PassInfoMixin<EJitStructFieldPass> {
 public:
   EJitStructFieldPass(PeriodArrayRegistry &reg,
                       const uint8_t *boundData = nullptr,
-                      uint32_t boundSize = 0, uint32_t boundArgIndex = 0)
+                      uint32_t boundSize = 0, uint32_t boundArgIndex = 0,
+                      StringRef boundRootFunction = {})
       : registry_(reg), boundData_(boundData), boundSize_(boundSize),
-        boundArgIndex_(boundArgIndex) {}
+        boundArgIndex_(boundArgIndex),
+        boundRootFunction_(boundRootFunction.str()) {}
 
   /// Pre-build GV metadata maps from the Module (call once before run()).
   void initFromModule(Module &M);
@@ -72,6 +75,14 @@ private:
   const uint8_t *boundData_ = nullptr;
   uint32_t boundSize_ = 0;
   uint32_t boundArgIndex_ = 0;
+  std::string boundRootFunction_;
+
+  // A specialization owns one pointee snapshot. Track which formal arguments
+  // are proven to receive that snapshot, and their byte offset into it, across
+  // direct calls from the entry. Ambiguous or indirect flows are omitted.
+  DenseMap<const Argument *, uint64_t> boundArguments_;
+  SmallVector<std::pair<uint64_t, uint64_t>, 4> boundMayConstFields_;
+  void initBoundArgumentPropagation(Module &M);
 
   // Cached metadata maps — built once per module, reused across functions.
   GVPeriodMap gvPeriodMap_;

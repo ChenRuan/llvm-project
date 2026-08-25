@@ -43,6 +43,7 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
+#include <algorithm>
 #ifndef EJIT_FREESTANDING
 #include <thread>
 #endif
@@ -1712,6 +1713,108 @@ TEST(EJitStructFieldPass, BoundPointerUsesOwnedSnapshot) {
   }
   EXPECT_EQ(Loads, 1u) << "dynamic field must remain a runtime load";
   EXPECT_TRUE(SawSnapshotConstant);
+}
+
+TEST(EJitStructFieldPass, BoundPointerPropagatesThroughDirectHelpers) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    %Cfg = type { i32, i32 }
+    define i32 @bound_chain(i32 %cell, ptr %cfg) !ejit.metadata !0 {
+    entry:
+      %result = call i32 @bound_helper1(i64 123, ptr %cfg)
+      ret i32 %result
+    }
+    define internal i32 @bound_helper1(i64 %unused, ptr %cfg) noinline {
+    entry:
+      %mode.ptr = getelementptr %Cfg, ptr %cfg, i32 0, i32 1
+      %result = call i32 @bound_helper2(ptr %mode.ptr)
+      ret i32 %result
+    }
+    define internal i32 @bound_helper2(ptr %mode.ptr) noinline {
+    entry:
+      %mode = load i32, ptr %mode.ptr, !ejit.may_const !4
+      ret i32 %mode
+    }
+    !0 = distinct !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, !5}
+    !4 = !{!"ejit"}
+    !5 = !{i64 4, i64 4}
+  )",
+                               Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+
+  struct Config {
+    uint32_t dynamic;
+    uint32_t mode;
+  } Snapshot{99, 17};
+  PeriodArrayRegistry Registry;
+  EJitStructFieldPass Pass(Registry,
+                           reinterpret_cast<const uint8_t *>(&Snapshot),
+                           sizeof(Snapshot), 1, "bound_chain");
+  Pass.initFromModule(*M);
+  FunctionAnalysisManager FAM;
+  for (Function &F : *M)
+    if (!F.isDeclaration())
+      Pass.run(F, FAM);
+
+  Function *Leaf = M->getFunction("bound_helper2");
+  ASSERT_NE(Leaf, nullptr);
+  EXPECT_EQ(std::count_if(inst_begin(Leaf), inst_end(Leaf),
+                          [](Instruction &I) { return isa<LoadInst>(I); }),
+            0);
+  auto *Ret = dyn_cast<ReturnInst>(Leaf->getEntryBlock().getTerminator());
+  ASSERT_NE(Ret, nullptr);
+  auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(Value, nullptr);
+  EXPECT_EQ(Value->getZExtValue(), 17u);
+}
+
+TEST(EJitStructFieldPass, AmbiguousHelperPointerIsNotSpecialized) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    %Cfg = type { i32 }
+    define i32 @bound_ambiguous(i32 %cell, ptr %cfg, ptr %other)
+        !ejit.metadata !0 {
+    entry:
+      %a = call i32 @shared_helper(ptr %cfg)
+      %b = call i32 @shared_helper(ptr %other)
+      %sum = add i32 %a, %b
+      ret i32 %sum
+    }
+    define internal i32 @shared_helper(ptr %cfg) noinline {
+    entry:
+      %value = load i32, ptr %cfg, !ejit.may_const !4
+      ret i32 %value
+    }
+    !0 = distinct !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
+    !4 = !{!"ejit"}
+    !5 = !{i64 0, i64 4}
+  )",
+                               Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+
+  uint32_t Snapshot = 23;
+  PeriodArrayRegistry Registry;
+  EJitStructFieldPass Pass(Registry,
+                           reinterpret_cast<const uint8_t *>(&Snapshot),
+                           sizeof(Snapshot), 1, "bound_ambiguous");
+  Pass.initFromModule(*M);
+  FunctionAnalysisManager FAM;
+  Pass.run(*M->getFunction("shared_helper"), FAM);
+
+  EXPECT_EQ(std::count_if(inst_begin(M->getFunction("shared_helper")),
+                          inst_end(M->getFunction("shared_helper")),
+                          [](Instruction &I) { return isa<LoadInst>(I); }),
+            1);
 }
 
 //===----------------------------------------------------------------------===//
