@@ -744,6 +744,18 @@ TEST(EJit, TaskpoolRegistrationFrozenAfterConstruction) {
 
 extern "C" {
 typedef enum { EJIT_OK_C = 0 } ejit_status_test_t;
+typedef struct {
+  uint64_t count;
+  uint64_t total;
+  uint64_t min;
+  uint64_t max;
+  uint64_t wrapper_total;
+  uint64_t wrapper_min;
+  uint64_t wrapper_max;
+  uint64_t overhead_total;
+  uint64_t overhead_min;
+  uint64_t overhead_max;
+} ejit_function_body_cycles_test_t;
 extern ejit_status_test_t ejit_init(const void *config);
 extern void ejit_shutdown(void);
 extern ejit_status_test_t ejit_activate(const char *, uint32_t);
@@ -767,7 +779,16 @@ extern int ejit_get_code_pool_stats(void *out);
 extern void ejit_print_code_pool_stats(void);
 extern void ejit_print_active(void);
 extern void ejit_print_version(void);
+extern void ejit_function_body_cycles_record(const char *, uint32_t, uint64_t,
+                                             uint64_t, uint64_t, uint64_t);
+extern unsigned
+ejit_function_body_cycles_get(const char *, uint32_t,
+                              ejit_function_body_cycles_test_t *);
+extern void ejit_function_body_cycles_reset(void);
 }
+
+static constexpr uint32_t kEjitFunctionBodyAot = 0;
+static constexpr uint32_t kEjitFunctionBodyJit = 1;
 
 // The "runtime-dynamic cellIdx" C-API tests below exercise the LEGACY model:
 // dynamic period-array registration AFTER ejit_init, then period-name activate.
@@ -915,6 +936,52 @@ TEST(EJitCApi, ActivationCycleWithRuntimeIndex) {
 //===----------------------------------------------------------------------===//
 
 namespace {
+
+TEST(EJitFunctionBodyCyclesTest, AggregatesAotAndJitIndependently) {
+  ejit_function_body_cycles_reset();
+
+  ejit_function_body_cycles_record("body_cost", kEjitFunctionBodyAot, 90, 100,
+                                   130, 140);
+  ejit_function_body_cycles_record("body_cost", kEjitFunctionBodyAot, 180, 200,
+                                   250, 270);
+  ejit_function_body_cycles_record("body_cost", kEjitFunctionBodyJit, 290, 300,
+                                   311, 321);
+
+  ejit_function_body_cycles_test_t Aot{};
+  ASSERT_EQ(
+      ejit_function_body_cycles_get("body_cost", kEjitFunctionBodyAot, &Aot),
+      1u);
+  EXPECT_EQ(Aot.count, 2u);
+  EXPECT_EQ(Aot.total, 80u);
+  EXPECT_EQ(Aot.min, 30u);
+  EXPECT_EQ(Aot.max, 50u);
+  EXPECT_EQ(Aot.wrapper_total, 140u);
+  EXPECT_EQ(Aot.wrapper_min, 50u);
+  EXPECT_EQ(Aot.wrapper_max, 90u);
+  EXPECT_EQ(Aot.overhead_total, 60u);
+  EXPECT_EQ(Aot.overhead_min, 20u);
+  EXPECT_EQ(Aot.overhead_max, 40u);
+
+  ejit_function_body_cycles_test_t Jit{};
+  ASSERT_EQ(
+      ejit_function_body_cycles_get("body_cost", kEjitFunctionBodyJit, &Jit),
+      1u);
+  EXPECT_EQ(Jit.count, 1u);
+  EXPECT_EQ(Jit.total, 11u);
+  EXPECT_EQ(Jit.min, 11u);
+  EXPECT_EQ(Jit.max, 11u);
+  EXPECT_EQ(Jit.wrapper_total, 31u);
+  EXPECT_EQ(Jit.wrapper_min, 31u);
+  EXPECT_EQ(Jit.wrapper_max, 31u);
+  EXPECT_EQ(Jit.overhead_total, 20u);
+  EXPECT_EQ(Jit.overhead_min, 20u);
+  EXPECT_EQ(Jit.overhead_max, 20u);
+
+  ejit_function_body_cycles_reset();
+  EXPECT_EQ(
+      ejit_function_body_cycles_get("body_cost", kEjitFunctionBodyAot, &Aot),
+      0u);
+}
 // Reset process-global registration state so each taskpool test starts clean:
 // no live gEJIT, no staged data, no staged error, empty name registries. This
 // is essential because the C ABI / registries are process singletons that leak

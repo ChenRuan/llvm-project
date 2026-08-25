@@ -114,6 +114,10 @@ constexpr const char *FN_TASKPOOL_RELEASE_READ = "ejit_taskpool_release_read";
 constexpr const char *FN_TASKPOOL_TRACE_NOW = "ejit_taskpool_trace_now";
 constexpr const char *FN_TASKPOOL_TRACE_WRAPPER =
     "ejit_taskpool_trace_wrapper";
+constexpr const char *FN_FUNCTION_BODY_CYCLES_RECORD =
+    "ejit_function_body_cycles_record";
+constexpr uint32_t kEJitFunctionBodyPathAOT = 0u;
+constexpr uint32_t kEJitFunctionBodyPathJIT = 1u;
 // Wrapper-timing sentinel status passed to ejit_taskpool_trace_wrapper for
 // icache-hit samples so they aggregate as their own report line (get_fn_avg =
 // probe cost, release_avg = 0), separate from the slow-path compile_or_get
