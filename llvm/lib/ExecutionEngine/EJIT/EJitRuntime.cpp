@@ -208,6 +208,12 @@ struct FunctionBodyTimingSlot {
   uint64_t Total = 0;
   uint64_t Min = UINT64_MAX;
   uint64_t Max = 0;
+  uint64_t WrapperTotal = 0;
+  uint64_t WrapperMin = UINT64_MAX;
+  uint64_t WrapperMax = 0;
+  uint64_t OverheadTotal = 0;
+  uint64_t OverheadMin = UINT64_MAX;
+  uint64_t OverheadMax = 0;
 };
 
 static TimingSpinLock gFunctionBodyTimingLock;
@@ -1342,11 +1348,17 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
 }
 
 void ejit_function_body_cycles_record(const char *funcName, uint32_t path,
-                                      uint64_t begin, uint64_t end) {
+                                      uint64_t wrapperBegin, uint64_t bodyBegin,
+                                      uint64_t bodyEnd, uint64_t wrapperEnd) {
   if (!funcName || !*funcName || path > kEJitFunctionBodyPathJIT)
     return;
 
-  const uint64_t Cycles = end - begin;
+  const uint64_t BodyCycles = bodyEnd - bodyBegin;
+  const uint64_t WrapperCycles = wrapperEnd - wrapperBegin;
+  // Use the two non-body intervals instead of subtracting aggregate values so
+  // counter wraparound remains well-defined for each individual sample.
+  const uint64_t OverheadCycles =
+      (bodyBegin - wrapperBegin) + (wrapperEnd - bodyEnd);
   // Never spin in an instrumented function's return path. A nested/preempting
   // sample on the same core is diagnostic-only and is safer to drop than to
   // wait for a recorder that cannot run until the nested call returns.
@@ -1362,11 +1374,21 @@ void ejit_function_body_cycles_record(const char *funcName, uint32_t path,
     return;
   }
   ++S->Count;
-  S->Total += Cycles;
-  if (Cycles < S->Min)
-    S->Min = Cycles;
-  if (Cycles > S->Max)
-    S->Max = Cycles;
+  S->Total += BodyCycles;
+  if (BodyCycles < S->Min)
+    S->Min = BodyCycles;
+  if (BodyCycles > S->Max)
+    S->Max = BodyCycles;
+  S->WrapperTotal += WrapperCycles;
+  if (WrapperCycles < S->WrapperMin)
+    S->WrapperMin = WrapperCycles;
+  if (WrapperCycles > S->WrapperMax)
+    S->WrapperMax = WrapperCycles;
+  S->OverheadTotal += OverheadCycles;
+  if (OverheadCycles < S->OverheadMin)
+    S->OverheadMin = OverheadCycles;
+  if (OverheadCycles > S->OverheadMax)
+    S->OverheadMax = OverheadCycles;
   gFunctionBodyTimingLock.unlock();
 }
 
@@ -1386,6 +1408,12 @@ unsigned ejit_function_body_cycles_get(const char *funcName, uint32_t path,
   out->total = S->Total;
   out->min = S->Min;
   out->max = S->Max;
+  out->wrapper_total = S->WrapperTotal;
+  out->wrapper_min = S->WrapperMin;
+  out->wrapper_max = S->WrapperMax;
+  out->overhead_total = S->OverheadTotal;
+  out->overhead_min = S->OverheadMin;
+  out->overhead_max = S->OverheadMax;
   gFunctionBodyTimingLock.unlock();
   return 1;
 }
@@ -1404,14 +1432,25 @@ void ejit_function_body_cycles_print(void) {
   for (const FunctionBodyTimingSlot &S : gFunctionBodyTimingSlots) {
     if (!S.Valid || S.Count == 0)
       continue;
-    EJIT_DIAG_RAW("  func=%s path=%s count=%llu avg=%llu min=%llu max=%llu "
-                  "total=%llu",
+    EJIT_DIAG_RAW("  func=%s path=%s count=%llu body_avg=%llu body_min=%llu "
+                  "body_max=%llu body_total=%llu wrapper_avg=%llu "
+                  "wrapper_min=%llu wrapper_max=%llu wrapper_total=%llu "
+                  "overhead_avg=%llu overhead_min=%llu overhead_max=%llu "
+                  "overhead_total=%llu",
                   S.Name, S.Path == kEJitFunctionBodyPathAOT ? "AOT" : "JIT",
                   static_cast<unsigned long long>(S.Count),
                   static_cast<unsigned long long>(S.Total / S.Count),
                   static_cast<unsigned long long>(S.Min),
                   static_cast<unsigned long long>(S.Max),
-                  static_cast<unsigned long long>(S.Total));
+                  static_cast<unsigned long long>(S.Total),
+                  static_cast<unsigned long long>(S.WrapperTotal / S.Count),
+                  static_cast<unsigned long long>(S.WrapperMin),
+                  static_cast<unsigned long long>(S.WrapperMax),
+                  static_cast<unsigned long long>(S.WrapperTotal),
+                  static_cast<unsigned long long>(S.OverheadTotal / S.Count),
+                  static_cast<unsigned long long>(S.OverheadMin),
+                  static_cast<unsigned long long>(S.OverheadMax),
+                  static_cast<unsigned long long>(S.OverheadTotal));
     ejitDiagPrintThrottle();
   }
   gFunctionBodyTimingLock.unlock();

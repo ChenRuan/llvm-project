@@ -71,8 +71,8 @@ static cl::opt<bool> EJitWrapperTiming(
 
 static cl::opt<bool> EJitFunctionBodyTiming(
     "ejit-function-body-timing", cl::init(false), cl::Hidden,
-    cl::desc("Measure only the selected AOT/JIT function body using the SRE "
-             "cycle counter, excluding wrapper lookup and dispatch overhead"));
+    cl::desc("Measure the selected AOT/JIT function body and its enclosing "
+             "wrapper overhead using the SRE cycle counter"));
 
 // Emit a per-function inline-cache probe DIRECTLY in the ejit_entry wrapper
 // (not a call). On a hit the wrapper loads its cell out of the per-function
@@ -714,8 +714,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
                                        FunctionType::get(I64Ty, false));
     }
     if (EJitWrapperTiming) {
-      SmallVector<Type *, 8> TraceTys = {I32Ty, I32Ty, PtrTy, I32Ty, I64Ty,
-                                         I64Ty, I64Ty, I64Ty};
+      SmallVector<Type *, 8> TraceTys = {I32Ty, I32Ty, PtrTy, I32Ty,
+                                         I64Ty, I64Ty, I64Ty, I64Ty};
       TraceWrapper = M.getOrInsertFunction(
           FN_TASKPOOL_TRACE_WRAPPER,
           FunctionType::get(Type::getVoidTy(Ctx), TraceTys, false));
@@ -723,23 +723,25 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     if (EJitFunctionBodyTiming) {
       TraceFunctionBody = M.getOrInsertFunction(
           FN_FUNCTION_BODY_CYCLES_RECORD,
-          FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, I32Ty, I64Ty, I64Ty},
-                            false));
+          FunctionType::get(Type::getVoidTy(Ctx),
+                            {PtrTy, I32Ty, I64Ty, I64Ty, I64Ty, I64Ty}, false));
       IRBuilder<> NameBuilder(Ctx);
       FunctionName = NameBuilder.CreateGlobalString(
           F->getName(), ".ejit.function_body_name", 0, &M);
     }
 
     auto emitFunctionBodyRecord = [&](IRBuilder<> &B, uint32_t Path,
-                                      Value *Begin) {
+                                      Value *WrapperBegin, Value *BodyBegin,
+                                      Value *BodyEnd, Value *WrapperEnd) {
       if (!EJitFunctionBodyTiming)
         return;
-      Value *End = B.CreateCall(TraceNow, {}, "ejit_body_end");
       B.CreateCall(TraceFunctionBody,
-                   {FunctionName, ConstantInt::get(I32Ty, Path), Begin, End});
+                   {FunctionName, ConstantInt::get(I32Ty, Path), WrapperBegin,
+                    BodyBegin, BodyEnd, WrapperEnd});
     };
 
-    auto instrumentAotBody = [&](BasicBlock *FallbackEntry) {
+    auto instrumentAotBody = [&](BasicBlock *FallbackEntry,
+                                 Value *WrapperBegin) {
       if (!EJitFunctionBodyTiming)
         return;
 
@@ -772,7 +774,12 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
           StartBuilder.CreateCall(TraceNow, {}, "ejit_aot_body_begin");
       for (ReturnInst *RI : TimedReturns) {
         IRBuilder<> EndBuilder(RI);
-        emitFunctionBodyRecord(EndBuilder, kEJitFunctionBodyPathAOT, Begin);
+        Value *BodyEnd =
+            EndBuilder.CreateCall(TraceNow, {}, "ejit_aot_body_end");
+        Value *WrapperEnd =
+            EndBuilder.CreateCall(TraceNow, {}, "ejit_wrapper_end");
+        emitFunctionBodyRecord(EndBuilder, kEJitFunctionBodyPathAOT,
+                               WrapperBegin, Begin, BodyEnd, WrapperEnd);
       }
     };
 
@@ -782,22 +789,28 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     // icache-off (in F) and icache-on (in MissFn).
     auto emitSlowPath = [&](Function &Fn, BasicBlock *EntryBB,
                             BasicBlock *CallBB, BasicBlock *DispatchBB,
-                            BasicBlock *FallbackBB) {
+                            BasicBlock *FallbackBB,
+                            Value *WrapperBegin) -> Value * {
       IRBuilder<> B(EntryBB);
       // Allocas live in the entry block so they dominate the call/dispatch
       // blocks (and match the original layout: allocas precede the funcidx
       // guard).
-      Value *DimsAlloca = UseFixed ? nullptr
-                                   : B.CreateAlloca(ArrayType::get(DimPairTy, 4),
-                                                    nullptr, "ejit_dims");
+      Value *DimsAlloca = UseFixed
+                              ? nullptr
+                              : B.CreateAlloca(ArrayType::get(DimPairTy, 4),
+                                               nullptr, "ejit_dims");
       Value *OutFnAlloca = B.CreateAlloca(PtrTy, nullptr, "ejit_out_fn");
-      Value *OutBucketAlloca = B.CreateAlloca(I32Ty, nullptr, "ejit_out_bucket");
+      Value *OutBucketAlloca =
+          B.CreateAlloca(I32Ty, nullptr, "ejit_out_bucket");
       Value *OutFnArg = B.CreatePointerCast(OutFnAlloca, PtrTy);
       Value *OutBucketArg = B.CreatePointerCast(OutBucketAlloca, PtrTy);
-      Value *FuncIdx = B.CreateLoad(
-          I32Ty, FuncIndexGlobals[F->getName().str()], "ejit_funcidx");
+      if (EJitFunctionBodyTiming && !WrapperBegin)
+        WrapperBegin = B.CreateCall(TraceNow, {}, "ejit_wrapper_begin");
+      Value *FuncIdx = B.CreateLoad(I32Ty, FuncIndexGlobals[F->getName().str()],
+                                    "ejit_funcidx");
       Value *IdxValid = B.CreateICmpNE(
-          FuncIdx, ConstantInt::get(I32Ty, kEJitInvalidFuncIndex), "ejit_idx_ok");
+          FuncIdx, ConstantInt::get(I32Ty, kEJitInvalidFuncIndex),
+          "ejit_idx_ok");
       B.CreateCondBr(IdxValid, CallBB, FallbackBB);
 
       B.SetInsertPoint(CallBB);
@@ -808,8 +821,10 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       auto emitInstanceVal = [&](unsigned I) -> Value * {
         Value *ArgVal = Fn.getArg(PeriodInds[I].ArgIndex);
         unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
-        if (BW > 32) return B.CreateTrunc(ArgVal, I32Ty);
-        if (BW < 32) return B.CreateZExt(ArgVal, I32Ty);
+        if (BW > 32)
+          return B.CreateTrunc(ArgVal, I32Ty);
+        if (BW < 32)
+          return B.CreateZExt(ArgVal, I32Ty);
         return ArgVal;
       };
       Value *TBeforeLookup = nullptr, *TAfterLookup = nullptr;
@@ -840,20 +855,23 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         Status = B.CreateCall(FixedFn, Args);
       } else {
         for (unsigned I = 0; I < DimCount; ++I) {
-          Value *Idxs[] = {ConstantInt::get(I32Ty, 0), ConstantInt::get(I32Ty, I)};
+          Value *Idxs[] = {ConstantInt::get(I32Ty, 0),
+                           ConstantInt::get(I32Ty, I)};
           Value *PairPtr = B.CreateInBoundsGEP(ArrayType::get(DimPairTy, 4),
                                                DimsAlloca, Idxs);
-          B.CreateStore(emitDimTypeVal(I), B.CreateStructGEP(DimPairTy, PairPtr,
-                                                              0, "dim_type_ptr"));
-          B.CreateStore(emitInstanceVal(I),
-                        B.CreateStructGEP(DimPairTy, PairPtr, 1, "instance_ptr"));
+          B.CreateStore(
+              emitDimTypeVal(I),
+              B.CreateStructGEP(DimPairTy, PairPtr, 0, "dim_type_ptr"));
+          B.CreateStore(
+              emitInstanceVal(I),
+              B.CreateStructGEP(DimPairTy, PairPtr, 1, "instance_ptr"));
         }
         Value *DimsPtr = DimCount > 0 ? B.CreatePointerCast(DimsAlloca, PtrTy)
                                       : ConstantPointerNull::get(PtrTy);
-        Status = B.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET),
-                              {FuncIdx, DimsPtr,
-                               ConstantInt::get(I32Ty, DimCount), OutFnArg,
-                               OutBucketArg});
+        Status =
+            B.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET),
+                         {FuncIdx, DimsPtr, ConstantInt::get(I32Ty, DimCount),
+                          OutFnArg, OutBucketArg});
       }
       if (EJitWrapperTiming)
         TAfterLookup = B.CreateCall(TraceNow, {}, "ejit_t_after_lookup");
@@ -864,24 +882,37 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
       B.SetInsertPoint(DispatchBB);
       SmallVector<Value *, 8> Args;
-      for (auto &A : Fn.args())
-        Args.push_back(&A);
+      for (unsigned I = 0; I < F->arg_size(); ++I)
+        Args.push_back(Fn.getArg(I));
       Value *BodyBegin = nullptr;
       if (EJitFunctionBodyTiming)
         BodyBegin = B.CreateCall(TraceNow, {}, "ejit_jit_body_begin");
       auto releaseAndTrace = [&]() {
-        emitFunctionBodyRecord(B, kEJitFunctionBodyPathJIT, BodyBegin);
+        Value *BodyEnd = nullptr;
+        if (EJitFunctionBodyTiming)
+          BodyEnd = B.CreateCall(TraceNow, {}, "ejit_jit_body_end");
+        Value *TAfterFn = nullptr;
         if (EJitWrapperTiming) {
-          Value *TAfterFn = B.CreateCall(TraceNow, {}, "ejit_t_after_fn");
+          TAfterFn =
+              BodyEnd ? BodyEnd : B.CreateCall(TraceNow, {}, "ejit_t_after_fn");
           Value *Bucket = B.CreateLoad(I32Ty, OutBucketAlloca);
           B.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ), {Bucket});
-          Value *TAfterRelease = B.CreateCall(TraceNow, {}, "ejit_t_after_release");
-          B.CreateCall(TraceWrapper, {FuncIdx, Status, OutFn, Bucket,
-                                      TBeforeLookup, TAfterLookup, TAfterFn,
-                                      TAfterRelease});
+          Value *TAfterRelease =
+              B.CreateCall(TraceNow, {}, "ejit_t_after_release");
+          B.CreateCall(TraceWrapper,
+                       {FuncIdx, Status, OutFn, Bucket, TBeforeLookup,
+                        TAfterLookup, TAfterFn, TAfterRelease});
+          if (EJitFunctionBodyTiming)
+            emitFunctionBodyRecord(B, kEJitFunctionBodyPathJIT, WrapperBegin,
+                                   BodyBegin, BodyEnd, TAfterRelease);
         } else {
           Value *Bucket = B.CreateLoad(I32Ty, OutBucketAlloca);
           B.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ), {Bucket});
+          if (EJitFunctionBodyTiming) {
+            Value *WrapperEnd = B.CreateCall(TraceNow, {}, "ejit_wrapper_end");
+            emitFunctionBodyRecord(B, kEJitFunctionBodyPathJIT, WrapperBegin,
+                                   BodyBegin, BodyEnd, WrapperEnd);
+          }
         }
       };
       if (F->getReturnType()->isVoidTy()) {
@@ -893,6 +924,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         releaseAndTrace();
         B.CreateRet(RetVal);
       }
+      return WrapperBegin;
     };
 
     // Helper: splice the original body into Dst, fixing PHI/uses, then erase
@@ -910,17 +942,24 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // MissFn on miss) -- no allocas, no calls, no frame. MissFn holds the
       // funcidx guard + compile_or_get + dispatch + the AOT fallback (original
       // body), with its own frame. Miss is rare, so the call overhead is fine.
-      Function *MissFn = Function::Create(F->getFunctionType(),
-                                          GlobalValue::InternalLinkage,
-                                          F->getName() + "_miss", &M);
-      // Function::Create only inherits module-default uwtable/frame-pointer from
-      // the context, NOT F's target-cpu/target-features/tune-cpu. Without those,
-      // TTI::areInlineCompatible(Caller=MissFn, Callee=helper) fails the subtarget
-      // feature-bit superset check, so InlinerPass rejects every cost-based
-      // inlining into MissFn with "conflicting attributes" (always_inline still
-      // inlines via the InlineCost.cpp AlwaysInline short-circuit). The AOT
-      // fallback body then loses ~all helper inlining vs the original function.
-      // Copy F's attributes so MissFn matches F's subtarget; re-affirm NoInline.
+      FunctionType *MissFnTy = F->getFunctionType();
+      if (EJitFunctionBodyTiming) {
+        SmallVector<Type *, 8> MissParamTys(F->getFunctionType()->params());
+        MissParamTys.push_back(I64Ty);
+        MissFnTy =
+            FunctionType::get(F->getReturnType(), MissParamTys, F->isVarArg());
+      }
+      Function *MissFn = Function::Create(
+          MissFnTy, GlobalValue::InternalLinkage, F->getName() + "_miss", &M);
+      // Function::Create only inherits module-default uwtable/frame-pointer
+      // from the context, NOT F's target-cpu/target-features/tune-cpu. Without
+      // those, TTI::areInlineCompatible(Caller=MissFn, Callee=helper) fails the
+      // subtarget feature-bit superset check, so InlinerPass rejects every
+      // cost-based inlining into MissFn with "conflicting attributes"
+      // (always_inline still inlines via the InlineCost.cpp AlwaysInline
+      // short-circuit). The AOT fallback body then loses ~all helper inlining
+      // vs the original function. Copy F's attributes so MissFn matches F's
+      // subtarget; re-affirm NoInline.
       MissFn->setAttributes(F->getAttributes());
       MissFn->addFnAttr(Attribute::NoInline);
       if (EJitMissFnCold)
@@ -948,8 +987,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
       // Create the slow-path entry (funcidx guard) BEFORE MissFallback so it
       // becomes MissFn's entry block.
-      auto *MissEntry = BasicBlock::Create(Ctx, "miss_entry", MissFn,
-                                            MissFallback);
+      auto *MissEntry =
+          BasicBlock::Create(Ctx, "miss_entry", MissFn, MissFallback);
       auto *MissCall = BasicBlock::Create(Ctx, "miss_call", MissFn);
       auto *MissDispatch = BasicBlock::Create(Ctx, "miss_dispatch", MissFn);
       if (!MissFallback->getTerminator()) {
@@ -959,20 +998,28 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         else
           B.CreateRet(PoisonValue::get(F->getReturnType()));
       }
-      emitSlowPath(*MissFn, MissEntry, MissCall, MissDispatch, MissFallback);
-      instrumentAotBody(MissFallback);
+      Value *MissWrapperBegin =
+          EJitFunctionBodyTiming ? MissFn->getArg(F->arg_size()) : nullptr;
+      emitSlowPath(*MissFn, MissEntry, MissCall, MissDispatch, MissFallback,
+                   MissWrapperBegin);
+      instrumentAotBody(MissFallback, MissWrapperBegin);
 
       // Wrapper (F): frame-less probe + tail calls.
       auto *JitEntry = BasicBlock::Create(Ctx, "jit_entry", F);
-      auto *JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
+      auto *JitIcacheDispatch =
+          BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
       auto *JitMiss = BasicBlock::Create(Ctx, "jit_miss", F);
       IRBuilder<> B(JitEntry);
+      Value *WrapperBegin = nullptr;
+      if (EJitFunctionBodyTiming)
+        WrapperBegin = B.CreateCall(TraceNow, {}, "ejit_wrapper_begin");
       Value *TBeforeIcache = nullptr, *FuncIdxForTiming = nullptr;
       if (EJitWrapperTiming) {
-        TBeforeIcache = B.CreateCall(TraceNow, {}, "ejit_t_before_icache");
-        FuncIdxForTiming = B.CreateLoad(I32Ty,
-                                        FuncIndexGlobals[F->getName().str()],
-                                        "ejit_funcidx_t");
+        TBeforeIcache =
+            WrapperBegin ? WrapperBegin
+                         : B.CreateCall(TraceNow, {}, "ejit_t_before_icache");
+        FuncIdxForTiming = B.CreateLoad(
+            I32Ty, FuncIndexGlobals[F->getName().str()], "ejit_funcidx_t");
       }
       GlobalVariable *IcacheSlot = IcacheIt->second.GV;
       unsigned NumDims = IcacheIt->second.NumDims;
@@ -984,8 +1031,10 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
           Value *ArgVal = F->getArg(PeriodInds[I].ArgIndex);
           unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
           Value *Idx = ArgVal;
-          if (BW > 32) Idx = B.CreateTrunc(ArgVal, I32Ty);
-          else if (BW < 32) Idx = B.CreateZExt(ArgVal, I32Ty);
+          if (BW > 32)
+            Idx = B.CreateTrunc(ArgVal, I32Ty);
+          else if (BW < 32)
+            Idx = B.CreateZExt(ArgVal, I32Ty);
           Indices.push_back(Idx);
         }
         SlotPtr = B.CreateInBoundsGEP(IcacheSlot->getValueType(), IcacheSlot,
@@ -1011,26 +1060,37 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // With -ejit-wrapper-timing the wrapper is NOT frame-less (JitEntry emits
       // bl @ejit_taskpool_trace_now), so the hit path cannot be a musttail tail
       // call: emitHitTiming() inserts calls BETWEEN the call and the ret, which
-      // would violate the musttail rule ("musttail call must precede a ret") and
-      // yield broken IR -> codegen silently drops the function -> boot
+      // would violate the musttail rule ("musttail call must precede a ret")
+      // and yield broken IR -> codegen silently drops the function -> boot
       // translation fault. Use a plain (framed) call + trace + ret instead; the
       // frame-less musttail fast path is reserved for the no-timing case.
       B.SetInsertPoint(JitIcacheDispatch);
       SmallVector<Value *, 8> ICArgs;
-      for (auto &A : F->args()) ICArgs.push_back(&A);
+      for (auto &A : F->args())
+        ICArgs.push_back(&A);
       Value *BodyBegin = nullptr;
       if (EJitFunctionBodyTiming)
         BodyBegin = B.CreateCall(TraceNow, {}, "ejit_jit_body_begin");
       auto emitHitTiming = [&]() {
-        emitFunctionBodyRecord(B, kEJitFunctionBodyPathJIT, BodyBegin);
-        if (!EJitWrapperTiming)
-          return;
-        Value *TAfterFn = B.CreateCall(TraceNow, {}, "ejit_t_after_fn");
-        B.CreateCall(TraceWrapper,
-                     {FuncIdxForTiming,
-                      ConstantInt::get(I32Ty, kEJitIcacheHitTimingStatus),
-                      ICSlotLoad, ConstantInt::get(I32Ty, 0), TBeforeIcache,
-                      TAfterIcache, TAfterFn, TAfterFn});
+        Value *BodyEnd = nullptr;
+        if (EJitFunctionBodyTiming)
+          BodyEnd = B.CreateCall(TraceNow, {}, "ejit_jit_body_end");
+        Value *WrapperEnd = nullptr;
+        if (EJitFunctionBodyTiming)
+          WrapperEnd = B.CreateCall(TraceNow, {}, "ejit_wrapper_end");
+        if (EJitWrapperTiming) {
+          Value *TAfterFn =
+              BodyEnd ? BodyEnd : B.CreateCall(TraceNow, {}, "ejit_t_after_fn");
+          B.CreateCall(TraceWrapper,
+                       {FuncIdxForTiming,
+                        ConstantInt::get(I32Ty, kEJitIcacheHitTimingStatus),
+                        ICSlotLoad, ConstantInt::get(I32Ty, 0), TBeforeIcache,
+                        TAfterIcache, TAfterFn, TAfterFn});
+        }
+        if (EJitFunctionBodyTiming) {
+          emitFunctionBodyRecord(B, kEJitFunctionBodyPathJIT, WrapperBegin,
+                                 BodyBegin, BodyEnd, WrapperEnd);
+        }
       };
       if (F->getReturnType()->isVoidTy()) {
         CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
@@ -1049,14 +1109,21 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // Miss: tail-call MissFn (which does compile_or_get + dispatch/fallback).
       B.SetInsertPoint(JitMiss);
       SmallVector<Value *, 8> MissArgs;
-      for (auto &A : F->args()) MissArgs.push_back(&A);
+      for (auto &A : F->args())
+        MissArgs.push_back(&A);
+      if (EJitFunctionBodyTiming)
+        MissArgs.push_back(WrapperBegin);
       if (F->getReturnType()->isVoidTy()) {
-        CallInst *CI = B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
-        CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
+        CallInst *CI =
+            B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
+        if (!EJitFunctionBodyTiming)
+          CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
         B.CreateRetVoid();
       } else {
-        CallInst *CI = B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
-        CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
+        CallInst *CI =
+            B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
+        if (!EJitFunctionBodyTiming)
+          CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
         B.CreateRet(CI);
       }
 
@@ -1076,11 +1143,14 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       spliceOriginalBody(JitFallback);
       if (!JitFallback->getTerminator()) {
         IRBuilder<> B(JitFallback);
-        if (F->getReturnType()->isVoidTy()) B.CreateRetVoid();
-        else B.CreateRet(PoisonValue::get(F->getReturnType()));
+        if (F->getReturnType()->isVoidTy())
+          B.CreateRetVoid();
+        else
+          B.CreateRet(PoisonValue::get(F->getReturnType()));
       }
-      emitSlowPath(*F, JitEntry, JitCall, JitDispatch, JitFallback);
-      instrumentAotBody(JitFallback);
+      Value *WrapperBegin = emitSlowPath(*F, JitEntry, JitCall, JitDispatch,
+                                         JitFallback, nullptr);
+      instrumentAotBody(JitFallback, WrapperBegin);
     }
 
     Changed = true;
