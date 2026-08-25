@@ -64,6 +64,9 @@ struct EJitMayConstBenefitSummary {
   int64_t maximumRemoved = 0;
   uint64_t runtimeHits = 0;
   uint64_t hitSites = 0;
+  /// Average dynamically-reached may_const sites per unique JIT version,
+  /// scaled by 1000 so freestanding diagnostics need no floating point.
+  uint64_t averageActiveSitesPermille = 0;
 };
 
 /// Summarize the branch weights attached by PGOInstrumentationUse. This is a

@@ -152,8 +152,8 @@ public:
   ArrayRef<EJitMayConstLoadSite> getLastMayConstLoadSites() const;
 #endif
 
-  /// Print the completed per-entry may_const benefit samples, sorted by the
-  /// average number of loads removed per specialization.
+  /// Print completed per-entry may_const benefit samples, sorted by average
+  /// runtime-active sites per specialization.
   bool printMayConstRanking() const;
 
   /// Register a user-defined external symbol (function or global) that the

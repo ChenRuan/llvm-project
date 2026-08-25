@@ -500,26 +500,35 @@ bool EJitOptimizer::printMayConstRanking() const {
     return false;
   }
   llvm::sort(Rows, [](const RankingRow &L, const RankingRow &R) {
-    if (L.summary.averageRemoved != R.summary.averageRemoved)
-      return L.summary.averageRemoved > R.summary.averageRemoved;
+    if (L.summary.averageActiveSitesPermille !=
+        R.summary.averageActiveSitesPermille)
+      return L.summary.averageActiveSitesPermille >
+             R.summary.averageActiveSitesPermille;
     if (L.summary.runtimeHits != R.summary.runtimeHits)
       return L.summary.runtimeHits > R.summary.runtimeHits;
+    if (L.summary.averageRemoved != R.summary.averageRemoved)
+      return L.summary.averageRemoved > R.summary.averageRemoved;
     return L.entry < R.entry;
   });
 
-  EJIT_DIAG_RAW("mayconst-ranking entries=%u sort=avg_removed_desc",
+  EJIT_DIAG_RAW("mayconst-ranking entries=%u sort=avg_active_sites_desc",
                 static_cast<unsigned>(Rows.size()));
   for (size_t I = 0; I < Rows.size(); ++I) {
     const RankingRow &Row = Rows[I];
+    const uint64_t AvgActiveSites =
+        Row.summary.averageActiveSitesPermille;
     EJIT_DIAG_RAW(
-        "rank=%u entry=%s versions=%llu avg_removed=%lld total_removed=%lld "
-        "runtime_hits=%llu hit_sites=%llu min=%lld max=%lld",
+        "rank=%u entry=%s versions=%llu avg_active_sites=%llu.%03llu "
+        "hit_sites=%llu runtime_hits=%llu avg_removed=%lld "
+        "total_removed=%lld min=%lld max=%lld",
         static_cast<unsigned>(I + 1), Row.entry.c_str(),
         static_cast<unsigned long long>(Row.summary.versions),
+        static_cast<unsigned long long>(AvgActiveSites / 1000),
+        static_cast<unsigned long long>(AvgActiveSites % 1000),
+        static_cast<unsigned long long>(Row.summary.hitSites),
+        static_cast<unsigned long long>(Row.summary.runtimeHits),
         static_cast<long long>(Row.summary.averageRemoved),
         static_cast<long long>(Row.summary.totalRemoved),
-        static_cast<unsigned long long>(Row.summary.runtimeHits),
-        static_cast<unsigned long long>(Row.summary.hitSites),
         static_cast<long long>(Row.summary.minimumRemoved),
         static_cast<long long>(Row.summary.maximumRemoved));
     ejitDiagPrintThrottle();

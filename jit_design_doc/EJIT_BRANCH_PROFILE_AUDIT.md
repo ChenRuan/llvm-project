@@ -92,21 +92,25 @@ ejit_print_mayconst_ranking();
 The call is read-only and does not start profiling or compilation. In a shared
 taskpool build, a non-owner core posts a diagnostic request and waits while the
 owner worker prints its local optimizer data. It prints one row per entry,
-ordered by the average number of may-const loads removed across that entry's
-unique JIT cache keys:
+ordered by the average number of runtime-active may-const sites across that
+entry's unique JIT cache keys:
 
 ```text
-[EJIT] mayconst-ranking entries=2 sort=avg_removed_desc
-[EJIT] rank=1 entry=FuncA versions=30 avg_removed=40 total_removed=1200 \
-  runtime_hits=99872 hit_sites=510 min=36 max=42
+[EJIT] mayconst-ranking entries=2 sort=avg_active_sites_desc
+[EJIT] rank=1 entry=FuncA versions=30 avg_active_sites=17.000 \
+  hit_sites=510 runtime_hits=99872 avg_removed=40 total_removed=1200 \
+  min=36 max=42
 ```
 
+`avg_active_sites` is `hit_sites / versions` and is the primary ranking key;
+three decimal places are printed using integer fixed-point arithmetic.
 `runtime_hits` is the sum of dynamic T0 executions of recognized may-const
 load sites; `hit_sites` is the sum of sites that executed at least once in each
-sampled version. An entry appears only after at least one specialization has
-completed its audit window and final compilation. The aggregation state stays
-local to the compile-owner worker; only a request/completion sequence and a
-boolean result cross shared memory.
+sampled version. Entries tied on `avg_active_sites` are ordered by
+`runtime_hits`, then `avg_removed`, then name. An entry appears only after at
+least one specialization has completed its audit window and final compilation.
+The aggregation state stays local to the compile-owner worker; only a
+request/completion sequence and a boolean result cross shared memory.
 
 ## Coverage boundary
 

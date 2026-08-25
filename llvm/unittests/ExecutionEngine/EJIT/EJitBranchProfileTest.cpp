@@ -86,7 +86,7 @@ TEST(EJitBranchProfile, AggregatesMayConstSpecializations) {
   const EJitMayConstBenefitSample Samples[] = {
       {1, 100, 70, 40, 1000, 10},
       {2, 120, 90, 50, 2000, 20},
-      {3, 80, 75, 85, 3000, 30}};
+      {3, 80, 75, 85, 3000, 31}};
   EJitMayConstBenefitSummary Summary = summarizeMayConstBenefits(Samples);
   EXPECT_EQ(Summary.versions, 3u);
   EXPECT_EQ(Summary.inputMayConstLoads, 300u);
@@ -100,7 +100,8 @@ TEST(EJitBranchProfile, AggregatesMayConstSpecializations) {
   EXPECT_EQ(Summary.minimumRemoved, -5);
   EXPECT_EQ(Summary.maximumRemoved, 70);
   EXPECT_EQ(Summary.runtimeHits, 6000u);
-  EXPECT_EQ(Summary.hitSites, 60u);
+  EXPECT_EQ(Summary.hitSites, 61u);
+  EXPECT_EQ(Summary.averageActiveSitesPermille, 20333u);
 }
 
 } // namespace

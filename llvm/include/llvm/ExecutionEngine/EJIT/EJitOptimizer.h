@@ -95,7 +95,8 @@ public:
     scalarSiteCountsByFunc_[funcName] = count;
   }
 
-  /// Print a descending per-entry ranking of average may_const load removal.
+  /// Print a descending per-entry ranking of average runtime-active may_const
+  /// sites per unique JIT version.
   /// Returns false when no completed specialization sample is available.
   bool printMayConstRanking() const;
 

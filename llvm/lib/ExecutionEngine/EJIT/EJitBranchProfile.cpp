@@ -60,6 +60,9 @@ EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
       static_cast<int64_t>(Summary.finalMayConstLoads);
   Summary.averageRemoved =
       Summary.totalRemoved / static_cast<int64_t>(Summary.versions);
+  Summary.averageActiveSitesPermille =
+      (Summary.hitSites / Summary.versions) * 1000 +
+      ((Summary.hitSites % Summary.versions) * 1000) / Summary.versions;
   if (Summary.inputMayConstLoads != 0)
     Summary.weightedRemovedPermille =
         Summary.totalRemoved * 1000 /
