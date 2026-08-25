@@ -684,7 +684,8 @@ void EJitOptimizer::runStructFieldPass(Module &M,
                                        const SpecializationContext &ctx) {
   EJitStructFieldPass structField(
       registry_, ctx.boundData.empty() ? nullptr : ctx.boundData.data(),
-      static_cast<uint32_t>(ctx.boundData.size()), ctx.boundArgIndex);
+      static_cast<uint32_t>(ctx.boundData.size()), ctx.boundArgIndex,
+      ctx.fnName);
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration())
