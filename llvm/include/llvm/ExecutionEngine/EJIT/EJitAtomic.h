@@ -53,9 +53,20 @@ public:
   EJitAtomic() = default;
   explicit EJitAtomic(T init) : value_(init) {}
 
-  // Atomic cells are not copyable/movable: they identify a fixed memory slot.
+  // Atomic cells are not copyable: they identify a fixed memory slot. They ARE
+  // movable: the move copies the value non-atomically, which is safe ONLY under
+  // exclusive access (EJIT moves cache entries during vector reallocation under
+  // the bucket write lock, with readers drained). The value is preserved; the
+  // "fixed slot" address identity is not, which is fine for value-only uses
+  // like hit counters. Fixed-slot uses (shared slots/counters, fixed arrays)
+  // never move.
   EJitAtomic(const EJitAtomic &) = delete;
   EJitAtomic &operator=(const EJitAtomic &) = delete;
+  EJitAtomic(EJitAtomic &&O) : value_(O.value_) {}
+  EJitAtomic &operator=(EJitAtomic &&O) {
+    value_ = O.value_;
+    return *this;
+  }
 
   /// Acquire load — pairs with storeRelease() to publish dependent writes.
   T loadAcquire() const { return __atomic_load_n(&value_, __ATOMIC_ACQUIRE); }
@@ -69,6 +80,9 @@ public:
   /// Relaxed store — no ordering.
   void storeRelaxed(T v) { __atomic_store_n(&value_, v, __ATOMIC_RELAXED); }
 
+  /// Atomic exchange, returning the previous value (acq_rel).
+  T exchange(T v) { return __atomic_exchange_n(&value_, v, __ATOMIC_ACQ_REL); }
+
   /// Strong compare-exchange. On success the cell becomes \p desired and the
   /// call returns true (acq_rel). On failure \p expected is updated with the
   /// observed value and the call returns false (acquire).
@@ -80,6 +94,14 @@ public:
 
   /// Atomic add, returning the previous value (acq_rel).
   T fetchAdd(T v) { return __atomic_fetch_add(&value_, v, __ATOMIC_ACQ_REL); }
+
+  /// Atomic add, returning the previous value (relaxed). Used by per-core
+  /// value-profiling shard cells whose line is written by ONE core only, so
+  /// the RMW resolves entirely in that core's private L1 without barriers and
+  /// without coherence traffic (EJIT_VALUE_PROFILE.md §3.2).
+  T fetchAddRelaxed(T v) {
+    return __atomic_fetch_add(&value_, v, __ATOMIC_RELAXED);
+  }
 
   /// Atomic subtract, returning the previous value (acq_rel).
   T fetchSub(T v) { return __atomic_fetch_sub(&value_, v, __ATOMIC_ACQ_REL); }

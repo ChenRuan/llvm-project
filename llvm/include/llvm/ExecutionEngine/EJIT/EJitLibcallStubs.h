@@ -23,6 +23,14 @@
 #define LLVM_EXECUTIONENGINE_EJIT_EJITLIBCALLSTUBS_H
 
 #include "llvm/ADT/ArrayRef.h"
+#include <cstdint>
+
+/// ABI emitted by InstrProfilingLoweringPass for indirect-call value sites.
+/// EJIT provides a weak no-op because this edge-only PGO implementation does
+/// not collect target values, but the declaration must match compiler-rt.
+extern "C" void __llvm_profile_instrument_target(uint64_t TargetValue,
+                                                  void *Data,
+                                                  uint32_t CounterIndex);
 
 namespace llvm {
 namespace ejit {
@@ -35,11 +43,16 @@ struct LibcallSymbol {
 /// Returns the codegen-synthesized runtime symbols the JIT must resolve but
 /// the AOT pass cannot collect: memset/memcpy/memmove/memcmp (lowered from
 /// the llvm.mem* intrinsics) and __stack_chk_guard/__stack_chk_fail (emitted
-/// by -fstack-protector). No symbol is defined by the EJIT runtime: the mem*
-/// entries point at the freestanding-mandated C library functions and the
-/// stack-protector entries point at the target's existing
-/// __stack_chk_guard/__stack_chk_fail (provided by its pseudo-OS / compiler-rt
-/// runtime). The engine only forwards these addresses as absolute symbols.
+/// by -fstack-protector). Those symbols are not defined by the EJIT runtime:
+/// the mem* entries point at the freestanding-mandated C library functions
+/// and the stack-protector entries point at the target's existing
+/// __stack_chk_guard/__stack_chk_fail (provided by its pseudo-OS /
+/// compiler-rt runtime). A missing weak guard is omitted so JIT linking fails
+/// closed for stack-protected code rather than using a predictable canary.
+/// The one symbol defined by the EJIT runtime is
+/// __llvm_profile_instrument_target, the PGO value-profiling hook lowered
+/// from llvm.instrprof.value.profile (a weak no-op; see EJitLibcallStubs.cpp).
+/// The engine only forwards these addresses as absolute symbols.
 ArrayRef<LibcallSymbol> getLibcallSymbols();
 
 } // namespace ejit

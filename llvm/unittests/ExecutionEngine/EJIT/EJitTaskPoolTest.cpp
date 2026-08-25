@@ -73,6 +73,17 @@ struct MockCompiler {
   }
 };
 
+struct PublishObserver {
+  uint32_t calls = 0;
+  bool lastPublished = false;
+
+  static void notify(void *ctx, const EJitCompileRequest &, bool published) {
+    auto *self = static_cast<PublishObserver *>(ctx);
+    ++self->calls;
+    self->lastPublished = published;
+  }
+};
+
 /// Bounded busy-wait (no sleep) used by the real-worker tests.
 template <typename Pred> bool spinUntil(Pred P, uint64_t MaxIters = 200000000) {
   for (uint64_t i = 0; i < MaxIters; ++i) {
@@ -371,6 +382,56 @@ TEST(EJitCacheTest, PublishLookupHit) {
   EXPECT_EQ(R.fnPtr, reinterpret_cast<void *>(&DummyFn0));
   EXPECT_TRUE(R.hasReadToken);
   C.releaseRead(R.bucketIndex);
+}
+
+// PGO (EJIT_ONLINE_PGO.md §7.1): a Tier-2 publish carries tier in funcIndex's
+// top 2 bits (EJitSreQueue.h). publish must strip it for identity so the Tier-2
+// recompile overwrites the Tier-1 slot (same stripped funcIndex + dims), not
+// land in a separate slot.
+TEST(EJitCacheTest, PublishTier2StripsTierAndOverwritesTier1) {
+  EJitSwitchController S;
+  EJitTaskPoolCache C(S);
+  EJitDimPair D[1] = {{0, 1}};
+  uint32_t versions[1] = {0};
+
+  // Tier-1 publish (plain funcIndex 10).
+  EXPECT_EQ(C.publish(10, D, 1, versions, reinterpret_cast<void *>(&DummyFn0)),
+            EJitPublishStatus::Published);
+
+  // Tier-2 publish: funcIndex carries PGOUse in the top 2 bits. Without strip
+  // this would be a different identity; with strip it must overwrite Tier-1.
+  uint32_t tier2Func = encodeReqTier(10, kEJitTierPgoUse);
+  EXPECT_NE(tier2Func, 10u);
+  EXPECT_EQ(
+      C.publish(tier2Func, D, 1, versions, reinterpret_cast<void *>(&DummyFn1)),
+      EJitPublishStatus::Published);
+
+  // Lookup with the plain (stripped) funcIndex must see the Tier-2 fnPtr.
+  EJitCacheLookupResult R = C.lookup(10, D, 1);
+  EXPECT_EQ(R.fnPtr, reinterpret_cast<void *>(&DummyFn1));
+  C.releaseRead(R.bucketIndex);
+}
+
+// PGO (§6): each cache hit increments the entry's hitCount (the Tier-2 trigger
+// counter). Verified via the hitCountOf diagnostic accessor.
+TEST(EJitCacheTest, HitIncrementsHitCount) {
+  EJitSwitchController S;
+  EJitTaskPoolCache C(S);
+  // hitCount is only accumulated when a PGO Tier-2 threshold is armed (PGO off
+  // has zero atomic-RMW overhead). Set a high threshold so hits are counted but
+  // never cross into a Tier-2 arm.
+  C.setTier2Threshold(100);
+  EJitDimPair D[1] = {{0, 1}};
+  uint32_t versions[1] = {0};
+  EXPECT_EQ(C.publish(10, D, 1, versions, reinterpret_cast<void *>(&DummyFn0)),
+            EJitPublishStatus::Published);
+  EXPECT_EQ(C.hitCountOf(10, D, 1), 0u); // no hits yet
+  for (int i = 0; i < 3; ++i) {
+    EJitCacheLookupResult R = C.lookup(10, D, 1);
+    EXPECT_EQ(R.fnPtr, reinterpret_cast<void *>(&DummyFn0));
+    C.releaseRead(R.bucketIndex);
+  }
+  EXPECT_EQ(C.hitCountOf(10, D, 1), 3u); // 3 hits counted
 }
 
 TEST(EJitCacheTest, LookupMissUnknownKey) {
@@ -902,6 +963,85 @@ TEST(EJitTaskPoolTest, OrderingInstanceCheckedBeforeCache) {
   EXPECT_FALSE(r.hasReadToken);
 }
 
+// PGO (§6): a cache hit that brings hitCount to exactly the Tier-2 threshold
+// lazily enqueues a Tier-2 recompile (Async only). The Tier-2 publish then
+// overwrites the Tier-1 slot and resets hitCount. End-to-end trigger test.
+TEST(EJitTaskPoolTest, PgoHitThresholdArmsTier2Recompile) {
+  EJitTaskPool P(8, false); // no auto-worker; pollOne drives compiles
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  P.setCompiler(&MockCompiler::compile, &C);
+  P.setPgoEnabled(true, 3); // arm Tier-2 at hitCount==3
+  EJitDimPair D[1] = {{0, 1}};
+
+  // Tier-1: miss -> enqueue -> pollOne compiles + publishes.
+  P.compileOrGet(5, D, 1, nullptr);
+  ASSERT_TRUE(P.pollOne());
+  EXPECT_EQ(P.pendingCount(), 0u);
+
+  void *fb = reinterpret_cast<void *>(&DummyFn2);
+  auto release = [&](EJitTaskPool::CompileOrGetResult &rr) {
+    if (rr.hasReadToken)
+      P.cache().releaseRead(rr.bucketIndex);
+  };
+
+  // Two hits: below threshold -> no Tier-2 armed.
+  for (int i = 0; i < 2; ++i) {
+    auto r = P.compileOrGet(5, D, 1, fb);
+    ASSERT_EQ(r.status, EJitCompileOrGetStatus::CacheHit);
+    release(r);
+  }
+  EXPECT_EQ(P.pendingCount(), 0u); // no Tier-2 yet
+  EXPECT_EQ(P.cache().hitCountOf(5, D, 1), 2u);
+
+  // Third hit crosses the threshold -> Tier-2 armed (enqueued).
+  auto r3 = P.compileOrGet(5, D, 1, fb);
+  EXPECT_EQ(r3.status, EJitCompileOrGetStatus::CacheHit);
+  release(r3);
+  EXPECT_EQ(P.pendingCount(), 1u); // Tier-2 req in flight
+
+  // pollOne compiles the Tier-2 req + publishes (overwrites Tier-1, resets).
+  ASSERT_TRUE(P.pollOne());
+  EXPECT_EQ(P.pendingCount(), 0u);
+  EXPECT_EQ(P.cache().hitCountOf(5, D, 1), 0u); // reset on Tier-2 publish
+}
+
+// PGO (§7.2): a version bump (instance toggle) between Tier-2 arming and its
+// publish must discard the Tier-2 - publish VersionMismatch, the Tier-1 slot
+// is NOT overwritten (hitCount not reset to 0). Validates the three-layer
+// version checkpoint discards a stale Tier-2 on instance toggle.
+TEST(EJitTaskPoolTest, PgoTier2DiscardedOnVersionBump) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  P.setCompiler(&MockCompiler::compile, &C);
+  P.setPgoEnabled(true, 3);
+  EJitDimPair D[1] = {{0, 1}};
+
+  P.compileOrGet(5, D, 1, nullptr);
+  ASSERT_TRUE(P.pollOne()); // Tier-1 published
+  void *fb = reinterpret_cast<void *>(&DummyFn2);
+  auto release = [&](EJitTaskPool::CompileOrGetResult &r) {
+    if (r.hasReadToken)
+      P.cache().releaseRead(r.bucketIndex);
+  };
+  for (int i = 0; i < 3; ++i) {
+    auto r = P.compileOrGet(5, D, 1, fb);
+    release(r);
+  }
+  ASSERT_EQ(P.pendingCount(), 1u); // Tier-2 armed
+  EXPECT_EQ(P.cache().hitCountOf(5, D, 1), 3u);
+
+  // Toggle the instance (version bump) BEFORE the Tier-2 publishes.
+  ASSERT_TRUE(P.switchController().setEnabled(0, 1, false));
+
+  // pollOne consumes the Tier-2 req, but publish must VersionMismatch (the
+  // req's versions are pre-toggle) -> Tier-2 discarded, Tier-1 untouched.
+  EXPECT_TRUE(P.pollOne());
+  EXPECT_EQ(P.pendingCount(), 0u); // Tier-2 req consumed (not published)
+  EXPECT_EQ(P.cache().hitCountOf(5, D, 1), 3u); // NOT reset => Tier-2 discarded
+}
+
 // §5.2: cache lookup precedes the Off check, so an existing cached entry is
 // still served while the pool is globally Off (Off only suppresses NEW
 // compiles).
@@ -1276,7 +1416,9 @@ TEST(EJitTaskPoolTest, ToggleBetweenCheckpointAndPublishRejectsResult) {
   EJitTaskPool P(8, false);
   P.switchController().setMode(EJitCompileMode::Async);
   MockCompiler C;
+  PublishObserver O;
   P.setCompiler(&MockCompiler::compile, &C);
+  P.setPublishCallback(&PublishObserver::notify, &O);
   P.cache().setPrePublishHookForTest(
       [](void *ctx) {
         static_cast<EJitTaskPool *>(ctx)->switchController().setEnabled(0, 1,
@@ -1289,12 +1431,29 @@ TEST(EJitTaskPoolTest, ToggleBetweenCheckpointAndPublishRejectsResult) {
   EXPECT_TRUE(P.pollOne()); // compiles, then publish is rejected at the gate
   P.cache().setPrePublishHookForTest(nullptr, nullptr);
   EXPECT_EQ(C.calls.loadAcquire(), 1u); // it did compile
-  EXPECT_EQ(P.pendingCount(), 0u);      // dedup released
+  EXPECT_EQ(O.calls, 1u);
+  EXPECT_FALSE(O.lastPublished);
+  EXPECT_EQ(P.pendingCount(), 0u); // dedup released
   // Re-enable so the instance check passes; lookup must still miss (nothing was
   // published for the stale result).
   P.switchController().setEnabled(0, 1, true);
   auto r = P.compileOrGet(40, D, 1, nullptr);
   EXPECT_NE(r.status, EJitCompileOrGetStatus::CacheHit);
+}
+
+TEST(EJitTaskPoolTest, PublishCallbackRunsAfterCommit) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  PublishObserver O;
+  P.setCompiler(&MockCompiler::compile, &C);
+  P.setPublishCallback(&PublishObserver::notify, &O);
+  EJitDimPair D[1] = {{0, 1}};
+  EXPECT_EQ(P.compileOrGet(41, D, 1, nullptr).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(P.pollOne());
+  EXPECT_EQ(O.calls, 1u);
+  EXPECT_TRUE(O.lastPublished);
 }
 
 // A toggle strictly AFTER a successful publish invalidates the entry on the

@@ -37,6 +37,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h" // EJitCompileMode, status enum
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 
@@ -69,8 +70,16 @@ struct EJitSharedDiagnostics {
   uint64_t compileFailed;
   uint64_t publishFailed;
   uint64_t instanceDisabled;
-  uint64_t instanceDisabledPreActivate; ///< instanceDisabled before first activate.
+  uint64_t
+      instanceDisabledPreActivate; ///< instanceDisabled before first activate.
   uint64_t executePrepareFailed;
+  uint32_t pgoActiveFunctionCount;
+  uint32_t pgoMaxActiveFunctions;
+  uint64_t pgoCompletedFunctions;
+  uint64_t pgoDeferredMisses;
+  uint64_t tier1Compiles;
+  uint64_t tier2Compiles;
+  uint64_t profileMergeFails;
 };
 
 //===----------------------------------------------------------------------===//
@@ -295,7 +304,8 @@ inline uint32_t ejitL0Index(uint32_t funcIndex, const EJitDimPair *dims,
                             uint32_t numDims) {
   uint32_t k = funcIndex * 2654435761u;
   for (uint32_t i = 0; i < numDims; ++i)
-    k = (k ^ (dims[i].dimType * 2654435761u) ^ dims[i].instanceId) * 2654435761u;
+    k = (k ^ (dims[i].dimType * 2654435761u) ^ dims[i].instanceId) *
+        2654435761u;
   return (k >> 26) & (kEJitL0Slots - 1);
 }
 
@@ -305,6 +315,8 @@ public:
   /// true and *outFn on success.
   using CompileCallback = bool (*)(void *ctx, const EJitCompileRequest &req,
                                    void **outFn);
+  using PublishCallback = void (*)(void *ctx, const EJitCompileRequest &req,
+                                   bool published);
   /// Owner-private physical-code release callback for an overwritten/retired
   /// pointer. Optional; a purely logical drop happens when unset.
   using ReleaseCallback = void (*)(void *ctx, void *oldFn);
@@ -326,8 +338,8 @@ public:
   /// stats. The owner publishes this into the shared mirror after every
   /// successful compile so every core's ejit_print_code_pool_stats is
   /// consistent (the real pools are owner-private). Returns false when no code
-  /// pool exists (clean fallback). Optional: when unset, the shared mirror stays
-  /// zero and readers fall back to their per-core (empty) view.
+  /// pool exists (clean fallback). Optional: when unset, the shared mirror
+  /// stays zero and readers fall back to their per-core (empty) view.
   using CodePoolStatsCallback = bool (*)(void *ctx, EJitCodePoolStatsOut *out);
   /// Per-core platform primitive: split a 2MiB-aligned [poolBase, poolBase +
   /// poolSize) window into 4KiB mappings in the CALLING core's translation
@@ -338,6 +350,15 @@ public:
   /// Per-core platform primitive: seal one 4KiB page at \p pageVA to RX in the
   /// CALLING core's translation context (enable_ex). Returns true on success.
   using SealPageCallback = bool (*)(void *ctx, uintptr_t pageVA);
+  /// Per-core platform primitive: make one 4KiB page at \p pageVA writable
+  /// (RX -> RW, enable_rw) in the CALLING core's translation context. Returns
+  /// true on success. Used only in 4K page-seal mode, for the runtime-writable
+  /// data pages of a JIT function (e.g. the Tier-1 __profc_ counters), so a
+  /// non-owner core running from the fixed RX .text.ejit segment may execute
+  /// code that writes them without a write-permission abort. Applied ONLY to
+  /// writable, non-executable pages (page-disjoint from the code), so it never
+  /// makes an executable page writable (no RWX).
+  using EnableRwPageCallback = bool (*)(void *ctx, uintptr_t pageVA);
 
   /// Worker loop entry (provided by this class, run on the injected task).
   using WorkerEntryFn = void (*)(void *ctx);
@@ -369,6 +390,12 @@ public:
   /// Owner-only teardown hook (see setOwnerReleasedCallback). Runs on the core
   /// giving up ownership, inside ownerShutdown().
   using OwnerReleasedFn = void (*)(void *ctx);
+  /// Owner-private diagnostic callback. It runs only on the owner worker and
+  /// may access owner-local optimizer state.
+  using MayConstRankingCallback = bool (*)(void *ctx);
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  using TestHookFn = void (*)(void *ctx);
+#endif
 
   enum class InitResult : uint32_t {
     BecameOwner =
@@ -465,6 +492,14 @@ public:
     compileFn_ = fn;
     compileCtx_ = ctx;
   }
+  void setPublishCallback(PublishCallback fn, void *ctx) {
+    publishFn_ = fn;
+    publishCtx_ = ctx;
+  }
+  void setMayConstRankingCallback(MayConstRankingCallback fn, void *ctx) {
+    mayConstRankingFn_ = fn;
+    mayConstRankingCtx_ = ctx;
+  }
   void setReleaser(ReleaseCallback fn, void *ctx) {
     const bool had = (releaseFn_ != nullptr);
     releaseFn_ = fn;
@@ -547,7 +582,8 @@ public:
     codeRangeFn_ = fn;
     codeRangeCtx_ = ctx;
   }
-  /// Owner: provide the code-pool stats snapshotter (see CodePoolStatsCallback).
+  /// Owner: provide the code-pool stats snapshotter (see
+  /// CodePoolStatsCallback).
   void setCodePoolStatsProvider(CodePoolStatsCallback fn, void *ctx) {
     codePoolStatsFn_ = fn;
     codePoolStatsCtx_ = ctx;
@@ -573,6 +609,14 @@ public:
   void setSealPageCallback(SealPageCallback fn, void *ctx) {
     sealPageFn_ = fn;
     sealPageCtx_ = ctx;
+  }
+  /// 4K mode: per-core per-page enable_rw primitive for runtime-writable data
+  /// (see EnableRwPageCallback). Optional: when unset, a slot that carries
+  /// runtime-writable ranges cannot be prepared on a peer core (clean fallback,
+  /// no fnPtr) rather than executing code whose counter writes would fault.
+  void setEnableRwPageCallback(EnableRwPageCallback fn, void *ctx) {
+    enableRwPageFn_ = fn;
+    enableRwPageCtx_ = ctx;
   }
   void setWorkerHooks(WorkerStartFn start, WorkerStopFn stop, void *ctx) {
     workerStart_ = start;
@@ -643,6 +687,58 @@ public:
   /// desired mode; use setSharedMode() to change the live cross-core mode.
   void setMode(EJitCompileMode mode) { configuredMode_ = mode; }
 
+  /// PGO (§6): enable the online-PGO Tier-2 auto-trigger on the shared
+  /// taskpool.  When enabled, every cache hit atomically increments the
+  /// slot's hitCount; the hit that crosses \p threshold arms a one-shot
+  /// Tier-2 (PGOUse) lazy recompile via enqueue. \p threshold 0 disables
+  /// the trigger (hits are still counted).
+  void setPgoEnabled(
+      bool enable, uint32_t threshold,
+      uint32_t maxConcurrentProfiles = EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES) {
+    maxConcurrentProfiles = std::max(
+        1u, std::min(maxConcurrentProfiles, kEJitSharedMaxConcurrentProfiles));
+    pgoEnabled_.storeRelaxed(enable ? 1 : 0);
+    tier2Threshold_.storeRelaxed(enable ? threshold : 0u);
+    pgoMaxConcurrentProfiles_.storeRelaxed(maxConcurrentProfiles);
+    if (!state_ || state_->initState.loadAcquire() !=
+                       static_cast<uint32_t>(EJitSharedInitState::Ready))
+      return;
+
+    // Publish the threshold before enabling so a peer that acquires the
+    // enabled flag also observes the matching threshold. Disable first when
+    // turning PGO off so no new hit can arm a Tier-2 request.
+    if (enable) {
+      state_->tier2Threshold.storeRelease(threshold);
+      state_->pgoMaxActiveFunctions.storeRelease(maxConcurrentProfiles);
+      state_->pgoEnabled.storeRelease(1);
+    } else {
+      state_->pgoEnabled.storeRelease(0);
+      state_->tier2Threshold.storeRelease(0);
+    }
+    // L0 hits bypass the shared slot hitCount. Retire every core's existing L0
+    // entries whenever PGO control changes; l0Fill() remains disabled while
+    // PGO is enabled so calls continue through the Tier-2 trigger path.
+    state_->dispatchEpoch.fetchAdd(1);
+  }
+
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  void setPgoAdmissionTestHook(TestHookFn fn, void *ctx) {
+    pgoAdmissionTestHook_ = fn;
+    pgoAdmissionTestHookCtx_ = ctx;
+  }
+#endif
+
+  /// True when the shared PGO auto-trigger is armed.
+  bool isPgoEnabled() const {
+    if (state_ && state_->initState.loadAcquire() ==
+                      static_cast<uint32_t>(EJitSharedInitState::Ready))
+      return state_->pgoEnabled.loadAcquire() != 0;
+    return pgoEnabled_.loadRelaxed() != 0;
+  }
+
+  /// Return true when this miss may start/continue a staged PGO function.
+  bool admitPgoFunction(uint32_t funcIndex, bool &newlyAdmitted);
+
   //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
   /// Publish the compile/taskpool mode as cross-core shared runtime state.
   /// Compile mode is a shared control flag (engine/worker ownership stays
@@ -657,9 +753,8 @@ public:
   ///     owner publishes the desired mode during init().
   void setSharedMode(EJitCompileMode mode) {
     configuredMode_ = mode;
-    if (state_ &&
-        state_->initState.loadAcquire() ==
-            static_cast<uint32_t>(EJitSharedInitState::Ready))
+    if (state_ && state_->initState.loadAcquire() ==
+                      static_cast<uint32_t>(EJitSharedInitState::Ready))
       state_->mode.storeRelease(static_cast<uint32_t>(mode));
   }
   /// Publish \p mode only if the blob is still Ready at generation \p gen --
@@ -686,9 +781,8 @@ public:
   /// The current cross-core compile mode: the shared state's mode (acquire
   /// load) once the blob is Ready, otherwise the staged configuredMode_.
   EJitCompileMode getSharedMode() const {
-    if (state_ &&
-        state_->initState.loadAcquire() ==
-            static_cast<uint32_t>(EJitSharedInitState::Ready))
+    if (state_ && state_->initState.loadAcquire() ==
+                      static_cast<uint32_t>(EJitSharedInitState::Ready))
       return static_cast<EJitCompileMode>(state_->mode.loadAcquire());
     return configuredMode_;
   }
@@ -862,10 +956,10 @@ public:
     std::atomic_signal_fence(std::memory_order_acquire);
 
     void *fn = e.fn;
-    const bool match = fn != nullptr && e.epoch == state_->dispatchEpoch.loadRelaxed() &&
-                       e.core == EJitCoreId::current() &&
-                       e.funcIndex == funcIndex && e.numDims == numDims &&
-                       dimsEqual(e.dims, dims, numDims);
+    const bool match =
+        fn != nullptr && e.epoch == state_->dispatchEpoch.loadRelaxed() &&
+        e.core == EJitCoreId::current() && e.funcIndex == funcIndex &&
+        e.numDims == numDims && dimsEqual(e.dims, dims, numDims);
 
     std::atomic_signal_fence(std::memory_order_acquire);
     if (e.seq != s0 || !match)
@@ -937,6 +1031,11 @@ public:
   /// In-flight dedup count (used by the taskpool C ABI pending_count).
   uint32_t pendingCount() const;
 
+  /// Ask the owner worker to print its owner-local may_const ranking. Any
+  /// attached core may call this; concurrent callers coalesce. The call waits
+  /// for the owner to complete the diagnostic and returns its success status.
+  bool requestMayConstRanking();
+
   /// The worker loop body: poll until the shared state leaves Ready. Public so
   /// an injected task entry can forward to it; normally reached via
   /// WorkerEntry.
@@ -967,6 +1066,7 @@ private:
   /// is a single yield (idle/wait); \p ticks=MULT*DELAY_TICKS is the post-task
   /// throttle delay. Bumps workerIdleYields_ either way.
   void workerIdle(uint32_t ticks);
+  bool serviceMayConstRankingRequest();
 
   /// Result of a shared-cache lookup, including the cross-core fnPtr gate.
   struct SharedLookup {
@@ -980,14 +1080,20 @@ private:
     /// releaseRead() is a safe no-op (its range check rejects it).
     bool noTokenHit = false;
     /// Set by peerPrepareSlot() when the pointer came from the out-of-line cold
-    /// first-touch path (which self-revalidates), so the seqlock caller must not
-    /// second-guess it with the bucket publishSeq check.
+    /// first-touch path (which self-revalidates), so the seqlock caller must
+    /// not second-guess it with the bucket publishSeq check.
     bool coldPrepared = false;
   };
 
   // shared cache helpers (POD table in the shared blob)
   uint64_t hashIdentity(uint32_t funcIndex, const EJitDimPair *dims,
                         uint32_t numDims) const;
+  /// True only when the shared cache currently publishes \p fnPtr as Tier-2
+  /// for this exact identity and version snapshot. Used while online PGO is
+  /// enabled to keep Tier-1 out of the wrapper's direct inline cache without
+  /// duplicating hit accounting or triggering another Tier-2 request.
+  bool isPublishedTier2(uint32_t funcIndex, void *fnPtr,
+                        const EJitDimPair *dims, uint32_t numDims);
   SharedLookup cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
                            uint32_t numDims);
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
@@ -1036,6 +1142,10 @@ private:
   /// by cacheLookup() and all fixed-dimension specializations.
   SharedLookup resolveMatchedSlot(EJitSharedCacheBucket &bucket,
                                   uint32_t bucketIndex, uint32_t slotIndex);
+  /// Submit Tier-2 from an identity/version-validated slot while its bucket
+  /// read lock is held. This preserves the exact slot snapshot without
+  /// enlarging the 16-byte CompileOrGetResult hot-path return value.
+  void enqueueTier2FromSlot(const EJitSharedCacheSlot &slot);
   /// Cold non-owner first-touch execute-permission preparation for a matched
   /// slot, with the bucket read lock HELD on entry (this function releases it).
   /// Snapshots the slot, drops the lock for the per-core platform seal, then
@@ -1051,7 +1161,8 @@ private:
   /// callers do those first).
   CompileOrGetResult classifyHit(const SharedLookup &Hit);
   EJitPublishStatus cachePublish(const EJitCompileRequest &req, void *fnPtr,
-                                 const EJitCompiledCodeInfo *info);
+                                 const EJitCompiledCodeInfo *info,
+                                 bool pgoClearExclusive = false);
 
   /// Snapshot of one Ready cache slot taken under the bucket read lock, so the
   /// expensive per-core execute-permission preparation (split + enable_ex)
@@ -1070,6 +1181,15 @@ private:
     uint64_t codeSize = 0;
     uintptr_t poolBase = 0;
     uint64_t poolSize = 0;
+    /// Runtime-writable extents (e.g. __profc_) this core must enable_rw before
+    /// it may execute the code. Snapshotted with the range so the per-core
+    /// enable_rw runs with NO bucket lock held. writableCount 0 => none.
+    uint32_t writableCount = 0;
+    /// 1 => this pool is a fixed RX region: the peer must enable_rw the
+    /// writable pages. 0 => dynamic RW pool: no enable_rw (ranges are
+    /// diagnostic only).
+    uint32_t requiresPeerEnableRw = 0;
+    EJitSharedWritableRange writables[kEJitSharedMaxWritableRanges] = {};
   };
   /// Prepare execute permission for the current core over \p R's code range
   /// WITHOUT holding any bucket lock. 2M mode delegates to prepareCodeFn_; 4K
@@ -1100,7 +1220,19 @@ private:
   /// stale worker (older gen) therefore cannot clear a newer generation's bit.
   void dedupClear(uint32_t funcIndex, uint32_t gen);
 
+  /// Compile one dequeued request through the two version checkpoints and the
+  /// commit-gated publish. The Tier-2 aarch64 exclusive-monitor workaround
+  /// (pgoClearExclusive) is derived here from the request's encoded tier
+  /// (decodeReqTier), so a PGOUse (Tier-2) publish clears the monitor primed by
+  /// the arming hit's hitCount RMW while a Tier-1 publish keeps the normal
+  /// write lock. No caller-supplied flag: the worker owns this policy (spec
+  /// §4.9).
   void runCompile(const EJitCompileRequest &req);
+
+  /// Release staged-PGO ownership if \p funcIndex still owns it. Tier-2
+  /// completion and terminal worker failures call this; transient queue-full
+  /// leaves ownership intact so the next hit can retry.
+  void finishPgoFunction(uint32_t funcIndex, bool completed);
 
   /// Owner-only: snapshot the owner-core code-pool stats via the registered
   /// provider and storeRelaxed them into the shared mirror. Called after every
@@ -1111,6 +1243,8 @@ private:
   EJitSharedTaskPoolState *state_ = nullptr;
   CompileCallback compileFn_ = nullptr;
   void *compileCtx_ = nullptr;
+  PublishCallback publishFn_ = nullptr;
+  void *publishCtx_ = nullptr;
   ReleaseCallback releaseFn_ = nullptr;
   void *releaseCtx_ = nullptr;
   PrepareCodeCallback prepareCodeFn_ = nullptr;
@@ -1119,16 +1253,24 @@ private:
   void *codeRangeCtx_ = nullptr;
   CodePoolStatsCallback codePoolStatsFn_ = nullptr;
   void *codePoolStatsCtx_ = nullptr;
+  MayConstRankingCallback mayConstRankingFn_ = nullptr;
+  void *mayConstRankingCtx_ = nullptr;
   SplitPoolCallback splitPoolFn_ = nullptr;
   void *splitPoolCtx_ = nullptr;
   SealPageCallback sealPageFn_ = nullptr;
   void *sealPageCtx_ = nullptr;
+  EnableRwPageCallback enableRwPageFn_ = nullptr;
+  void *enableRwPageCtx_ = nullptr;
   bool fourKSeal_ = false;
   WorkerStartFn workerStart_ = nullptr;
   WorkerStopFn workerStop_ = nullptr;
   void *workerCtx_ = nullptr;
   WorkerIdleFn workerIdle_ = nullptr;
   void *workerIdleCtx_ = nullptr;
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  TestHookFn pgoAdmissionTestHook_ = nullptr;
+  void *pgoAdmissionTestHookCtx_ = nullptr;
+#endif
   OwnerElectedFn ownerElected_ = nullptr;
   void *ownerElectedCtx_ = nullptr;
   OwnerReleasedFn ownerReleased_ = nullptr;
@@ -1187,7 +1329,18 @@ private:
       state_->icachePerCorePrepare.storeRelease(1);
   }
 
-  // Worker observability + startup-wait bound (owner-local).
+  // Pre-init staging only. Once the shared blob is Ready, state_->pgoEnabled
+  // and state_->tier2Threshold are the cross-core source of truth.
+  EJitAtomicU8 pgoEnabled_{0};
+  EJitAtomicU32 tier2Threshold_{0};
+  EJitAtomicU32 pgoMaxConcurrentProfiles_{1};
+  // PGO (§6): Tier-2 requests are NOT held in a facade-local bypass. A hit that
+  // crosses the threshold (on ANY producer core / facade) submits a fully
+  // value-initialized EJitCompileRequest through the shared MPSC queue, so the
+  // single owner worker consumes it via the normal pollOne()/runCompile() path.
+  // This is what lets a peer core's Tier-2 trigger actually be serviced.
+
+  // Worker observability+ startup-wait bound (owner-local).
   EJitAtomicU64 workerConsumeLoops_{0};
   EJitAtomicU32 workerWaitedForReady_{0};
   EJitAtomicU64 workerIdleYields_{0};

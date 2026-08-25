@@ -11,7 +11,14 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
+#include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+#include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
+#endif
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+#include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
+#endif
 #ifdef EJIT_SRE_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
 #endif
@@ -20,6 +27,7 @@
 #endif
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -40,9 +48,8 @@ public:
     size_t codeSize = 0;
   };
 
-  EJitCompileDriver(const Config &config,
-                    EJitRuntimeState &runtimeState, EJitModuleLoader &loader,
-                    EJitLogger *logger = nullptr);
+  EJitCompileDriver(const Config &config, EJitRuntimeState &runtimeState,
+                    EJitModuleLoader &loader, EJitLogger *logger = nullptr);
 
   ~EJitCompileDriver();
 
@@ -56,6 +63,10 @@ public:
   /// taskpool's compile callback (the taskpool owns its own fixed cache).
   /// Returns the JIT function pointer or nullptr.
   void *compileNow(const EJitCompileRequest &req);
+
+  /// Taskpool commit notification. A value-profile round is consumed only
+  /// after Tier-2 is actually published, so failed commits keep collecting.
+  void notifyTaskpoolPublished(const EJitCompileRequest &req, bool published);
 
   /// The SRE taskpool scheduler (non-null when EJIT_SRE_TASKPOOL is built).
   EJitTaskPool *taskPool() { return taskPool_.get(); }
@@ -164,7 +175,45 @@ private:
 
   /// Cold compile path (decode → verify active → load bitcode → JIT compile).
   /// When \p storeLru is true the result is inserted into the LRU EJitCache.
-  void *compileCold(uint64_t cacheKey, bool storeLru);
+  /// \p tier is the CompileTier (uint32_t, EJitOrcEngine.h) decoded from
+  /// the request's funcIndex high bits (EJitSreQueue.h); gated by
+  /// Config::enablePgo (off => Baseline regardless).
+  void *compileCold(uint64_t cacheKey, uint32_t tier, bool storeLru);
+
+  /// PGO: Tier-1 captured counter refs per cacheKey (EJIT_ONLINE_PGO.md
+  /// §5.2). Filled after a Tier-1 compile (ORC lookup of __profc_/__profd_
+  /// by the optimizer's captured names); consumed by a Tier-2 compile to
+  /// synthesize the in-memory profile before loadBitcode (§5.3).
+  struct Tier1CounterInfo {
+    std::string pgoName;
+    uintptr_t profcAddr = 0;
+    uintptr_t profdAddr = 0;
+  };
+  std::unordered_map<uint64_t, std::vector<Tier1CounterInfo>> tier1Counters_;
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  struct Tier1MayConstState {
+    uintptr_t counterBase = 0;
+    std::vector<EJitMayConstLoadSite> sites;
+  };
+  std::unordered_map<uint64_t, Tier1MayConstState> tier1MayConst_;
+#endif
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  /// Value-profile capture per cacheKey (EJIT_VALUE_PROFILE.md §5.1): the
+  /// verified target table (runtime address -> IR-PGO-name MD5) and the
+  /// function site inventory, filled after a Tier-1 compile and consumed by
+  /// the Tier-2 merge. The address table is verified at capture time: only
+  /// symbols the engine resolves (module functions via ORC lookup, externals
+  /// via registered user symbols) are entered.
+  struct Tier1VpState {
+    std::vector<PgoValueTarget> targets;
+    std::vector<PgoValueFunction> functions;
+  };
+  std::unordered_map<uint64_t, Tier1VpState> tier1Vp_;
+  /// Active collection rounds (Tier-1 publishes not yet consumed by a Tier-2
+  /// merge), touched only by the single owner worker: the collector is armed
+  /// at the first Tier-1 capture and disarmed once the last round merged.
+  uint32_t vpRoundsActive_ = 0;
+#endif
 };
 
 } // namespace ejit

@@ -34,6 +34,7 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -777,6 +778,7 @@ extern void ejit_print_func_meta(const char *funcName);
 // -2=NOT_ACTIVE, -9=DISABLED) so the test need not include the C API header.
 extern int ejit_get_code_pool_stats(void *out);
 extern void ejit_print_code_pool_stats(void);
+extern void ejit_print_mayconst_ranking(void);
 extern void ejit_print_active(void);
 extern void ejit_print_version(void);
 extern void ejit_function_body_cycles_record(const char *, uint32_t, uint64_t,
@@ -1284,7 +1286,7 @@ TEST(EJitOptimizer, OptimizationPipelineL1) {
   EJitOptimizerTestAccess opt(reg);
 
   // L1 should not crash
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L1);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L1, CompileTier::Baseline);
 }
 
 TEST(EJitOptimizer, OptimizationPipelineL2) {
@@ -1296,7 +1298,7 @@ TEST(EJitOptimizer, OptimizationPipelineL2) {
   EJitOptimizerTestAccess opt(reg);
 
   // L2 should not crash
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2, CompileTier::Baseline);
 }
 
 TEST(EJitOptimizer, OptimizationPipelineL3) {
@@ -1308,7 +1310,7 @@ TEST(EJitOptimizer, OptimizationPipelineL3) {
   EJitOptimizerTestAccess opt(reg);
 
   // L3 should not crash
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3, CompileTier::Baseline);
 }
 
 TEST(EJitOptimizer, FullPipelineEndToEnd) {
@@ -1333,7 +1335,7 @@ TEST(EJitOptimizer, FullPipelineEndToEnd) {
   // 3. Inline (no-op for a single function, but shouldn't crash)
 
   // 4. Optimization pipeline at L3
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3, CompileTier::Baseline);
 }
 
 /// Verify the optimization pipeline folds llvm.expect-guarded constant
@@ -1379,7 +1381,7 @@ TEST(EJitOptimizer, FoldsExpectGuardedConstantBranch) {
 
   PeriodArrayRegistry reg;
   EJitOptimizerTestAccess opt(reg);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3, CompileTier::Baseline);
 
   // No llvm.expect should remain.
   bool hasExpect = false;
@@ -1475,6 +1477,12 @@ TEST(EJitStructFieldPass, MayConstLoadSubstitution) {
   // Run the StructFieldPass
   EJitStructFieldPass structPass(reg);
   structPass.initFromModule(*M);
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+  auto AuditSites = structPass.collectMayConstLoadSites(*M);
+  ASSERT_EQ(AuditSites.size(), 1u);
+  EXPECT_EQ(AuditSites.front().functionName, F->getName().str());
+  EXPECT_EQ(AuditSites.front().globalName, "g_arr");
+#endif
   FunctionAnalysisManager FAM;
   LoopAnalysisManager LAM;
   CGSCCAnalysisManager CGAM;
@@ -1491,6 +1499,9 @@ TEST(EJitStructFieldPass, MayConstLoadSubstitution) {
   // The pass should find the GEP+load, compute offset for g_arr[2] = 8 bytes,
   // read mockArr + 8 = mockArr[2] = 30, and replace the load.
   EXPECT_FALSE(PA.areAllPreserved());
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+  EXPECT_TRUE(structPass.collectMayConstLoadSites(*M).empty());
+#endif
 
   // Verify the load was replaced: the ret should now use a ConstantInt(30)
   bool loadRemoved = true;
@@ -1507,6 +1518,47 @@ TEST(EJitStructFieldPass, MayConstLoadSubstitution) {
   ASSERT_NE(RetVal, nullptr);
   EXPECT_EQ(RetVal->getSExtValue(), 30);
 }
+
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+TEST(EJitStructFieldPass, InstrumentsRuntimeMayConstHitsBeforeReplacement) {
+  LLVMContext Ctx;
+  Module M("test_mayconst_hits", Ctx);
+  M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  Function *F = createStructFieldFunc(Ctx, M, 2);
+
+  int32_t MockArr[4] = {10, 20, 30, 40};
+  PeriodArrayRegistry Reg;
+  Reg.registerArray("cell", "g_arr", MockArr, 4);
+  EJitStructFieldPass Pass(Reg);
+  Pass.initFromModule(M);
+
+  auto Sites = Pass.instrumentMayConstLoadSites(M);
+  ASSERT_EQ(Sites.size(), 1u);
+  auto *Counters = M.getGlobalVariable(
+      EJitStructFieldPass::MayConstCounterName);
+  ASSERT_NE(Counters, nullptr);
+  auto *CounterArray = dyn_cast<ArrayType>(Counters->getValueType());
+  ASSERT_NE(CounterArray, nullptr);
+  EXPECT_EQ(CounterArray->getNumElements(), 1u);
+
+  unsigned AtomicAdds = 0;
+  for (Instruction &I : instructions(*F))
+    if (auto *RMW = dyn_cast<AtomicRMWInst>(&I)) {
+      ++AtomicAdds;
+      EXPECT_EQ(RMW->getOperation(), AtomicRMWInst::Add);
+      EXPECT_EQ(RMW->getOrdering(), AtomicOrdering::Monotonic);
+    }
+  EXPECT_EQ(AtomicAdds, 1u);
+
+  EJitStructFieldPass::removeMayConstLoadInstrumentation(M);
+  EXPECT_EQ(M.getGlobalVariable(EJitStructFieldPass::MayConstCounterName),
+            nullptr);
+  AtomicAdds = 0;
+  for (Instruction &I : instructions(*F))
+    AtomicAdds += isa<AtomicRMWInst>(I);
+  EXPECT_EQ(AtomicAdds, 0u);
+}
+#endif
 
 TEST(EJitStructFieldPass, NoMayConstNoChange) {
   LLVMContext Ctx;
@@ -2055,6 +2107,13 @@ TEST(EJitStructFieldPass, SpuriousMetadataOnNonPeriodGVNoReplace) {
   EJitStructFieldPass sp(reg);
   StructFieldHarness H;
   sp.initFromModule(*M);
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+  auto AuditSites = sp.collectMayConstLoadSites(*M);
+  ASSERT_EQ(AuditSites.size(), 1u)
+      << "audit must recognize metadata-marked may_const loads";
+  EXPECT_EQ(AuditSites.front().globalName, "g_arr");
+  EXPECT_TRUE(AuditSites.front().hasFieldOffset);
+#endif
   auto PA = sp.run(*F, H.FAM);
 
   // The load must survive: no registered period GV backs this annotation.
@@ -2106,6 +2165,13 @@ TEST(EJitStructFieldPass, MissingPerLoadMetadataGVOffsetFallback) {
   EJitStructFieldPass sp(reg);
   StructFieldHarness H;
   sp.initFromModule(*M);
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+  auto AuditSites = sp.collectMayConstLoadSites(*M);
+  ASSERT_EQ(AuditSites.size(), 1u)
+      << "audit must use the same GV-offset fallback as replacement";
+  EXPECT_EQ(AuditSites.front().globalName, "g_arr");
+  EXPECT_TRUE(AuditSites.front().hasFieldOffset);
+#endif
   auto PA = sp.run(*F, H.FAM);
 
   EXPECT_EQ(countLoads(*F), 0u);
@@ -2428,7 +2494,7 @@ TEST(EJitOptimizer, OptimizationL1DeadCodeElimination) {
 
   PeriodArrayRegistry reg;
   EJitOptimizerTestAccess opt(reg);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L1);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L1, CompileTier::Baseline);
 
   // Dead block should be removed
   int bbAfter = (int)std::distance(F->begin(), F->end());
@@ -2473,7 +2539,7 @@ TEST(EJitOptimizer, OptimizationL2InlineAndSimplify) {
 
   PeriodArrayRegistry reg;
   EJitOptimizerTestAccess opt(reg);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2, CompileTier::Baseline);
 
   // After inlining 41+1, should fold to constant 42
   auto *Ret = dyn_cast_or_null<ReturnInst>(&F->back().back());
@@ -2535,7 +2601,7 @@ TEST(EJitOptimizer, OptimizationL3LoopUnroll) {
   // Promote first (mem2reg)
   opt.runInstCombine(*M);
   // Then L3 with loop unroll
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3, CompileTier::Baseline);
 
   // After unrolling 0+1+2+3, should fold to constant 6
   auto *Ret = dyn_cast_or_null<ReturnInst>(&F->back().back());
@@ -2565,7 +2631,7 @@ static std::string optimizeLoopFnAt(llvm::ejit::OptimizationLevel lvl) {
   PeriodArrayRegistry reg;
   EJitOptimizerTestAccess opt(reg);
   opt.runInstCombine(*M);
-  opt.runOptimizationPipeline(*M, lvl);
+  opt.runOptimizationPipeline(*M, lvl, CompileTier::Baseline);
   std::string Out;
   raw_string_ostream OS(Out);
   M->print(OS, nullptr);
@@ -2675,7 +2741,7 @@ TEST(EJitEndToEnd, BranchFolding) {
 
   sfp.run(*F, FAM);
   opt.runInstCombine(*M);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2, CompileTier::Baseline);
 
   auto *Ret = dyn_cast_or_null<ReturnInst>(&F->back().back());
   ASSERT_NE(Ret, nullptr);
@@ -2704,7 +2770,7 @@ static std::string specializeBranchAt(llvm::ejit::OptimizationLevel lvl) {
   EJitOptimizerTestAccess opt(reg);
   opt.runInstCombine(*M);
   opt.runStructFieldPass(*M);
-  opt.runOptimizationPipeline(*M, lvl);
+  opt.runOptimizationPipeline(*M, lvl, CompileTier::Baseline);
 
   std::string Out;
   raw_string_ostream OS(Out);
@@ -2811,7 +2877,8 @@ TEST(EJitInterprocedural, ConstantsStopAtCallEdgeWithoutIPSCCP) {
   EJitOptimizerTestAccess opt(reg);
   opt.runInstCombine(*M);
   opt.runStructFieldPass(*M);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2,
+                              CompileTier::Baseline);
 
   Function *Callee = M->getFunction("ip_callee");
   ASSERT_NE(Callee, nullptr);
@@ -2840,7 +2907,8 @@ TEST(EJitInterprocedural, IPSCCPPropagatesDimsIntoCallee) {
   opt.runInterproceduralPropagation(*M);
   opt.runInstCombine(*M);
   opt.runStructFieldPass(*M);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2,
+                              CompileTier::Baseline);
 
   Function *Callee = M->getFunction("ip_callee");
   Function *Entry = M->getFunction("ip_entry");
@@ -3051,7 +3119,7 @@ TEST(EJitPipelineIR, BranchFoldingOnMayConst) {
 
   sfp.run(*F, FAM);
   opt.runInstCombine(*M);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2, CompileTier::Baseline);
 
   // After full pipeline: no loads should remain (all may_const replaced)
   int loadCount = 0;
@@ -3188,7 +3256,7 @@ TEST(EJitPipelineIR, CellProcessBranchFolding) {
 
   // 4. Final cleanup
   opt.runInstCombine(*M);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2, CompileTier::Baseline);
 
   // All may_const loads should be gone
   int mayConstLoads = 0;
@@ -3320,6 +3388,10 @@ TEST(EJitDiagnostics, CodePoolStatsNoCrash) {
 
 TEST(EJitDiagnostics, PrintCodePoolStatsNoCrash) {
   ejit_print_code_pool_stats(); // uninitialized or no pool: prints a notice
+}
+
+TEST(EJitDiagnostics, PrintMayConstRankingNoCrash) {
+  ejit_print_mayconst_ranking(); // uninitialized: prints a notice
 }
 
 // ejitDiagPermille() drives the code-pool usage percentage: integer-only

@@ -18,6 +18,7 @@
 #include "gtest/gtest.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <thread>
@@ -74,16 +75,42 @@ bool mockPrepareCode(void *ctx, const void * /*fnPtr*/) {
   return log->succeed;
 }
 
+struct RankingLog {
+  uint32_t calls = 0;
+  uint32_t callbackCore = kEJitInvalidCoreId;
+  bool succeed = true;
+};
+bool mockMayConstRanking(void *ctx) {
+  auto *log = static_cast<RankingLog *>(ctx);
+  ++log->calls;
+  log->callbackCore = EJitCoreId::current();
+  return log->succeed;
+}
+
+struct DriveOwnerCtx {
+  EJitSharedTaskPool *owner = nullptr;
+  uint32_t requesterCore = 1;
+};
+void driveOwnerOnRequesterIdle(void *ctx, uint32_t /*ticks*/) {
+  auto *drive = static_cast<DriveOwnerCtx *>(ctx);
+  EJitCoreId::setCurrentForTest(0);
+  (void)drive->owner->workerPollOnce();
+  EJitCoreId::setCurrentForTest(drive->requesterCore);
+}
+
 //===----------------------------------------------------------------------===//
 // 4K page-seal mocks: a per-core split + per-page seal that log which core ran
 // them and (optionally) fail or inject a concurrent slot/generation change at a
 // chosen seal step (to exercise the re-validate-after-prepare protocol).
 //===----------------------------------------------------------------------===//
 struct FourKLog {
-  std::vector<std::pair<uintptr_t, uint32_t>> splits; // (poolBase, core)
-  std::vector<std::pair<uintptr_t, uint32_t>> seals;  // (pageVA, core)
+  std::vector<std::pair<uintptr_t, uint32_t>> splits;  // (poolBase, core)
+  std::vector<std::pair<uintptr_t, uint32_t>> seals;   // (pageVA, core)
+  std::vector<std::pair<uintptr_t, uint32_t>> rwPages; // (pageVA, core)
   bool splitOk = true;
   int failSealAtIndex = -1;           // fail the Nth (0-based) seal call
+  bool rwOk = true;                   // enable_rw success/fail switch
+  int failRwAtIndex = -1;             // fail the Nth (0-based) enable_rw call
   void (*raceHook)(void *) = nullptr; // run during a chosen seal (no lock held)
   void *raceCtx = nullptr;
   int raceAtSealIndex = -1;
@@ -103,6 +130,17 @@ bool mockSealPage(void *ctx, uintptr_t pageVA) {
     return false;
   return true;
 }
+// Per-core enable_rw of a JIT function's runtime-writable data pages (e.g. the
+// Tier-1 __profc_ counters). Logs (pageVA, core) so a test can prove the peer
+// made exactly the counter pages writable before executing.
+bool mockEnableRwPage(void *ctx, uintptr_t pageVA) {
+  auto *l = static_cast<FourKLog *>(ctx);
+  int idx = static_cast<int>(l->rwPages.size());
+  l->rwPages.push_back({pageVA, EJitCoreId::current()});
+  if (l->failRwAtIndex == idx)
+    return false;
+  return l->rwOk;
+}
 
 // Owner-side resolver of a compiled pointer to a (test-controlled) executable
 // range. Mutating the RangeCtx between compiles models distinct code extents.
@@ -113,6 +151,15 @@ struct RangeCtx {
   uint64_t codeSize = 64;
   uint32_t poolId = 0;
   bool provide = true;
+  // Runtime-writable ranges (v9): 0 => none (non-PGO / Tier-2). When set,
+  // models the Tier-1 __profc_ counter pages a peer core must enable_rw.
+  uint32_t writableCount = 0;
+  uintptr_t writableAddr[kEJitSharedMaxWritableRanges] = {};
+  uint64_t writableSize[kEJitSharedMaxWritableRanges] = {};
+  // 1 => fixed RX pool: a peer must enable_rw the writable pages. Defaults true
+  // so the writable-range tests exercise the enable_rw path; a dynamic-pool
+  // test sets it false.
+  uint32_t requiresPeerEnableRw = 1;
 };
 bool mockCodeRange(void *ctx, const void *fnPtr, EJitCompiledCodeInfo *out) {
   auto *r = static_cast<RangeCtx *>(ctx);
@@ -124,6 +171,14 @@ bool mockCodeRange(void *ctx, const void *fnPtr, EJitCompiledCodeInfo *out) {
   out->poolBase = r->poolBase;
   out->poolSize = r->poolSize;
   out->poolId = r->poolId;
+  out->writableCount = r->writableCount;
+  out->requiresPeerEnableRw = r->requiresPeerEnableRw;
+  for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
+    out->writableRanges[i].addr =
+        (i < r->writableCount) ? r->writableAddr[i] : 0;
+    out->writableRanges[i].size =
+        (i < r->writableCount) ? r->writableSize[i] : 0;
+  }
   return true;
 }
 
@@ -140,12 +195,24 @@ bool mockCompileSeq(void *ctx, const EJitCompileRequest & /*req*/,
   return true;
 }
 
+struct PublishObserver {
+  uint32_t calls = 0;
+  bool lastPublished = false;
+
+  static void notify(void *ctx, const EJitCompileRequest &, bool published) {
+    auto *self = static_cast<PublishObserver *>(ctx);
+    ++self->calls;
+    self->lastPublished = published;
+  }
+};
+
 // Injectable worker hooks. The entry is never run on a real thread here; tests
 // drive pollOne() manually, so these only prove "exactly one worker started".
 struct WorkerHooks {
   int starts = 0;
   int stops = 0;
   bool failNext = false;
+  uint32_t startCore = kEJitInvalidCoreId;
 };
 bool mockWorkerStart(void *ctx, EJitSharedTaskPool::WorkerEntryFn /*entry*/,
                      void * /*entryCtx*/, uint64_t *outTaskId) {
@@ -153,14 +220,15 @@ bool mockWorkerStart(void *ctx, EJitSharedTaskPool::WorkerEntryFn /*entry*/,
   if (w->failNext)
     return false;
   ++w->starts;
+  w->startCore = EJitCoreId::current();
   *outTaskId = 0xABCDull;
   return true;
 }
 void mockWorkerStop(void *ctx) { ++static_cast<WorkerHooks *>(ctx)->stops; }
 
 // Stands in for building/releasing the owner's ORC engine, and records what the
-// blob looked like WHILE it ran -- the ordering against the worker start and the
-// Ready publish is the contract, not just that it ran.
+// blob looked like WHILE it ran -- the ordering against the worker start and
+// the Ready publish is the contract, not just that it ran.
 struct OwnerEngineLog {
   int built = 0;
   int released = 0;
@@ -255,6 +323,7 @@ protected:
     pool.setCodeRangeProvider(&mockCodeRange, &range);
     pool.setSplitPoolCallback(&mockSplitPool, &fourK);
     pool.setSealPageCallback(&mockSealPage, &fourK);
+    pool.setEnableRwPageCallback(&mockEnableRwPage, &fourK);
     ASSERT_EQ(pool.init(), EJitSharedTaskPool::InitResult::BecameOwner);
   }
 
@@ -333,6 +402,28 @@ TEST_F(SharedTaskPoolTest, ExactlyOneOwnerAcrossCores) {
   // Idempotency: the owner re-observing init() stays Ready, no re-election.
   EJitCoreId::setCurrentForTest(0);
   EXPECT_EQ(c0.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+}
+
+TEST_F(SharedTaskPoolTest, PeerRequestsMayConstRankingFromOwnerWorker) {
+  EJitSharedTaskPool owner;
+  RankingLog log;
+  owner.setMayConstRankingCallback(&mockMayConstRanking, &log);
+  bringUpOwner(owner);
+
+  EJitSharedTaskPool peer;
+  DriveOwnerCtx drive{&owner, 1};
+  peer.bind(state_.get());
+  peer.setMode(EJitCompileMode::Async);
+  peer.setWorkerIdleHook(&driveOwnerOnRequesterIdle, &drive);
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+
+  EXPECT_TRUE(peer.requestMayConstRanking());
+  EXPECT_EQ(log.calls, 1u);
+  EXPECT_EQ(log.callbackCore, 0u);
+  EXPECT_EQ(state_->mayConstRankingRequest.loadAcquire(), 1u);
+  EXPECT_EQ(state_->mayConstRankingComplete.loadAcquire(), 1u);
+  EXPECT_EQ(state_->mayConstRankingResult.loadAcquire(), 1u);
 }
 
 //===----------------------------------------------------------------------===//
@@ -740,7 +831,9 @@ TEST_F(SharedTaskPoolTest, DeactivateDuringCompileBlocksPublish) {
   owner.bind(state_.get());
   owner.setMode(EJitCompileMode::Async);
   ToggleCtx tctx{&owner, 0, 7};
+  PublishObserver observer;
   owner.setCompiler(&mockCompileThenToggle, &tctx);
+  owner.setPublishCallback(&PublishObserver::notify, &observer);
   ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
   owner.setInstanceEnabled(0, 7, true);
 
@@ -752,6 +845,18 @@ TEST_F(SharedTaskPoolTest, DeactivateDuringCompileBlocksPublish) {
   owner.getDiagnostics(d);
   EXPECT_EQ(d.cacheReadyCount, 0u); // nothing published
   EXPECT_EQ(d.compileFailed, 1u);
+  EXPECT_EQ(observer.calls, 1u);
+  EXPECT_FALSE(observer.lastPublished);
+}
+
+TEST_F(SharedTaskPoolTest, PublishCallbackRunsAfterCommit) {
+  EJitSharedTaskPool owner;
+  PublishObserver observer;
+  bringUpOwner(owner);
+  owner.setPublishCallback(&PublishObserver::notify, &observer);
+  publish(owner, 10);
+  EXPECT_EQ(observer.calls, 1u);
+  EXPECT_TRUE(observer.lastPublished);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1588,6 +1693,352 @@ TEST_F(SharedTaskPoolTest, FourKPeerSealsEveryCoveredPageUnaligned) {
   EXPECT_EQ(fourK.seals[1].first, 0x40001000ull); // page-aligned up
 }
 
+//===----------------------------------------------------------------------===//
+// Cross-core runtime-writable (Online-PGO Tier-1) peer preparation (v9).
+//
+// A JIT function whose body writes runtime data (e.g. the Tier-1 __profc_
+// counters) lives in the fixed RX .text.ejit code segment. A non-owner core
+// must make those data pages writable (enable_rw) in its own translation
+// context BEFORE executing, or the first counter atomicrmw faults. These tests
+// drive that path with the enable_rw mock.
+//===----------------------------------------------------------------------===//
+
+// A peer's first touch of a Tier-1 entry enable_rw's the counter page(s) AND
+// enable_ex's the code page(s), on that peer core, before the pointer is
+// returned. enable_rw happens before the seal (RW data prepared first).
+TEST_F(SharedTaskPoolTest, FourKPeerFirstTouchEnablesRwThenSeals) {
+  FourKLog fourK;
+  RangeCtx range; // code at 0x40000000 size 64 (page 0)
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40001000ull; // __profc_ page 1 (disjoint from code)
+  range.writableSize[0] = 32;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(hit.fnPtr, codeFor(1));
+  owner.releaseRead(hit.bucketIndex);
+
+  // enable_rw ran on core 3 for the counter page, and the code page was sealed.
+  ASSERT_EQ(fourK.rwPages.size(), 1u);
+  EXPECT_EQ(fourK.rwPages[0].first, 0x40001000ull);
+  EXPECT_EQ(fourK.rwPages[0].second, 3u);
+  ASSERT_EQ(fourK.seals.size(), 1u);
+  EXPECT_EQ(fourK.seals[0].first, 0x40000000ull);
+  EXPECT_EQ(fourK.seals[0].second, 3u);
+  // The peer's executable+writable ready bit is set (memoized).
+  EJitSharedCacheSlot *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_NE(slot->executableCoreMask.loadRelaxed() & (uint64_t{1} << 3), 0u);
+}
+
+// A writable range spanning an unaligned start/end enable_rw's every covered
+// 4K page, and none of them is a code page.
+TEST_F(SharedTaskPoolTest, FourKPeerEnablesRwEveryCounterPage) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40002F00ull; // unaligned, near end of page 2
+  range.writableSize[0] = 0x200;         // crosses into page 3
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(4);
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(hit.bucketIndex);
+
+  ASSERT_EQ(fourK.rwPages.size(), 2u);
+  EXPECT_EQ(fourK.rwPages[0].first, 0x40002000ull);
+  EXPECT_EQ(fourK.rwPages[1].first, 0x40003000ull);
+}
+
+// A repeated hit on the SAME peer core (after the first-touch prepared it) does
+// NO enable_rw / enable_ex callback: the per-core ready bit is memoized, so the
+// cache-hit path adds no permission traffic.
+TEST_F(SharedTaskPoolTest, FourKRepeatedPeerHitNoRwCallback) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40001000ull;
+  range.writableSize[0] = 16;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto h1 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h1.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h1.bucketIndex);
+  auto h2 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h2.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h2.bucketIndex);
+
+  EXPECT_EQ(fourK.rwPages.size(), 1u); // not repeated on the second hit
+  EXPECT_EQ(fourK.seals.size(), 1u);
+}
+
+// enable_rw failure on a peer: NO fnPtr is handed back, NO code page is sealed
+// (enable_rw runs first), and the peer's ready bit stays clear so a later hit
+// re-attempts rather than executing un-prepared code.
+TEST_F(SharedTaskPoolTest, FourKPeerEnableRwFailureNoFnPtrNoMask) {
+  FourKLog fourK;
+  fourK.failRwAtIndex = 0; // fail the first enable_rw
+  RangeCtx range;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40001000ull;
+  range.writableSize[0] = 16;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  void *fallback = reinterpret_cast<void *>(0xFEEDull);
+  auto r = owner.compileOrGet(1, nullptr, 0, fallback);
+  EXPECT_TRUE(r.readyButNotShareable);
+  EXPECT_EQ(r.fnPtr, fallback);        // clean fallback, never the shared ptr
+  EXPECT_EQ(fourK.rwPages.size(), 1u); // attempted once
+  EXPECT_TRUE(fourK.seals.empty());    // never reached the code seal
+  EJitSharedCacheSlot *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->executableCoreMask.loadRelaxed() & (uint64_t{1} << 3), 0u);
+}
+
+// A non-PGO / Tier-2 entry carries NO writable ranges: the peer seals code
+// pages but makes no enable_rw call (nothing to prepare).
+TEST_F(SharedTaskPoolTest, FourKPeerNoWritableDataSkipsRw) {
+  FourKLog fourK;
+  RangeCtx range; // writableCount defaults to 0
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(hit.bucketIndex);
+
+  EXPECT_TRUE(
+      fourK.rwPages.empty());        // no runtime-writable data -> no enable_rw
+  EXPECT_EQ(fourK.seals.size(), 1u); // code still sealed
+}
+
+// W^X guard: a writable range that shares a 4K page with the executable extent
+// is refused (never enable_rw'd), so a peer never makes a code page writable.
+TEST_F(SharedTaskPoolTest, FourKPeerRejectsWritableOverlappingCode) {
+  FourKLog fourK;
+  RangeCtx range; // code at 0x40000000 size 64
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40000040ull; // SAME page as the code -> illegal
+  range.writableSize[0] = 16;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  void *fallback = reinterpret_cast<void *>(0xFEEDull);
+  auto r = owner.compileOrGet(1, nullptr, 0, fallback);
+  EXPECT_TRUE(r.readyButNotShareable);
+  EXPECT_EQ(r.fnPtr, fallback);
+  EXPECT_TRUE(fourK.rwPages.empty()); // refused before any enable_rw
+  EXPECT_TRUE(fourK.seals.empty());   // and before any seal
+  EJitSharedCacheSlot *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->executableCoreMask.loadRelaxed() & (uint64_t{1} << 3), 0u);
+}
+
+// A writable range that lies outside the code's pool is rejected (a peer only
+// splits/prepares within the pool it knows).
+TEST_F(SharedTaskPoolTest, FourKPeerRejectsWritableOutOfPool) {
+  FourKLog fourK;
+  RangeCtx range; // pool [0x40000000, 0x40200000)
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x50000000ull; // outside the pool
+  range.writableSize[0] = 16;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  void *fallback = reinterpret_cast<void *>(0xFEEDull);
+  auto r = owner.compileOrGet(1, nullptr, 0, fallback);
+  EXPECT_TRUE(r.readyButNotShareable);
+  EXPECT_TRUE(fourK.rwPages.empty());
+  EXPECT_TRUE(fourK.seals.empty());
+}
+
+// Two peer cores each independently enable_rw the counter page in their OWN
+// translation context (execute permission and write permission are per-core).
+TEST_F(SharedTaskPoolTest, FourKTwoPeerCoresEachEnableRw) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40001000ull;
+  range.writableSize[0] = 16;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto h3 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h3.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h3.bucketIndex);
+  EJitCoreId::setCurrentForTest(4);
+  auto h4 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h4.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h4.bucketIndex);
+
+  ASSERT_EQ(fourK.rwPages.size(), 2u);
+  EXPECT_EQ(fourK.rwPages[0].second, 3u);
+  EXPECT_EQ(fourK.rwPages[1].second, 4u);
+}
+
+// An over-bound writable count on a slot (should never occur: the owner rejects
+// an over-bound allocation before publish) is a clean fallback, never a
+// truncated/partial enable_rw.
+TEST_F(SharedTaskPoolTest, FourKPeerRejectsOverflowWritableCount) {
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  // Corrupt the slot to claim more writable ranges than the fixed bound.
+  EJitSharedCacheSlot *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  slot->writableCount = kEJitSharedMaxWritableRanges + 1;
+
+  EJitCoreId::setCurrentForTest(3);
+  void *fallback = reinterpret_cast<void *>(0xFEEDull);
+  auto r = owner.compileOrGet(1, nullptr, 0, fallback);
+  EXPECT_TRUE(r.readyButNotShareable);
+  EXPECT_TRUE(fourK.rwPages.empty()); // never partially prepared
+  EXPECT_TRUE(fourK.seals.empty());
+}
+
+// The owner core itself already made its counter pages RW at compile time, so a
+// hit on the owner core performs NO peer enable_rw / seal callback.
+TEST_F(SharedTaskPoolTest, FourKOwnerHitDoesNotEnableRw) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40001000ull;
+  range.writableSize[0] = 16;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(0); // owner core
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(hit.bucketIndex);
+
+  EXPECT_TRUE(fourK.rwPages.empty());
+  EXPECT_TRUE(fourK.seals.empty());
+}
+
+// A DYNAMIC RW pool (requiresPeerEnableRw=0) that still carries writable
+// metadata: a peer seals the code pages but makes NO enable_rw call, and
+// succeeds even though the writable ranges are present (they are diagnostic
+// only — the pool memory is already RW). This is the dynamic-pool + 4K + shared
+// pointers configuration that must NOT be forced to fall back.
+TEST_F(SharedTaskPoolTest, FourKDynamicPoolWritableRangesNoEnableRw) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40001000ull;
+  range.writableSize[0] = 32;
+  range.requiresPeerEnableRw = 0; // dynamic pool: already RW
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(hit.fnPtr, codeFor(1));
+  owner.releaseRead(hit.bucketIndex);
+
+  EXPECT_TRUE(fourK.rwPages.empty()); // dynamic pool -> no enable_rw
+  ASSERT_EQ(fourK.seals.size(), 1u);  // code still sealed per-core
+  EXPECT_EQ(fourK.seals[0].second, 3u);
+  EJitSharedCacheSlot *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->requiresPeerEnableRw, 0u);
+  EXPECT_NE(slot->executableCoreMask.loadRelaxed() & (uint64_t{1} << 3), 0u);
+}
+
+// A fixed RX pool (requiresPeerEnableRw=1) with writable ranges but NO
+// enable_rw callback wired: clean fallback (no fnPtr, no seal, no core bit).
+TEST_F(SharedTaskPoolTest, FourKFixedPoolMissingEnableRwCallbackFallsBack) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40001000ull;
+  range.writableSize[0] = 16;
+  range.requiresPeerEnableRw = 1;
+  // Bring up WITHOUT an enable_rw callback (mimic a build/config that forgot
+  // it).
+  EJitCoreId::setCurrentForTest(0);
+  EJitSharedTaskPool owner;
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setCodeSharingEnabled(true);
+  owner.setSealMode(true);
+  owner.setCodeRangeProvider(&mockCodeRange, &range);
+  owner.setSplitPoolCallback(&mockSplitPool, &fourK);
+  owner.setSealPageCallback(&mockSealPage, &fourK);
+  // NOTE: setEnableRwPageCallback intentionally NOT called.
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  void *fallback = reinterpret_cast<void *>(0xFEEDull);
+  auto r = owner.compileOrGet(1, nullptr, 0, fallback);
+  EXPECT_TRUE(r.readyButNotShareable);
+  EXPECT_EQ(r.fnPtr, fallback);
+  EXPECT_TRUE(fourK.rwPages.empty());
+  EXPECT_TRUE(fourK.seals.empty()); // enable_rw needed first -> never sealed
+  EJitSharedCacheSlot *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->executableCoreMask.loadRelaxed() & (uint64_t{1} << 3), 0u);
+}
+
+// An over-bound writableCount from the code-range provider must make the owner
+// REJECT the publish entirely: no slot goes Ready, no fnPtr is shared, so a
+// peer (and even the owner) cleanly misses instead of running under-prepared
+// code. This is the end-to-end guard for the "never degrade to writableCount=0
+// and publish anyway" rule.
+TEST_F(SharedTaskPoolTest, FourKOverflowWritableRejectsPublish) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.writableCount = kEJitSharedMaxWritableRanges + 1; // over-bound
+  range.requiresPeerEnableRw = 1;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+
+  // Owner compile + attempted publish: the publish is rejected, so no Ready
+  // slot.
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.compileOrGet(1, nullptr, 0, codeFor(1)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  owner.pollOne(); // runs the compile + rejected publish
+
+  EXPECT_EQ(findReadySlot(1), nullptr); // nothing published
+
+  // A peer lookup finds no Ready slot -> clean miss/fallback, no fnPtr shared.
+  EJitCoreId::setCurrentForTest(3);
+  void *fallback = reinterpret_cast<void *>(0xFEEDull);
+  auto r = owner.compileOrGet(1, nullptr, 0, fallback);
+  EXPECT_NE(r.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_TRUE(fourK.rwPages.empty());
+}
+
 // 4/ Repeated hit on the SAME core does NOT re-split or re-seal (memoized).
 TEST_F(SharedTaskPoolTest, FourKSameCoreRepeatHitNoRework) {
   FourKLog fourK;
@@ -1867,7 +2318,7 @@ TEST_F(SharedTaskPoolTest, FourKGenerationChangeDuringPrepareNotReturned) {
   EXPECT_TRUE(r.readyButNotShareable);
 }
 
-// 16/17 ABI v7 layout: the slot carries the executable range as fixed-width,
+// Shared ABI layout: the slot carries the executable range as fixed-width,
 // naturally-aligned scalars (read back by value — endian-safe), the pool-split
 // table is POD, dump state contains metadata only, and each bucket carries the
 // NO_RECLAIM seqlock publishSeq word.
@@ -1878,11 +2329,16 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // one-shot diagnostic mask. Bump this deliberately: the blob is mapped at one
   // address by every core, so a layout change that slips through unversioned is
   // a silent cross-core corruption.
-  EXPECT_EQ(kEJitSharedAbiVersion, 9u);
+  // v10 adds shared PGO controls, v11 adds Tier-1 writable ranges, and v12
+  // adds staged concurrent-profile admission and progress counters.
+  EXPECT_EQ(kEJitSharedAbiVersion, 12u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
       std::is_trivially_default_constructible<EJitSharedPoolSplit>::value);
+  EXPECT_TRUE(std::is_standard_layout<EJitSharedWritableRange>::value);
+  EXPECT_TRUE(
+      std::is_trivially_default_constructible<EJitSharedWritableRange>::value);
 
   FourKLog fourK;
   RangeCtx range;
@@ -1891,6 +2347,9 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   range.poolBase = 0x40000000ull;
   range.poolSize = 0x200000ull;
   range.poolId = 7;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40080000ull;
+  range.writableSize[0] = 0x40;
   EJitSharedTaskPool owner;
   bringUpOwner4K(owner, fourK, range);
   EXPECT_EQ(state_->abiVersion, kEJitSharedAbiVersion);
@@ -1904,6 +2363,13 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   EXPECT_EQ(slot->poolSize, 0x200000ull);
   EXPECT_EQ(slot->poolId, 7u);
   EXPECT_EQ(slot->rangeReserved, 0u);
+  // Runtime-writable ranges (v9): published verbatim from the code-range info.
+  EXPECT_EQ(slot->writableCount, 1u);
+  EXPECT_EQ(slot->requiresPeerEnableRw, 1u); // RangeCtx default: fixed RX pool
+  EXPECT_EQ(slot->writableRanges[0].addr, 0x40080000ull);
+  EXPECT_EQ(slot->writableRanges[0].size, 0x40ull);
+  // PGO fields: zero on a Baseline publish (PGO off).
+  EXPECT_EQ(slot->hitCount.loadRelaxed(), 0u);
 }
 
 TEST_F(SharedTaskPoolTest, DumpStateHoldsOnlySmallMetadata) {
@@ -1996,6 +2462,12 @@ TEST_F(SharedTaskPoolTest, FourKReinitScrubsStaleV5Fields) {
       Slot.poolSize = 0x4444;
       Slot.poolId = 0x5555;
       Slot.rangeReserved = 0x6666;
+      Slot.writableCount = 0x7777;
+      Slot.requiresPeerEnableRw = 0x8888;
+      for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
+        Slot.writableRanges[i].addr = 0x9999 + i;
+        Slot.writableRanges[i].size = 0xAAAA + i;
+      }
     }
 
   // init-state was left Uninitialized, so owner election runs
@@ -2023,6 +2495,12 @@ TEST_F(SharedTaskPoolTest, FourKReinitScrubsStaleV5Fields) {
       EXPECT_EQ(Slot.poolSize, 0u);
       EXPECT_EQ(Slot.poolId, 0u);
       EXPECT_EQ(Slot.rangeReserved, 0u);
+      EXPECT_EQ(Slot.writableCount, 0u);
+      EXPECT_EQ(Slot.requiresPeerEnableRw, 0u);
+      for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
+        EXPECT_EQ(Slot.writableRanges[i].addr, 0u);
+        EXPECT_EQ(Slot.writableRanges[i].size, 0u);
+      }
     }
 }
 
@@ -2738,7 +3216,8 @@ static BatchStats summarize(std::vector<double> &perIterNs) {
   return s;
 }
 static void report(const char *name, const BatchStats &s) {
-  printf("  %-28s avg=%.1fns p50=%.1f p90=%.1f p99=%.1f max=%.1f (n=%zu batches)\n",
+  printf("  %-28s avg=%.1fns p50=%.1f p90=%.1f p99=%.1f max=%.1f (n=%zu "
+         "batches)\n",
          name, s.avgNs, s.p50, s.p90, s.p99, s.maxNs, s.samples);
 }
 } // namespace
@@ -2750,9 +3229,10 @@ TEST_F(SharedTaskPoolTest, DISABLED_HotHitMicroBench) {
   EJitCoreId::setCurrentForTest(0); // owner-core hit path
   const uint64_t freq = benchFreq();
   const double tickNs = 1e9 / static_cast<double>(freq);
-  const uint32_t kIters = 2000;    // per batch
-  const uint32_t kBatches = 2000;  // distribution samples
-  printf("HotHit micro-bench: cntfrq=%llu Hz (%.3f ns/tick), %u iters x %u batches\n",
+  const uint32_t kIters = 2000;   // per batch
+  const uint32_t kBatches = 2000; // distribution samples
+  printf("HotHit micro-bench: cntfrq=%llu Hz (%.3f ns/tick), %u iters x %u "
+         "batches\n",
          (unsigned long long)freq, tickNs, kIters, kBatches);
 
   // Warm up + correctness sanity.
@@ -2786,7 +3266,8 @@ TEST_F(SharedTaskPoolTest, DISABLED_HotHitMicroBench) {
     owner.releaseRead(r.bucketIndex);
   });
 
-  // (B) Lookup only (read-token acquired but released untimed): isolates get_fn.
+  // (B) Lookup only (read-token acquired but released untimed): isolates
+  // get_fn.
   auto lookup = runBatches([&] {
     auto r = owner.tryCacheHit0D(42);
     sink = r.fnPtr;
@@ -2828,9 +3309,9 @@ TEST_F(SharedTaskPoolTest, DISABLED_HotHitMicroBench) {
 }
 
 // Multi-core contention model of the real board: N cores hammering the SAME hot
-// function share one bucket cache line. The read-token RMW (fetchAdd/fetchSub on
-// bucket.readers) then bounces that line between cores; a load-only seqlock read
-// does not. This is the scenario the 6us regression comes from.
+// function share one bucket cache line. The read-token RMW (fetchAdd/fetchSub
+// on bucket.readers) then bounces that line between cores; a load-only seqlock
+// read does not. This is the scenario the 6us regression comes from.
 TEST_F(SharedTaskPoolTest, DISABLED_HotHitContendedBench) {
   EJitSharedTaskPool owner;
   bringUpOwner(owner, /*codeSharing=*/true);
@@ -3749,7 +4230,8 @@ TEST_F(SharedTaskPoolTest, L0RetiredByPublishAndByVersionChange) {
   ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
 
   publish(pool, 9);
-  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out)) << "publish must retire the L0";
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out))
+      << "publish must retire the L0";
 
   pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
   ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
@@ -3977,6 +4459,1163 @@ TEST_F(SharedTaskPoolTest, L0CollidingIdentitiesNeverCrossServe) {
   pool.l0Fill(31, codeFor(37), c, 1);
   if (pool.l0Try(30, c, 1, &out))
     EXPECT_NE(out, codeFor(37)) << "funcIndex 30 served funcIndex 31's entry";
+}
+
+// PGO (§6): shared taskpool hitCount + Tier-2 auto-trigger.
+//===----------------------------------------------------------------------===//
+
+TEST_F(SharedTaskPoolTest, SharedPgoFastHitEnqueuesTier2) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setPgoEnabled(true, 1);
+
+  ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+  ASSERT_EQ(pool.pendingCount(), 0u);
+
+  auto hit = pool.tryCacheHit0D(5);
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(pool.pendingCount(), 1u)
+      << "the flattened C-API fast hit must enqueue Tier-2 itself";
+  if (hit.hasReadToken)
+    pool.releaseRead(hit.bucketIndex);
+}
+
+TEST_F(SharedTaskPoolTest, SharedPgoDisablesL0Fill) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setPgoEnabled(true, 2);
+
+  void *out = nullptr;
+  pool.l0Fill(5, codeFor(5), nullptr, 0);
+  EXPECT_FALSE(pool.l0Try(5, nullptr, 0, &out));
+}
+
+TEST_F(SharedTaskPoolTest, SharedPgoInlineCacheWaitsForTier2) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  constexpr uint32_t kFunc = 5;
+  uintptr_t cell = 0;
+  ejitIcacheRegisterSlot(kFunc, &cell, 0);
+  pool.setPgoEnabled(true, 1);
+
+  // Publish Tier-1. Its first hit crosses the threshold, but the wrapper cell
+  // must remain empty so subsequent calls can continue observing the shared
+  // PGO state until Tier-2 lands.
+  ASSERT_EQ(pool.compileOrGet(kFunc, nullptr, 0, codeFor(kFunc)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+  auto tier1 = pool.tryCacheHit0D(kFunc);
+  ASSERT_EQ(tier1.status, EJitCompileOrGetStatus::CacheHit);
+  pool.icacheFill(kFunc, tier1.fnPtr, nullptr, 0,
+                  pool.icacheBeginResolve());
+  EXPECT_EQ(cell, 0u);
+  EXPECT_EQ(pool.pendingCount(), 1u);
+  if (tier1.hasReadToken)
+    pool.releaseRead(tier1.bucketIndex);
+
+  // Tier-2 replaces the slot. The next normal resolve returns the Tier-2
+  // pointer, which is now eligible for the calling core's private cell.
+  ASSERT_TRUE(pool.pollOne());
+  auto tier2 = pool.tryCacheHit0D(kFunc);
+  ASSERT_EQ(tier2.status, EJitCompileOrGetStatus::CacheHit);
+  pool.icacheFill(kFunc, tier2.fnPtr, nullptr, 0,
+                  pool.icacheBeginResolve());
+  EXPECT_EQ(cell, reinterpret_cast<uintptr_t>(tier2.fnPtr));
+  EXPECT_NE(tier2.fnPtr, tier1.fnPtr);
+  if (tier2.hasReadToken)
+    pool.releaseRead(tier2.bucketIndex);
+
+  void *out = nullptr;
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, tier2.fnPtr);
+  ejitIcacheClearAll();
+}
+
+TEST_F(SharedTaskPoolTest, SharedPgoInlineCacheRequiresExactTier2Identity) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  constexpr uint32_t kFunc = 5;
+  constexpr uint32_t D = EJIT_ICACHE_DIM_SIZE;
+  uintptr_t cells[D] = {};
+  ejitIcacheRegisterSlot(kFunc, cells, 1);
+  pool.setPgoEnabled(true, 1);
+  pool.setInstanceEnabled(1, 0, true);
+  pool.setInstanceEnabled(1, 1, true);
+  EJitDimPair d0[1] = {dim(1, 0)};
+  EJitDimPair d1[1] = {dim(1, 1)};
+
+  ASSERT_EQ(pool.compileOrGet(kFunc, d0, 1, codeFor(kFunc)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+  auto hit = pool.tryCacheHit1D(kFunc, 1, 0);
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  if (hit.hasReadToken)
+    pool.releaseRead(hit.bucketIndex);
+  ASSERT_TRUE(pool.pollOne()); // publish Tier-2 for d0 only
+  auto tier2 = pool.tryCacheHit1D(kFunc, 1, 0);
+  ASSERT_EQ(tier2.status, EJitCompileOrGetStatus::CacheHit);
+
+  pool.icacheFill(kFunc, tier2.fnPtr, d1, 1, pool.icacheBeginResolve());
+  EXPECT_EQ(cells[1], 0u) << "a Tier-2 pointer must not fill another identity";
+  pool.icacheFill(kFunc, tier2.fnPtr, d0, 1, pool.icacheBeginResolve());
+  EXPECT_EQ(cells[0], reinterpret_cast<uintptr_t>(tier2.fnPtr));
+  if (tier2.hasReadToken)
+    pool.releaseRead(tier2.bucketIndex);
+  ejitIcacheClearAll();
+}
+
+// Shared equivalent of EJitTaskPoolTest::PgoHitThresholdArmsTier2Recompile.
+// Set PGO threshold=3, publish Tier-1, hit it twice (below threshold), then
+// the third hit crosses the threshold -> Tier-2 request enqueued.
+// pollOne compiles it -> publish resets hitCount to 0.
+TEST_F(SharedTaskPoolTest, SharedPgoHitThresholdArmsTier2Recompile) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+
+  pool.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+  pool.setPgoEnabled(true, 2); // arm Tier-2 on the 2nd hit
+
+  // Tier-1: miss -> enqueue -> pollOne compiles + publishes.
+  ASSERT_EQ(pool.compileOrGet(5, d0, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+  EXPECT_EQ(pool.pendingCount(), 0u);
+
+  // One hit: below threshold -> no Tier-2 armed, but hitCount increments.
+  auto r1 = pool.compileOrGet(5, d0, 1, codeFor(5));
+  ASSERT_EQ(r1.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(pool.pendingCount(), 0u);
+  if (r1.hasReadToken)
+    pool.releaseRead(r1.bucketIndex);
+
+  // Verify hitCount incremented.
+  {
+    EJitSharedCacheSlot *s = findReadySlot(5);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->hitCount.loadRelaxed(), 1u);
+  }
+
+  // Second hit crosses threshold -> Tier-2 armed + enqueued on the SHARED
+  // MPSC queue (no facade-local bypass).  The in-flight dedup bit for the
+  // (stripped) funcIndex is now claimed, so pendingCount reflects the queued
+  // Tier-2 request.
+  auto r2 = pool.compileOrGet(5, d0, 1, codeFor(5));
+  EXPECT_EQ(r2.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(pool.pendingCount(), 1u)
+      << "Tier-2 request queued via shared queue";
+  if (r2.hasReadToken)
+    pool.releaseRead(r2.bucketIndex);
+
+  // Verify hitCount.
+  {
+    EJitSharedCacheSlot *s = findReadySlot(5);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->hitCount.loadRelaxed(), 2u);
+  }
+
+  // The owner worker consumes the shared queue: pollOne() pops the Tier-2
+  // request and compiles it (returns true — the Tier-2 travelled through the
+  // ring, it is NOT a facade-local inline bypass).  runCompile() derives the
+  // aarch64 exclusive-monitor workaround from the request's encoded PGOUse
+  // tier.
+  EXPECT_TRUE(pool.pollOne());
+  EXPECT_EQ(pool.pendingCount(), 0u);
+
+  // hitCount reset to 0 on Tier-2 publish (cachePublish overwrites Tier-1).
+  {
+    EJitSharedCacheSlot *s = findReadySlot(5);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->hitCount.loadRelaxed(), 0u);
+    EXPECT_NE(s->fnPtr.loadRelaxed(), 0u); // now has Tier-2 code
+    EXPECT_EQ(s->tier.loadRelaxed(),
+              static_cast<uint8_t>(kEJitTierPgoUse)); // slot now Tier-2
+  }
+}
+
+TEST_F(SharedTaskPoolTest, SharedPgoProfilesFunctionsSequentially) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setPgoEnabled(true, 2);
+  EXPECT_EQ(state_->pgoMaxActiveFunctions.loadAcquire(), 1u);
+
+  // The first miss owns staged profiling and is explicitly queued as Tier-1.
+  ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+  EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 6u);
+  EXPECT_EQ(state_->enqueuePos.loadRelaxed() - state_->dequeuePos.loadRelaxed(),
+            1u);
+
+  // A different function stays on its AOT fallback and adds no compiler work.
+  auto deferred = pool.compileOrGet(6, nullptr, 0, codeFor(6));
+  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(deferred.fnPtr, codeFor(6));
+  EXPECT_EQ(state_->enqueuePos.loadRelaxed() - state_->dequeuePos.loadRelaxed(),
+            1u);
+  EXPECT_EQ(state_->pgoDeferredMisses.loadRelaxed(), 1u);
+
+  ASSERT_TRUE(pool.pollOne());
+  EJitSharedCacheSlot *tier1 = findReadySlot(5);
+  ASSERT_NE(tier1, nullptr);
+  EXPECT_EQ(tier1->tier.loadRelaxed(),
+            static_cast<uint8_t>(kEJitTierInstrumented));
+
+  // Only the active function accumulates profile progress and arms Tier-2.
+  for (unsigned i = 0; i < 2; ++i) {
+    auto hit = pool.compileOrGet(5, nullptr, 0, codeFor(5));
+    ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+    if (hit.hasReadToken)
+      pool.releaseRead(hit.bucketIndex);
+  }
+  EXPECT_EQ(state_->pgoProgressQuarters[0].loadAcquire(), 4u);
+  EXPECT_EQ(pool.pendingCount(), 1u);
+
+  // Tier-2 completion releases admission. The next called function can then
+  // begin its own Tier-1; there is never more than one instrumented function.
+  ASSERT_TRUE(pool.pollOne());
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(state_->pgoCompletedFunctions.loadRelaxed(), 1u);
+  ASSERT_EQ(pool.compileOrGet(6, nullptr, 0, codeFor(6)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+  EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 7u);
+}
+
+TEST_F(SharedTaskPoolTest, SharedPgoReleasesAdmissionForPreexistingWork) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+
+  ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  pool.setPgoEnabled(true, 2);
+
+  EXPECT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 0u);
+
+  EXPECT_EQ(pool.compileOrGet(6, nullptr, 0, codeFor(6)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+  EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 7u);
+}
+
+TEST_F(SharedTaskPoolTest, SharedPgoHonorsConcurrentProfileLimit) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setPgoEnabled(true, 2, 2);
+
+  ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_EQ(pool.compileOrGet(6, nullptr, 0, codeFor(6)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 2u);
+  EXPECT_EQ(state_->pgoMaxActiveFunctions.loadAcquire(), 2u);
+
+  auto deferred = pool.compileOrGet(7, nullptr, 0, codeFor(7));
+  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(deferred.fnPtr, codeFor(7));
+  ASSERT_TRUE(pool.pollOne());
+  ASSERT_TRUE(pool.pollOne());
+
+  for (unsigned i = 0; i < 2; ++i) {
+    auto hit = pool.compileOrGet(5, nullptr, 0, codeFor(5));
+    ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+    if (hit.hasReadToken)
+      pool.releaseRead(hit.bucketIndex);
+  }
+  ASSERT_TRUE(pool.pollOne());
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+
+  ASSERT_EQ(pool.compileOrGet(7, nullptr, 0, codeFor(7)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 2u);
+}
+
+TEST_F(SharedTaskPoolTest,
+       DesignatedOwnerWorkerServesConcurrentPgoProducerCores) {
+  constexpr uint32_t kOwnerCore = 8;
+  constexpr uint32_t kProducerCount = 3;
+  constexpr uint32_t kProducerCores[kProducerCount] = {18, 19, 20};
+  constexpr uint32_t kFuncIndices[kProducerCount] = {5, 6, 7};
+
+  WorkerHooks hooks;
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(kOwnerCore);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setWorkerHooks(&mockWorkerStart, &mockWorkerStop, &hooks);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setCodeSharingEnabled(true);
+  owner.setPgoEnabled(true, /*threshold=*/2,
+                      /*maxConcurrentProfiles=*/2);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(state_->ownerCoreId.loadAcquire(), kOwnerCore);
+  ASSERT_EQ(hooks.starts, 1);
+  ASSERT_EQ(hooks.startCore, kOwnerCore);
+
+  EJitSharedTaskPool peers[kProducerCount];
+  for (uint32_t i = 0; i < kProducerCount; ++i) {
+    peers[i].setWorkerHooks(&mockWorkerStart, &mockWorkerStop, &hooks);
+    EJitCoreId::setCurrentForTest(kProducerCores[i]);
+    peers[i].bind(state_.get());
+    peers[i].setMode(EJitCompileMode::Async);
+    ASSERT_EQ(peers[i].init(), EJitSharedTaskPool::InitResult::AttachedReady);
+  }
+  ASSERT_EQ(hooks.starts, 1) << "peer cores must not start workers";
+
+  EJitSharedTaskPool::CompileOrGetResult first[kProducerCount];
+  std::atomic<uint32_t> ready{0};
+  std::atomic<bool> go{false};
+  std::vector<std::thread> producers;
+  for (uint32_t i = 0; i < kProducerCount; ++i) {
+    producers.emplace_back([&, i] {
+      EJitCoreId::setCurrentForTest(kProducerCores[i]);
+      ready.fetch_add(1, std::memory_order_release);
+      while (!go.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      first[i] = peers[i].compileOrGet(kFuncIndices[i], nullptr, 0,
+                                       codeFor(kFuncIndices[i]));
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != kProducerCount)
+    std::this_thread::yield();
+  go.store(true, std::memory_order_release);
+  for (auto &producer : producers)
+    producer.join();
+
+  uint32_t admitted = 0;
+  uint32_t deferred = kProducerCount;
+  for (uint32_t i = 0; i < kProducerCount; ++i) {
+    if (first[i].status == EJitCompileOrGetStatus::EnqueuedPending) {
+      ++admitted;
+    } else {
+      EXPECT_EQ(first[i].status, EJitCompileOrGetStatus::AlreadyPending);
+      EXPECT_EQ(first[i].fnPtr, codeFor(kFuncIndices[i]));
+      deferred = i;
+    }
+  }
+  ASSERT_EQ(admitted, 2u);
+  ASSERT_LT(deferred, kProducerCount);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 2u);
+  EXPECT_EQ(owner.pendingCount(), 2u);
+
+  // Deterministically step the already-started core-8 worker. Producer-side
+  // admission above used real concurrent host threads; manual polling keeps
+  // compile completion ordering stable for the assertions below.
+  EJitCoreId::setCurrentForTest(kOwnerCore);
+  ASSERT_TRUE(owner.pollOne());
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_FALSE(owner.pollOne());
+  for (uint32_t i = 0; i < kProducerCount; ++i) {
+    if (i == deferred)
+      continue;
+    EJitSharedCacheSlot *slot = findReadySlot(kFuncIndices[i]);
+    ASSERT_NE(slot, nullptr);
+    EXPECT_EQ(slot->tier.loadRelaxed(),
+              static_cast<uint8_t>(kEJitTierInstrumented));
+  }
+
+  // The same producer cores now run together. The admitted functions collect
+  // two hits each and enqueue Tier-2; the deferred function remains on AOT.
+  ready.store(0, std::memory_order_relaxed);
+  go.store(false, std::memory_order_relaxed);
+  producers.clear();
+  EJitSharedTaskPool::CompileOrGetResult profile[kProducerCount][2];
+  for (uint32_t i = 0; i < kProducerCount; ++i) {
+    producers.emplace_back([&, i] {
+      EJitCoreId::setCurrentForTest(kProducerCores[i]);
+      ready.fetch_add(1, std::memory_order_release);
+      while (!go.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      unsigned calls = i == deferred ? 1u : 2u;
+      for (unsigned hit = 0; hit < calls; ++hit) {
+        profile[i][hit] = peers[i].compileOrGet(kFuncIndices[i], nullptr, 0,
+                                                codeFor(kFuncIndices[i]));
+        if (profile[i][hit].hasReadToken)
+          peers[i].releaseRead(profile[i][hit].bucketIndex);
+      }
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != kProducerCount)
+    std::this_thread::yield();
+  go.store(true, std::memory_order_release);
+  for (auto &producer : producers)
+    producer.join();
+
+  EXPECT_EQ(profile[deferred][0].status,
+            EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(profile[deferred][0].fnPtr, codeFor(kFuncIndices[deferred]));
+  EXPECT_EQ(owner.pendingCount(), 2u);
+  uint32_t profilesAtThreshold = 0;
+  for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
+    if (state_->pgoActiveFunctions[i].loadAcquire() == 0)
+      continue;
+    ++profilesAtThreshold;
+    EXPECT_EQ(state_->pgoProgressQuarters[i].loadAcquire(), 4u);
+  }
+  EXPECT_EQ(profilesAtThreshold, 2u);
+  EJitCoreId::setCurrentForTest(kOwnerCore);
+  ASSERT_TRUE(owner.pollOne());
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_EQ(state_->pgoCompletedFunctions.loadRelaxed(), 2u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+
+  // Once the two profiles finish, the function that stayed on AOT can claim a
+  // slot. The designated owner remains the only worker throughout.
+  EJitCoreId::setCurrentForTest(kProducerCores[deferred]);
+  EXPECT_EQ(peers[deferred]
+                .compileOrGet(kFuncIndices[deferred], nullptr, 0,
+                              codeFor(kFuncIndices[deferred]))
+                .status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EJitCoreId::setCurrentForTest(kOwnerCore);
+  ASSERT_TRUE(owner.pollOne());
+  EJitSharedCacheSlot *last = findReadySlot(kFuncIndices[deferred]);
+  ASSERT_NE(last, nullptr);
+  EXPECT_EQ(last->tier.loadRelaxed(),
+            static_cast<uint8_t>(kEJitTierInstrumented));
+  EXPECT_EQ(hooks.starts, 1);
+}
+
+// Shared version bump test (§7.2 / §4): a Tier-2 request that was queued when
+// the identity was current is DISCARDED by the worker when a version bump lands
+// between arm and consume. runCompile's checkpoint 1 (versionsCurrent) fails,
+// the code is never published over Tier-1, and the encoded-funcIndex dedup bit
+// is cleared (dedupClear strips the tier bits), so a later hit can retry.
+TEST_F(SharedTaskPoolTest, SharedPgoTier2DiscardedOnVersionBump) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+
+  pool.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+
+  pool.setPgoEnabled(true, 2);
+
+  // Tier-1 published.
+  ASSERT_EQ(pool.compileOrGet(5, d0, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+  void *tier1Fn = nullptr;
+  {
+    EJitSharedCacheSlot *s = findReadySlot(5);
+    ASSERT_NE(s, nullptr);
+    tier1Fn = reinterpret_cast<void *>(s->fnPtr.loadRelaxed());
+  }
+
+  // First hit below threshold, second hit arms + enqueues the Tier-2 request
+  // (snapshotting the CURRENT versions).
+  auto r1 = pool.compileOrGet(5, d0, 1, codeFor(5));
+  ASSERT_EQ(r1.status, EJitCompileOrGetStatus::CacheHit);
+  if (r1.hasReadToken)
+    pool.releaseRead(r1.bucketIndex);
+  auto r2 = pool.compileOrGet(5, d0, 1, codeFor(5));
+  ASSERT_EQ(r2.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(pool.pendingCount(), 1u); // Tier-2 queued
+  EXPECT_NE(state_->inFlight[5].loadRelaxed(), 0u);
+  if (r2.hasReadToken)
+    pool.releaseRead(r2.bucketIndex);
+
+  // Toggle the instance AFTER the Tier-2 is queued (version bump): the queued
+  // request's snapshot versions are now stale.
+  pool.setInstanceEnabled(1, 4, false);
+  pool.setInstanceEnabled(1, 4, true);
+
+  // Worker consumes the queued Tier-2: it pops it (returns true) but
+  // runCompile drops it at the version checkpoint — no publish over Tier-1.
+  EXPECT_TRUE(pool.pollOne());
+
+  // Tier-1 code is intact (Tier-2 never overwrote it) and the encoded-funcIndex
+  // dedup bit was cleared by the strip-aware dedupClear, so a retry is
+  // possible.
+  EXPECT_EQ(pool.pendingCount(), 0u);
+  EXPECT_EQ(state_->inFlight[5].loadRelaxed(), 0u)
+      << "dedupClear must strip the Tier-2 tier bits and free the in-flight "
+         "bit";
+  {
+    EJitSharedCacheSlot *s = findReadySlot(5);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(reinterpret_cast<void *>(s->fnPtr.loadRelaxed()), tier1Fn)
+        << "stale Tier-2 must not overwrite the still-executable Tier-1 code";
+    EXPECT_NE(s->tier.loadRelaxed(), static_cast<uint8_t>(kEJitTierPgoUse))
+        << "the slot must not have been upgraded to Tier-2";
+  }
+}
+
+// PGO off → no hitCount increment and no Tier-2 enqueue.
+// Baseline guards: compileOrGet hits are ordinary cache hits with zero
+// PGO behaviour when setPgoEnabled was never called.
+TEST_F(SharedTaskPoolTest, SharedPgoOffZeroOverhead) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+
+  pool.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+
+  // PGO left off (default) — never call setPgoEnabled.
+
+  // Tier-1 published.
+  ASSERT_EQ(pool.compileOrGet(5, d0, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+
+  // Hits remain ordinary cache hits and do not enqueue Tier-2.
+  for (int i = 0; i < 10; ++i) {
+    auto r = pool.compileOrGet(5, d0, 1, codeFor(5));
+    ASSERT_EQ(r.status, EJitCompileOrGetStatus::CacheHit);
+    if (r.hasReadToken)
+      pool.releaseRead(r.bucketIndex);
+  }
+  EXPECT_EQ(pool.pendingCount(), 0u); // no Tier-2 enqueued
+
+  // hitCount stays at 0 (threshold was never set).
+  EJitSharedCacheSlot *slot = findReadySlot(5);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->hitCount.loadRelaxed(), 0u);
+}
+
+// PGO threshold=0 (setPgoEnabled(true,0)) → counting disabled, no trigger.
+// hitCount is still incremented but no Tier-2 is ever armed.
+TEST_F(SharedTaskPoolTest, SharedPgoThresholdZeroDisablesTrigger) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+
+  pool.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+
+  // Enable PGO but with threshold=0 → hitCount increments but trigger is off.
+  pool.setPgoEnabled(true, 0);
+
+  ASSERT_EQ(pool.compileOrGet(5, d0, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+
+  for (int i = 0; i < 10; ++i) {
+    auto r = pool.compileOrGet(5, d0, 1, codeFor(5));
+    ASSERT_EQ(r.status, EJitCompileOrGetStatus::CacheHit);
+    if (r.hasReadToken)
+      pool.releaseRead(r.bucketIndex);
+  }
+  EXPECT_EQ(pool.pendingCount(), 0u); // no trigger
+
+  // hitCount IS incremented (bookkeeping, not arming).
+  EJitSharedCacheSlot *slot = findReadySlot(5);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_GT(slot->hitCount.loadRelaxed(), 0u);
+}
+
+// End-to-end: PGO enabled → Tier-1 publish → hits cross threshold → pollOne
+// inline Tier-2 compile with pgoClearExclusive → publish overwrites Tier-1 →
+// hitCount reset → subsequent hits return Tier-2 code.
+TEST_F(SharedTaskPoolTest, SharedPgoEndToEndTier2OverwritesTier1) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+  pool.setPgoEnabled(true, 2);
+
+  // Phase 1: Tier-1 compile + publish.
+  ASSERT_EQ(pool.compileOrGet(5, d0, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+
+  void *tier1Fn = nullptr;
+  {
+    EJitSharedCacheSlot *s = findReadySlot(5);
+    ASSERT_NE(s, nullptr);
+    tier1Fn = reinterpret_cast<void *>(s->fnPtr.loadRelaxed());
+    ASSERT_NE(tier1Fn, nullptr);
+  }
+
+  // Phase 2: two cache hits → 2nd arms Tier-2.
+  auto r1 = pool.compileOrGet(5, d0, 1, codeFor(5));
+  ASSERT_EQ(r1.status, EJitCompileOrGetStatus::CacheHit);
+  if (r1.hasReadToken)
+    pool.releaseRead(r1.bucketIndex);
+
+  auto r2 = pool.compileOrGet(5, d0, 1, codeFor(5));
+  ASSERT_EQ(r2.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(pool.pendingCount(), 1u);
+  if (r2.hasReadToken)
+    pool.releaseRead(r2.bucketIndex);
+
+  // Phase 3: the owner worker consumes the shared queue — pollOne pops the
+  // Tier-2 request and compiles it (returns true; runCompile derives the
+  // aarch64 exclusive-monitor workaround from the encoded PGOUse tier).
+  EXPECT_TRUE(pool.pollOne());
+  EXPECT_EQ(pool.pendingCount(), 0u);
+
+  // Phase 4: Tier-2 overwrote Tier-1 — fnPtr changed, hitCount reset.
+  {
+    EJitSharedCacheSlot *s = findReadySlot(5);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->hitCount.loadRelaxed(), 0u);
+    void *tier2Fn = reinterpret_cast<void *>(s->fnPtr.loadRelaxed());
+    ASSERT_NE(tier2Fn, nullptr);
+    EXPECT_NE(tier2Fn, tier1Fn) << "Tier-2 compile produced new code";
+  }
+
+  // Phase 5: subsequent hit returns Tier-2 pointer.
+  auto r3 = pool.compileOrGet(5, d0, 1, codeFor(5));
+  ASSERT_EQ(r3.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_NE(r3.fnPtr, codeFor(5))
+      << "hit after Tier-2 returns Tier-2 code, not fallback";
+  if (r3.hasReadToken)
+    pool.releaseRead(r3.bucketIndex);
+}
+
+//===----------------------------------------------------------------------===//
+// PGO (§1-§4): peer-triggered Tier-2 through the SHARED queue, exact-slot
+// snapshots, dedup coalescing, queue-full rollback, and strip-aware
+// dedupClear.  These exercise the hardened cross-core tier transition where a
+// non-owner facade may cross the threshold but only the single owner worker
+// consumes the shared MPSC queue.
+//===----------------------------------------------------------------------===//
+
+// Compiler that records what tier / snapshot each request carried, so a test
+// can assert the owner worker saw the EXACT hit slot's generation + versions.
+struct PgoRecorder {
+  int tier1 = 0;
+  int tier2 = 0;
+  std::vector<uint32_t> t2Func; // stripped funcIndex per Tier-2 compile
+  std::vector<uint32_t> t2Gen;  // generation per Tier-2 compile
+  std::vector<uint32_t> t2Ver0; // versions[0] per Tier-2 compile
+};
+bool mockCompileRecordPgo(void *ctx, const EJitCompileRequest &req,
+                          void **outFn) {
+  auto *r = static_cast<PgoRecorder *>(ctx);
+  if (decodeReqTier(req.funcIndex) == kEJitTierPgoUse) {
+    ++r->tier2;
+    r->t2Func.push_back(stripReqTier(req.funcIndex));
+    r->t2Gen.push_back(req.generation);
+    r->t2Ver0.push_back(req.numDims ? req.versions[0] : 0u);
+  } else {
+    ++r->tier1;
+  }
+  *outFn = codeFor(req.funcIndex);
+  return true;
+}
+
+// Fails only the Tier-2 (PGOUse) compile; Tier-1/Baseline succeed. Lets a test
+// drive the compile-failure dedup-rollback path.
+bool mockCompileFailTier2(void * /*ctx*/, const EJitCompileRequest &req,
+                          void **outFn) {
+  if (decodeReqTier(req.funcIndex) == kEJitTierPgoUse)
+    return false;
+  *outFn = codeFor(req.funcIndex);
+  return true;
+}
+
+struct CapturedFailingCompile {
+  uint32_t funcIndex = 0;
+  uint32_t calls = 0;
+};
+
+bool mockCompileCaptureAndFail(void *ctx, const EJitCompileRequest &req,
+                               void ** /*outFn*/) {
+  auto *capture = static_cast<CapturedFailingCompile *>(ctx);
+  capture->funcIndex = req.funcIndex;
+  ++capture->calls;
+  return false;
+}
+
+void disablePgoHook(void *ctx) {
+  static_cast<EJitSharedTaskPool *>(ctx)->setPgoEnabled(false, 0);
+}
+
+// Mirror of EJitSharedTaskPool::hashIdentity's bucket selection so a test can
+// deterministically construct two identities that collide into one bucket.
+uint32_t bucketOfIdentity(uint32_t funcIndex, const EJitDimPair *dims,
+                          uint32_t numDims) {
+  uint64_t key = static_cast<uint64_t>(funcIndex);
+  for (uint32_t i = 0; i < numDims; ++i) {
+    key ^= (static_cast<uint64_t>(dims[i].dimType) << 32) |
+           static_cast<uint64_t>(dims[i].instanceId);
+    key *= 0x9e3779b97f4a7c15ULL;
+  }
+  return static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
+}
+
+// Attach a non-owner producer facade on \p core. PGO configuration is read
+// from the shared blob; the peer must not need facade-local configuration.
+void attachPeer(EJitSharedTaskPool &peer, EJitSharedTaskPoolState *state,
+                uint32_t core) {
+  EJitCoreId::setCurrentForTest(core);
+  peer.bind(state);
+  peer.setMode(EJitCompileMode::Async);
+  ASSERT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+}
+
+TEST_F(SharedTaskPoolTest, PgoControlIsSharedAcrossFacades) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 17);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EXPECT_EQ(state_->pgoEnabled.loadAcquire(), 1u);
+  EXPECT_EQ(state_->tier2Threshold.loadAcquire(), 17u);
+
+  EJitSharedTaskPool peer;
+  attachPeer(peer, state_.get(), /*core=*/1);
+  EXPECT_TRUE(peer.isPgoEnabled());
+
+  // A live owner-side update is shared too; the peer has no local setter call.
+  EJitCoreId::setCurrentForTest(0);
+  owner.setPgoEnabled(false, 0);
+  EJitCoreId::setCurrentForTest(1);
+  EXPECT_FALSE(peer.isPgoEnabled());
+  EXPECT_EQ(state_->tier2Threshold.loadAcquire(), 0u);
+}
+
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+TEST_F(SharedTaskPoolTest, PgoTier2PublishWaitsForExistingWriter) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setPgoEnabled(true, 1);
+
+  ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne()); // Publish Tier-1.
+  auto hit = pool.tryCacheHit0D(5);
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  if (hit.hasReadToken)
+    pool.releaseRead(hit.bucketIndex);
+  ASSERT_EQ(pool.pendingCount(), 1u); // Tier-2 is queued.
+
+  uint32_t bucket = bucketOfIdentity(5, nullptr, 0);
+  state_->buckets[bucket].writeFlag.storeRelease(1);
+
+  std::atomic<bool> ready{false};
+  std::atomic<bool> start{false};
+  std::atomic<bool> done{false};
+  bool consumed = false;
+  std::thread publisher([&] {
+    ready.store(true, std::memory_order_release);
+    while (!start.load(std::memory_order_acquire))
+      std::this_thread::yield();
+    consumed = pool.pollOne();
+    done.store(true, std::memory_order_release);
+  });
+
+  while (!ready.load(std::memory_order_acquire))
+    std::this_thread::yield();
+  start.store(true, std::memory_order_release);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_FALSE(done.load(std::memory_order_acquire))
+      << "Tier-2 publish entered while another writer held writeFlag";
+
+  state_->buckets[bucket].writeFlag.storeRelease(0);
+  publisher.join();
+  EXPECT_TRUE(consumed);
+  EXPECT_EQ(pool.pendingCount(), 0u);
+  EJitSharedCacheSlot *slot = findReadySlot(5);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->tier.loadRelaxed(),
+            static_cast<uint8_t>(kEJitTierPgoUse));
+}
+#endif
+
+TEST_F(SharedTaskPoolTest, PgoAdmissionSnapshotSelectsInstrumentedTier) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  CapturedFailingCompile capture;
+  pool.setCompiler(&mockCompileCaptureAndFail, &capture);
+  pool.setPgoEnabled(true, 2);
+  pool.setPgoAdmissionTestHook(&disablePgoHook, &pool);
+
+  ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  pool.setPgoAdmissionTestHook(nullptr, nullptr);
+
+  ASSERT_TRUE(pool.pollOne());
+  ASSERT_EQ(capture.calls, 1u);
+  EXPECT_EQ(stripReqTier(capture.funcIndex), 5u);
+  EXPECT_EQ(decodeReqTier(capture.funcIndex), kEJitTierInstrumented)
+      << "admission and queued tier must use the same PGO snapshot";
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u)
+      << "Tier-1 failure must roll back the admission taken for this request";
+  EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 0u);
+}
+
+// (1) A peer core crosses the Tier-2 threshold; the request travels the shared
+// queue and only the OWNER worker consumes it, publishing Tier-2.
+TEST_F(SharedTaskPoolTest, PeerCrossesThresholdOwnerConsumes) {
+  EJitSharedTaskPool owner;
+  PgoRecorder rec;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompileRecordPgo, &rec);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setCodeSharingEnabled(true);
+  owner.setPgoEnabled(true, 3);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  owner.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+
+  // Tier-1 published by the owner.
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.compileOrGet(5, d0, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_EQ(rec.tier1, 1);
+
+  // A peer facade attaches on core 1 and drives the hits.
+  EJitSharedTaskPool peer;
+  attachPeer(peer, state_.get(), /*core=*/1);
+
+  // Peer hits: each increments the SHARED slot hitCount; the third crosses the
+  // threshold and enqueues a Tier-2 request onto the shared queue.
+  EJitCoreId::setCurrentForTest(1);
+  for (int i = 0; i < 3; ++i) {
+    auto Hit = peer.compileOrGet(5, d0, 1, codeFor(5));
+    if (Hit.hasReadToken)
+      peer.releaseRead(Hit.bucketIndex);
+  }
+  EXPECT_EQ(peer.pendingCount(), 1u) << "peer enqueued exactly one Tier-2";
+  EXPECT_NE(state_->inFlight[5].loadRelaxed(), 0u);
+
+  // The peer has no worker; the OWNER worker consumes the shared queue.
+  EJitCoreId::setCurrentForTest(0);
+  EXPECT_TRUE(owner.pollOne());
+  EXPECT_EQ(rec.tier2, 1) << "owner compiled the peer-triggered Tier-2 once";
+
+  // Tier-2 published: slot tier upgraded, fnPtr changed, queue + dedup drained.
+  EJitSharedCacheSlot *s = findReadySlot(5);
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->tier.loadRelaxed(), static_cast<uint8_t>(kEJitTierPgoUse));
+  EXPECT_EQ(s->hitCount.loadRelaxed(), 0u);
+  EXPECT_NE(reinterpret_cast<void *>(s->fnPtr.loadRelaxed()), codeFor(5));
+  EXPECT_EQ(owner.pendingCount(), 0u);
+  EXPECT_FALSE(owner.pollOne()); // queue empty
+}
+
+// (2) Two peers cross the threshold on the SAME identity; shared dedup admits
+// exactly one Tier-2 request and the owner compiles it once. No permanent
+// pending remains.
+TEST_F(SharedTaskPoolTest, MultiplePeersTriggerOnlyOneTier2) {
+  EJitSharedTaskPool owner;
+  PgoRecorder rec;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompileRecordPgo, &rec);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setCodeSharingEnabled(true);
+  owner.setPgoEnabled(true, 2);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  owner.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+
+  // Tier-1 published.
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.compileOrGet(5, d0, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  EJitSharedTaskPool peerA, peerB;
+  attachPeer(peerA, state_.get(), /*core=*/1);
+  attachPeer(peerB, state_.get(), /*core=*/2);
+
+  // Both peers reach/exceed the threshold on the same (5, dim) identity.
+  auto hitAndRelease = [&](EJitSharedTaskPool &Pool) {
+    auto Hit = Pool.compileOrGet(5, d0, 1, codeFor(5));
+    if (Hit.hasReadToken)
+      Pool.releaseRead(Hit.bucketIndex);
+  };
+  EJitCoreId::setCurrentForTest(1);
+  hitAndRelease(peerA);
+  hitAndRelease(peerA); // crosses -> enqueue
+  EJitCoreId::setCurrentForTest(2);
+  hitAndRelease(peerB);
+  hitAndRelease(peerB); // crosses -> AlreadyPending
+
+  // Shared dedup coalesced both peers into a single queued Tier-2 request.
+  EXPECT_EQ(owner.pendingCount(), 1u);
+
+  EJitCoreId::setCurrentForTest(0);
+  EXPECT_TRUE(owner.pollOne());  // compiles the single Tier-2
+  EXPECT_FALSE(owner.pollOne()); // nothing else queued
+  EXPECT_EQ(rec.tier2, 1) << "owner compiled Tier-2 exactly once for two peers";
+  EXPECT_EQ(owner.pendingCount(), 0u) << "no permanent pending";
+
+  EJitSharedCacheSlot *s = findReadySlot(5);
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->tier.loadRelaxed(), static_cast<uint8_t>(kEJitTierPgoUse));
+}
+
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+// (3) NO_RECLAIM: two DISTINCT identities each trigger Tier-2; the second
+// request must carry its OWN generation/version snapshot, never inherit the
+// first's (the stale-request bug the removed generation==0 sentinel caused).
+TEST_F(SharedTaskPoolTest, NoReclaimDistinctTier2RequestsUseOwnSnapshots) {
+  EJitSharedTaskPool owner;
+  PgoRecorder rec;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompileRecordPgo, &rec);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setCodeSharingEnabled(true);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  // Two functions on two instances with DISTINCT versions.
+  owner.setInstanceEnabled(1, 4, true);  // version 1
+  owner.setInstanceEnabled(2, 7, true);  // version 1
+  owner.setInstanceEnabled(2, 7, false); // version 2
+  owner.setInstanceEnabled(2, 7, true);  // version 3
+  EJitDimPair dA[1] = {dim(1, 4)};
+  EJitDimPair dB[1] = {dim(2, 7)};
+  ASSERT_EQ(state_->version[1][4].loadAcquire(), 1u);
+  ASSERT_EQ(state_->version[2][7].loadAcquire(), 3u);
+
+  // Tier-1 for both.
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.compileOrGet(5, dA, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  ASSERT_EQ(owner.compileOrGet(6, dB, 1, codeFor(6)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  owner.setPgoEnabled(true, 1); // a single hit arms
+
+  // Trigger + consume A, then B — consecutively.
+  auto HitA = owner.compileOrGet(5, dA, 1, codeFor(5));
+  if (HitA.hasReadToken)
+    owner.releaseRead(HitA.bucketIndex);
+  ASSERT_TRUE(owner.pollOne());
+  auto HitB = owner.compileOrGet(6, dB, 1, codeFor(6));
+  if (HitB.hasReadToken)
+    owner.releaseRead(HitB.bucketIndex);
+  ASSERT_TRUE(owner.pollOne());
+
+  ASSERT_EQ(rec.tier2, 2u);
+  // The two Tier-2 requests carried their OWN identity + version snapshot.
+  ASSERT_EQ(rec.t2Func.size(), 2u);
+  EXPECT_EQ(rec.t2Func[0], 5u);
+  EXPECT_EQ(rec.t2Ver0[0], 1u);
+  EXPECT_EQ(rec.t2Func[1], 6u);
+  EXPECT_EQ(rec.t2Ver0[1], 3u)
+      << "second Tier-2 must use its own version, not inherit the first's";
+}
+#endif // EJIT_SRE_TASKPOOL_NO_RECLAIM
+
+// (4) Two specializations with the SAME funcIndex + same numDims but different
+// dims that COLLIDE into one bucket. Triggering Tier-2 on one must snapshot
+// THAT slot's version, never the colliding sibling's.
+TEST_F(SharedTaskPoolTest, SameFuncSameNumDimsBucketCollisionUsesExactSlot) {
+  EJitSharedTaskPool owner;
+  PgoRecorder rec;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompileRecordPgo, &rec);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setCodeSharingEnabled(true);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  // Find two instanceIds on dimType 1 whose (funcIndex=5, 1-dim) identities
+  // hash to the SAME bucket.
+  const uint32_t funcIndex = 5;
+  uint32_t instA = 0, instB = 0;
+  bool found = false;
+  for (uint32_t i = 1; i < kEJitSharedInstances && !found; ++i) {
+    EJitDimPair di[1] = {dim(1, i)};
+    uint32_t bi = bucketOfIdentity(funcIndex, di, 1);
+    for (uint32_t j = i + 1; j < kEJitSharedInstances && !found; ++j) {
+      EJitDimPair dj[1] = {dim(1, j)};
+      if (bucketOfIdentity(funcIndex, dj, 1) == bi) {
+        instA = i;
+        instB = j;
+        found = true;
+      }
+    }
+  }
+  ASSERT_TRUE(found) << "need two colliding identities";
+  EJitDimPair dA[1] = {dim(1, instA)};
+  EJitDimPair dB[1] = {dim(1, instB)};
+  ASSERT_EQ(bucketOfIdentity(funcIndex, dA, 1),
+            bucketOfIdentity(funcIndex, dB, 1));
+
+  // Give the two instances DISTINCT versions: A=1, B=3.
+  owner.setInstanceEnabled(1, instA, true);  // A version 1
+  owner.setInstanceEnabled(1, instB, true);  // B version 1
+  owner.setInstanceEnabled(1, instB, false); // B version 2
+  owner.setInstanceEnabled(1, instB, true);  // B version 3
+  ASSERT_EQ(state_->version[1][instA].loadAcquire(), 1u);
+  ASSERT_EQ(state_->version[1][instB].loadAcquire(), 3u);
+
+  // Tier-1 for both (they land in the same bucket, distinct slots).
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.compileOrGet(funcIndex, dA, 1, codeFor(funcIndex)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  ASSERT_EQ(owner.compileOrGet(funcIndex, dB, 1, codeFor(funcIndex)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  owner.setPgoEnabled(true, 1);
+
+  // Trigger Tier-2 on A ONLY: the snapshot must come from A's slot (version 1).
+  {
+    auto h = owner.compileOrGet(funcIndex, dA, 1, codeFor(funcIndex));
+    if (h.hasReadToken)
+      owner.releaseRead(h.bucketIndex);
+  }
+  ASSERT_TRUE(owner.pollOne());
+
+  ASSERT_EQ(rec.tier2, 1u);
+  ASSERT_EQ(rec.t2Func.size(), 1u);
+  EXPECT_EQ(rec.t2Func[0], funcIndex);
+  EXPECT_EQ(rec.t2Ver0[0], 1u)
+      << "Tier-2 must snapshot the hit slot (A, version 1), not the colliding "
+         "sibling (B, version 3)";
+}
+
+// (5) A full queue makes the Tier-2 enqueue fail; the in-flight dedup bit is
+// rolled back so a later hit (after space frees) can retrigger and succeed.
+TEST_F(SharedTaskPoolTest, Tier2QueueFullRollsBackDedup) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+
+  // Publish Tier-1 for the target (funcIndex 5).
+  ASSERT_EQ(pool.compileOrGet(5, d0, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+
+  // Fill the shared queue with ordinary undrained requests until full, then
+  // enable PGO so staged admission does not intentionally defer the fillers.
+  bool full = false;
+  uint32_t f = 100;
+  for (; f < 100 + kEJitSharedQueueSlots + 8; ++f) {
+    auto rr = pool.compileOrGet(f, nullptr, 0, codeFor(f));
+    if (rr.status == EJitCompileOrGetStatus::QueueFullFallback) {
+      full = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(full) << "expected the shared queue to reach capacity";
+  pool.setPgoEnabled(true, 1);
+
+  // A hit on the target arms Tier-2, but the enqueue fails (queue full) and the
+  // in-flight bit is rolled back (dedupClear strips the encoded tier bits).
+  ASSERT_EQ(state_->inFlight[5].loadRelaxed(), 0u);
+  auto hit = pool.compileOrGet(5, d0, 1, codeFor(5));
+  EXPECT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(state_->inFlight[5].loadRelaxed(), 0u)
+      << "queue-full Tier-2 must roll back its in-flight claim";
+  if (hit.hasReadToken)
+    pool.releaseRead(hit.bucketIndex);
+
+  // Free a few queue slots (keep most fillers queued so the target's Tier-1
+  // slot is not evicted by a full recompile storm before we retry).
+  (void)pool.pollBudget(8);
+
+  // Now the target can retrigger and successfully enqueue its Tier-2.
+  auto hit2 = pool.compileOrGet(5, d0, 1, codeFor(5));
+  EXPECT_EQ(hit2.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_NE(state_->inFlight[5].loadRelaxed(), 0u)
+      << "retry after space frees must claim the in-flight bit";
+  if (hit2.hasReadToken)
+    pool.releaseRead(hit2.bucketIndex);
+
+  // Drain the rest of the queue; the retried Tier-2 (queued at the tail, after
+  // all fillers) is compiled last and publishes func 5 at tier PGOUse.
+  (void)pool.pollBudget(kEJitSharedQueueSlots * 2);
+  EXPECT_EQ(state_->inFlight[5].loadRelaxed(), 0u);
+  EJitSharedCacheSlot *s = findReadySlot(5);
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->tier.loadRelaxed(), static_cast<uint8_t>(kEJitTierPgoUse));
+}
+
+// (6) The encoded Tier-2 funcIndex must leave NO in-flight bit after success,
+// version mismatch, OR compile failure — i.e. dedupClear strips the tier bits.
+TEST_F(SharedTaskPoolTest, Tier2DedupClearStripsTierBits) {
+  EJitSharedTaskPool pool;
+  PgoRecorder rec;
+  EJitCoreId::setCurrentForTest(0);
+  pool.bind(state_.get());
+  pool.setCompiler(&mockCompileRecordPgo, &rec);
+  pool.setMode(EJitCompileMode::Async);
+  ASSERT_EQ(pool.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  pool.setPgoEnabled(true, 1);
+
+  // --- Phase A: successful Tier-2 clears the in-flight bit. ---
+  pool.setInstanceEnabled(1, 4, true);
+  EJitDimPair dA[1] = {dim(1, 4)};
+  ASSERT_EQ(pool.compileOrGet(7, dA, 1, codeFor(7)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+  {
+    auto h = pool.compileOrGet(7, dA, 1, codeFor(7)); // arm -> enqueue
+    if (h.hasReadToken)
+      pool.releaseRead(h.bucketIndex);
+  }
+  EXPECT_NE(state_->inFlight[7].loadRelaxed(), 0u);
+  ASSERT_TRUE(pool.pollOne()); // publish Tier-2
+  EXPECT_EQ(state_->inFlight[7].loadRelaxed(), 0u)
+      << "successful Tier-2 must clear the stripped-funcIndex in-flight bit";
+
+  // --- Phase B: version mismatch drops Tier-2 and clears the in-flight bit.
+  // ---
+  pool.setInstanceEnabled(3, 9, true);
+  EJitDimPair dB[1] = {dim(3, 9)};
+  ASSERT_EQ(pool.compileOrGet(8, dB, 1, codeFor(8)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+  {
+    auto h = pool.compileOrGet(8, dB, 1, codeFor(8)); // arm -> enqueue
+    if (h.hasReadToken)
+      pool.releaseRead(h.bucketIndex);
+  }
+  EXPECT_NE(state_->inFlight[8].loadRelaxed(), 0u);
+  pool.setInstanceEnabled(3, 9, false); // version bump invalidates the request
+  pool.setInstanceEnabled(3, 9, true);
+  ASSERT_TRUE(pool.pollOne()); // worker drops it at the version checkpoint
+  EXPECT_EQ(state_->inFlight[8].loadRelaxed(), 0u)
+      << "version-mismatch Tier-2 must still clear the in-flight bit";
+
+  // --- Phase C: compile failure clears the in-flight bit. ---
+  pool.setCompiler(&mockCompileFailTier2, nullptr); // fail only PGOUse
+  pool.setInstanceEnabled(5, 2, true);
+  EJitDimPair dC[1] = {dim(5, 2)};
+  ASSERT_EQ(pool.compileOrGet(9, dC, 1, codeFor(9)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne()); // Tier-1 succeeds (mockCompileFailTier2)
+  {
+    auto h = pool.compileOrGet(9, dC, 1, codeFor(9)); // arm -> enqueue
+    if (h.hasReadToken)
+      pool.releaseRead(h.bucketIndex);
+  }
+  EXPECT_NE(state_->inFlight[9].loadRelaxed(), 0u);
+  ASSERT_TRUE(pool.pollOne()); // Tier-2 compile fails
+  EXPECT_EQ(state_->inFlight[9].loadRelaxed(), 0u)
+      << "failed Tier-2 compile must clear the in-flight bit";
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u)
+      << "valid Tier-1 remains instrumented, so staged admission must stay "
+         "with this function for a later Tier-2 retry";
 }
 
 //===----------------------------------------------------------------------===//

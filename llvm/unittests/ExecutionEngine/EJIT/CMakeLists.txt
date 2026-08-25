@@ -5,8 +5,10 @@ set(LLVM_LINK_COMPONENTS
   EmbeddedJIT
   EJIT
   ExecutionEngine
+  Instrumentation
   OrcJIT
   Passes
+  ProfileData
   Support
   TargetParser
   )
@@ -15,9 +17,44 @@ add_llvm_unittest(EJITTests
   EJitRuntimeTest.cpp
   EJitFieldOffsetTest.cpp
   EJitLinkOptimizationPluginTest.cpp
+  EJitPgoTest.cpp
+  EJitVpMergeTest.cpp
+  EJitVpScalarSpecTest.cpp
+  EJitVpPipelineTest.cpp
 
   PARTIAL_SOURCES_INTENDED
   )
+
+# The value-profile test sources are #ifdef EJIT_SRE_PGO_VALUE_PROFILE-gated,
+# matching the LLVMEJIT build; without these definitions they compile to empty
+# translation units.
+if(EJIT_SRE_PGO_VALUE_PROFILE)
+  target_compile_definitions(EJITTests PRIVATE
+    EJIT_SRE_PGO_VALUE_PROFILE
+    EJIT_SRE_VP_K=${EJIT_SRE_VP_K}
+    EJIT_SRE_VP_SITES_PER_CORE=${EJIT_SRE_VP_SITES_PER_CORE}
+    EJIT_SRE_VP_MAX_CORES=${EJIT_SRE_VP_MAX_CORES}
+    EJIT_SRE_VP_TOP_N=${EJIT_SRE_VP_TOP_N}
+    EJIT_SRE_VP_DRAIN_TICKS=${EJIT_SRE_VP_DRAIN_TICKS}
+    EJIT_SRE_VP_MIN_SAMPLES=${EJIT_SRE_VP_MIN_SAMPLES}
+    EJIT_SRE_VP_MIN_CONF_PERCENT=${EJIT_SRE_VP_MIN_CONF_PERCENT}
+  )
+endif()
+
+if(EJIT_SRE_PGO_BRANCH_AUDIT)
+  target_compile_definitions(EJITTests PRIVATE EJIT_SRE_PGO_BRANCH_AUDIT)
+endif()
+
+# EJit.cpp calls InitializeAllAsmParsers(); a target's AsmParser lib is only
+# referenced at runtime (no CMake dependency edge), so when listed via
+# LLVM_LINK_COMPONENTS it can be ordered BEFORE LLVMEJIT on the static link
+# line and its LLVMInitialize<T>AsmParser symbol is dropped. Append each built
+# target's AsmParser lib AFTER the target so the reference resolves.
+foreach(ejit_target ${LLVM_TARGETS_TO_BUILD})
+  if(TARGET LLVM${ejit_target}AsmParser)
+    target_link_libraries(EJITTests PRIVATE LLVM${ejit_target}AsmParser)
+  endif()
+endforeach()
 
 # SRE code pool tests live in their own executable so they build and run
 # independently of EJITTests (host-runnable: mock allocator + mock enable_ex,
@@ -154,6 +191,99 @@ add_custom_target(check-ejit-shared-taskpool
   COMMAND $<TARGET_FILE:EJITSharedTaskPoolTests>
   DEPENDS EJITSharedTaskPoolTests
   COMMENT "Running EmbeddedJIT cross-core shared taskpool unit tests"
+  USES_TERMINAL
+  )
+
+# Cross-core runtime-writable (Online-PGO Tier-1) END-TO-END integration test.
+# It spans BOTH real components changed by the fix in one binary: the code-pool
+# JITLink finalize path (EJitCodePool / EJitCodePoolMemoryManager) AND the
+# shared taskpool peer preparation (EJitSharedTaskPool). The shared-taskpool
+# sources are compiled directly here (with the shared macros + code sharing) so
+# the peer read path is active; the code-pool sources are compiled directly too
+# so the target links only JITLink + OrcShared (never libLLVMEJIT, which would
+# duplicate the directly-compiled EJitSharedTaskPool symbols). No real SRE
+# platform symbols are needed (all callbacks are mocked).
+set(EJIT_TIER1_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
+set(LLVM_LINK_COMPONENTS JITLink OrcShared Support TargetParser)
+add_llvm_unittest(EJITTier1WritableIntegrationTests
+  EJitTier1WritableIntegrationTest.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitCodePool.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
+
+  PARTIAL_SOURCES_INTENDED
+  )
+set(LLVM_LINK_COMPONENTS "${EJIT_TIER1_LINK_COMPONENTS_SAVED}")
+
+target_compile_definitions(EJITTier1WritableIntegrationTests PRIVATE
+  EJIT_SRE_TASKPOOL
+  EJIT_SRE_SHARED_TASKPOOL
+  EJIT_SRE_TASKPOOL_TESTING
+  EJIT_SRE_SHARED_CODE_POINTERS
+  EJIT_STATS_ENABLE
+  EJIT_SRE_TASKPOOL_BUCKETS=32
+  EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
+  EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=1048576
+  )
+
+add_custom_target(check-ejit-tier1-writable
+  COMMAND $<TARGET_FILE:EJITTier1WritableIntegrationTests>
+  DEPENDS EJITTier1WritableIntegrationTests
+  COMMENT "Running EmbeddedJIT Tier-1 runtime-writable integration test"
+  USES_TERMINAL
+  )
+
+# Online-PGO value-profiling collector tests: compile the collector sources
+# directly with the VP macros so they build and run independently of LLVMEJIT
+# and need no real SRE platform symbols. Only LLVMSupport is linked (the gtest
+# harness), so this target never pulls in OrcJIT/EJIT. Multi-core behavior is
+# simulated in one host process via the injectable EJitCoreId (no real thread).
+set(EJIT_VP_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
+set(LLVM_LINK_COMPONENTS Support)
+add_llvm_unittest(EJITValueProfileTests
+  EJitVpCollectorTest.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitVpCollector.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSreTask_host.cpp
+
+  PARTIAL_SOURCES_INTENDED
+  )
+set(LLVM_LINK_COMPONENTS "${EJIT_VP_LINK_COMPONENTS_SAVED}")
+
+target_compile_definitions(EJITValueProfileTests PRIVATE
+  EJIT_SRE_PGO_VALUE_PROFILE
+  EJIT_SRE_VP_K=2
+  EJIT_SRE_VP_SITES_PER_CORE=64
+  EJIT_SRE_VP_MAX_CORES=${EJIT_SRE_VP_MAX_CORES}
+  EJIT_SRE_VP_TOP_N=2
+  EJIT_SRE_VP_DRAIN_TICKS=64
+  )
+
+# Convenience target: build + run only the value-profiling collector tests.
+add_custom_target(check-ejit-value-profile
+  COMMAND $<TARGET_FILE:EJITValueProfileTests>
+  DEPENDS EJITValueProfileTests
+  COMMENT "Running EmbeddedJIT online-PGO value-profiling collector unit tests"
+  USES_TERMINAL
+  )
+
+# Branch-audit tests are independent of LLVMEJIT and always compile the small
+# read-only analyzer, even though production inclusion is default-off.
+set(EJIT_BRANCH_AUDIT_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
+set(LLVM_LINK_COMPONENTS Core Support)
+add_llvm_unittest(EJITBranchProfileTests
+  EJitBranchProfileTest.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitBranchProfile.cpp
+
+  PARTIAL_SOURCES_INTENDED
+  )
+set(LLVM_LINK_COMPONENTS "${EJIT_BRANCH_AUDIT_LINK_COMPONENTS_SAVED}")
+
+add_custom_target(check-ejit-branch-profile
+  COMMAND $<TARGET_FILE:EJITBranchProfileTests>
+  DEPENDS EJITBranchProfileTests
+  COMMENT "Running EmbeddedJIT branch-profile audit unit tests"
   USES_TERMINAL
   )
 

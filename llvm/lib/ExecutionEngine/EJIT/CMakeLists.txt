@@ -19,6 +19,41 @@ if(EJIT_FREESTANDING)
   endif()
 endif()
 
+#===-- Online-PGO value profiling (guarded specialization) ----------------===#
+# Runtime value collector + Tier-1 instrumentation hooks + Tier-2 guarded
+# scalar specialization (EJIT_VALUE_PROFILE.md). DEFAULT OFF: with the option
+# off, no collector/pass source is compiled, the shared-memory ABI is
+# unchanged, and every other build is byte-for-byte identical. The definitions
+# are applied narrowly to LLVMEJIT (their only user) rather than globally, so
+# toggling it does not recompile the whole tree.
+option(EJIT_SRE_PGO_VALUE_PROFILE
+  "EmbeddedJIT online-PGO value profiling (per-core heavy-hitter collector + guarded Tier-2 specialization)" OFF)
+set(EJIT_SRE_VP_K "2" CACHE STRING
+  "Value-profiling heavy-hitter candidates per site (1-8)")
+set(EJIT_SRE_VP_SITES_PER_CORE "64" CACHE STRING
+  "Value-profiling fixed sites per core shard (power of two)")
+set(EJIT_SRE_VP_MAX_CORES "32" CACHE STRING
+  "Value-profiling per-core shard slots (1-256)")
+set(EJIT_SRE_VP_TOP_N "2" CACHE STRING
+  "Value-profiling top values carried per site (1-K)")
+set(EJIT_SRE_VP_DRAIN_TICKS "4096" CACHE STRING
+  "Value-profiling snapshot straggler-drain iterations")
+set(EJIT_SRE_VP_MIN_SAMPLES "100" CACHE STRING
+  "Scalar specialization minimum samples per site")
+set(EJIT_SRE_VP_MIN_CONF_PERCENT "99" CACHE STRING
+  "Scalar specialization minimum top-1 dominance percent")
+if(EJIT_SRE_PGO_VALUE_PROFILE)
+  message(STATUS "EmbeddedJIT: online-PGO value profiling enabled "
+                 "(K=${EJIT_SRE_VP_K}, sites/core=${EJIT_SRE_VP_SITES_PER_CORE}, "
+                 "cores=${EJIT_SRE_VP_MAX_CORES})")
+endif()
+
+option(EJIT_SRE_PGO_BRANCH_AUDIT
+  "Report per-function branch-profile shape before Tier-2 inlining" OFF)
+if(EJIT_SRE_PGO_BRANCH_AUDIT)
+  message(STATUS "EmbeddedJIT: online-PGO branch audit enabled")
+endif()
+
 option(EJIT_FREESTANDING_MUTEX
   "Inject no-op <mutex>/<shared_mutex>/<condition_variable> headers \
 (for freestanding toolchains that lack these C++ standard headers). \
@@ -69,6 +104,7 @@ set(EJIT_SOURCES
   EJitStructFieldPass.cpp
   EJitOptimizer.cpp
   EJitPassBuilder.cpp
+  EJitProfileMerge.cpp
   EJitCodePool.cpp
   EJitCodePoolMemoryManager.cpp
   EJitSrePlatform.cpp
@@ -102,6 +138,23 @@ if(EJIT_SRE_SHARED_TASKPOOL)
   )
 endif()
 
+# Online-PGO value profiling (default OFF): per-core collector + the runtime
+# hooks the Tier-1 instrumentation calls, plus the scalar/loop-bound discovery
+# and guarded-specialization passes. No C++ threading facilities (the hot path
+# is atomic-cell-only), so it is compatible with EJIT_FREESTANDING. The compile
+# definitions are applied after the LLVMEJIT target exists (see the option
+# block below).
+if(EJIT_SRE_PGO_VALUE_PROFILE)
+  list(APPEND EJIT_SOURCES
+    EJitVpCollector.cpp
+    EJitValueProfile.cpp
+  )
+endif()
+
+if(EJIT_SRE_PGO_BRANCH_AUDIT)
+  list(APPEND EJIT_SOURCES EJitBranchProfile.cpp)
+endif()
+
 # Async/sync compiler — excluded in freestanding mode (single-threaded, no std::thread)
 if(NOT EJIT_FREESTANDING)
   list(APPEND EJIT_SOURCES
@@ -123,6 +176,13 @@ add_llvm_component_library(LLVMEJIT
   TransformUtils
   Analysis
   ${EJIT_TARGET_COMPONENTS}
+  # PGO (EJIT_ONLINE_PGO.md): Instrumentation (PGOInstrumentationGen/Use +
+  # InstrProfilingLowering) and ProfileData (InstrProfWriter) are required for
+  # online PGO. This is the P0-1 footprint cost (~640 KB stripped after lipo
+  # --gc-sections). PGO behavior is opt-in (Config::enablePgo); the libs are
+  # linked whenever LLVMEJIT is, regardless of the flag.
+  Instrumentation
+  ProfileData
   # IPO and Scalar are not listed here — their LINK_COMPONENTS would
   # recursively pull in BitWriter, Instrumentation, Linker, AsmParser,
   # and AggressiveInstCombine.  Instead, they are added manually to the
@@ -141,6 +201,27 @@ endif()
 if(EJIT_DEFAULT_TARGET_TRIPLE)
   target_compile_definitions(LLVMEJIT PUBLIC
     EJIT_DEFAULT_TRIPLE="${EJIT_DEFAULT_TARGET_TRIPLE}")
+endif()
+
+#===-- Online-PGO value profiling definitions (after the LLVMEJIT target
+#     exists) -------------------------------------------------------------===#
+# Online-PGO value profiling: definitions scoped to LLVMEJIT (the only user),
+# so toggling the option never recompiles the rest of the tree.
+if(EJIT_SRE_PGO_VALUE_PROFILE)
+  target_compile_definitions(LLVMEJIT PRIVATE
+    EJIT_SRE_PGO_VALUE_PROFILE
+    EJIT_SRE_VP_K=${EJIT_SRE_VP_K}
+    EJIT_SRE_VP_SITES_PER_CORE=${EJIT_SRE_VP_SITES_PER_CORE}
+    EJIT_SRE_VP_MAX_CORES=${EJIT_SRE_VP_MAX_CORES}
+    EJIT_SRE_VP_TOP_N=${EJIT_SRE_VP_TOP_N}
+    EJIT_SRE_VP_DRAIN_TICKS=${EJIT_SRE_VP_DRAIN_TICKS}
+    EJIT_SRE_VP_MIN_SAMPLES=${EJIT_SRE_VP_MIN_SAMPLES}
+    EJIT_SRE_VP_MIN_CONF_PERCENT=${EJIT_SRE_VP_MIN_CONF_PERCENT}
+  )
+endif()
+
+if(EJIT_SRE_PGO_BRANCH_AUDIT)
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_SRE_PGO_BRANCH_AUDIT)
 endif()
 
 # 4K-granular code-pool sealing. The only user of this macro is the SRE adapter
@@ -237,6 +318,14 @@ llvm_map_components_to_libnames(EJIT_LLVM_LIBS
 # (BitWriter, Instrumentation, Linker, AsmParser, AggressiveInstCombine).
 # See EJIT_LIBRARY_TRIMMING.md §6.5.
 list(APPEND EJIT_LLVM_LIBS LLVMipo LLVMScalarOpts)
+# PGO (EJIT_ONLINE_PGO.md): LLVMInstrumentation + LLVMProfileData are NOT added
+# to this fat archive yet. The fat archive is pre-gc and bundling the full
+# Instrumentation.a (all sanitizers) would blow the 10 MB check-ejit-size gate.
+# The deployable is the lipo ld -r --gc-sections ejit.o (~640 KB PGO increment,
+# P0-1), which keeps only reachable PGO objects. The lipo pipeline's COMMON_LIBS
+# list (ejit_test/lipo) + moving check-ejit-size to the lipo output are wired in
+# the deployable-integration task. LLVMEJIT LINK_COMPONENTS (above) already
+# pulls these for test-binary linking.
 
 # Build a file listing all .a files to combine (one per line)
 # LLVM_LIBRARY_DIR is the build output directory for static libraries

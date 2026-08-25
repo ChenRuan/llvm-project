@@ -40,6 +40,19 @@ struct Config {
   /// If non-empty, dump JIT-optimized LLVM IR (.ll) to this directory.
   /// One file per specialization, named <funcName>_<cacheKey>.ll.
   std::string dumpJITDir;
+  /// Online PGO opt-in (EJIT_ONLINE_PGO.md). Off => the JIT pipeline is
+  /// unchanged (Baseline only, no instrumentation, no Tier-2). On => Tier-1
+  /// instrumentation + lazy Tier-2 PGOUse recompile. The footprint cost
+  /// (~640 KB stripped runtime, P0-1) is incurred whenever the PGO component
+  /// libs are linked, regardless of this flag; this flag only gates behavior.
+  bool enablePgo = false;
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  /// Build-option-gated runtime sampling. This reuses the temporary
+  /// instrumented tier but does not require profile-guided optimization.
+  bool enableProfileAudit = true;
+#else
+  bool enableProfileAudit = false;
+#endif
 };
 
 } // namespace ejit

@@ -739,7 +739,7 @@ EJitOrcEngine::Create(const Config &config,
   engine->P->J->getIRTransformLayer().setTransform(
       [engine = engine.get()](
           orc::ThreadSafeModule TSM,
-          const orc::MaterializationResponsibility &R)
+          orc::MaterializationResponsibility &R)
           -> Expected<orc::ThreadSafeModule> {
         TSM.withModuleDo([engine](Module &M) {
           LLVM_DEBUG(dbgs() << "ejit-orc-engine: JIT transform on "
@@ -852,6 +852,30 @@ EJitOrcEngine::Create(const Config &config,
             }
           }
         });
+        // PGO: claim transform-generated __profc_*/__profd_* (Instrumented).
+        // Gen creates them inside runPipeline (after addIRModule), so the
+        // MR's claim - computed at addIRModule from the original module -
+        // does NOT include them. defineMaterializing adds them so ORC
+        // lookup resolves (compileCold's Tier-1 counter capture, §5.2).
+        {
+          orc::SymbolFlagsMap symFlags;
+          for (const std::string &name :
+               engine->P->optimizer->getLastCounterNames()) {
+            symFlags[engine->P->J->mangleAndIntern("__profc_" + name)] =
+                JITSymbolFlags::Exported;
+            symFlags[engine->P->J->mangleAndIntern("__profd_" + name)] =
+                JITSymbolFlags::Exported;
+          }
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+          if (!engine->P->optimizer->getLastMayConstLoadSites().empty())
+            symFlags[engine->P->J->mangleAndIntern(
+                "__ejit_mayconst_hits")] = JITSymbolFlags::Exported;
+#endif
+          if (!symFlags.empty())
+            if (auto Err = R.defineMaterializing(std::move(symFlags)))
+              EJIT_DIAG("transform: defineMaterializing PGO counters "
+                        "failed: %s", toString(std::move(Err)).c_str());
+        }
         return std::move(TSM);
       });
 
@@ -904,6 +928,26 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     if (!EntryF->isDeclaration() && EntryF->hasLocalLinkage())
       EntryF->setLinkage(GlobalValue::ExternalLinkage);
 
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  // Value-profile target capture (EJIT_VALUE_PROFILE.md §5.1): the Tier-1
+  // compile resolves EVERY module function's runtime address to build the
+  // verified address -> IR-PGO-name-MD5 table. Most callees are internal
+  // linkage (C `static`), which ORC excludes from the JITDylib symbol table,
+  // so lookup would fail for exactly the targets the indirect-call promotion
+  // needs. Two-part fix: (1) export every defined function here, BEFORE
+  // addIRModule, so ORC claims the symbol; (2) the optimizer's capture
+  // re-exports them again AFTER the transform (phase 1 internalized them for
+  // IPSCCP) so the EMITTED symbol is global again - a claimed-but-local
+  // symbol would link as a null absolute (same claim discipline as the
+  // __profc_* counters, §5.2).
+  if (P->activeCtx &&
+      P->activeCtx->tier == CompileTier::Instrumented) {
+    for (Function &F : (**ModuleOrErr).functions())
+      if (!F.isDeclaration() && !F.isIntrinsic() && F.hasLocalLinkage())
+        F.setLinkage(GlobalValue::ExternalLinkage);
+  }
+#endif
+
   // Collect global variable addresses from the registry for symbols
   // that appear as external declarations in the bitcode module.
   orc::SymbolMap globalSymbols;
@@ -926,6 +970,12 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
   // different specializations (same TU bitcode loaded multiple times)
   // never conflict. Remove any stale JD from a previous compilation
   // of the same cacheKey (e.g., after ejit_clear_cache).
+  // PGO: a Tier-2 recompile for the same cacheKey removes the Tier-1
+  // JITDylib BEFORE the new compile.  This is safe under code-pool v1
+  // (NO_RECLAIM) where slab memory is never freed, so existing Tier-1
+  // fnPtrs in the cache remain valid.  A future retain-until-publish
+  // path (deferring removeJITDylib until after cachePublish succeeds)
+  // would be needed for reclaimable memory managers (§5 JD lifecycle).
   auto it = P->specDylibs.find(cacheKey);
   if (it != P->specDylibs.end()) {
     if (auto Err = P->J->getExecutionSession().removeJITDylib(*it->second))
@@ -1091,6 +1141,30 @@ const SpecializationContext *EJitOrcEngine::getActiveContext() const {
   return P->activeCtx;
 }
 
+ArrayRef<std::string> EJitOrcEngine::getLastCounterNames() const {
+  if (P->optimizer)
+    return P->optimizer->getLastCounterNames();
+  return {};
+}
+
+ArrayRef<EJitVpFunctionInfo> EJitOrcEngine::getLastVpFunctions() const {
+  if (P->optimizer)
+    return P->optimizer->getLastVpFunctions();
+  return {};
+}
+
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+ArrayRef<EJitMayConstLoadSite>
+EJitOrcEngine::getLastMayConstLoadSites() const {
+  if (P->optimizer)
+    return P->optimizer->getLastMayConstLoadSites();
+  return {};
+}
+#endif
+
+bool EJitOrcEngine::printMayConstRanking() const {
+  return P->optimizer && P->optimizer->printMayConstRanking();
+}
 
 void EJitOrcEngine::addUserSymbol(const std::string &name, void *addr) {
   P->userSymbols[name] = addr;

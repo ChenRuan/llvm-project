@@ -11,10 +11,15 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
+#include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+#include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
+#endif
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/Support/Error.h"
 #include <memory>
 #include <string>
+#include <vector>
 
 #ifdef EJIT_SRE_CODE_POOL
 #include "llvm/ExecutionEngine/EJIT/EJitCodePool.h"
@@ -28,6 +33,7 @@ namespace ejit {
 class PeriodArrayRegistry;
 class EJitRuntimeState;
 struct EJitSharedTaskPoolState;
+struct EJitVpFunctionInfo; // defined in EJitOptimizer.h (value-profile capture)
 
 namespace detail {
 /// Render one function definition without the rest of its specialization
@@ -65,6 +71,14 @@ bool printDumped(const char *name);
 /// printDumped(), this function does not consult cross-core metadata.
 bool printDumpedModule(const char *name);
 
+/// Compile tier for online PGO (EJIT_ONLINE_PGO.md §3). Baseline is the
+/// existing no-PGO pipeline; the other two are opt-in via Config::enablePgo.
+enum class CompileTier : uint8_t {
+  Baseline = 0,     ///< No PGO: specialize + opt pipeline (current behavior).
+  Instrumented = 1, ///< Tier-1: specialize + PGOInstrumentationGen + Lowering.
+  PGOUse = 2, ///< Tier-2: specialize + PGOInstrumentationUse(profile) + opts.
+};
+
 struct SpecializationContext {
   std::string fnName;
   uint64_t cacheKey = 0;
@@ -74,6 +88,25 @@ struct SpecializationContext {
   };
   SmallVector<DimInfo, 4> dimensions;
   OptimizationLevel optLevel = OptimizationLevel::L2;
+  /// PGO tier (Baseline when PGO is disabled or for the first compile).
+  CompileTier tier = CompileTier::Baseline;
+  /// Tier-2 indexed profile buffer (synthesized from Tier-1 counters by
+  /// EJitProfileMerge before loadBitcode). Empty for Baseline/Instrumented.
+  /// Owned by the context; lives through the JIT transform that consumes it.
+  std::string profileData;
+  /// Scalar/loop-bound specialization side table (EJIT_VALUE_PROFILE.md §7):
+  /// filled by the Tier-2 merge with the top-1 dominant value per qualifying
+  /// site (min samples + confidence thresholds applied by the driver). Empty
+  /// for Baseline/Instrumented and when value profiling is not built.
+  std::vector<PgoScalarSite> scalarValueSites;
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+  /// Runtime hit snapshot from the temporary Instrumented tier. Populated by
+  /// the compile driver before the final compile starts.
+  std::vector<EJitMayConstLoadSite> mayConstLoadSites;
+  /// True when profile data is collected for diagnostics only. The optimizer
+  /// restores weights for reporting but must publish ordinary Baseline code.
+  bool profileAuditOnly = false;
+#endif
 };
 
 /// Wraps an LLJIT instance with EmbeddedJIT-specific configuration:
@@ -103,6 +136,25 @@ public:
   /// Set the active specialization context (used during compilation).
   void setActiveContext(const SpecializationContext *ctx);
   const SpecializationContext *getActiveContext() const;
+
+  /// PGO: PGOFuncNames captured by the last Tier-1 compile (the suffix of each
+  /// __profc_<name> that captureCounterGlobals forced external). The compile
+  /// driver looks up __profc_/__profd_ by these names after a Tier-1 compile to
+  /// capture counter addresses for Tier-2 profile synthesis (§5.2).
+  ArrayRef<std::string> getLastCounterNames() const;
+
+  /// Value profile: function table captured by the last Tier-1 compile (see
+  /// EJitOptimizer::getLastVpFunctions). Empty unless the Tier-1 compile ran
+  /// with EJIT_SRE_PGO_VALUE_PROFILE.
+  ArrayRef<EJitVpFunctionInfo> getLastVpFunctions() const;
+
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  ArrayRef<EJitMayConstLoadSite> getLastMayConstLoadSites() const;
+#endif
+
+  /// Print completed per-entry may_const benefit samples, sorted by average
+  /// runtime-active sites per specialization.
+  bool printMayConstRanking() const;
 
   /// Register a user-defined external symbol (function or global) that the
   /// JIT can resolve when compiling bitcode modules. Required for bare-metal

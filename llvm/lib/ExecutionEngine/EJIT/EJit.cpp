@@ -14,6 +14,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+#include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
+#endif
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/LLVMContext.h"
@@ -302,6 +305,23 @@ EJit::EJit(const Config &config) : config_(config) {
   for (auto &sym : data.userSymbols)
     compileDriver_->registerSymbol(sym.name, sym.addr);
 
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  // Value-profiling runtime hooks (EJIT_VALUE_PROFILE.md §2.1): the Tier-1
+  // machine code calls these; resolve them against this image's runtime. On a
+  // same-image cross-core platform every core's image carries the identical
+  // copy at the same VA, so the published shared code resolves correctly on
+  // every core (same precondition as shared code pointers).
+  compileDriver_->registerSymbol(
+      "__llvm_profile_instrument_target",
+      reinterpret_cast<void *>(&__llvm_profile_instrument_target));
+  compileDriver_->registerSymbol(
+      "__llvm_profile_instrument_memop",
+      reinterpret_cast<void *>(&__llvm_profile_instrument_memop));
+  compileDriver_->registerSymbol(
+      "ejit_vp_record_scalar",
+      reinterpret_cast<void *>(&ejit_vp_record_scalar));
+#endif
+
   // Build the ORC engine. On the shared-taskpool async path this is DEFERRED to
   // the core that wins the owner election: only the owner's worker ever invokes
   // the compile callback, so every other core would construct an LLJIT
@@ -383,8 +403,21 @@ EJit::EJit(const Config &config) : config_(config) {
         recordInitError(EJIT_ERR_COMPILE_FAILED,
                         "taskpool worker failed to start", "");
 #endif
-      else
+      else {
         EJIT_DIAG("taskpool async init complete: worker running");
+        // PGO and the default-off profile audit share the temporary
+        // Instrumented-tier hit window. Audit-only mode publishes ordinary
+        // Baseline code after collecting the window.
+        if (config_.enablePgo || config_.enableProfileAudit) {
+          constexpr uint32_t kDefaultPgoThreshold = 64;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+          compileDriver_->sharedTaskPool()->setPgoEnabled(
+              true, kDefaultPgoThreshold);
+#else
+          compileDriver_->taskPool()->setPgoEnabled(true, kDefaultPgoThreshold);
+#endif
+        }
+      }
     } else {
       EJIT_DIAG_VERBOSE("taskpool sync init complete: worker remains stopped");
     }
@@ -990,6 +1023,21 @@ void EJit::printCodePoolStats() const {
 #else
   EJIT_DIAG_RAW("code pool: EJIT_SRE_CODE_POOL not enabled");
 #endif
+}
+
+bool EJit::printMayConstRanking() {
+  if (!compileDriver_) {
+    EJIT_DIAG_RAW("mayconst-ranking: no compile driver");
+    return false;
+  }
+  if (EJitOrcEngine *Engine = compileDriver_->getJitEngine())
+    return Engine->printMayConstRanking();
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (EJitSharedTaskPool *Pool = compileDriver_->sharedTaskPool())
+    return Pool->requestMayConstRanking();
+#endif
+  EJIT_DIAG_RAW("mayconst-ranking: no local or shared compiler");
+  return false;
 }
 
 void EJit::printActive() const {

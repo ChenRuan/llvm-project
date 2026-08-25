@@ -143,6 +143,14 @@ typedef struct {
 
 // Initialization
 ejit_status_t ejit_init(const ejit_config_t *config);
+/// Initialize with online PGO enabled (Tier-1 instrumentation + lazy Tier-2
+/// PGOUse recompile). Additive, ABI-compatible entry point: `ejit_config_t`
+/// keeps its original layout (no versioned tail field), so an old caller's
+/// struct is never over-read. Behaves exactly like ejit_init(config) but forces
+/// the runtime's online-PGO auto-trigger on. Requires the runtime to be linked
+/// with LLVMProfileData + LLVMInstrumentation (a build without PGO support
+/// treats this as ejit_init). PGO is off for plain ejit_init().
+ejit_status_t ejit_init_pgo(const ejit_config_t *config);
 void ejit_shutdown(void);
 
 // Symbol registration for bare-metal (no dlsym)
@@ -320,6 +328,24 @@ void ejit_taskpool_print_stats();
 void ejit_taskpool_print_compiled();
 uint32_t ejit_taskpool_get_worker_core();
 
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+// Online-PGO value-profiling observability (EJIT_VALUE_PROFILE.md §9). All
+// counters are cold-path (Tier-2 merge / transform), so they are always
+// compiled when the feature is; the per-call cost stays zero. Fixed layout
+// (uint64_t only) for stable ABI across the aarch64_be target.
+typedef struct {
+  uint64_t merges;            ///< Tier-2 value-profile merges performed.
+  uint64_t icValueSites;      ///< Indirect-call value sites merged.
+  uint64_t memopValueSites;   ///< Memop-size value sites merged.
+  uint64_t scalarValueSites;  ///< Scalar sites merged (pre-threshold).
+  uint64_t scalarDropped;     ///< Scalar sites dropped by the thresholds.
+  uint64_t scalarSpecialized; ///< Guarded scalar specializations created.
+  uint64_t reserved;          ///< Reserved; always 0.
+} ejit_vp_stats_t;
+
+ejit_status_t ejit_vp_get_stats(ejit_vp_stats_t *out);
+#endif
+
 /// Enable name-filtered JIT IR+ASM capture. When \p name is non-null and
 /// non-empty, the next time a specialization whose entry name exactly matches
 /// \p name is JIT-compiled, the engine saves (in memory) post-optimization IR
@@ -392,6 +418,13 @@ ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out);
 /// Print code pool usage statistics through the platform log. Paired with
 /// ejit_get_code_pool_stats() (human-readable form).
 void ejit_print_code_pool_stats(void);
+
+/// Print a ranking for every sampled ejit_entry function. The ranking is
+/// ordered by the average number of may_const loads removed across its JIT
+/// specializations. Call this explicitly after the audit sampling windows have
+/// completed. In a shared-taskpool build, a non-owner core forwards the request
+/// to the compile-owner worker and waits for printing to finish.
+void ejit_print_mayconst_ranking(void);
 
 /// Print the currently-active time-window instances through the platform log:
 /// for each registered period, every active (period, cell) is listed. Works

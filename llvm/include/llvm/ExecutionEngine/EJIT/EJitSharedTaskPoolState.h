@@ -38,6 +38,7 @@
 #define LLVM_EXECUTIONENGINE_EJIT_EJITSHAREDTASKPOOLSTATE_H
 
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h" // EJitWritableRange bound
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h" // EJitCompileRequest, EJitDimPair
 #include <cstddef>
@@ -56,6 +57,9 @@
 #endif
 #ifndef EJIT_SRE_TASKPOOL_QUEUE_CAPACITY
 #define EJIT_SRE_TASKPOOL_QUEUE_CAPACITY 1024u
+#endif
+#ifndef EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES
+#define EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES 1u
 #endif
 // Fixed slots per cache bucket. The shared cache is a fixed-capacity POD table
 // (no std::unordered_map can live in shared memory), so each bucket holds a
@@ -83,6 +87,14 @@ namespace ejit {
 constexpr uint32_t kEJitSharedMaxDims = 4u;
 constexpr uint32_t kEJitSharedDimTypes = 8u;
 constexpr uint32_t kEJitSharedInstances = 256u;
+/// Max runtime-writable ranges carried per cache slot (v9). Kept in lockstep
+/// with the code-pool descriptor bound so a range published by the owner is
+/// never truncated crossing the shared slot; an allocation with more writable
+/// segments is rejected before publish (see EJitCodePoolManager).
+constexpr uint32_t kEJitSharedMaxWritableRanges = kEJitMaxWritableRanges;
+static_assert(kEJitSharedMaxWritableRanges == kEJitMaxWritableRanges,
+              "shared-slot and code-pool writable-range bounds must match so "
+              "a published range is never silently truncated");
 constexpr uint32_t kEJitSharedMaxFuncIndex = EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX;
 constexpr uint32_t kEJitSharedCacheBuckets = EJIT_SRE_TASKPOOL_BUCKETS;
 
@@ -93,7 +105,13 @@ constexpr uint32_t kEJitNoBucket = 0xFFFFFFFFu;
 constexpr uint32_t kEJitSharedCacheSlots = EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS;
 constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
 constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
-constexpr uint32_t kEJitSharedDumpNameBytes = EJIT_SRE_SHARED_DUMP_NAME_BYTES;
+constexpr uint32_t kEJitSharedMaxConcurrentProfiles = 16u;
+static_assert(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES >= 1u &&
+                  EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES <=
+                      kEJitSharedMaxConcurrentProfiles,
+              "EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES must be in [1, 16]");
+constexpr uint32_t kEJitSharedDumpNameBytes =
+    EJIT_SRE_SHARED_DUMP_NAME_BYTES;
 constexpr uint32_t kEJitSharedCacheLine = 64u;
 /// Execute-permission seal granularity (the platform's per-page enable_ex unit)
 /// and the large-page / split granularity. Fixed platform constants.
@@ -142,6 +160,16 @@ enum class EJitSharedSlotState : uint32_t {
 };
 
 //===----------------------------------------------------------------------===//
+// EJitSharedWritableRange: one runtime-writable extent of a published code
+// allocation (e.g. the Tier-1 __profc_ counters). Plain fixed-width scalars so
+// it lives in the shared blob and is read by value on any core (endian-safe).
+//===----------------------------------------------------------------------===//
+struct EJitSharedWritableRange {
+  uintptr_t addr; ///< start of the runtime-writable extent (0 = unused entry)
+  uint64_t size;  ///< size in bytes of that extent (0 = unused entry)
+};
+
+//===----------------------------------------------------------------------===//
 // EJitSharedCacheSlot: one POD result-cache entry.
 //===----------------------------------------------------------------------===//
 struct EJitSharedCacheSlot {
@@ -170,6 +198,39 @@ struct EJitSharedCacheSlot {
   uint64_t poolSize;      ///< usable pool size
   uint32_t poolId;        ///< stable pool index (diagnostic / convenience key)
   uint32_t rangeReserved; ///< reserved, keeps the tail explicit (must be 0)
+  /// Runtime-writable extents of the published code (v9): the pages the JIT
+  /// body writes at runtime (e.g. Tier-1 __profc_ counters). A non-owner core
+  /// in 4K-seal mode MUST enable_rw exactly these in its own translation
+  /// context BEFORE it may execute the code — otherwise the first counter
+  /// atomicrmw faults with a write-permission abort (the fixed code segment is
+  /// RX on every core at load; only the owner made these pages RW). Written
+  /// under the bucket write lock BEFORE state=Ready is released, so an
+  /// acquiring reader sees them consistently. writableCount 0 => no
+  /// runtime-writable data (non-PGO / Tier-2 code): the peer seals only the
+  /// executable pages. These ranges are page-disjoint from [codeStart,
+  /// codeStart+codeSize) by construction (the finalize layout is page-aligned),
+  /// so making them RW on a peer never touches a code page (no RWX).
+  uint32_t writableCount; ///< valid entries in writableRanges (<= max)
+  /// 1 => a peer core MUST enable_rw these pages before executing (the code is
+  /// in a fixed RX code-segment pool). 0 => the pool is already RW (dynamic
+  /// SRE_MemDbgAlloc): the ranges are diagnostic only and a peer executes with
+  /// NO enable_rw. This separates "has runtime-writable data" (writableCount)
+  /// from "peer must flip it writable" (requiresPeerEnableRw), so a dynamic
+  /// pool is never forced to fall back merely because it carries writable
+  /// metadata.
+  uint32_t requiresPeerEnableRw;
+  EJitSharedWritableRange writableRanges[kEJitSharedMaxWritableRanges];
+  /// PGO (v7): per-slot hotspot counter for the Tier-2 auto-trigger (§6).
+  /// Incremented on cache hit; reset to 0 when Tier-2 publishes over Tier-1
+  /// (§7.1).  Counter addresses (__profc_/__profd_) are resolved by the
+  /// compile driver via ORC lookup and kept driver-private — they do not
+  /// need to live in the shared slot.
+  EJitAtomicU64 hitCount;
+  /// PGO (§7.1): current compile tier of the published code.  0 = Baseline /
+  /// not yet published, 1 = Instrumented (Tier-1), 2 = PGOUse (Tier-2).
+  /// Used to suppress the Tier-2 auto-trigger on slots that are already
+  /// Tier-2 — a Tier-2 hit should never request another Tier-2 compile.
+  EJitAtomicU8 tier;
 };
 
 //===----------------------------------------------------------------------===//
@@ -266,6 +327,11 @@ struct EJitSharedCounters {
                                              ///< setInstanceEnabled(true) — i.e.
                                              ///< the init→activate window.
   EJitAtomicU64 executePrepareFailed;
+  /// PGO (v7, EJIT_ONLINE_PGO.md §10): Tier-1/Tier-2 compile counts + profile
+  /// synthesis failures. Zero when PGO is off; fields always present for ABI.
+  EJitAtomicU64 tier1Compiles;
+  EJitAtomicU64 tier2Compiles;
+  EJitAtomicU64 profileMergeFails;
 };
 
 //===----------------------------------------------------------------------===//
@@ -337,6 +403,12 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   /// the line stays Shared in every core's L1 rather than bouncing. Sits in
   /// this cache line's padding, so sizeof() and later offsets are unchanged.
   EJitAtomicU32 dispatchEpoch;
+  /// Cross-core diagnostic rendezvous. A producer increments request; the
+  /// owner worker prints its local may_const ranking, publishes result, then
+  /// advances complete. These fields are cold and stay in existing padding.
+  EJitAtomicU32 mayConstRankingRequest;
+  EJitAtomicU32 mayConstRankingComplete;
+  EJitAtomicU32 mayConstRankingResult;
 
   //--- SwitchController state (own cache line)
   alignas(kEJitSharedCacheLine)
@@ -391,6 +463,17 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   /// because facades wire and unwire independently: the cache may only re-arm
   /// once the LAST releaser is gone.
   EJitAtomicU32 icacheReleasersWired;
+  EJitAtomicU32 pgoEnabled;     ///< 1 => shared online-PGO trigger is enabled
+  EJitAtomicU32 tier2Threshold; ///< shared hit threshold; 0 disables trigger
+  /// Staged PGO admission. Entries are funcIndex + 1; zero means free.
+  EJitAtomicU32 pgoAdmissionLock;
+  EJitAtomicU32 pgoMaxActiveFunctions;
+  EJitAtomicU32 pgoActiveFunctionCount;
+  EJitAtomicU32 pgoActiveFunctions[kEJitSharedMaxConcurrentProfiles];
+  /// Last logged progress quarter for each admission slot: 0..4.
+  EJitAtomicU32 pgoProgressQuarters[kEJitSharedMaxConcurrentProfiles];
+  EJitAtomicU64 pgoCompletedFunctions;
+  EJitAtomicU64 pgoDeferredMisses;
   EJitAtomicU32 anyInstanceActivated; ///< 1 once any instance first
                                       ///< setInstanceEnabled(true); gates the
                                       ///< instanceDisabledPreActivate counter.
@@ -468,6 +551,11 @@ static_assert(
         std::is_trivially_destructible<EJitSharedCacheSlot>::value &&
         std::is_trivially_default_constructible<EJitSharedCacheSlot>::value,
     "EJitSharedCacheSlot must be POD-style");
+static_assert(
+    std::is_standard_layout<EJitSharedWritableRange>::value &&
+        std::is_trivially_destructible<EJitSharedWritableRange>::value &&
+        std::is_trivially_default_constructible<EJitSharedWritableRange>::value,
+    "EJitSharedWritableRange must be POD-style");
 static_assert(
     std::is_standard_layout<EJitSharedQueueCell>::value &&
         std::is_trivially_destructible<EJitSharedQueueCell>::value &&
