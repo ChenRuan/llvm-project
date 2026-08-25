@@ -6,7 +6,7 @@
 ; DEFAULT-NOT: jit_icache_probe_0:
 ; DEFAULT-COUNT-4: jit_icache_dispatch:
 
-; Eligible one-dimensional cell entries use a direct conditional branch tree.
+; Eligible one-dimensional cell entries use a bit-test conditional branch tree.
 ; Values outside [0, 15] bypass the inline table and take the existing miss path.
 ; Every in-range instance has a distinct constant slot load and indirect call PC.
 ; SPLIT-LABEL: define i32 @cell_entry(
@@ -17,6 +17,10 @@
 ; SPLIT: load atomic ptr, ptr @__ejit_icache_fn_cell_entry monotonic
 ; SPLIT: jit_icache_dispatch_0:
 ; SPLIT-COUNT-16: musttail call i32 %ejit_ic_fn_
+; SPLIT-DAG: and i32 %cell, 8
+; SPLIT-DAG: and i32 %cell, 4
+; SPLIT-DAG: and i32 %cell, 2
+; SPLIT-DAG: and i32 %cell, 1
 
 ; trp is the other supported one-dimensional lifecycle name.
 ; SPLIT-LABEL: define i32 @trp_entry(

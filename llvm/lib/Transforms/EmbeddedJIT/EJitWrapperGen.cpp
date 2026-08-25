@@ -1022,6 +1022,9 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
       if (UseSplitDispatch) {
         constexpr unsigned SplitInstances = kEJitIcacheDirectPadCount;
+        static_assert((SplitInstances & (SplitInstances - 1)) == 0,
+                      "bit-test dispatch requires a power-of-two "
+                      "instance count");
         Value *ArgVal = F->getArg(PeriodInds[0].ArgIndex);
         unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
         Value *Instance = ArgVal;
@@ -1122,9 +1125,18 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
           BasicBlock *Node = BasicBlock::Create(
               Ctx, "jit_icache_select_" + Twine(Lo) + "_" + Twine(Hi), F);
           IRBuilder<> NB(Node);
-          Value *GoLeft = NB.CreateICmpULT(
-              Instance, ConstantInt::get(I32Ty, Mid), "ejit_split_left");
-          NB.CreateCondBr(GoLeft, Left, Right);
+          // The entry range guard makes these low bits a complete instance
+          // key. AArch64 lowers the lower levels to single-instruction TBNZ
+          // branches instead of a CMP plus a conditional branch at each node.
+          unsigned Bit = 0;
+          for (unsigned Width = Hi - Lo; Width > 2; Width >>= 1)
+            ++Bit;
+          Value *SelectedBit = NB.CreateAnd(
+              Instance, ConstantInt::get(I32Ty, 1u << Bit),
+              "ejit_split_bit");
+          Value *GoRight = NB.CreateICmpNE(
+              SelectedBit, ConstantInt::get(I32Ty, 0), "ejit_split_right");
+          NB.CreateCondBr(GoRight, Right, Left);
           return Node;
         };
         BasicBlock *TreeRoot = BuildTree(BuildTree, 0, SplitInstances);
