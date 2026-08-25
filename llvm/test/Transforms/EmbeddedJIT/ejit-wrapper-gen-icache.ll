@@ -1,15 +1,18 @@
 ; -ejit-inline-cache (ON): emits an inline probe DIRECTLY in the ejit_entry
 ; wrapper - a GEP into the per-function @__ejit_icache_fn_<name> [D]^numDims
 ; cell table (D = EJIT_ICACHE_DIM_SIZE, power-of-2) by the ejit_dim argument
-; values, then ONE monotonic load + null-check; the hit path
-; (jit_icache_dispatch) calls the cached specialization directly with NO
-; ejit_icache_try call and NO ejit_taskpool_release_read. The load is atomic
-; because the table is shared across cores (a peer's period toggle zeroes cells
-; in place); monotonic is the weakest order that makes that a defined race, and
-; lowers to the same LDR a plain load would. There is NO freshness check on the
-; hit path - draining the shared cells IS the invalidation. numDims=0 is a
-; scalar cell (no GEP). Default (OFF): the original 4-block wrapper, no icache.
-; Idempotent: running the pass twice does not duplicate the probe.
+; values, then ONE monotonic load + musttail indirect call. For NumDims <= 2
+; (no timing) the table is DEFINED pre-filled with &<name>_miss: the loaded
+; value is always a callable pointer (the specialization on a hit, MissFn
+; itself before the first fill / after a drain), so the wrapper has NO guard
+; branch at all - a miss simply executes MissFn, whose funcidx guard falls to
+; the AOT body while registration has not run. The load is atomic because the
+; table is shared across cores (a peer's period toggle rewrites cells in
+; place); monotonic is the weakest order that makes that a defined race, and
+; lowers to the same LDR a plain load would. There is NO freshness check on
+; the hit path - draining the shared cells IS the invalidation. numDims=0 is
+; a scalar cell (no GEP). Default (OFF): the original 4-block wrapper, no
+; icache. Idempotent: running the pass twice does not duplicate the probe.
 
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -S %s | FileCheck %s --check-prefix=ICACHE
 ; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s --check-prefix=NOICACHE
@@ -28,38 +31,45 @@
 ;     other core probes. Nothing else about the wrapper changes. ---
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section=.mc_shared -S %s | FileCheck %s --check-prefix=SECTION
 
-; --- icache globals: [D]^numDims, D=8 (EJIT_ICACHE_DIM_SIZE). 0D is scalar. ---
-; ICACHE-DAG: @__ejit_icache_fn_zero_dim_entry = internal global ptr null, align 8
-; ICACHE-DAG: @__ejit_icache_fn_one_dim_entry = internal global [16 x ptr] zeroinitializer, align 8
-; ICACHE-DAG: @__ejit_icache_fn_two_dim_entry = internal global [16 x [16 x ptr]] zeroinitializer, align 8
+; --- icache globals: [D]^numDims, D=16 (EJIT_ICACHE_DIM_SIZE). 0D is scalar.
+;     Every cell is DEFINED as &<name>_miss - the sentinel that makes the
+;     branchless probe safe. ---
+; ICACHE-DAG: @__ejit_icache_fn_zero_dim_entry = internal global ptr @zero_dim_entry_miss, align 8
+; ICACHE-DAG: @__ejit_icache_fn_one_dim_entry = internal global [16 x ptr] [ptr @one_dim_entry_miss, {{.*}}], align 8
+; ICACHE-DAG: @__ejit_icache_fn_two_dim_entry = internal global [16 x [16 x ptr]] {{.*}}@two_dim_entry_miss{{.*}}, align 8
 
-; --- 0D entry: scalar slot, direct plain load (NO GEP).  Without extra flags
-;     the dispatcher stays in default .text (no section attribute). ---
+; --- 0D entry: scalar slot, direct plain load (NO GEP), NO guard branch -
+;     the whole wrapper is load + musttail. Without extra flags the dispatcher
+;     stays in default .text (no section attribute). ---
 ; ICACHE-LABEL: define i32 @zero_dim_entry(
 ; ICACHE-NOT: section
 ; ICACHE-NOT: ejit_icache_try
 ; ICACHE-NOT: getelementptr
+; ICACHE-NOT: br
 ; ICACHE: load atomic ptr, ptr @__ejit_icache_fn_zero_dim_entry monotonic, align 8
-; ICACHE-LABEL: jit_icache_dispatch:
-; ICACHE-NOT: call void @ejit_taskpool_release_read
-; ICACHE: call {{.*}} %ejit_ic_fn
+; ICACHE-NOT: br
+; ICACHE: musttail call {{.*}} %ejit_ic_fn
 ; ICACHE: ret
 
-; --- 1D entry: [16 x ptr] slot, GEP by the single dim arg + plain load. ---
+; --- 1D entry: [16 x ptr] slot, GEP by the single dim arg + plain load,
+;     still branchless. ---
 ; ICACHE-LABEL: define i32 @one_dim_entry(
 ; ICACHE-NOT: section
 ; ICACHE-NOT: ejit_icache_try
+; ICACHE-NOT: br
 ; ICACHE: getelementptr {{.*}} ptr @__ejit_icache_fn_one_dim_entry, i32 0, i32 {{.*}}
 ; ICACHE: load atomic ptr, ptr {{.*}} monotonic, align 8
-; ICACHE-LABEL: jit_icache_dispatch:
 ; ICACHE-NOT: call void @ejit_taskpool_release_read
-; ICACHE: call {{.*}} %ejit_ic_fn
+; ICACHE-NOT: br
+; ICACHE: musttail call {{.*}} %ejit_ic_fn
 ; ICACHE: ret
 
-; --- 2D entry: [16 x [16 x ptr]] slot, 2-subscript GEP. ---
+; --- 2D entry: [16 x [16 x ptr]] slot, 2-subscript GEP, branchless. ---
 ; ICACHE-LABEL: define i32 @two_dim_entry(
 ; ICACHE-NOT: section
 ; ICACHE: getelementptr {{.*}} ptr @__ejit_icache_fn_two_dim_entry, i32 0, i32 {{.*}}, i32 {{.*}}
+; ICACHE: load atomic ptr, ptr {{.*}} monotonic, align 8
+; ICACHE: musttail call {{.*}} %ejit_ic_fn
 
 ; --- OPT (dispatcher-cluster + missfn-cold ON): section and cold present ---
 ; OPT-LABEL: define i32 @zero_dim_entry(
@@ -76,24 +86,25 @@
 ; OPT-SAME: #[[MISS_ATTRS]]
 ; OPT-DAG: attributes #[[MISS_ATTRS]] = { cold noinline }
 
-; --- registration carries numDims (3rd arg): 0 / 1 / 2 (DAG: order-independent). ---
-; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_zero_dim_entry, i32 0)
-; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_one_dim_entry, i32 1)
-; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_two_dim_entry, i32 2)
+; --- registration carries numDims (3rd arg) and the sentinel MissFn (4th arg,
+;     which the runtime writes back on drain / fill-retract). DAG: order-
+;     independent. ---
+; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_zero_dim_entry, i32 0, ptr @zero_dim_entry_miss)
+; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_one_dim_entry, i32 1, ptr @one_dim_entry_miss)
+; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_two_dim_entry, i32 2, ptr @two_dim_entry_miss)
 
 ; --- -ejit-icache-section (default .mc_shared, pinned here so the test does not
 ;     depend on the CMake value): every cell table lands in the inter-core
-;     shared section and the probe is unchanged (one monotonic load + null
-;     check, no freshness compare). The other RUN lines pin it EMPTY to check
-;     the plain-.bss shape. ---
-; SECTION-DAG: @__ejit_icache_fn_zero_dim_entry = internal global ptr null, section ".mc_shared", align 8
-; SECTION-DAG: @__ejit_icache_fn_one_dim_entry = internal global [16 x ptr] zeroinitializer, section ".mc_shared", align 8
-; SECTION-DAG: @__ejit_icache_fn_two_dim_entry = internal global [16 x [16 x ptr]] zeroinitializer, section ".mc_shared", align 8
+;     shared section - now carrying its &MissFn sentinel initializer, which is
+;     what the image loader must place before any core runs - and the probe is
+;     unchanged (one monotonic load + musttail, no freshness compare). The
+;     other RUN lines pin it EMPTY to check the plain-.bss shape. ---
+; SECTION-DAG: @__ejit_icache_fn_zero_dim_entry = internal global ptr @zero_dim_entry_miss, section ".mc_shared", align 8
+; SECTION-DAG: @__ejit_icache_fn_one_dim_entry = internal global [16 x ptr] [ptr @one_dim_entry_miss, {{.*}}], section ".mc_shared", align 8
+; SECTION-DAG: @__ejit_icache_fn_two_dim_entry = internal global [16 x [16 x ptr]] {{.*}}@two_dim_entry_miss{{.*}}, section ".mc_shared", align 8
 ; SECTION-LABEL: define i32 @one_dim_entry(
 ; SECTION: load atomic ptr, ptr {{.*}} monotonic, align 8
-; SECTION-LABEL: jit_icache_dispatch:
-; SECTION-NOT: load
-; SECTION: call {{.*}} %ejit_ic_fn
+; SECTION: musttail call {{.*}} %ejit_ic_fn
 
 ; --- Default (flag OFF): no icache anywhere; original compile_or_get path. ---
 ; NOICACHE-LABEL: define i32 @one_dim_entry(
@@ -101,9 +112,11 @@
 ; NOICACHE-NOT: ejit_register_icache_slot
 ; NOICACHE: call i32 @ejit_taskpool_compile_or_get_1d(i32 {{.*}}, i32 {{.*}}, i32 {{.*}}, ptr {{.*}}, ptr {{.*}})
 
-; --- Idempotent: two passes emit each probe exactly once. ---
+; --- Idempotent: two passes emit each probe exactly once, and the sentinel
+;     registration (with its MissFn argument) is not duplicated either. ---
 ; IDEM-LABEL: define i32 @one_dim_entry(
 ; IDEM-COUNT-1: getelementptr {{.*}} @__ejit_icache_fn_one_dim_entry, i32 0, i32 {{.*}}
+; IDEM-COUNT-1: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_one_dim_entry, i32 1, ptr @one_dim_entry_miss)
 
 ; --- timing hit path: plain call (NOT musttail) + trace + ret. The miss path
 ;     stays musttail (no trailing calls), so we only forbid musttail within the

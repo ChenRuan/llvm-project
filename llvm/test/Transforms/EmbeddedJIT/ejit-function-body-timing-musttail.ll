@@ -7,11 +7,14 @@
 ; the caller and callee parameter counts differ. Keep MissFn ABI-identical,
 ; preserve every original musttail, and time only JIT execution for this entry.
 ;
+; OFF (no timing flags): NumDims=1 and no timing -> the SENTINEL form. The
+; table is defined pre-filled with &MissFn and the wrapper is ONE block
+; (load + musttail BLR, no guard/miss blocks); musttail survives on the hit
+; path exactly as it did in the guarded form.
+; OFF: @__ejit_icache_fn_musttail_entry = internal global [16 x ptr] [ptr @musttail_entry_miss, {{.*}}]
 ; OFF-LABEL: define i32 @musttail_entry(
-; OFF-LABEL: jit_icache_dispatch:
+; OFF-NOT: br
 ; OFF: musttail call i32 %ejit_ic_fn
-; OFF-LABEL: jit_miss:
-; OFF: musttail call i32 @musttail_entry_miss(i32 %cell)
 ; OFF-LABEL: define internal i32 @musttail_entry_miss(i32 %0)
 ; OFF: musttail call i32 @helper(i32 %0)
 ;

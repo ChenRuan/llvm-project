@@ -207,12 +207,14 @@ EJit::EJit(const Config &config) : config_(config) {
           // Wire the wrapper's per-function @__ejit_icache_fn_<name> slot into
           // the runtime's slot registry (gIcacheSlots), keyed by the SAME
           // registry funcIndex assigned above. e->size carries numDims (the
-          // [D]^numDims shape) so icacheFill can linearize. The wrapper reads
-          // the cell directly on the icache hit path (no ejit_icache_try call);
-          // icacheFill writes the frozen specialization pointer through it on
-          // resolve. A null fixup pointer or an exhausted funcIndex capacity is
-          // a hard init failure (the base stays null -> probe misses -> taskpool
-          // fallback, correct but without the icache fast path).
+          // [D]^numDims shape) so icacheFill can linearize; e->name2 carries
+          // the sentinel MissFn pointer for branchless-probe slots (null for
+          // guarded ones). The wrapper reads the cell directly on the icache
+          // hit path (no ejit_icache_try call); icacheFill writes the frozen
+          // specialization pointer through it on resolve. A null fixup pointer
+          // or an exhausted funcIndex capacity is a hard init failure (the
+          // base stays null -> probe misses -> taskpool fallback, correct but
+          // without the icache fast path).
           if (!e->name1 || !e->ptr) {
             recordInitError(EJIT_ERR_INVALID_PARAM,
                             "icache slot registration has a null fixup pointer",
@@ -228,7 +230,7 @@ EJit::EJit(const Config &config) : config_(config) {
             break;
           }
           switch (ejitIcacheRegisterSlot(idx, const_cast<void *>(e->ptr),
-                                         numDims)) {
+                                         numDims, e->name2)) {
           case EJitIcacheRegResult::Ok:
             break;
           case EJitIcacheRegResult::CapacityMiss:

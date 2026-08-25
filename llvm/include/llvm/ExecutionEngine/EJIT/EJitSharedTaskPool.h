@@ -112,11 +112,13 @@ enum class EJitWorkerStep : uint32_t {
 //    what it was when the table was private: no gate, no contention, one load.
 //
 //  * DRAINABLE ACROSS CORES, which a private table is not. activate/deactivate
-//    zeroes every registered cell in place (icacheDrainAll), reaching a peer's
-//    partition directly. A permanently-hot core -- one that never misses and
-//    never calls the runtime again -- stops running the stale specialization on
-//    its next call, with no invalidation epoch on the probe, no per-core drain
-//    rendezvous, and no sync entry point for the application to call.
+//    rewrites every registered cell to its empty value in place (icacheDrainAll
+//    -- the &MissFn sentinel for sentinel-form tables, 0 for guarded ones),
+//    reaching a peer's partition directly. A permanently-hot core -- one that
+//    never misses and never calls the runtime again -- stops running the stale
+//    specialization on its next call, with no invalidation epoch on the probe,
+//    no per-core drain rendezvous, and no sync entry point for the application
+//    to call.
 //
 // PREREQUISITE, and it is a CORRECTNESS one: the partitioning must be real --
 // each core drives its OWN ejit_period_lc instance indices, so no two cores
@@ -215,12 +217,17 @@ void ejitIcacheClearAll();
 
 // Register a per-function icache slot: \p base is the address of the wrapper's
 // @__ejit_icache_fn_<name> global (a uintptr_t cell, or a [D]^numDims array of
-// them for a multi-version entry), and \p numDims is its dimensionality. The
-// runtime writes the specialization pointer through the cell at [i0][i1]...
-// (linearized from dims) on a successful resolve (icacheFill), and zeroes the
-// whole array on a period toggle (icacheDrainAll); the wrapper reads the cell
-// directly. Called from ejit_register_icache_slot (name->funcIndex resolution)
-// at ejit_auto_register / .ejit_period time.
+// them for a multi-version entry), \p numDims is its dimensionality, and \p
+// missFn is the slot's SENTINEL value when the wrapper's probe is branchless
+// (the table is defined pre-filled with &MissFn): non-null tells
+// icacheDrainAll and icacheFill's retract to write \p missFn back instead of
+// 0, so the cell never holds a non-callable value. Null keeps the historical
+// zero semantics for guarded (3D/4D, timing) slots. The runtime writes the
+// specialization pointer through the cell at [i0][i1]... (linearized from
+// dims) on a successful resolve (icacheFill), and empties the whole array on
+// a period toggle (icacheDrainAll); the wrapper reads the cell directly.
+// Called from ejit_register_icache_slot (name->funcIndex resolution) at
+// ejit_auto_register / .ejit_period time.
 //
 // Every core registers the SAME base: with EJIT_ICACHE_SECTION set the array is
 // one shared object, which is what lets a drain on any core clear the cells
@@ -237,7 +244,8 @@ void ejitIcacheClearAll();
 enum class EJitIcacheRegResult { Ok, CapacityMiss, Invalid };
 
 EJitIcacheRegResult ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
-                                           uint32_t numDims);
+                                           uint32_t numDims,
+                                           const void *missFn = nullptr);
 
 /// Diagnostic: dump every registered icache slot to the diagnostic log.
 /// Shows funcIndex, base pointer, numDims, the per-slot cell capacity
@@ -917,8 +925,10 @@ public:
   // NOTE: the production hit path does NOT use icacheTry. With -ejit-inline-cache
   // the ejit_entry wrapper reads its per-function @__ejit_icache_fn_<name> slot
   // directly - a GEP into the [D]^numDims array by the ejit_dim arg values, one
-  // load + null-check + indirect call, NO ejit_icache_try call, NO
-  // per-call guards. icacheTry is retained for unit tests / diagnostics: on a
+  // load + indirect call, NO ejit_icache_try call, NO
+  // per-call guards; for NumDims <= 2 (no timing) the table is sentinel-formed,
+  // so even the null-check is gone - a miss BLRs into MissFn itself. icacheTry
+  // is retained for unit tests / diagnostics: on a
   // hit it sets *outFn to the cached specialization for the given dims (call
   // with NO releaseRead) and returns true; on a miss returns false. It keeps
   // the reclamation-safety, pool-Ready, range, and cross-core code-sharing gates
@@ -1001,7 +1011,20 @@ public:
   void icacheFill(uint32_t funcIndex, void *fnPtr, const EJitDimPair *dims,
                   uint32_t numDims, uint64_t token);
 
-  /// Zero every cell of every registered icache slot, bracketed by
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  /// Test-only hook fired inside icacheFill() AFTER the cell store and BEFORE
+  /// the post-store re-validation, so a single-threaded test can interleave a
+  /// drain exactly where a preempting peer core would - the only way to reach
+  /// the retract deterministically (the pre-store checks decline a token that
+  /// is already stale when icacheFill is entered).
+  using IcacheFillMidpointHook = void (*)(void *ctx);
+  void setIcacheFillMidpointForTest(IcacheFillMidpointHook fn, void *ctx) {
+    icacheFillMidpointHook_ = fn;
+    icacheFillMidpointCtx_ = ctx;
+  }
+#endif
+
+  /// Empty every cell of every registered icache slot, bracketed by
   /// icacheDrainsInFlight and closed by an icacheDrainSeq bump, so any resolve
   /// this overlaps drops its fill. This is THE cross-core
   /// invalidation: the cells are shared, so clearing them here clears them for
@@ -1014,8 +1037,9 @@ public:
   ///
   /// Safe against a concurrent probe on any core: it reads the old pointer (and
   /// calls it once more; the code is never freed under the gate this cache
-  /// requires) or 0 (and misses).
-  /// Zero every registered cell. \p reason names the event that triggered it
+  /// requires) or the empty value (and misses -- for sentinel-form tables the
+  /// empty value IS MissFn, so the miss executes the slow path directly).
+  /// \p reason names the event that triggered it
   /// and appears in the EJIT_DIAG line, which is what makes a drain visible on
   /// an SRE board -- the probe never enters the runtime on a hit, so a sudden
   /// burst of misses is otherwise unexplained.
@@ -1282,6 +1306,10 @@ private:
   EJitCompileMode configuredMode_ = EJitCompileMode::Async;
   bool codeSharingEnabled_ = false;
   bool isOwner_ = false;
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  IcacheFillMidpointHook icacheFillMidpointHook_ = nullptr;
+  void *icacheFillMidpointCtx_ = nullptr;
+#endif
   // Inline-cache safety gate: true while the cache is safe to use (no releaser
   // wired - the production default). v2 does no HP-scan retire, so a wired
   // releaser (code may be freed) + the cache = UAF; the gate then auto-disables

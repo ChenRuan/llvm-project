@@ -310,9 +310,12 @@ protected:
   }
 
   // Register a test-local stand-in for the wrapper's @__ejit_icache_fn_<name>
-  // cell table.
-  void registerSlot(uint32_t funcIndex, void *base, uint32_t numDims) {
-    ASSERT_EQ(ejitIcacheRegisterSlot(funcIndex, base, numDims),
+  // cell table. \p missFn non-null models a SENTINEL-form slot (NumDims <= 2,
+  // timing off): the table is defined pre-filled with &MissFn and the runtime
+  // must write that value back on drain / retract.
+  void registerSlot(uint32_t funcIndex, void *base, uint32_t numDims,
+                    const void *missFn = nullptr) {
+    ASSERT_EQ(ejitIcacheRegisterSlot(funcIndex, base, numDims, missFn),
               EJitIcacheRegResult::Ok);
   }
 
@@ -4217,6 +4220,224 @@ TEST_F(SharedTaskPoolTest, InlineCacheMultiVersion) {
   for (uint32_t i = 0; i < D; ++i)
     for (uint32_t j = 0; j < D; ++j)
       ASSERT_EQ(slots[i][j], 0u) << "cell [" << i << "][" << j << "] survived";
+}
+
+//===----------------------------------------------------------------------===//
+// Sentinel-form slots: the branchless wrapper.
+//
+// For NumDims <= 2 (no -ejit-wrapper-timing) the AOT DEFINES the cell table
+// pre-filled with &MissFn and the wrapper is load + musttail BLR with no null
+// guard, so a cell holding 0 is a crash, not a miss. The runtime's side of
+// that contract: whatever path empties a cell writes the slot's registered
+// missFn back, and icacheTry reports the sentinel as a miss. Guarded slots
+// (3D/4D, timing - registered with a null missFn) keep the historical 0.
+//===----------------------------------------------------------------------===//
+
+namespace {
+// A stand-in for the AOT-generated <name>_miss: the runtime only stores and
+// compares the address, so any stable non-null function address models it.
+// C++ has no implicit function-pointer -> void* conversion (and the cast is
+// not a constant expression), so both forms come from these helpers.
+void testMissFn() {}
+const void *testSentinelPtr() {
+  return reinterpret_cast<const void *>(&testMissFn);
+}
+uintptr_t testSentinel() {
+  return reinterpret_cast<uintptr_t>(&testMissFn);
+}
+} // namespace
+
+// The full sentinel lifecycle: definition-time sentinel -> miss; fill -> hit;
+// period toggle -> SENTINEL back (never 0); refill -> hit again.
+TEST_F(SharedTaskPoolTest, InlineCacheSentinelDrainsToMissFn) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  // The cell as the image loader places it: DEFINED as &MissFn. 0D here; the
+  // multi-dim walk is pinned below.
+  uintptr_t slot = testSentinel();
+  registerSlot(kFunc, &slot, 0, testSentinelPtr());
+  void *fn = codeFor(kFunc);
+  void *out = nullptr;
+
+  // The sentinel IS a miss: icacheTry reports it with *outFn cleared.
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, nullptr);
+
+  // A resolve fills over the sentinel and serves.
+  pool.icacheFill(kFunc, fn, nullptr, 0, pool.icacheBeginResolve());
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, fn);
+
+  // A period toggle empties the cell back to the SENTINEL. This is the
+  // load-bearing assertion of the branchless wrapper: the probe BLRs the cell
+  // unconditionally, so 0 here would be a jump to null.
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
+  EXPECT_EQ(slot, testSentinel()) << "drain must empty a sentinel slot to &MissFn";
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+
+  // Not poisoned: a fresh resolve refills and serves again.
+  pool.icacheFill(kFunc, fn, nullptr, 0, pool.icacheBeginResolve());
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, fn);
+}
+
+// A stale-token fill DECLINES before storing, so it must leave the sentinel
+// the drain just wrote in place -- it must not zero the cell either.
+TEST_F(SharedTaskPoolTest, InlineCacheSentinelDeclinesLeaveTheDrainValue) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  uintptr_t slot = testSentinel();
+  registerSlot(kFunc, &slot, 0, testSentinelPtr());
+
+  // Arm the table with a live fill, so the toggle's drain below actually
+  // walks (an unarmed drain skips the walk -- there is nothing to empty).
+  pool.icacheFill(kFunc, codeFor(kFunc), nullptr, 0, pool.icacheBeginResolve());
+  ASSERT_NE(slot, testSentinel());
+
+  const uint64_t staleTok = pool.icacheBeginResolve();
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true)); // drain -> sentinel
+  EXPECT_EQ(slot, testSentinel());
+  pool.icacheFill(kFunc, codeFor(kFunc), nullptr, 0, staleTok); // declines
+  EXPECT_EQ(slot, testSentinel())
+      << "a declined fill must leave the drain's sentinel untouched";
+  void *out = nullptr;
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+}
+
+// The retract: a drain that begins after the fill's pre-store checks pass but
+// before its re-validation. Reached deterministically through the test-only
+// midpoint hook (the production interleave is a preempting peer core). The
+// retracted cell must hold the SENTINEL, not 0 -- same contract as the drain.
+TEST_F(SharedTaskPoolTest, InlineCacheSentinelFillRetractWritesMissFn) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  uintptr_t slot = testSentinel();
+  registerSlot(kFunc, &slot, 0, testSentinelPtr());
+
+  // Fire a period toggle from inside the fill, between the store and the
+  // re-validation -- exactly where a preempting peer's drain lands.
+  pool.setIcacheFillMidpointForTest(
+      [](void *ctx) {
+        static_cast<EJitSharedTaskPool *>(ctx)->setInstanceEnabled(0, 5, true);
+      },
+      &pool);
+  pool.icacheFill(kFunc, codeFor(kFunc), nullptr, 0,
+                  pool.icacheBeginResolve());
+  pool.setIcacheFillMidpointForTest(nullptr, nullptr);
+
+  EXPECT_EQ(slot, testSentinel())
+      << "a retracted fill must reset the cell to &MissFn, not 0";
+  void *out = nullptr;
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+}
+
+// The same retract with a GUARDED slot (null missFn): the empty value stays 0.
+// One seam, both forms - the retract picks its value from the registration.
+TEST_F(SharedTaskPoolTest, InlineCacheGuardedFillRetractStillWritesZero) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  uintptr_t slot = 0;
+  registerSlot(kFunc, &slot, 0); // guarded form: no missFn
+
+  pool.setIcacheFillMidpointForTest(
+      [](void *ctx) {
+        static_cast<EJitSharedTaskPool *>(ctx)->setInstanceEnabled(0, 5, true);
+      },
+      &pool);
+  pool.icacheFill(kFunc, codeFor(kFunc), nullptr, 0,
+                  pool.icacheBeginResolve());
+  pool.setIcacheFillMidpointForTest(nullptr, nullptr);
+
+  EXPECT_EQ(slot, 0u) << "a guarded slot's retract keeps the historical 0";
+}
+
+// A multi-dim (2D) sentinel table: the drain walks every cell writing the
+// sentinel, wherever the filled identities sit.
+TEST_F(SharedTaskPoolTest, InlineCacheSentinelDrainsEveryCellOfAMultiDimTable) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  constexpr uint32_t D = EJIT_ICACHE_DIM_SIZE;
+  // The [D][D] table as defined: every cell &MissFn.
+  uintptr_t slots[D][D];
+  for (uint32_t i = 0; i < D; ++i)
+    for (uint32_t j = 0; j < D; ++j)
+      slots[i][j] = testSentinel();
+  registerSlot(kFunc, &slots[0][0], 2, testSentinelPtr());
+
+  EJitDimPair id01[2] = {{0, 0}, {0, 1}};
+  EJitDimPair id10[2] = {{0, 1}, {0, 0}};
+  void *out = nullptr;
+
+  EXPECT_FALSE(pool.icacheTry(kFunc, id01, 2, &out));
+  pool.icacheFill(kFunc, codeFor(kFunc), id01, 2, pool.icacheBeginResolve());
+  pool.icacheFill(kFunc, codeFor(kFunc + 1), id10, 2,
+                  pool.icacheBeginResolve());
+  EXPECT_EQ(slots[0][1], reinterpret_cast<uintptr_t>(codeFor(kFunc)));
+  EXPECT_EQ(slots[1][0], reinterpret_cast<uintptr_t>(codeFor(kFunc + 1)));
+
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
+  for (uint32_t i = 0; i < D; ++i)
+    for (uint32_t j = 0; j < D; ++j)
+      ASSERT_EQ(slots[i][j], testSentinel())
+          << "cell [" << i << "][" << j << "] must drain to &MissFn";
+  EXPECT_FALSE(pool.icacheTry(kFunc, id01, 2, &out));
+  EXPECT_FALSE(pool.icacheTry(kFunc, id10, 2, &out));
+}
+
+// One drain, two forms: a sentinel slot and a guarded slot registered side by
+// side empty to their own values. The registration is the ONLY thing that
+// decides the empty value - a guarded slot next to a sentinel one must not
+// inherit the sentinel.
+TEST_F(SharedTaskPoolTest, InlineCacheGuardedSlotStillDrainsToZero) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kSentinelFunc = 3;
+  constexpr uint32_t kGuardedFunc = 4;
+  uintptr_t sentinelSlot = testSentinel();
+  uintptr_t guardedSlot = 0;
+  registerSlot(kSentinelFunc, &sentinelSlot, 0, testSentinelPtr());
+  registerSlot(kGuardedFunc, &guardedSlot, 0); // guarded: null missFn
+
+  pool.icacheFill(kSentinelFunc, codeFor(kSentinelFunc), nullptr, 0,
+                  pool.icacheBeginResolve());
+  pool.icacheFill(kGuardedFunc, codeFor(kGuardedFunc), nullptr, 0,
+                  pool.icacheBeginResolve());
+  ASSERT_EQ(sentinelSlot, reinterpret_cast<uintptr_t>(codeFor(kSentinelFunc)));
+  ASSERT_EQ(guardedSlot, reinterpret_cast<uintptr_t>(codeFor(kGuardedFunc)));
+
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
+  EXPECT_EQ(sentinelSlot, testSentinel());
+  EXPECT_EQ(guardedSlot, 0u);
+  void *out = nullptr;
+  EXPECT_FALSE(pool.icacheTry(kSentinelFunc, nullptr, 0, &out));
+  EXPECT_FALSE(pool.icacheTry(kGuardedFunc, nullptr, 0, &out));
+}
+
+// ejitIcacheClearAll() retires the registration wholesale: re-registering the
+// same funcIndex as a guarded slot must not inherit the stale missFn (a drain
+// would then write &MissFn into a wrapper that null-checks 0 - harmless to
+// execution, but the sentinel-vs-0 contract would be lying).
+TEST_F(SharedTaskPoolTest, InlineCacheClearAllDropsTheSentinelRegistration) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  uintptr_t slot = 0;
+  registerSlot(kFunc, &slot, 0, testSentinelPtr());
+  pool.icacheFill(kFunc, codeFor(kFunc), nullptr, 0, pool.icacheBeginResolve());
+  ASSERT_NE(slot, 0u);
+
+  ejitIcacheClearAll();
+  slot = 0;
+  registerSlot(kFunc, &slot, 0); // re-register guarded
+  pool.icacheFill(kFunc, codeFor(kFunc), nullptr, 0, pool.icacheBeginResolve());
+  ASSERT_NE(slot, 0u);
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
+  EXPECT_EQ(slot, 0u) << "clearAll must drop the missFn, not leak it";
 }
 
 //===----------------------------------------------------------------------===//

@@ -769,6 +769,11 @@ extern void ejit_register_period_array(const char *, const char *, void *,
 extern void ejit_register_bitcode(const char *, const uint8_t *, uint64_t);
 extern void ejit_register_static_var(const char *, void *);
 extern void ejit_register_lifecycle(const char *, uint32_t *);
+// Icache slot registration: name-keyed (resolved against the SAME registry
+// funcIndex ejit_register_funcindex assigns), 4th arg is the sentinel MissFn
+// for branchless-probe slots (null keeps the guarded form's 0 semantics).
+extern void ejit_register_funcindex(const char *, uint32_t *);
+extern void ejit_register_icache_slot(const char *, void *, uint32_t, void *);
 extern void ejit_set_log_level(int level);
 extern int ejit_get_log_level(void);
 extern void ejit_print_registry(void);
@@ -1046,6 +1051,69 @@ TEST(EJitCApiTaskpool, PreInitLifecycleActivateAndArraySync) {
   EXPECT_FALSE(ejit_is_active("wrong", 0));
   ejit_shutdown();
 }
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+// The C ABI's ejit_register_icache_slot gained a 4th argument: the sentinel
+// MissFn the branchless wrapper's cell table is DEFINED pre-filled with. The
+// registration must carry it into the slot registry, so a drain triggered
+// through the public activate path empties a sentinel-form cell to &MissFn --
+// never 0, which the branchless probe would BLR -- while a slot registered
+// with a null missFn (guarded form: 3D/4D, timing) keeps the historical 0.
+TEST(EJitCApiTaskpool, IcacheSlotRegistrationCarriesTheSentinel) {
+  resetTaskpoolRegState();
+  // A lifecycle + period array, so the public activate below has a registered
+  // period to toggle (its drain is the observable under test).
+  uint32_t lifeSlot = 0xFFFFFFFFu;
+  ejit_register_lifecycle("cell", &lifeSlot);
+  static int cellArr[16];
+  ejit_register_period_array("cell", "cellArr", cellArr, 16);
+
+  // Stand-ins for the AOT globals: two [D] cell tables, and (for the sentinel
+  // slot) the MissFn the table is defined pre-filled with. The runtime only
+  // stores and compares these addresses; nothing ever calls through them.
+  constexpr uint32_t D = 16;
+  static uintptr_t sentinelCells[D];
+  static uintptr_t guardedCells[D];
+  static uintptr_t missFnStandIn = 0;
+  sentinelCells[3] = reinterpret_cast<uintptr_t>(&missFnStandIn);
+
+  // C ABI registration: funcindex first (name -> registry funcIndex), then
+  // the slot with its dimensionality and sentinel.
+  uint32_t sentinelIdx = 0xFFFFFFFFu;
+  uint32_t guardedIdx = 0xFFFFFFFFu;
+  ejit_register_funcindex("sentinel_c_fn", &sentinelIdx);
+  ejit_register_funcindex("guarded_c_fn", &guardedIdx);
+  ASSERT_NE(sentinelIdx, 0xFFFFFFFFu);
+  ASSERT_NE(guardedIdx, 0xFFFFFFFFu);
+  ejit_register_icache_slot("sentinel_c_fn", &sentinelCells[0], 1,
+                            &missFnStandIn);
+  ejit_register_icache_slot("guarded_c_fn", &guardedCells[0], 1, nullptr);
+
+  EJit ejit(Config{});
+  ASSERT_FALSE(ejit.initFailed());
+  EJitSharedTaskPool *sp = ejit.sharedTaskPool();
+  ASSERT_NE(sp, nullptr);
+
+  // Model a resolve that filled each slot's identity (this also arms the
+  // table, so the toggle's drain actually walks it).
+  EJitDimPair id[1] = {{0, 3}};
+  sp->icacheFill(sentinelIdx, reinterpret_cast<void *>(0x2000), id, 1,
+                 sp->icacheBeginResolve());
+  sp->icacheFill(guardedIdx, reinterpret_cast<void *>(0x3000), id, 1,
+                 sp->icacheBeginResolve());
+  ASSERT_EQ(sentinelCells[3], 0x2000u);
+  ASSERT_EQ(guardedCells[3], 0x3000u);
+
+  // The public activate path drains: sentinel slot -> &MissFn, guarded slot
+  // -> 0. This is the C-ABI end of the contract the SharedTaskPool tests pin
+  // at the internal-API level.
+  EXPECT_TRUE(ejit.activate("cell", 3));
+  EXPECT_EQ(sentinelCells[3], reinterpret_cast<uintptr_t>(&missFnStandIn))
+      << "a sentinel slot registered through the C ABI must drain to &MissFn";
+  EXPECT_EQ(guardedCells[3], 0u)
+      << "a guarded (null-missFn) slot must keep the historical 0";
+}
+#endif // EJIT_SRE_SHARED_TASKPOOL
 
 // Finding (一): name-level activate/deactivate through the PUBLIC EJit API
 // syncs the time-window state AND the taskpool SwitchController; the version

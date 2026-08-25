@@ -566,12 +566,16 @@ void ejit_register_funcindex(const char *funcName, uint32_t *slotOut) {
 }
 
 void ejit_register_icache_slot(const char *funcName, void *slot,
-                               uint32_t numDims) {
+                               uint32_t numDims, void *missFn) {
   // Wire the wrapper's per-function @__ejit_icache_fn_<name> cell table into
   // the runtime slot registry, keyed by the SAME registry funcIndex
   // ejit_register_funcindex assigns by name. numDims is the [D]^numDims shape
-  // so icacheFill can linearize and icacheDrainAll knows how far to walk. The
-  // wrapper reads a cell directly on the icache hit path. Idempotent by name
+  // so icacheFill can linearize and icacheDrainAll knows how far to walk.
+  // missFn is non-null exactly for sentinel-form slots (their table is defined
+  // pre-filled with &MissFn and the branchless probe BLRs the cell): the
+  // runtime writes it back on drain / fill-retract so the cell never holds a
+  // non-callable value. The wrapper reads a cell directly on the icache hit
+  // path. Idempotent by name
   // (resolveAssign is), and every core registering the same shared table
   // records the same base. A null slot, an unresolvable name, or a numDims
   // above the cap is recorded; the base stays null and the wrapper's probe
@@ -581,7 +585,8 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
               (const void *)funcName, slot);
     return;
   }
-  EJIT_DIAG_VERBOSE("register_icache_slot name=%s numDims=%u", funcName, numDims);
+  EJIT_DIAG_VERBOSE("register_icache_slot name=%s numDims=%u missFn=%p",
+                    funcName, numDims, missFn);
 #ifdef EJIT_SRE_TASKPOOL
   if (gEJIT && gEJIT->registrationFrozen()) {
     EJitRegistrationStore::instance().recordError(
@@ -601,7 +606,7 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
               funcName);
     return;
   }
-  switch (ejitIcacheRegisterSlot(idx, slot, numDims)) {
+  switch (ejitIcacheRegisterSlot(idx, slot, numDims, missFn)) {
   case EJitIcacheRegResult::Ok:
     EJIT_DIAG_VERBOSE("register_icache_slot OK name=%s idx=%u numDims=%u",
                       funcName, idx, numDims);

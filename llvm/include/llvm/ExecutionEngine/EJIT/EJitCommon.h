@@ -94,8 +94,12 @@ constexpr const char *FN_REGISTER_FUNCINDEX = "ejit_register_funcindex";
 // @__ejit_icache_fn_<name> global (a frozen, sticky specialization pointer) is
 // registered by name so the runtime can backfill it on a successful resolve
 // (icacheFill). The wrapper reads it directly with an inline atomic load - no
-// ejit_icache_try call - so the hit path is one load + null-check + indirect
-// call. Signature: void ejit_register_icache_slot(const char *name, void *slot).
+// ejit_icache_try call - so the hit path is one load + indirect call (plus a
+// null-check only on guarded 3D/4D shapes; <=2D tables are defined pre-filled
+// with &MissFn and BLR it branchlessly). Signature: void
+// ejit_register_icache_slot(const char *name, void *slot, uint32_t numDims,
+// void *missFn), where missFn is the slot's sentinel for branchless tables
+// (drain/fill-retract write it back instead of 0) and null for guarded ones.
 constexpr const char *FN_REGISTER_ICACHE_SLOT = "ejit_register_icache_slot";
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET =
     "ejit_taskpool_compile_or_get";
