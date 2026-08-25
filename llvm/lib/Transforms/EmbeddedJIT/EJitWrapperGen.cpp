@@ -703,6 +703,18 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     for (BasicBlock &BB : *F)
       if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
         OriginalReturns.push_back(RI);
+    bool HasMustTailAotExit = false;
+    for (BasicBlock &BB : *F) {
+      for (Instruction &I : BB) {
+        auto *CI = dyn_cast<CallInst>(&I);
+        if (CI && CI->isMustTailCall()) {
+          HasMustTailAotExit = true;
+          break;
+        }
+      }
+      if (HasMustTailAotExit)
+        break;
+    }
 
     // Timing callees (shared by hit and slow paths).
     FunctionCallee TraceNow{};
@@ -942,8 +954,14 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // MissFn on miss) -- no allocas, no calls, no frame. MissFn holds the
       // funcidx guard + compile_or_get + dispatch + the AOT fallback (original
       // body), with its own frame. Miss is rare, so the call overhead is fine.
+      // Moving a musttail AOT exit into a function with one extra fixed
+      // parameter would invalidate its caller/callee ABI match. Such entries
+      // keep an ABI-identical MissFn; their slow JIT path starts timing locally
+      // and their AOT fallback is deliberately left uninstrumented.
+      const bool ThreadWrapperBegin =
+          EJitFunctionBodyTiming && !HasMustTailAotExit;
       FunctionType *MissFnTy = F->getFunctionType();
-      if (EJitFunctionBodyTiming) {
+      if (ThreadWrapperBegin) {
         SmallVector<Type *, 8> MissParamTys(F->getFunctionType()->params());
         MissParamTys.push_back(I64Ty);
         MissFnTy =
@@ -999,10 +1017,11 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
           B.CreateRet(PoisonValue::get(F->getReturnType()));
       }
       Value *MissWrapperBegin =
-          EJitFunctionBodyTiming ? MissFn->getArg(F->arg_size()) : nullptr;
+          ThreadWrapperBegin ? MissFn->getArg(F->arg_size()) : nullptr;
       emitSlowPath(*MissFn, MissEntry, MissCall, MissDispatch, MissFallback,
                    MissWrapperBegin);
-      instrumentAotBody(MissFallback, MissWrapperBegin);
+      if (!HasMustTailAotExit)
+        instrumentAotBody(MissFallback, MissWrapperBegin);
 
       // Wrapper (F): frame-less probe + tail calls.
       auto *JitEntry = BasicBlock::Create(Ctx, "jit_entry", F);
@@ -1111,7 +1130,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       SmallVector<Value *, 8> MissArgs;
       for (auto &A : F->args())
         MissArgs.push_back(&A);
-      if (EJitFunctionBodyTiming)
+      if (ThreadWrapperBegin)
         MissArgs.push_back(WrapperBegin);
       if (F->getReturnType()->isVoidTy()) {
         CallInst *CI =

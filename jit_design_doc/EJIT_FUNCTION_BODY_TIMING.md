@@ -61,4 +61,7 @@ caution. Production builds with the option off retain the original wrapper.
 Only normal returns are sampled. An AOT exit consisting of a `musttail` call and
 its required adjacent return is left untouched and is not reported, because
 inserting a recorder there would invalidate the IR or change tail-call
-behaviour.
+behaviour. With the inline cache enabled, any function containing such an exit
+keeps an ABI-identical internal miss function and disables AOT fallback samples
+for that function. Its slow-path JIT sample starts the wrapper interval inside
+the miss function; inline-cache JIT hits retain the full pre-probe interval.

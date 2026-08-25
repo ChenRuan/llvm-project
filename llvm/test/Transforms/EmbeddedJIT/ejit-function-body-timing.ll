@@ -2,6 +2,7 @@
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-function-body-timing -S %s | FileCheck %s --check-prefix=JIT
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-function-body-timing -S %s | FileCheck %s --check-prefix=AOT
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -ejit-function-body-timing -S %s | FileCheck %s --check-prefix=ICACHE
+; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -ejit-wrapper-timing -ejit-function-body-timing -S %s | FileCheck %s --check-prefix=BOTH
 
 ; OFF-NOT: @ejit_function_body_cycles_record
 
@@ -54,6 +55,17 @@
 ; ICACHE: %ejit_aot_body_begin = call i64 @ejit_taskpool_trace_now()
 ; ICACHE: call void @ejit_function_body_cycles_record({{.*}}i32 0, i64 %[[WRAPPER_BEGIN]], i64 %ejit_aot_body_begin,
 
+; Wrapper and body timing coexist for multiple entries, including void returns.
+; BOTH-LABEL: define i32 @timed_body(
+; BOTH: call void @ejit_taskpool_trace_wrapper(
+; BOTH: call void @ejit_function_body_cycles_record(
+; BOTH-LABEL: define void @timed_void(
+; BOTH-LABEL: jit_icache_dispatch:
+; BOTH: call void %ejit_ic_fn
+; BOTH: call void @ejit_taskpool_trace_wrapper(
+; BOTH: call void @ejit_function_body_cycles_record(
+; BOTH-NEXT: ret void
+
 define i32 @timed_body(i32 %cell, i32 %value) !ejit.metadata !0 {
 entry:
   %positive = icmp sgt i32 %value, 0
@@ -68,7 +80,14 @@ aot.nonpositive:
   ret i32 %neg
 }
 
+define void @timed_void(i32 %cell, ptr %out) !ejit.metadata !1 {
+entry:
+  store i32 %cell, ptr %out
+  ret void
+}
+
 @data = global [16 x i32] zeroinitializer, !ejit.metadata !10
 
 !0 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
+!1 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
 !10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}}
