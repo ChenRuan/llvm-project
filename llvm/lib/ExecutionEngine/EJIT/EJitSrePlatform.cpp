@@ -157,12 +157,12 @@ void syncCodeCaches(uintptr_t Va, size_t Size) {
   uintptr_t End = Va + Size;
   uintptr_t P = Va & ~static_cast<uintptr_t>(DLine - 1);
   for (; P < End; P += DLine)
-    __asm__ __volatile__("dc cvau, %0" :: "r"(P) : "memory");
+    __asm__ __volatile__("dc cvau, %0" ::"r"(P) : "memory");
   __asm__ __volatile__("dsb ish" ::: "memory");
 
   P = Va & ~static_cast<uintptr_t>(ILine - 1);
   for (; P < End; P += ILine)
-    __asm__ __volatile__("ic ivau, %0" :: "r"(P) : "memory");
+    __asm__ __volatile__("ic ivau, %0" ::"r"(P) : "memory");
   __asm__ __volatile__("dsb ish" ::: "memory");
   __asm__ __volatile__("isb" ::: "memory");
 #else
@@ -191,10 +191,16 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
   Opts.poolSize = static_cast<size_t>(kSrePoolSize);
   Opts.poolAlign = k2MiB; // large-page / split granularity
   Opts.minCodeAlign = 64;
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
+  if (Placement == EJitCodePoolPlacement::NearFixed) {
+    Opts.minCodeAlign = 16;
+    Opts.batchedPageSeal = true;
+  }
+#endif
   EJIT_DIAG_VERBOSE(
-      "makeSreCodePoolManager: kind=%s poolSize=%llu poolAlign=%zu",
+      "makeSreCodePoolManager: kind=%s poolSize=%llu poolAlign=%zu batched=%u",
       Placement == EJitCodePoolPlacement::NearFixed ? "near" : "far",
-      kSrePoolSize, k2MiB);
+      kSrePoolSize, k2MiB, static_cast<unsigned>(Opts.batchedPageSeal));
 #ifdef EJIT_CODE_POOL_4K_SEAL
   // Adapt to the platform's 4K execute-permission interface: the 2MiB pool is
   // split into 4K mappings at creation and sealed one 4KiB page at a time.
@@ -216,33 +222,33 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
   if (Placement == EJitCodePoolPlacement::NearFixed) {
     uintptr_t FBase = reinterpret_cast<uintptr_t>(__ejit_code_start);
     uintptr_t FEnd = reinterpret_cast<uintptr_t>(__ejit_code_end);
-    uintptr_t AlignedBase =
-        (FBase + (static_cast<uintptr_t>(k2MiB) - 1)) &
-        ~(static_cast<uintptr_t>(k2MiB) - 1);
+    uintptr_t AlignedBase = (FBase + (static_cast<uintptr_t>(k2MiB) - 1)) &
+                            ~(static_cast<uintptr_t>(k2MiB) - 1);
     if (FEnd > AlignedBase && (FEnd - AlignedBase) >= kSrePoolSize) {
       Opts.fixedBase = AlignedBase;
       Opts.fixedSize = FEnd - AlignedBase;
-      EJIT_DIAG("makeSreCodePoolManager: FIXED region sym=[0x%llx,0x%llx) "
-                "alignedBase=0x%llx usable=%llu (~%llu pools of %lluB)",
-                static_cast<unsigned long long>(FBase),
-                static_cast<unsigned long long>(FEnd),
-                static_cast<unsigned long long>(AlignedBase),
-                static_cast<unsigned long long>(FEnd - AlignedBase),
-                static_cast<unsigned long long>((FEnd - AlignedBase) / kSrePoolSize),
-                static_cast<unsigned long long>(kSrePoolSize));
+      EJIT_DIAG(
+          "makeSreCodePoolManager: FIXED region sym=[0x%llx,0x%llx) "
+          "alignedBase=0x%llx usable=%llu (~%llu pools of %lluB)",
+          static_cast<unsigned long long>(FBase),
+          static_cast<unsigned long long>(FEnd),
+          static_cast<unsigned long long>(AlignedBase),
+          static_cast<unsigned long long>(FEnd - AlignedBase),
+          static_cast<unsigned long long>((FEnd - AlignedBase) / kSrePoolSize),
+          static_cast<unsigned long long>(kSrePoolSize));
     } else {
-      EJIT_DIAG("makeSreCodePoolManager: fixed region absent or too small after "
-                "2MiB alignment (sym=[0x%llx,0x%llx) alignedBase=0x%llx "
-                "usable=%llu < poolSize=%llu), falling back to SRE_MemDbgAlloc "
-                "ptNo=%u",
-                static_cast<unsigned long long>(FBase),
-                static_cast<unsigned long long>(FEnd),
-                static_cast<unsigned long long>(AlignedBase),
-                static_cast<unsigned long long>(FEnd > AlignedBase
-                                                    ? FEnd - AlignedBase
-                                                    : 0),
-                static_cast<unsigned long long>(kSrePoolSize),
-                static_cast<unsigned>(kSrePtNo));
+      EJIT_DIAG(
+          "makeSreCodePoolManager: fixed region absent or too small after "
+          "2MiB alignment (sym=[0x%llx,0x%llx) alignedBase=0x%llx "
+          "usable=%llu < poolSize=%llu), falling back to SRE_MemDbgAlloc "
+          "ptNo=%u",
+          static_cast<unsigned long long>(FBase),
+          static_cast<unsigned long long>(FEnd),
+          static_cast<unsigned long long>(AlignedBase),
+          static_cast<unsigned long long>(
+              FEnd > AlignedBase ? FEnd - AlignedBase : 0),
+          static_cast<unsigned long long>(kSrePoolSize),
+          static_cast<unsigned>(kSrePtNo));
     }
   }
 #endif
@@ -254,7 +260,8 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
   // meaningful when the fixed region is actually engaged (fixedSize > 0).
   if (Opts.fixedSize > 0) {
     Opts.needsEnableRw = true;
-    EJIT_DIAG("makeSreCodePoolManager: code-segment placement -> needsEnableRw=1");
+    EJIT_DIAG(
+        "makeSreCodePoolManager: code-segment placement -> needsEnableRw=1");
   }
 #endif
 
@@ -265,9 +272,9 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
 
   auto Seal = [](void *Va) -> unsigned {
 #ifdef EJIT_SRE_ENABLE_EX
-    // In 4K seal mode Va is a single 4KiB page; in legacy mode it is the 2MiB
-    // pool base. sealAndSyncCache syncs caches for the written range then makes
-    // the page executable (enable_ex does not sync caches).
+  // In 4K seal mode Va is a single 4KiB page; in legacy mode it is the 2MiB
+  // pool base. sealAndSyncCache syncs caches for the written range then makes
+  // the page executable (enable_ex does not sync caches).
 #ifdef EJIT_CODE_POOL_4K_SEAL
     return sealAndSyncCache(reinterpret_cast<uintptr_t>(Va), k4KiB);
 #else
@@ -312,7 +319,7 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
   };
 
   return std::make_unique<EJitCodePoolManager>(Opts, RawAlloc, Seal, Split,
-                                                EnableRw);
+                                               EnableRw);
 }
 
 bool llvm::ejit::prepareSreCodeForCurrentCore(const void *FnPtr) {
@@ -349,9 +356,9 @@ bool llvm::ejit::ejitSreSplitPoolForCurrentCore(uintptr_t PoolBase,
   }
   // Per-core: this splits the 2MiB large page into 4K mappings in the calling
   // core's stage-1 translation only. enable_ex per page follows.
-  unsigned Rc = ejit_sre_split_2m_to_4k(
-      static_cast<unsigned long long>(PoolBase),
-      static_cast<unsigned long long>(PoolSize));
+  unsigned Rc =
+      ejit_sre_split_2m_to_4k(static_cast<unsigned long long>(PoolBase),
+                              static_cast<unsigned long long>(PoolSize));
   if (Rc != 0) {
     EJIT_DIAG("splitPoolForCurrentCore FAIL: split_2m_to_4k poolBase=0x%llx "
               "size=%llu rc=%u",

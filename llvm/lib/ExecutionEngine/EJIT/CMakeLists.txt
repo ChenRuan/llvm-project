@@ -239,6 +239,10 @@ if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_CODE_POOL_4K_SEAL)
 endif()
 
+if(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_CODE_POOL_BATCHED_PUBLISH)
+endif()
+
 # Pin the JIT code pool to a fixed linker-script region [__ejit_code_start,
 # __ejit_code_end) in the RX code segment (enable_rw write / enable_ex seal)
 # instead of dynamic SRE_MemDbgAlloc. The only user of this macro is the SRE

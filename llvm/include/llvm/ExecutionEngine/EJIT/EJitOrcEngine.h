@@ -136,15 +136,13 @@ public:
 
   /// Create a configured engine. Thread-safe to call once.
   static Expected<std::unique_ptr<EJitOrcEngine>>
-  Create(const Config &config,
-         PeriodArrayRegistry &periodReg,
+  Create(const Config &config, PeriodArrayRegistry &periodReg,
          EJitRuntimeState &runtimeState);
 
   /// Load a bitcode module into a per-specialization JITDylib identified
   /// by cacheKey. Each specialization gets its own JITDylib so symbols
   /// from the same TU bitcode can be defined multiple times without conflict.
-  Error loadBitcodeModule(StringRef bitcodeData,
-                          uint64_t cacheKey,
+  Error loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
                           const std::string &origFnName);
 
   /// Look up a compiled function symbol in the specialization JITDylib
@@ -195,6 +193,8 @@ public:
   /// preparation). Returns false if \p FnPtr is not pool-backed code with a
   /// recorded finalized range. Available only with EJIT_SRE_CODE_POOL.
   bool findCodeRange(const void *FnPtr, EJitCompiledCodeInfo &Out) const;
+  bool isCodeReady(const void *FnPtr) const;
+  Error flushPendingCode();
 #endif
 
 private:

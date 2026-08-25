@@ -12,8 +12,8 @@
 //  permissions on the 4KiB page containing the supplied VA, but the underlying
 //  large page is still 2MiB: a 2MiB-aligned region must first be split into 4K
 //  mappings via split_2m_to_4k before any per-page enable_ex is legal. Wrapping
-//  the global mprotect breaks ORC/JITLink's later writes, so instead EmbeddedJIT
-//  owns the JIT code memory directly. There are two sealing modes:
+//  the global mprotect breaks ORC/JITLink's later writes, so instead
+//  EmbeddedJIT owns the JIT code memory directly. There are two sealing modes:
 //
 //    * Legacy whole-pool seal (fourKSeal = false): each 2MiB-aligned pool is
 //      sealed as a unit (one enable_ex on the pool base); a sealed pool is
@@ -129,6 +129,9 @@ public:
     /// creation + enable_ex per covered page at finalize) instead of sealing
     /// the whole 2MiB pool. Default false (legacy whole-pool seal).
     bool fourKSeal = false;
+    /// Keep finalized code RW/NX until flushPendingRanges(), allowing pure
+    /// executable allocations to share pages at minCodeAlign granularity.
+    bool batchedPageSeal = false;
     /// Execute-permission seal granularity in 4K mode. Platform constant 4KiB.
     size_t sealPageSize = 4096;
     /// When fixedSize > 0, new pools are carved sequentially from the fixed
@@ -143,7 +146,8 @@ public:
     ///     enable_rw'd (RX->RW) before writing, then enable_ex'd (RW->RX) at
     ///     finalize. Requires an EnableRwFn.
     /// Exhausting the region is a clean Error (no fallback to RawAllocFn, which
-    /// would break the fixed-address guarantee). Default 0 = dynamic allocation.
+    /// would break the fixed-address guarantee). Default 0 = dynamic
+    /// allocation.
     uintptr_t fixedBase = 0;
     size_t fixedSize = 0;
     /// When true, the fixed region starts read-only (code segment, RX) and each
@@ -238,6 +242,19 @@ public:
   /// correctly (the same JITLink layout is used by both pool kinds).
   bool needsPeerEnableRw() const { return Opts_.needsEnableRw; }
 
+  bool usesBatchedPageSeal() const { return Opts_.batchedPageSeal; }
+  size_t codeAlignment() const { return Opts_.minCodeAlign; }
+
+  /// Stage a fully linked executable range without making it callable yet.
+  /// All staged ranges are sealed and promoted atomically as one publication
+  /// batch by flushPendingRanges().
+  bool recordPendingRange(const void *Base, size_t Size,
+                          const EJitWritableRange *Writables = nullptr,
+                          uint32_t WritableCount = 0);
+  void notePendingAllocation();
+  Error flushPendingRanges();
+  size_t pendingRangeCount() const;
+
   /// Record the executable extent of a finalized JITLink allocation
   /// [Base, Base + Size). Called by the code-pool memory manager at finalize,
   /// after all writes/relocations are complete (and, in 4K mode, after the
@@ -315,6 +332,8 @@ private:
     EJitWritableRange writables[kEJitMaxWritableRanges] = {};
   };
   std::vector<FinalizedRange> FinalizedRanges_;
+  std::vector<FinalizedRange> PendingRanges_;
+  size_t PendingAllocations_ = 0;
 
 #ifndef EJIT_FREESTANDING
   mutable std::mutex Mutex_;

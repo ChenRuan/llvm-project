@@ -716,6 +716,23 @@ if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
   message(STATUS "EmbeddedJIT: SRE code pool uses 4K-granular page sealing")
 endif()
 
+# Experimental near-code-pool packing. Ordinary EJIT code and online-PGO Tier-2
+# code remain RW/NX and hidden from dispatch until an explicit API call asks
+# the shared worker to seal and publish the batch. Online-PGO Tier-1 uses the
+# far temporary pool and is sealed/published immediately so sampling can start.
+# Pure executable JITLink allocations use 16-byte layout/alignment; allocations
+# containing data/GOT segments retain the existing page-isolated layout.
+option(EJIT_CODE_POOL_BATCHED_PUBLISH
+  "Pack pure JIT code at 16-byte alignment for explicit RX batch publication" OFF)
+if(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  if(NOT EJIT_SRE_CODE_POOL OR NOT EJIT_CODE_POOL_4K_SEAL)
+    message(FATAL_ERROR
+      "EJIT_CODE_POOL_BATCHED_PUBLISH requires EJIT_SRE_CODE_POOL=ON and EJIT_CODE_POOL_4K_SEAL=ON")
+  endif()
+  message(STATUS
+    "EmbeddedJIT: 16-byte compact code + manual batched publish enabled")
+endif()
+
 # Pin the JIT code pool to a fixed, linker-script-defined region
 # [__ejit_code_start, __ejit_code_end) (the .text.ejit output section) in the
 # executable CODE segment, instead of dynamic SRE_MemDbgAlloc. A fixed region
@@ -1046,6 +1063,11 @@ if(EJIT_SRE_SHARED_TASKPOOL)
                  "codePointers=${EJIT_SRE_SHARED_CODE_POINTERS}, "
                  "sharedSection=${_ejit_shared_section}, "
                  "icacheSection=${EJIT_ICACHE_SECTION})")
+endif()
+
+if(EJIT_CODE_POOL_BATCHED_PUBLISH AND NOT EJIT_SRE_SHARED_TASKPOOL)
+  message(FATAL_ERROR
+    "EJIT_CODE_POOL_BATCHED_PUBLISH requires EJIT_SRE_SHARED_TASKPOOL=ON for owner-worker publication")
 endif()
 
 if(EJIT_SRE_TASKPOOL_NO_RECLAIM AND NOT EJIT_SRE_SHARED_TASKPOOL)

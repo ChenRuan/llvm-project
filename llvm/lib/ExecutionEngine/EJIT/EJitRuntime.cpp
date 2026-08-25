@@ -658,8 +658,9 @@ ejit_status_t ejit_deactivate(const char *periodName, uint32_t cellIdx) {
     return EJIT_ERR_NOT_ACTIVE;
   }
   if (cellIdx >= kEJitMaxInstances) {
-    EJIT_DIAG("deactivate(%s,%u) failed: instance index >= kEJitMaxInstances=%u",
-              periodName, cellIdx, kEJitMaxInstances);
+    EJIT_DIAG(
+        "deactivate(%s,%u) failed: instance index >= kEJitMaxInstances=%u",
+        periodName, cellIdx, kEJitMaxInstances);
     return EJIT_ERR_INVALID_PARAM;
   }
   EJIT_DIAG("deactivate(%s,%u)", periodName, cellIdx);
@@ -700,16 +701,19 @@ bool ejit_is_active(const char *periodName, uint32_t cellIdx) {
   // Reject out-of-range indices instead of truncating at the ABI boundary and
   // querying the wrong instance (pre-fix uint8_t signature).
   if (cellIdx >= kEJitMaxInstances) {
-    EJIT_DIAG("is_active(%s,%u) rejected: instance index >= kEJitMaxInstances=%u",
-              periodName, cellIdx, kEJitMaxInstances);
+    EJIT_DIAG(
+        "is_active(%s,%u) rejected: instance index >= kEJitMaxInstances=%u",
+        periodName, cellIdx, kEJitMaxInstances);
     return false;
   }
   return gEJIT->isActive(periodName, cellIdx);
 }
 
 void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn) {
-  if (out_pfn) *out_pfn = nullptr;
-  EJIT_DIAG("compile_or_get(key=0x%016lx): retired, use taskpool API", cacheKey);
+  if (out_pfn)
+    *out_pfn = nullptr;
+  EJIT_DIAG("compile_or_get(key=0x%016lx): retired, use taskpool API",
+            cacheKey);
   return nullptr;
 }
 
@@ -731,8 +735,9 @@ void ejit_invalidate(const char *periodName, uint32_t cellIdx) {
   // Reject out-of-range indices instead of truncating at the ABI boundary and
   // invalidating the wrong instance (pre-fix uint8_t signature).
   if (cellIdx >= kEJitMaxInstances) {
-    EJIT_DIAG("invalidate(%s,%u) rejected: instance index >= kEJitMaxInstances=%u",
-              periodName, cellIdx, kEJitMaxInstances);
+    EJIT_DIAG(
+        "invalidate(%s,%u) rejected: instance index >= kEJitMaxInstances=%u",
+        periodName, cellIdx, kEJitMaxInstances);
     return;
   }
   gEJIT->invalidateByPeriod(periodName, cellIdx);
@@ -743,8 +748,10 @@ void ejit_invalidate(const char *periodName, uint32_t cellIdx) {
 }
 
 ejit_status_t ejit_get_stats(ejit_stats_t *stats) {
-  if (!gEJIT) return EJIT_ERR_NOT_ACTIVE;
-  if (!stats) return EJIT_ERR_INVALID_PARAM;
+  if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  if (!stats)
+    return EJIT_ERR_INVALID_PARAM;
   memset(stats, 0, sizeof(*stats));
   return EJIT_OK;
 }
@@ -771,7 +778,7 @@ void ejit_set_compile_mode(ejit_compile_mode_t mode) {
     return;
   }
   (void)gEJIT->setCompileMode(mode == EJIT_COMPILE_ASYNC ? CompileMode::Async
-                                                        : CompileMode::Sync);
+                                                         : CompileMode::Sync);
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (auto *tp = gEJIT->sharedTaskPool())
     tp->retireDispatchCache();
@@ -831,10 +838,10 @@ inline EJitTaskPool *activeTaskPool() {
 #endif
 
 // Open a resolve window and return the token icacheFill needs to prove no drain
-// overlapped it. Runs at the taskpool entry point, BEFORE any bucket read token.
-// The token lives in the caller's LOCAL, so a higher-priority task preempting
-// this core mid-resolve cannot clobber it. 0 without the shared pool, so call
-// sites need no #ifdef guards.
+// overlapped it. Runs at the taskpool entry point, BEFORE any bucket read
+// token. The token lives in the caller's LOCAL, so a higher-priority task
+// preempting this core mid-resolve cannot clobber it. 0 without the shared
+// pool, so call sites need no #ifdef guards.
 inline uint64_t ejitIcacheBeginResolve() {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr)
@@ -930,13 +937,15 @@ taskpoolCompileOrGetImpl(uint32_t funcIndex, const ejit_dim_pair_t *dims,
   }
   for (uint32_t i = 0; i < numDims; ++i) {
     if (dims[i].dimType >= EJitSwitchController::MAX_DIM_TYPES) {
-      EJIT_DIAG("taskpool_compile_or_get reject func=%u: dim[%u] dimType=%u OOR",
-                funcIndex, i, dims[i].dimType);
+      EJIT_DIAG(
+          "taskpool_compile_or_get reject func=%u: dim[%u] dimType=%u OOR",
+          funcIndex, i, dims[i].dimType);
       return EJIT_ERR_INVALID_PARAM;
     }
     if (dims[i].instanceId >= EJitSwitchController::MAX_INSTANCES) {
-      EJIT_DIAG("taskpool_compile_or_get reject func=%u: dim[%u] instanceId=%u OOR",
-                funcIndex, i, dims[i].instanceId);
+      EJIT_DIAG(
+          "taskpool_compile_or_get reject func=%u: dim[%u] instanceId=%u OOR",
+          funcIndex, i, dims[i].instanceId);
       return EJIT_ERR_INVALID_PARAM;
     }
   }
@@ -954,8 +963,10 @@ taskpoolCompileOrGetImpl(uint32_t funcIndex, const ejit_dim_pair_t *dims,
   // compileOrGet unchanged (enqueue/dedup/compile).
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, dimsCast, numDims, &l0Fn)) {
-    if (outFn) *outFn = l0Fn;
-    if (outBucket) *outBucket = kEJitNoBucket;
+    if (outFn)
+      *outFn = l0Fn;
+    if (outBucket)
+      *outBucket = kEJitNoBucket;
     return EJIT_OK;
   }
   auto fast = tp->tryCacheHit(funcIndex, dimsCast, numDims);
@@ -1041,8 +1052,10 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
 
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, nullptr, 0, &l0Fn)) {
-    if (outFn) *outFn = l0Fn;
-    if (outBucket) *outBucket = kEJitNoBucket;
+    if (outFn)
+      *outFn = l0Fn;
+    if (outBucket)
+      *outBucket = kEJitNoBucket;
     return EJIT_OK;
   }
   auto fast = tp->tryCacheHit0D(funcIndex);
@@ -1135,8 +1148,10 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
   const EJitDimPair dims[2] = {{dim0, inst0}, {dim1, inst1}};
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, dims, 2, &l0Fn)) {
-    if (outFn) *outFn = l0Fn;
-    if (outBucket) *outBucket = kEJitNoBucket;
+    if (outFn)
+      *outFn = l0Fn;
+    if (outBucket)
+      *outBucket = kEJitNoBucket;
     return EJIT_OK;
   }
   auto fast = tp->tryCacheHit2D(funcIndex, dim0, inst0, dim1, inst1);
@@ -1184,8 +1199,10 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
   const EJitDimPair dims[3] = {{dim0, inst0}, {dim1, inst1}, {dim2, inst2}};
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, dims, 3, &l0Fn)) {
-    if (outFn) *outFn = l0Fn;
-    if (outBucket) *outBucket = kEJitNoBucket;
+    if (outFn)
+      *outFn = l0Fn;
+    if (outBucket)
+      *outBucket = kEJitNoBucket;
     return EJIT_OK;
   }
   auto fast =
@@ -1237,8 +1254,10 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
       {dim0, inst0}, {dim1, inst1}, {dim2, inst2}, {dim3, inst3}};
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, dims, 4, &l0Fn)) {
-    if (outFn) *outFn = l0Fn;
-    if (outBucket) *outBucket = kEJitNoBucket;
+    if (outFn)
+      *outFn = l0Fn;
+    if (outBucket)
+      *outBucket = kEJitNoBucket;
     return EJIT_OK;
   }
   auto fast = tp->tryCacheHit4D(funcIndex, dim0, inst0, dim1, inst1, dim2,
@@ -1297,7 +1316,8 @@ void ejit_taskpool_release_read(uint32_t bucketIndex) {
   }
   auto *tp = activeTaskPool();
   if (!tp) {
-    EJIT_DIAG("taskpool_release_read bucket=%u reject: no taskpool", bucketIndex);
+    EJIT_DIAG("taskpool_release_read bucket=%u reject: no taskpool",
+              bucketIndex);
     return;
   }
   tp->releaseRead(bucketIndex);
@@ -1344,6 +1364,29 @@ unsigned ejit_taskpool_pending_count(void) {
   return tp->pendingCount();
 }
 
+ejit_status_t ejit_publish_pending_code(void) {
+#if defined(EJIT_SRE_SHARED_TASKPOOL) && defined(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  if (!gEJIT) {
+    EJIT_DIAG("publish_pending_code failed: not initialized");
+    return EJIT_ERR_DISABLED;
+  }
+  EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
+  if (!sp) {
+    EJIT_DIAG("publish_pending_code failed: no shared taskpool");
+    return EJIT_ERR_DISABLED;
+  }
+  if (!sp->requestCodeBatchFlushAndWait()) {
+    EJIT_DIAG("publish_pending_code failed: worker flush/enable");
+    return EJIT_ERR_COMPILE_FAILED;
+  }
+  EJIT_DIAG("publish_pending_code OK");
+  return EJIT_OK;
+#else
+  EJIT_DIAG("publish_pending_code disabled: manual batching not built");
+  return EJIT_ERR_DISABLED;
+#endif
+}
+
 uint64_t ejit_taskpool_trace_now(void) {
 #ifdef EJIT_FREESTANDING
   return SRE_CycleCountGet64();
@@ -1358,10 +1401,8 @@ uint64_t ejit_taskpool_trace_now(void) {
 
 void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
                                  void *fnPtr, uint32_t bucketIndex,
-                                 uint64_t tBeforeLookup,
-                                 uint64_t tAfterLookup,
-                                 uint64_t tAfterFn,
-                                 uint64_t tAfterRelease) {
+                                 uint64_t tBeforeLookup, uint64_t tAfterLookup,
+                                 uint64_t tAfterFn, uint64_t tAfterRelease) {
   uint64_t getFn = tAfterLookup - tBeforeLookup;
   uint64_t fnCall = tAfterFn - tAfterLookup;
   uint64_t release = tAfterRelease - tAfterFn;
@@ -1628,13 +1669,15 @@ void ejit_taskpool_print_stats() {
                 static_cast<unsigned long long>(s.publishFailed));
   EJIT_DIAG_RAW("  instanceDisabled = %llu",
                 static_cast<unsigned long long>(s.instanceDisabled));
-  EJIT_DIAG_RAW("  instanceDisabledPreActivate  = %llu   (init->activate window)",
-                static_cast<unsigned long long>(s.instanceDisabledPreActivate));
-  EJIT_DIAG_RAW("  instanceDisabledPostActivate = %llu   (after first activate)",
-                static_cast<unsigned long long>(
-                    s.instanceDisabled > s.instanceDisabledPreActivate
-                        ? s.instanceDisabled - s.instanceDisabledPreActivate
-                        : 0));
+  EJIT_DIAG_RAW(
+      "  instanceDisabledPreActivate  = %llu   (init->activate window)",
+      static_cast<unsigned long long>(s.instanceDisabledPreActivate));
+  EJIT_DIAG_RAW(
+      "  instanceDisabledPostActivate = %llu   (after first activate)",
+      static_cast<unsigned long long>(
+          s.instanceDisabled > s.instanceDisabledPreActivate
+              ? s.instanceDisabled - s.instanceDisabledPreActivate
+              : 0));
   EJIT_DIAG_RAW("  readyEntries     = %u", s.readyEntries);
   EJIT_DIAG_RAW("  pendingEntries   = %u", s.pendingEntries);
   EJIT_DIAG_RAW("  queueApproxSize  = %u", s.queueApproxSize);
@@ -1781,9 +1824,9 @@ void ejit_taskpool_print_compiled() {
         void *fn = reinterpret_cast<void *>(slot.fnPtr.loadAcquire());
         // Only the numDims leading pairs are meaningful; clamp a corrupt
         // slot's numDims to the ABI maximum so the builders cannot overflow.
-        const uint32_t n =
-            slot.numDims < kEJitSharedMaxDims ? slot.numDims
-                                              : kEJitSharedMaxDims;
+        const uint32_t n = slot.numDims < kEJitSharedMaxDims
+                               ? slot.numDims
+                               : kEJitSharedMaxDims;
         // dims=[d:i,...] for the n meaningful pairs, e.g. "1:5" / "1:5,2:7".
         // Sized for the uint32 worst case: kEJitSharedMaxDims x
         // ("4294967295:4294967295" = 21) + separators + NUL.
@@ -1945,7 +1988,8 @@ ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out) {
     return EJIT_ERR_NOT_ACTIVE;
   }
   if (!gEJIT->getCodePoolStats(out)) {
-    EJIT_DIAG("get_code_pool_stats: no code pool (EJIT_SRE_CODE_POOL off or no engine)");
+    EJIT_DIAG("get_code_pool_stats: no code pool (EJIT_SRE_CODE_POOL off or no "
+              "engine)");
     return EJIT_ERR_DISABLED;
   }
   return EJIT_OK;
@@ -1993,14 +2037,14 @@ void ejit_print_active(void) {
 }
 
 void ejit_print_version(void) {
-  // LLVM release version (major.minor.patch) comes from llvm/Config/llvm-config.h
-  // (LLVM_VERSION_STRING); the git commit + branch come from the build-time
-  // generated EJitVersion.h. Printed unconditionally - not through EJIT_DIAG and
-  // not gated on EJIT_DIAG_ENABLE or gEJitDiagLevel - so the build identity is
-  // always recoverable, even on a build with diagnostics compiled out and before
-  // ejit_init(). Routes through the same platform sink as EJIT_DIAG: SRE_printf
-  // on SRE/bare-metal builds (declared at file scope above / by EJitDiag.h),
-  // std::printf otherwise.
+  // LLVM release version (major.minor.patch) comes from
+  // llvm/Config/llvm-config.h (LLVM_VERSION_STRING); the git commit + branch
+  // come from the build-time generated EJitVersion.h. Printed unconditionally -
+  // not through EJIT_DIAG and not gated on EJIT_DIAG_ENABLE or gEJitDiagLevel -
+  // so the build identity is always recoverable, even on a build with
+  // diagnostics compiled out and before ejit_init(). Routes through the same
+  // platform sink as EJIT_DIAG: SRE_printf on SRE/bare-metal builds (declared
+  // at file scope above / by EJitDiag.h), std::printf otherwise.
 #ifdef EJIT_SRE_DIAG
   SRE_printf("[EJIT] LLVM version %s, branch %s, commit %s\n",
              LLVM_VERSION_STRING, EJIT_GIT_BRANCH, EJIT_GIT_COMMIT);

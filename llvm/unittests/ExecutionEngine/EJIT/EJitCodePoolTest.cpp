@@ -25,6 +25,23 @@ using namespace llvm::ejit;
 
 namespace {
 
+void *testAlignedAlloc(size_t Alignment, size_t Size) {
+  if (Alignment < alignof(void *) || (Alignment & (Alignment - 1)) != 0)
+    return nullptr;
+  void *Raw = std::malloc(Size + Alignment - 1 + sizeof(void *));
+  if (!Raw)
+    return nullptr;
+  uintptr_t Start = reinterpret_cast<uintptr_t>(Raw) + sizeof(void *);
+  uintptr_t Aligned = (Start + Alignment - 1) & ~(Alignment - 1);
+  reinterpret_cast<void **>(Aligned)[-1] = Raw;
+  return reinterpret_cast<void *>(Aligned);
+}
+
+void testAlignedFree(void *P) {
+  if (P)
+    std::free(reinterpret_cast<void **>(P)[-1]);
+}
+
 /// Mock SRE backend: tracks raw allocations (freed at teardown), records seal
 /// calls and the bases that were sealed, and can be configured to fail.
 struct MockSre {
@@ -61,8 +78,7 @@ struct MockSre {
   }
 };
 
-EJitCodePoolManager makeManager(MockSre &M,
-                                EJitCodePoolManager::Options Opts) {
+EJitCodePoolManager makeManager(MockSre &M, EJitCodePoolManager::Options Opts) {
   return EJitCodePoolManager(
       Opts, [&M](size_t N) { return M.rawAlloc(N); },
       [&M](void *B) { return M.seal(B); });
@@ -216,7 +232,7 @@ TEST(EJitCodePool, StatsAreAccurate) {
   MockSre M;
   auto Mgr = makeManager(M, smallOpts(/*PoolSize=*/4096));
 
-  (void)cantFail(Mgr.allocateCode(100, 64)); // off 0,   used 100
+  (void)cantFail(Mgr.allocateCode(100, 64));     // off 0,   used 100
   void *b = cantFail(Mgr.allocateCode(200, 64)); // off 128, used 328
 
   auto S = Mgr.getStats();
@@ -256,7 +272,7 @@ TEST(EJitCodePool, RespectsLargerAlignment) {
   MockSre M;
   auto Mgr = makeManager(M, smallOpts(/*PoolSize=*/4096));
 
-  (void)cantFail(Mgr.allocateCode(8, 64));   // off 0
+  (void)cantFail(Mgr.allocateCode(8, 64));      // off 0
   void *b = cantFail(Mgr.allocateCode(8, 256)); // must be 256-aligned
   EXPECT_EQ(A(b) % 256u, 0u);
 }
@@ -267,7 +283,7 @@ TEST(EJitCodePool, SealAllWritablePools) {
   auto Mgr = makeManager(M, smallOpts());
 
   void *a = cantFail(Mgr.allocateCode(64, 64));
-  cantFail(Mgr.sealPoolContaining(a)); // pool 1 sealed
+  cantFail(Mgr.sealPoolContaining(a));      // pool 1 sealed
   (void)cantFail(Mgr.allocateCode(64, 64)); // pool 2 active
 
   cantFail(Mgr.sealAllWritablePools());
@@ -305,7 +321,7 @@ constexpr size_t kFourKiB = static_cast<size_t>(4) * 1024;
 /// base, records split_2m_to_4k(base,size) calls and per-page enable_ex calls,
 /// and can be made to fail split or a chosen seal call.
 struct MockSre4K {
-  std::vector<void *> Origs; // posix_memalign bases (freed at teardown)
+  std::vector<void *> Origs; // aligned bases (freed at teardown)
   uintptr_t LastRawReturned = 0;
   size_t LastBytesRequested = 0;
   size_t AllocCalls = 0;
@@ -324,7 +340,7 @@ struct MockSre4K {
 
   ~MockSre4K() {
     for (void *P : Origs)
-      std::free(P);
+      testAlignedFree(P);
   }
 
   void *rawAlloc(size_t Bytes) {
@@ -333,7 +349,8 @@ struct MockSre4K {
     void *Base = nullptr;
     // Over-allocate, 2MiB-aligned, then hand back a deliberately misaligned
     // pointer (offset 4KiB) so the manager must round the base up to 2MiB.
-    if (posix_memalign(&Base, kTwoMiB, Bytes + kTwoMiB) != 0)
+    Base = testAlignedAlloc(kTwoMiB, Bytes + kTwoMiB);
+    if (!Base)
       return nullptr;
     Origs.push_back(Base);
     void *Raw = static_cast<char *>(Base) + kFourKiB;
@@ -392,9 +409,9 @@ TEST(EJitCodePool4K, AlignsMisalignedRawBaseTo2MiB) {
 
   void *P = cantFail(Mgr.allocateCode(128, 64));
   // First allocation in 4K mode starts at offset 0, i.e. the pool base.
-  EXPECT_EQ(A(P) % kTwoMiB, 0u);          // aligned base is 2MiB aligned
+  EXPECT_EQ(A(P) % kTwoMiB, 0u); // aligned base is 2MiB aligned
   EXPECT_TRUE(Mgr.contains(P));
-  EXPECT_NE(A(P), M.LastRawReturned);     // raw base was misaligned, base != raw
+  EXPECT_NE(A(P), M.LastRawReturned); // raw base was misaligned, base != raw
   // Usable window [base, base+poolSize) must fit within [raw, raw+requested).
   EXPECT_LE(A(P) + kTwoMiB, M.LastRawReturned + M.LastBytesRequested);
   // The manager requests poolSize + 2MiB of alignment slack.
@@ -409,8 +426,8 @@ TEST(EJitCodePool4K, SplitCalledOncePerPool) {
 
   void *P = cantFail(Mgr.allocateCode(128, 64));
   ASSERT_EQ(M.Splits.size(), 1u);
-  EXPECT_EQ(M.Splits[0].first, A(P));      // split base == aligned pool base
-  EXPECT_EQ(M.Splits[0].second, kTwoMiB);  // split size == usable pool size
+  EXPECT_EQ(M.Splits[0].first, A(P));     // split base == aligned pool base
+  EXPECT_EQ(M.Splits[0].second, kTwoMiB); // split size == usable pool size
   EXPECT_EQ(M.Splits[0].first % kTwoMiB, 0u);
   EXPECT_EQ(Mgr.getStats().splitInvocations, 1u);
 
@@ -475,10 +492,11 @@ TEST(EJitCodePool4K, NextAllocationSkipsSealedPage) {
 
   EXPECT_TRUE(Mgr.contains(A2));
   EXPECT_GE(A(A2), A(A1) + kFourKiB);
-  EXPECT_FALSE(A(A2) >= A(A1) && A(A2) < A(A1) + kFourKiB); // not in sealed page
-  EXPECT_EQ(A(A2) % kFourKiB, 0u);                          // fresh page start
+  EXPECT_FALSE(A(A2) >= A(A1) &&
+               A(A2) < A(A1) + kFourKiB); // not in sealed page
+  EXPECT_EQ(A(A2) % kFourKiB, 0u);        // fresh page start
   auto S = Mgr.getStats();
-  EXPECT_EQ(S.poolCount, 1u);          // same pool reused
+  EXPECT_EQ(S.poolCount, 1u); // same pool reused
   EXPECT_EQ(S.splitInvocations, 1u);
 }
 
@@ -496,8 +514,8 @@ TEST(EJitCodePool4K, SplitFailureFailsPoolCreation) {
   EXPECT_EQ(Mgr.getStats().splitInvocations, 0u);
 }
 
-// Rolling over to a new pool splits the new pool exactly once, and no whole-pool
-// seal happens (sealing is per-page at finalize, not on rollover).
+// Rolling over to a new pool splits the new pool exactly once, and no
+// whole-pool seal happens (sealing is per-page at finalize, not on rollover).
 TEST(EJitCodePool4K, RolloverCreatesNewPoolAndSplitsAgain) {
   MockSre4K M;
   auto Mgr = makeManager4K(M, fourKOpts());
@@ -706,9 +724,9 @@ TEST(EJitCodePoolFixed, CarvesAlignedPoolsWithoutAlloc) {
   constexpr size_t kAlign = 256;
   constexpr size_t kPool = 256;
   constexpr size_t kRegion = 1024; // 4 pools
-  void *Region = nullptr;
-  ASSERT_EQ(posix_memalign(&Region, kAlign, kRegion), 0);
-  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+  void *Region = testAlignedAlloc(kAlign, kRegion);
+  ASSERT_NE(Region, nullptr);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, testAlignedFree);
 
   EJitCodePoolManager::Options O;
   O.poolSize = kPool;
@@ -741,9 +759,9 @@ TEST(EJitCodePoolFixed, ExhaustsCleanly) {
   constexpr size_t kAlign = 256;
   constexpr size_t kPool = 256;
   constexpr size_t kRegion = 512; // 2 pools
-  void *Region = nullptr;
-  ASSERT_EQ(posix_memalign(&Region, kAlign, kRegion), 0);
-  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+  void *Region = testAlignedAlloc(kAlign, kRegion);
+  ASSERT_NE(Region, nullptr);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, testAlignedFree);
 
   EJitCodePoolManager::Options O;
   O.poolSize = kPool;
@@ -771,9 +789,9 @@ TEST(EJitCodePoolFixed, StillSplitsAndSealsIn4KMode) {
   constexpr size_t kPool = 256;
   constexpr size_t kPage = 256;
   constexpr size_t kRegion = 512; // 2 pools
-  void *Region = nullptr;
-  ASSERT_EQ(posix_memalign(&Region, kAlign, kRegion), 0);
-  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+  void *Region = testAlignedAlloc(kAlign, kRegion);
+  ASSERT_NE(Region, nullptr);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, testAlignedFree);
 
   EJitCodePoolManager::Options O;
   O.poolSize = kPool;
@@ -813,9 +831,9 @@ TEST(EJitCodePoolFixed, AlignsMisalignedBase) {
   constexpr size_t kPool = 256;
   // 256-aligned buffer; start the region at +100 so it is NOT 256-aligned, with
   // enough headroom that the align-up still leaves room for a pool.
-  void *Buf = nullptr;
-  ASSERT_EQ(posix_memalign(&Buf, kAlign, kAlign + 1024), 0);
-  std::unique_ptr<void, void (*)(void *)> Guard(Buf, std::free);
+  void *Buf = testAlignedAlloc(kAlign, kAlign + 1024);
+  ASSERT_NE(Buf, nullptr);
+  std::unique_ptr<void, void (*)(void *)> Guard(Buf, testAlignedFree);
   uintptr_t MisalignedBase = reinterpret_cast<uintptr_t>(Buf) + 100;
 
   EJitCodePoolManager::Options O;
@@ -848,9 +866,9 @@ TEST(EJitCodePoolFixed, EnableRwRangeFlipsCoveredPages) {
   constexpr size_t kPool = 1024; // >= the 384-byte request
   constexpr size_t kPage = 256;
   constexpr size_t kRegion = 2048; // 2 pools
-  void *Region = nullptr;
-  ASSERT_EQ(posix_memalign(&Region, kAlign, kRegion), 0);
-  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+  void *Region = testAlignedAlloc(kAlign, kRegion);
+  ASSERT_NE(Region, nullptr);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, testAlignedFree);
 
   EJitCodePoolManager::Options O;
   O.poolSize = kPool;
@@ -881,9 +899,9 @@ TEST(EJitCodePoolFixed, EnableRwRangeNoOpWhenNotNeeded) {
   constexpr size_t kPool = 256;
   constexpr size_t kPage = 256;
   constexpr size_t kRegion = 512;
-  void *Region = nullptr;
-  ASSERT_EQ(posix_memalign(&Region, kAlign, kRegion), 0);
-  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+  void *Region = testAlignedAlloc(kAlign, kRegion);
+  ASSERT_NE(Region, nullptr);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, testAlignedFree);
 
   EJitCodePoolManager::Options O;
   O.poolSize = kPool;
@@ -911,9 +929,9 @@ TEST(EJitCodePoolFixed, EnableRwRangeFailsOnRc) {
   constexpr size_t kPool = 256;
   constexpr size_t kPage = 256;
   constexpr size_t kRegion = 512;
-  void *Region = nullptr;
-  ASSERT_EQ(posix_memalign(&Region, kAlign, kRegion), 0);
-  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+  void *Region = testAlignedAlloc(kAlign, kRegion);
+  ASSERT_NE(Region, nullptr);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, testAlignedFree);
 
   EJitCodePoolManager::Options O;
   O.poolSize = kPool;
@@ -941,9 +959,9 @@ TEST(EJitCodePoolFixed, PermissionRangeCannotCrossPoolBoundary) {
   constexpr size_t kAlign = 256;
   constexpr size_t kPool = 256;
   constexpr size_t kRegion = 512;
-  void *Region = nullptr;
-  ASSERT_EQ(posix_memalign(&Region, kAlign, kRegion), 0);
-  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+  void *Region = testAlignedAlloc(kAlign, kRegion);
+  ASSERT_NE(Region, nullptr);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, testAlignedFree);
 
   EJitCodePoolManager::Options O;
   O.poolSize = kPool;
@@ -968,4 +986,34 @@ TEST(EJitCodePoolFixed, PermissionRangeCannotCrossPoolBoundary) {
   EXPECT_TRUE(bool(SealErr));
   consumeError(std::move(SealErr));
   EXPECT_EQ(M.SealCalls, 0u);
+}
+
+TEST(EJitCodePoolBatch, PacksRangesAndStartsFreshPageAfterFlush) {
+  MockSre4K M;
+  auto O = fourKOpts();
+  O.minCodeAlign = 16;
+  O.batchedPageSeal = true;
+  auto Mgr = makeManager4K(M, O);
+
+  void *A0 = cantFail(Mgr.allocateCode(2000, 16));
+  void *A1 = cantFail(Mgr.allocateCode(2000, 16));
+  EXPECT_EQ(A(A1) - A(A0), 2000u);
+  EXPECT_EQ(A(A0) / O.sealPageSize, A(A1) / O.sealPageSize);
+
+  Mgr.recordPendingRange(A0, 2000);
+  Mgr.notePendingAllocation();
+  Mgr.recordPendingRange(A1, 2000);
+  Mgr.notePendingAllocation();
+  EJitCompiledCodeInfo Info{};
+  EXPECT_FALSE(Mgr.findRange(A0, Info));
+  EXPECT_EQ(M.SealCalls, 0u);
+
+  cantFail(Mgr.flushPendingRanges());
+  EXPECT_EQ(M.SealCalls, 1u);
+  EXPECT_TRUE(Mgr.findRange(A0, Info));
+  EXPECT_TRUE(Mgr.findRange(A1, Info));
+
+  void *Next = cantFail(Mgr.allocateCode(64, 16));
+  EXPECT_EQ(A(Next) % O.sealPageSize, 0u);
+  EXPECT_GE(A(Next), A(A0) + O.sealPageSize);
 }
