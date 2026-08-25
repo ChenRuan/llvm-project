@@ -483,6 +483,10 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       auto mayConstIt = tier1MayConst_.find(cacheKey);
       if (mayConstIt != tier1MayConst_.end()) {
         ctx.mayConstLoadSites = mayConstIt->second.sites;
+        const uint64_t SampleEnd = ejit_taskpool_trace_now();
+        if (mayConstIt->second.sampleStart != 0)
+          ctx.mayConstSampleCycles =
+              SampleEnd - mayConstIt->second.sampleStart;
         const auto *Counters = reinterpret_cast<const EJitAtomicU64 *>(
             mayConstIt->second.counterBase);
         if (Counters) {
@@ -664,6 +668,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
     Tier1MayConstState &MayConst = tier1MayConst_[cacheKey];
     MayConst.counterBase = 0;
+    MayConst.sampleStart = 0;
     MayConst.sites.assign(jitEngine_->getLastMayConstLoadSites().begin(),
                           jitEngine_->getLastMayConstLoadSites().end());
     if (!MayConst.sites.empty()) {
@@ -674,6 +679,8 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     }
     EJIT_DIAG("mayconst T0 published key=0x%016lx func=%s sites=%zu", cacheKey,
               funcName.c_str(), MayConst.sites.size());
+    pendingTier1MayConstKey_ = cacheKey;
+    hasPendingTier1MayConstKey_ = true;
 #endif
 
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
@@ -825,6 +832,18 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
 
 void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
                                                 bool published) {
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  const uint32_t AuditTier = decodeReqTier(req.funcIndex);
+  if (AuditTier == kEJitTierInstrumented) {
+    if (published && hasPendingTier1MayConstKey_) {
+      auto It = tier1MayConst_.find(pendingTier1MayConstKey_);
+      if (It != tier1MayConst_.end())
+        It->second.sampleStart = ejit_taskpool_trace_now();
+    }
+    pendingTier1MayConstKey_ = 0;
+    hasPendingTier1MayConstKey_ = false;
+  }
+#endif
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
   const uint32_t tier = decodeReqTier(req.funcIndex);
   const bool consumesRound = (tier == kEJitTierPgoUse && published) ||

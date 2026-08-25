@@ -34,6 +34,9 @@ struct EJitMayConstLoadSite {
   std::string functionName;
   std::string globalName;
   std::string sourceFile;
+  /// Stable module-order identity attached to the load as IR metadata before
+  /// optimization. Zero means that provenance could not be recovered.
+  uint64_t siteId = 0;
   uint64_t fieldOffset = 0;
   uint64_t runtimeHits = 0;
   uint32_t sourceLine = 0;
@@ -48,6 +51,10 @@ struct EJitMayConstBenefitSample {
   uint64_t finalMayConstLoads = 0;
   uint64_t runtimeHits = 0;
   uint64_t hitSites = 0;
+  uint64_t removedRuntimeHits = 0;
+  uint64_t removedHitSites = 0;
+  uint64_t sampledEntries = 0;
+  uint64_t sampleCycles = 0;
 };
 
 struct EJitMayConstBenefitSummary {
@@ -64,9 +71,18 @@ struct EJitMayConstBenefitSummary {
   int64_t maximumRemoved = 0;
   uint64_t runtimeHits = 0;
   uint64_t hitSites = 0;
+  uint64_t removedRuntimeHits = 0;
+  uint64_t removedHitSites = 0;
+  uint64_t sampledEntries = 0;
+  uint64_t sampleCycles = 0;
   /// Average dynamically-reached may_const sites per unique JIT version,
   /// scaled by 1000 so freestanding diagnostics need no floating point.
   uint64_t averageActiveSitesPermille = 0;
+  /// Removed dynamic load executions per sampled root entry, scaled by 1000.
+  uint64_t removedHitsPerEntryPermille = 0;
+  /// Removed dynamic load executions per million platform timestamp units,
+  /// scaled by 1000 for three decimal places.
+  uint64_t benefitPerMillionCyclesMilli = 0;
 };
 
 /// Summarize the branch weights attached by PGOInstrumentationUse. This is a

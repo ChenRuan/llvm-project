@@ -9,6 +9,7 @@
 #include "gtest/gtest.h"
 
 #include <algorithm>
+#include <limits>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -84,9 +85,9 @@ TEST(EJitBranchProfile, ClassifiesBranchShapeWithoutChangingIR) {
 
 TEST(EJitBranchProfile, AggregatesMayConstSpecializations) {
   const EJitMayConstBenefitSample Samples[] = {
-      {1, 100, 70, 40, 1000, 10},
-      {2, 120, 90, 50, 2000, 20},
-      {3, 80, 75, 85, 3000, 31}};
+      {1, 100, 70, 40, 1000, 10, 800, 8, 64, 1000000},
+      {2, 120, 90, 50, 2000, 20, 1500, 15, 80, 2000000},
+      {3, 80, 75, 85, 3000, 31, 0, 0, 100, 1000000}};
   EJitMayConstBenefitSummary Summary = summarizeMayConstBenefits(Samples);
   EXPECT_EQ(Summary.versions, 3u);
   EXPECT_EQ(Summary.inputMayConstLoads, 300u);
@@ -102,6 +103,32 @@ TEST(EJitBranchProfile, AggregatesMayConstSpecializations) {
   EXPECT_EQ(Summary.runtimeHits, 6000u);
   EXPECT_EQ(Summary.hitSites, 61u);
   EXPECT_EQ(Summary.averageActiveSitesPermille, 20333u);
+  EXPECT_EQ(Summary.removedRuntimeHits, 2300u);
+  EXPECT_EQ(Summary.removedHitSites, 23u);
+  EXPECT_EQ(Summary.sampledEntries, 244u);
+  EXPECT_EQ(Summary.sampleCycles, 4000000u);
+  EXPECT_EQ(Summary.removedHitsPerEntryPermille, 9426u);
+  EXPECT_EQ(Summary.benefitPerMillionCyclesMilli, 575000u);
+}
+
+TEST(EJitBranchProfile, BenefitScalingSaturatesWithoutOverflow) {
+  EJitMayConstBenefitSample Sample;
+  Sample.removedRuntimeHits = std::numeric_limits<uint64_t>::max();
+  Sample.sampledEntries = 1;
+  Sample.sampleCycles = 1;
+  EJitMayConstBenefitSummary Summary = summarizeMayConstBenefits({Sample});
+  EXPECT_EQ(Summary.removedHitsPerEntryPermille,
+            std::numeric_limits<uint64_t>::max());
+  EXPECT_EQ(Summary.benefitPerMillionCyclesMilli,
+            std::numeric_limits<uint64_t>::max());
+}
+
+TEST(EJitBranchProfile, BenefitScalingRoundsToNearestFixedPoint) {
+  EJitMayConstBenefitSample Sample;
+  Sample.removedRuntimeHits = 2;
+  Sample.sampledEntries = 3;
+  EJitMayConstBenefitSummary Summary = summarizeMayConstBenefits({Sample});
+  EXPECT_EQ(Summary.removedHitsPerEntryPermille, 667u);
 }
 
 } // namespace

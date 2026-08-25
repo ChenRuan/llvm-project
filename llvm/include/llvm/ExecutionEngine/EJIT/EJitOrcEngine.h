@@ -103,6 +103,9 @@ struct SpecializationContext {
   /// Runtime hit snapshot from the temporary Instrumented tier. Populated by
   /// the compile driver before the final compile starts.
   std::vector<EJitMayConstLoadSite> mayConstLoadSites;
+  /// Platform timestamp distance from Tier-1 counter capture to the Tier-2
+  /// snapshot. SRE uses cycle counter ticks; hosts use steady-clock ns.
+  uint64_t mayConstSampleCycles = 0;
   /// True when profile data is collected for diagnostics only. The optimizer
   /// restores weights for reporting but must publish ordinary Baseline code.
   bool profileAuditOnly = false;

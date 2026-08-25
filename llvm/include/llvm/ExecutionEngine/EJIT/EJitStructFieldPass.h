@@ -59,6 +59,8 @@ public:
   static void removeMayConstLoadInstrumentation(Module &M);
 
   static constexpr const char *MayConstCounterName = "__ejit_mayconst_hits";
+  static constexpr const char *MayConstAuditSiteMD =
+      "ejit.mayconst.audit.site";
 #endif
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);

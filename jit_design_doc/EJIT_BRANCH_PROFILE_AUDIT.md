@@ -44,7 +44,9 @@ unique-cache-key aggregate for that entry:
 ```text
 [EJIT] mayconst-audit entry=FuncA key=0x1234 tier=2 versions=30 \
   mayconst=42/3/0 removed=42 direct=39 pipeline=3 runtime_hits=99872 \
-  hit_sites=17 avg_removed=40 weighted_permille=952 min=36 max=42
+  hit_sites=17 removed_runtime_hits=95000 removed_hit_sites=16 \
+  sampled_entries=67 sample_cycles=1900000 avg_removed=40 \
+  weighted_permille=952 min=36 max=42
 ```
 
 `mayconst=input/specialized/final` counts only may-const loads. Negative removal is
@@ -91,23 +93,40 @@ ejit_print_mayconst_ranking();
 
 The call is read-only and does not start profiling or compilation. In a shared
 taskpool build, a non-owner core posts a diagnostic request and waits while the
-owner worker prints its local optimizer data. It prints one row per entry,
-ordered by the average number of runtime-active may-const sites across that
-entry's unique JIT cache keys:
+owner worker prints its local optimizer data. Each Tier-1 may-const load carries
+a stable audit site ID. A site contributes to `removed_runtime_hits` only when
+all copies of that ID are absent after final optimization; unknown provenance is
+matched conservatively by field/source identity, and a site with no recoverable
+identity is kept. Rows are ordered by removed dynamic load executions per
+million platform timestamp units:
 
 ```text
-[EJIT] mayconst-ranking entries=2 sort=avg_active_sites_desc
-[EJIT] rank=1 entry=FuncA versions=30 avg_active_sites=17.000 \
-  hit_sites=510 runtime_hits=99872 avg_removed=40 total_removed=1200 \
+[EJIT] mayconst-ranking entries=2 sort=benefit_per_mcycle_desc
+[EJIT] rank=1 entry=FuncA versions=30 benefit_per_mcycle=71225.850 \
+  removed_per_entry=20882.518 removed_runtime_hits=8582715 \
+  sampled_entries=411 sample_cycles=120500000 avg_active_sites=17.000 \
+  hit_sites=510 runtime_hits=10000000 avg_removed=40 total_removed=1200 \
   min=36 max=42
 ```
 
-`avg_active_sites` is `hit_sites / versions` and is the primary ranking key;
+`sample_cycles` uses `SRE_CycleCountGet64()` ticks on SRE and steady-clock
+nanoseconds on hosts. All ratios use wide integer intermediates, round to the
+nearest fixed-point value, and saturate to `uint64_t`; diagnostics use no
+floating point. The primary score is
+`removed_runtime_hits * 1,000,000 / sample_cycles`. The equivalent decomposition
+is `(removed_runtime_hits / sampled_entries) *
+(sampled_entries / sample_cycles)`: work removed per entry multiplied by entry
+frequency. Recording the actual entries and elapsed ticks makes samples
+comparable even though the asynchronous Tier-2 snapshot normally occurs after
+the nominal 64-hit trigger rather than at exactly 64 completed calls.
+
+`avg_active_sites` is `hit_sites / versions` and remains an explanatory metric;
 three decimal places are printed using integer fixed-point arithmetic.
 `runtime_hits` is the sum of dynamic T0 executions of recognized may-const
 load sites; `hit_sites` is the sum of sites that executed at least once in each
-sampled version. Entries tied on `avg_active_sites` are ordered by
-`runtime_hits`, then `avg_removed`, then name. An entry appears only after at
+sampled version. Entries tied on `benefit_per_mcycle` are ordered by
+`removed_per_entry`, `avg_active_sites`, `runtime_hits`, `avg_removed`, then
+name. An entry appears only after at
 least one specialization has completed its audit window and final compilation.
 The aggregation state stays local to the compile-owner worker; only a
 request/completion sequence and a boolean result cross shared memory.
