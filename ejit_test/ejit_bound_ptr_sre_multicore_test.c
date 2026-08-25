@@ -15,10 +15,82 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include <stdint.h>
-#include <string.h>
+// Kept self-contained for direct board integration: no project or libc
+// headers are required by this file.
+typedef unsigned char uint8_t;
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+typedef unsigned long size_t;
+typedef _Bool bool;
 
-#include "ejit_test_helpers.h"
+#define true 1
+#define false 0
+
+#define EJIT_PERIOD_CONST __attribute__((ejit_period_const))
+#define EJIT_IN_PERIOD_ARRAY(x) __attribute__((ejit_in_period_array(#x)))
+#define EJIT_DIM(x) __attribute__((ejit_dim(#x)))
+#define EJIT_BOUND_PTR(x) __attribute__((ejit_bound_ptr(#x)))
+#define EJIT_ENTRY __attribute__((ejit_entry))
+
+#define ejit_may_const EJIT_PERIOD_CONST
+#define ejit_period_arr(x) EJIT_IN_PERIOD_ARRAY(x)
+#define ejit_period_arr_ind(x) EJIT_DIM(x)
+#define ejit_entry EJIT_ENTRY
+
+typedef enum {
+  EJIT_OK = 0,
+  EJIT_COMPILE_ERROR = -3,
+} ejit_status_t;
+
+typedef enum {
+  EJIT_COMPILE_SYNC = 0,
+  EJIT_COMPILE_ASYNC = 1,
+} ejit_compile_mode_t;
+
+typedef enum {
+  EJIT_OPT_L1 = 1,
+  EJIT_OPT_L2 = 2,
+  EJIT_OPT_L3 = 3,
+} ejit_opt_level_t;
+
+typedef struct {
+  ejit_compile_mode_t compileMode;
+  ejit_opt_level_t optLevel;
+  size_t maxCodeMemory;
+  size_t maxDataMemory;
+  size_t maxCacheEntries;
+  size_t maxCacheSize;
+  bool enableLogger;
+  bool forceStaticRegistry;
+  const char *dumpJITDir;
+} ejit_config_t;
+
+typedef struct {
+  uint64_t cacheHits;
+  uint64_t asyncCompiles;
+  uint64_t asyncEnqueues;
+  uint64_t alreadyPending;
+  uint64_t queueFull;
+  uint64_t compileFailed;
+  uint64_t publishFailed;
+  uint64_t instanceDisabled;
+  uint64_t instanceDisabledPreActivate;
+  uint32_t readyEntries;
+  uint32_t pendingEntries;
+  uint32_t queueApproxSize;
+  uint32_t reserved;
+} ejit_taskpool_stats_t;
+
+extern ejit_status_t ejit_init(const ejit_config_t *config);
+extern ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx);
+extern void ejit_clear_cache(void);
+extern unsigned ejit_taskpool_pending_count(void);
+extern ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
+extern void ejit_taskpool_print_stats(void);
+extern void ejit_taskpool_print_compiled(void);
+extern uint32_t ejit_taskpool_get_worker_core(void);
+extern void ejit_dump_func(const char *name);
+extern void ejit_print_dumped(const char *name);
 
 extern void SRE_printf(const char *format, ...);
 extern uint32_t SRE_TaskDelay(uint32_t tick);
@@ -85,8 +157,7 @@ __attribute__((noinline)) static void clobber_producer_stack(void) {
 
 static int wait_for_two_compiles(uint64_t baseline) {
   for (uint32_t round = 0; round < BOUND_PTR_WAIT_ROUNDS; ++round) {
-    ejit_taskpool_stats_t stats;
-    memset(&stats, 0, sizeof(stats));
+    ejit_taskpool_stats_t stats = {0};
     (void)ejit_taskpool_get_stats(&stats);
     if (stats.compileFailed || stats.publishFailed) {
       SRE_printf("[BOUND-PTR-MC] FAIL compile=%llu publish=%llu\n",
@@ -122,8 +193,7 @@ static int run_producer(void) {
   }
 
   ejit_clear_cache();
-  ejit_taskpool_stats_t before;
-  memset(&before, 0, sizeof(before));
+  ejit_taskpool_stats_t before = {0};
   (void)ejit_taskpool_get_stats(&before);
 
   // The first call returns AOT while the worker is pending. The local object
@@ -148,8 +218,7 @@ static int run_producer(void) {
     return -6;
   }
 
-  ejit_taskpool_stats_t compiled;
-  memset(&compiled, 0, sizeof(compiled));
+  ejit_taskpool_stats_t compiled = {0};
   (void)ejit_taskpool_get_stats(&compiled);
 
   // Each cell keeps its own stable scale, while runtimeBias deliberately
@@ -159,8 +228,7 @@ static int run_producer(void) {
   uint32_t jitB = enqueue_from_stack(BOUND_PTR_CELL_B, 9u, 200u);
   const uint32_t expectedJitA = 253u;
   const uint32_t expectedJitB = 294u;
-  ejit_taskpool_stats_t after;
-  memset(&after, 0, sizeof(after));
+  ejit_taskpool_stats_t after = {0};
   (void)ejit_taskpool_get_stats(&after);
   if (jitA != expectedJitA || jitB != expectedJitB) {
     SRE_printf("[BOUND-PTR-MC][core=18] FAIL JIT cell1=%u/%u cell2=%u/%u\n",
@@ -257,8 +325,7 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   SRE_printf("\n=== EJIT bound-pointer multicore demo (core=%u) ===\n", core);
   call_init_array_functions();
 
-  ejit_config_t cfg;
-  memset(&cfg, 0, sizeof(cfg));
+  ejit_config_t cfg = {0};
   cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
   cfg.enableLogger = true;
