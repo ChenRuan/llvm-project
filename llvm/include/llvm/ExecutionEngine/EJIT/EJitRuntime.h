@@ -37,6 +37,7 @@
 #define EJIT_IN_PERIOD_ARRAY(x)
 #define ejit_period_arr(x)
 #define EJIT_DIM(x)
+#define EJIT_BOUND_PTR(x)
 #define ejit_period_arr_ind(x)
 #define EJIT_ENTRY
 #define ejit_entry
@@ -48,6 +49,7 @@
 #define EJIT_IN_PERIOD(x)       __attribute__((ejit_in_period(#x)))
 #define EJIT_IN_PERIOD_ARRAY(x) __attribute__((ejit_in_period_array(#x)))
 #define EJIT_DIM(x)             __attribute__((ejit_dim(#x)))
+#define EJIT_BOUND_PTR(x) __attribute__((ejit_bound_ptr(#x)))
 #define EJIT_ENTRY              __attribute__((ejit_entry))
 #define EJIT_PERIOD_GUARD(x)    __attribute__((ejit_period_guard(#x)))
 // Old names (aliases — use new macros to avoid double expansion)
@@ -213,6 +215,14 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
                                            const ejit_dim_pair_t *dims,
                                            uint32_t numDims, void **outFn,
                                            uint32_t *outBucket);
+
+// Slow-path variant used by wrappers with EJIT_BOUND_PTR. The runtime copies
+// snapshotData before returning; asynchronous compilation never retains the
+// caller's pointer. Oversize/null snapshots fail cleanly and execute AOT.
+ejit_status_t ejit_taskpool_compile_or_get_bound(
+    uint32_t funcIndex, const ejit_dim_pair_t *dims, uint32_t numDims,
+    const void *snapshotData, uint32_t snapshotSize, uint32_t boundArgIndex,
+    void **outFn, uint32_t *outBucket);
 
 // Fixed-dimension fast paths (0-4 dims). Additive alternatives to
 // ejit_taskpool_compile_or_get that pass the dim identity as scalar arguments

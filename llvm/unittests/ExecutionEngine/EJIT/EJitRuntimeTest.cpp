@@ -1594,6 +1594,58 @@ TEST(EJitStructFieldPass, NoMayConstNoChange) {
   EXPECT_TRUE(PA.areAllPreserved());
 }
 
+TEST(EJitStructFieldPass, BoundPointerUsesOwnedSnapshot) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    %Stable = type { i32, i32 }
+    %Cfg = type { %Stable, i32 }
+    define i32 @bound(i32 %cell, ptr %cfg) !ejit.metadata !0 {
+    entry:
+      %mode.ptr = getelementptr %Cfg, ptr %cfg, i32 0, i32 0, i32 1
+      %mode = load i32, ptr %mode.ptr
+      %dynamic.ptr = getelementptr %Cfg, ptr %cfg, i32 0, i32 1
+      %dynamic = load i32, ptr %dynamic.ptr
+      %sum = add i32 %mode, %dynamic
+      ret i32 %sum
+    }
+    !0 = distinct !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 12, !4}
+    !4 = !{i64 0, i64 8}
+  )",
+                               Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+
+  struct Config {
+    uint32_t stablePrefix;
+    uint32_t mode;
+    uint32_t dynamic;
+  } Snapshot{3, 7, 99};
+  PeriodArrayRegistry Registry;
+  EJitStructFieldPass Pass(Registry,
+                           reinterpret_cast<const uint8_t *>(&Snapshot),
+                           sizeof(Snapshot), 1);
+  Pass.initFromModule(*M);
+  FunctionAnalysisManager FAM;
+  Pass.run(*M->getFunction("bound"), FAM);
+
+  unsigned Loads = 0;
+  bool SawSnapshotConstant = false;
+  for (Instruction &I : instructions(*M->getFunction("bound"))) {
+    if (isa<LoadInst>(I))
+      ++Loads;
+    if (auto *Add = dyn_cast<BinaryOperator>(&I))
+      for (Value *Operand : Add->operands())
+        if (auto *C = dyn_cast<ConstantInt>(Operand))
+          SawSnapshotConstant |= C->getZExtValue() == 7;
+  }
+  EXPECT_EQ(Loads, 1u) << "dynamic field must remain a runtime load";
+  EXPECT_TRUE(SawSnapshotConstant);
+}
+
 //===----------------------------------------------------------------------===//
 // EJitStructFieldPass extended tests
 //===----------------------------------------------------------------------===//

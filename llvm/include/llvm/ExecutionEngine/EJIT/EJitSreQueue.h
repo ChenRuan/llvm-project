@@ -33,6 +33,12 @@
 #ifndef EJIT_SRE_TASKPOOL_QUEUE_CAPACITY
 #define EJIT_SRE_TASKPOOL_QUEUE_CAPACITY 1024u
 #endif
+#ifndef EJIT_BOUND_PTR_MAX_BYTES
+#define EJIT_BOUND_PTR_MAX_BYTES 256u
+#endif
+static_assert(EJIT_BOUND_PTR_MAX_BYTES > 0 &&
+                  (EJIT_BOUND_PTR_MAX_BYTES % 8u) == 0,
+              "EJIT_BOUND_PTR_MAX_BYTES must be a positive multiple of 8");
 
 namespace llvm {
 namespace ejit {
@@ -64,13 +70,21 @@ struct EJitCompileRequest {
   // cache. Unused (left 0) by the non-shared taskpool. Endianness: a plain
   // fixed-width scalar accessed by value, never byte-parsed.
   uint32_t generation;
+  // Optional shallow pointee snapshot for ejit_bound_ptr. It is stored inline
+  // so an async request owns every byte it needs after the caller returns.
+  // boundSize == 0 means no bound pointer. No raw caller pointer crosses the
+  // queue boundary.
+  uint32_t boundArgIndex;
+  uint32_t boundSize;
+  alignas(uintptr_t) uint8_t boundData[EJIT_BOUND_PTR_MAX_BYTES];
 };
 
 // Size is stable per pointer width: on a 64-bit target the trailing uint32_t
 // generation forces 4 bytes of tail padding (alignof == 8) -> 72; on a 32-bit
 // target everything is 4-aligned with no padding -> 64.
 static_assert(sizeof(EJitCompileRequest) ==
-                  (sizeof(uintptr_t) == 8 ? 72u : 64u),
+                  (sizeof(uintptr_t) == 8 ? 80u + EJIT_BOUND_PTR_MAX_BYTES
+                                          : 72u + EJIT_BOUND_PTR_MAX_BYTES),
               "EJitCompileRequest size must stay stable (incl. generation)");
 static_assert(alignof(EJitCompileRequest) <= 8,
               "EJitCompileRequest alignment must stay <= 8 bytes");

@@ -24,6 +24,10 @@ using namespace clang;
 using namespace CodeGen;
 using namespace llvm::ejit;
 
+static void collectBoundMayConstFields(
+    ASTContext &Ctx, const RecordDecl *RD, uint64_t BaseOffset,
+    SmallVectorImpl<std::pair<uint64_t, uint64_t>> &Fields);
+
 /// Emit !ejit.metadata for an ejit_entry or ejit_period_lc function.
 void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
                                               const FunctionDecl *FD,
@@ -78,6 +82,36 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
     }
   }
 
+  // ejit_bound_ptr (on pointer parameters). The pointee size is part of the
+  // metadata so the AOT wrapper can snapshot it before an async request
+  // outlives the call and its pointer.
+  for (unsigned I = 0; I < FD->getNumParams(); ++I) {
+    const ParmVarDecl *PD = FD->getParamDecl(I);
+    if (const auto *BoundAttr = PD->getAttr<EjitBoundPtrAttr>()) {
+      QualType Pointee = PD->getType()->getPointeeType();
+      uint64_t Size =
+          CGM.getContext().getTypeSizeInChars(Pointee).getQuantity();
+      SmallVector<llvm::Metadata *, 8> BoundOps = {
+          llvm::MDString::get(Ctx, TAG_EJIT_BOUND_PTR),
+          llvm::MDString::get(Ctx, BoundAttr->getPeriodName()),
+          llvm::ConstantAsMetadata::get(
+              llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), I)),
+          llvm::ConstantAsMetadata::get(
+              llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), Size))};
+      if (const auto *RD = Pointee->getAsRecordDecl()) {
+        SmallVector<std::pair<uint64_t, uint64_t>, 8> Fields;
+        collectBoundMayConstFields(CGM.getContext(), RD, 0, Fields);
+        for (const auto &[Offset, FieldSize] : Fields)
+          BoundOps.push_back(llvm::MDNode::get(
+              Ctx, {llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(Ctx), Offset)),
+                    llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(Ctx), FieldSize))}));
+      }
+      Entries.push_back(llvm::MDNode::get(Ctx, BoundOps));
+    }
+  }
+
   if (!Entries.empty()) {
     llvm::MDNode *MD = llvm::MDNode::getDistinct(Ctx, Entries);
     F->setMetadata(MD_EJIT_METADATA, MD);
@@ -107,6 +141,26 @@ static void collectMayConstFieldOffsets(ASTContext &Ctx, const RecordDecl *RD,
       Offsets.push_back(FieldOff);
     if (const auto *InnerRD = FD->getType()->getAsRecordDecl())
       collectMayConstFieldOffsets(Ctx, InnerRD, FieldOff, Offsets);
+  }
+}
+
+static void collectBoundMayConstFields(
+    ASTContext &Ctx, const RecordDecl *RD, uint64_t BaseOffset,
+    SmallVectorImpl<std::pair<uint64_t, uint64_t>> &Fields) {
+  if (RD->isUnion())
+    return;
+  const ASTRecordLayout &Layout = Ctx.getASTRecordLayout(RD);
+  for (const FieldDecl *FD : RD->fields()) {
+    if (FD->isBitField())
+      continue;
+    uint64_t Offset =
+        BaseOffset + Layout.getFieldOffset(FD->getFieldIndex()) / 8;
+    QualType FieldType = FD->getType();
+    if (FD->hasAttr<EjitMayConstAttr>() && !FieldType.isVolatileQualified())
+      Fields.push_back(
+          {Offset, Ctx.getTypeSizeInChars(FieldType).getQuantity()});
+    if (const auto *InnerRD = FieldType->getAsRecordDecl())
+      collectBoundMayConstFields(Ctx, InnerRD, Offset, Fields);
   }
 }
 

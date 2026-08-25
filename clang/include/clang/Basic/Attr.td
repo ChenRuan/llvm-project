@@ -5257,6 +5257,14 @@ def EjitPeriodArrInd : InheritableParamAttr {
   let Documentation = [EjitPeriodArrIndDocs];
 }
 
+// Binds a pointer parameter's pointee to one specialization dimension.
+def EjitBoundPtr : InheritableParamAttr {
+  let Spellings = [Clang<"ejit_bound_ptr">];
+  let Args = [StringArgument<"PeriodName">];
+  let Subjects = SubjectList<[ParmVar]>;
+  let Documentation = [EjitBoundPtrDocs];
+}
+
 // Marks a function for JIT optimization
 def EjitEntry : InheritableAttr {
   let Spellings = [Clang<"ejit_entry">];

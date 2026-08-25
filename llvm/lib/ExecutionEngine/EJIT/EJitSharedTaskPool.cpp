@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 
 // Compile-time guard: if EJIT_ICACHE_FUNC_SLOTS ever falls below
 // EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX (defined in EJitSharedTaskPoolState.h,
@@ -2850,7 +2851,9 @@ EJitSharedTaskPool::tryCacheHit4D(uint32_t funcIndex, uint32_t dim0,
 
 EJitSharedTaskPool::CompileOrGetResult
 EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
-                                 uint32_t numDims, void *fallback) {
+                                 uint32_t numDims, void *fallback,
+                                 const void *boundData, uint32_t boundSize,
+                                 uint32_t boundArgIndex) {
   EJIT_DIAG_VERBOSE("shared taskpool request func=%u dims=%u fallback=%p",
                     funcIndex, numDims, fallback);
   // Parameter check already done by the C API layer.
@@ -2867,6 +2870,13 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   }
   // True miss: continue the slow path with the caller's fallback.
   R.fnPtr = fallback;
+  if ((boundSize != 0 && !boundData) || boundSize > EJIT_BOUND_PTR_MAX_BYTES) {
+    EJIT_DIAG("shared taskpool bound snapshot reject func=%u size=%u max=%u",
+              funcIndex, boundSize,
+              static_cast<unsigned>(EJIT_BOUND_PTR_MAX_BYTES));
+    R.status = EJitCompileOrGetStatus::InvalidParam;
+    return R;
+  }
   // Off mode (§5.2 step 2).
   if (state_->mode.loadAcquire() ==
       static_cast<uint32_t>(EJitCompileMode::Off)) {
@@ -2894,6 +2904,16 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
       ReqLocal.dims[i] = dims[i];
       ReqLocal.versions[i] =
           instanceVersion(dims[i].dimType, dims[i].instanceId);
+    }
+    ReqLocal.boundArgIndex = boundArgIndex;
+    ReqLocal.boundSize = boundSize;
+    if (boundSize)
+      std::memcpy(ReqLocal.boundData, boundData, boundSize);
+    if (!versionsCurrent(ReqLocal)) {
+      EJIT_DIAG("shared taskpool sync snapshot drop func=%u: version changed",
+                funcIndex);
+      R.status = EJitCompileOrGetStatus::CompileFailed;
+      return R;
     }
     void *fn = nullptr;
     bool ok = compileFn_(compileCtx_, ReqLocal, &fn);
@@ -2978,6 +2998,16 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   for (uint32_t i = 0; i < numDims; ++i) {
     Req.dims[i] = dims[i];
     Req.versions[i] = instanceVersion(dims[i].dimType, dims[i].instanceId);
+  }
+  Req.boundArgIndex = boundArgIndex;
+  Req.boundSize = boundSize;
+  if (boundSize)
+    std::memcpy(Req.boundData, boundData, boundSize);
+  if (!versionsCurrent(Req) || state_->generation.loadAcquire() != gen) {
+    EJIT_DIAG("shared taskpool async snapshot drop func=%u: lifecycle changed",
+              funcIndex);
+    R.status = EJitCompileOrGetStatus::CompileFailed;
+    return R;
   }
   switch (dedupMark(funcIndex, gen)) {
   case EJitDedupResult::AlreadyPending:

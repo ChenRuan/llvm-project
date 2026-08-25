@@ -385,7 +385,8 @@ void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
 }
 
 void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
-                                     bool storeLru) {
+                                     bool storeLru,
+                                     const EJitCompileRequest *request) {
   // ── Cold path: decode cacheKey, verify, compile ────────────────────────
   uint32_t funcIdx = static_cast<uint32_t>(cacheKey >> 32);
   uint8_t dims[4] = {
@@ -465,6 +466,16 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   ctx.optLevel = config_.optLevel;
   for (unsigned i = 0; i < dimCount; ++i)
     ctx.dimensions.push_back({periodNames[i], dims[i]});
+  if (request && request->boundSize) {
+    if (request->boundSize > EJIT_BOUND_PTR_MAX_BYTES) {
+      EJIT_DIAG("compile FAIL key=0x%016lx func=%s: bound snapshot too large",
+                cacheKey, funcName.c_str());
+      return nullptr;
+    }
+    ctx.boundArgIndex = request->boundArgIndex;
+    ctx.boundData.append(request->boundData,
+                         request->boundData + request->boundSize);
+  }
 
   // PGO tier (EJIT_ONLINE_PGO.md §4). Gated by Config::enablePgo: off => the
   // default Baseline (unchanged pipeline). On => first compile is Tier-1
@@ -820,7 +831,7 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
   EJIT_DIAG("compileNow dispatch func=%u key=0x%016lx dims=[%u,%u,%u,%u]",
             funcIdx, cacheKey, packedDims[0], packedDims[1], packedDims[2],
             packedDims[3]);
-  return compileCold(cacheKey, tier, /*storeLru=*/false);
+  return compileCold(cacheKey, tier, /*storeLru=*/false, &req);
 }
 
 void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,

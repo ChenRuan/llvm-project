@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <thread>
 #include <type_traits>
@@ -38,6 +39,22 @@ void *codeFor(uint32_t funcIndex) {
 }
 
 bool mockCompile(void * /*ctx*/, const EJitCompileRequest &req, void **outFn) {
+  *outFn = codeFor(req.funcIndex);
+  return true;
+}
+
+struct BoundSnapshotLog {
+  uint32_t argIndex = 0;
+  uint32_t size = 0;
+  uint32_t value = 0;
+};
+bool mockCompileBoundSnapshot(void *ctx, const EJitCompileRequest &req,
+                              void **outFn) {
+  auto *log = static_cast<BoundSnapshotLog *>(ctx);
+  log->argIndex = req.boundArgIndex;
+  log->size = req.boundSize;
+  if (req.boundSize >= sizeof(log->value))
+    std::memcpy(&log->value, req.boundData, sizeof(log->value));
   *outFn = codeFor(req.funcIndex);
   return true;
 }
@@ -740,6 +757,27 @@ TEST_F(SharedTaskPoolTest, MultiProducerSharedQueue) {
   owner.getDiagnostics(d);
   EXPECT_EQ(d.cacheReadyCount, 3u);
   EXPECT_EQ(d.asyncCompiles, 3u);
+}
+
+TEST_F(SharedTaskPoolTest, BoundSnapshotOwnedAcrossCores) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  BoundSnapshotLog log;
+  owner.setCompiler(&mockCompileBoundSnapshot, &log);
+
+  EJitCoreId::setCurrentForTest(2);
+  uint32_t callerValue = 0x12345678u;
+  auto r = owner.compileOrGet(101, nullptr, 0, codeFor(101), &callerValue,
+                              sizeof(callerValue), 3);
+  ASSERT_EQ(r.status, EJitCompileOrGetStatus::EnqueuedPending);
+
+  // The producer may reuse or destroy its object before the owner runs.
+  callerValue = 0;
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_EQ(log.argIndex, 3u);
+  EXPECT_EQ(log.size, sizeof(callerValue));
+  EXPECT_EQ(log.value, 0x12345678u);
 }
 
 //===----------------------------------------------------------------------===//
@@ -2329,9 +2367,9 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // one-shot diagnostic mask. Bump this deliberately: the blob is mapped at one
   // address by every core, so a layout change that slips through unversioned is
   // a silent cross-core corruption.
-  // v10 adds shared PGO controls, v11 adds Tier-1 writable ranges, and v12
-  // adds staged concurrent-profile admission and progress counters.
-  EXPECT_EQ(kEJitSharedAbiVersion, 12u);
+  // v10-v13 add PGO controls, writable ranges, staged admission, and audit
+  // requests; v14 adds the owned bound-pointer snapshot.
+  EXPECT_EQ(kEJitSharedAbiVersion, 14u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(

@@ -61,6 +61,7 @@ constexpr const char *MD_EJIT_MAY_CONST = "ejit.may_const";
 constexpr const char *TAG_EJIT_ENTRY = "ejit_entry";
 constexpr const char *TAG_EJIT_PERIOD_LC = "ejit_period_lc";
 constexpr const char *TAG_EJIT_PERIOD_ARR_IND = "ejit_period_arr_ind";
+constexpr const char *TAG_EJIT_BOUND_PTR = "ejit_bound_ptr";
 constexpr const char *TAG_EJIT_PERIOD_ARR = "ejit_period_arr";
 constexpr const char *TAG_EJIT_PERIOD = "ejit_period";
 constexpr const char *TAG_EJIT_MAY_CONST_FIELD = "ejit_may_const_field";
@@ -98,6 +99,8 @@ constexpr const char *FN_REGISTER_FUNCINDEX = "ejit_register_funcindex";
 constexpr const char *FN_REGISTER_ICACHE_SLOT = "ejit_register_icache_slot";
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET =
     "ejit_taskpool_compile_or_get";
+constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_BOUND =
+    "ejit_taskpool_compile_or_get_bound";
 // Fixed-dimension fast-path C ABI entries (0-4 dims), emitted by the wrapper
 // when -ejit-wrapper-fixed-dim-entry is enabled and the entry has <= 4 dims.
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_0D =

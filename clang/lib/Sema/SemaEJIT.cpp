@@ -219,6 +219,30 @@ void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
       EjitPeriodArrIndAttr(S.Context, AL, PeriodName));
 }
 
+void handleEjitBoundPtrAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  auto *PVD = dyn_cast<ParmVarDecl>(D);
+  if (!PVD) {
+    S.Diag(AL.getLoc(), diag::warn_attribute_wrong_decl_type_str)
+        << AL << AL.isRegularKeywordAttribute() << "function parameters";
+    return;
+  }
+
+  QualType PT = PVD->getType();
+  QualType Pointee;
+  if (PT->isPointerType())
+    Pointee = PT->getPointeeType();
+  if (Pointee.isNull() || !Pointee->isObjectType() ||
+      Pointee->isIncompleteType()) {
+    S.Diag(AL.getLoc(), diag::err_ejit_bound_ptr_invalid_type) << PVD;
+    return;
+  }
+
+  StringRef PeriodName;
+  if (!S.checkStringLiteralArgumentAttr(AL, 0, PeriodName))
+    return;
+  PVD->addAttr(::new (S.Context) EjitBoundPtrAttr(S.Context, AL, PeriodName));
+}
+
 /// handleEjitEntryAttr - Process the ejit_entry attribute.
 /// Checks:
 ///   1. Applies only to FunctionDecl
@@ -293,6 +317,36 @@ void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD) {
           << FD << Count;
     }
   }
+}
+
+void checkEjitBoundPtrIndex(Sema &S, const FunctionDecl *FD) {
+  if (!FD)
+    return;
+
+  unsigned BoundCount = 0;
+  const EjitBoundPtrAttr *LastBound = nullptr;
+  for (const ParmVarDecl *P : FD->parameters())
+    if (const auto *A = P->getAttr<EjitBoundPtrAttr>()) {
+      ++BoundCount;
+      LastBound = A;
+    }
+
+  if (BoundCount > 1 && LastBound) {
+    S.Diag(LastBound->getLocation(), diag::err_ejit_bound_ptr_too_many)
+        << FD << BoundCount;
+    return;
+  }
+
+  if (!LastBound)
+    return;
+  unsigned MatchingDims = 0;
+  for (const ParmVarDecl *P : FD->parameters())
+    if (const auto *D = P->getAttr<EjitPeriodArrIndAttr>())
+      if (D->getPeriodName() == LastBound->getPeriodName())
+        ++MatchingDims;
+  if (MatchingDims != 1)
+    S.Diag(LastBound->getLocation(), diag::err_ejit_bound_ptr_missing_dim)
+        << LastBound->getPeriodName();
 }
 
 /// checkEjitEntryLcConflict - ejit_entry and ejit_period_lc are mutually

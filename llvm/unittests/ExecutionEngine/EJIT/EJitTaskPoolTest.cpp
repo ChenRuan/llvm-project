@@ -26,6 +26,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRwLock.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h"
 #include "gtest/gtest.h"
+#include <cstring>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -84,6 +85,24 @@ struct PublishObserver {
   }
 };
 
+struct SnapshotCompiler {
+  uint32_t first = 0;
+  uint32_t second = 0;
+  uint32_t argIndex = 0;
+
+  static bool compile(void *ctx, const EJitCompileRequest &req, void **outFn) {
+    auto *self = static_cast<SnapshotCompiler *>(ctx);
+    if (req.boundSize >= 2 * sizeof(uint32_t)) {
+      std::memcpy(&self->first, req.boundData, sizeof(uint32_t));
+      std::memcpy(&self->second, req.boundData + sizeof(uint32_t),
+                  sizeof(uint32_t));
+    }
+    self->argIndex = req.boundArgIndex;
+    *outFn = reinterpret_cast<void *>(&DummyFn0);
+    return true;
+  }
+};
+
 /// Bounded busy-wait (no sleep) used by the real-worker tests.
 template <typename Pred> bool spinUntil(Pred P, uint64_t MaxIters = 200000000) {
   for (uint64_t i = 0; i < MaxIters; ++i) {
@@ -106,10 +125,11 @@ TEST(EJitTaskPoolLayout, RequestIsFlatPod) {
   static_assert(std::is_standard_layout<EJitCompileRequest>::value,
                 "EJitCompileRequest must be standard layout");
   EXPECT_LE(alignof(EJitCompileRequest), 8u);
-  // funcIndex + numDims + dims[4] + versions[4] + fallbackPtr + generation,
-  // with tail padding to alignof on a 64-bit target (72) and none on 32-bit
-  // (64). See the static_assert in EJitSreQueue.h.
-  EXPECT_EQ(sizeof(EJitCompileRequest), sizeof(uintptr_t) == 8 ? 72u : 64u);
+  // The fixed request owns its optional bound-pointer bytes inline. See the
+  // cross-pointer-width layout assertion in EJitSreQueue.h.
+  EXPECT_EQ(sizeof(EJitCompileRequest), sizeof(uintptr_t) == 8
+                                            ? 80u + EJIT_BOUND_PTR_MAX_BYTES
+                                            : 72u + EJIT_BOUND_PTR_MAX_BYTES);
 }
 
 //===----------------------------------------------------------------------===//
@@ -931,6 +951,41 @@ TEST(EJitTaskPoolTest, InvalidParam) {
   // The C API layer (ejit_taskpool_compile_or_get) performs runtime validation
   // for these invariants; the internal compileOrGet/tryCacheHit assumes
   // already-validated inputs.
+}
+
+TEST(EJitTaskPoolTest, BoundSnapshotOutlivesCallerObject) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  SnapshotCompiler C;
+  P.setCompiler(&SnapshotCompiler::compile, &C);
+  EJitDimPair D[1] = {{0, 3}};
+  struct Config {
+    uint32_t mode;
+    uint32_t scale;
+  };
+
+  {
+    Config Local{7, 5};
+    auto R = P.compileOrGet(17, D, 1, nullptr, &Local, sizeof(Local), 2);
+    ASSERT_EQ(R.status, EJitCompileOrGetStatus::EnqueuedPending);
+    Local.mode = 99;
+    Local.scale = 99;
+  }
+
+  ASSERT_TRUE(P.pollOne());
+  EXPECT_EQ(C.first, 7u);
+  EXPECT_EQ(C.second, 5u);
+  EXPECT_EQ(C.argIndex, 2u);
+}
+
+TEST(EJitTaskPoolTest, OversizeBoundSnapshotFallsBack) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  uint8_t Data[EJIT_BOUND_PTR_MAX_BYTES + 1] = {};
+  EJitDimPair D[1] = {{0, 3}};
+  auto R = P.compileOrGet(18, D, 1, nullptr, Data, sizeof(Data), 1);
+  EXPECT_EQ(R.status, EJitCompileOrGetStatus::InvalidParam);
+  EXPECT_EQ(P.pendingCount(), 0u);
 }
 
 TEST(EJitTaskPoolTest, OutOfRangeFuncIndexRejected) {

@@ -109,6 +109,7 @@ private:
 
   /// Run EJitStructFieldPass on all functions.
   void runStructFieldPass(Module &M);
+  void runStructFieldPass(Module &M, const SpecializationContext &ctx);
 
   /// Push the specialized constants across call edges. The AOT inliner keeps a
   /// call edge wherever it chose not to inline, so after phase 1 every call

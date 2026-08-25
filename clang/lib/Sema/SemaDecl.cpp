@@ -75,6 +75,7 @@ using namespace sema;
 // Forward declaration for EmbeddedJIT deferred parameter check.
 // Defined in SemaEJIT.cpp.
 void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD);
+void checkEjitBoundPtrIndex(Sema &S, const FunctionDecl *FD);
 
 // Forward declaration for EmbeddedJIT always_inline conflict check.
 // Defined in SemaEJIT.cpp.
@@ -12306,6 +12307,7 @@ bool Sema::CheckFunctionDeclaration(Scope *S, FunctionDecl *NewFD,
   // declaration's parameter (propagated by the merge), so this runs here
   // rather than at attribute-handling time.
   checkEjitPeriodLcIndex(*this, NewFD);
+  checkEjitBoundPtrIndex(*this, NewFD);
 
   // A function defined without ejit_entry / ejit_period_lc even though a
   // prior declaration carries the attribute is not JIT-specialized: warn and

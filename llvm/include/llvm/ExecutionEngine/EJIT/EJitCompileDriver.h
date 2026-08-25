@@ -19,6 +19,7 @@
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 #include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
 #endif
+#include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h"
 #ifdef EJIT_SRE_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
 #endif
@@ -178,7 +179,8 @@ private:
   /// \p tier is the CompileTier (uint32_t, EJitOrcEngine.h) decoded from
   /// the request's funcIndex high bits (EJitSreQueue.h); gated by
   /// Config::enablePgo (off => Baseline regardless).
-  void *compileCold(uint64_t cacheKey, uint32_t tier, bool storeLru);
+  void *compileCold(uint64_t cacheKey, uint32_t tier, bool storeLru,
+                    const EJitCompileRequest *request = nullptr);
 
   /// PGO: Tier-1 captured counter refs per cacheKey (EJIT_ONLINE_PGO.md
   /// §5.2). Filled after a Tier-1 compile (ORC lookup of __profc_/__profd_

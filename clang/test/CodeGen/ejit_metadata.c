@@ -27,6 +27,14 @@ void lc_func(__attribute__((ejit_period_arr_ind("cell"))) int cellIdx) {
   g_cellCfg[cellIdx].xx = 42; // modify non-may_const field
 }
 
+// CHECK: define {{.*}}i32 @bound_entry({{.*}} !ejit.metadata ![[BOUND_META:[0-9]+]]
+__attribute__((ejit_entry))
+int bound_entry(__attribute__((ejit_period_arr_ind("cell"))) int cellIdx,
+                __attribute__((ejit_bound_ptr("cell")))
+                const struct CellConfig *cfg) {
+  return cfg->cellType + cfg->xx;
+}
+
 // CHECK-DAG: ![[MAYCONST_FIELD:[0-9]+]] = !{!"ejit_may_const_field", i32 0}
 // CHECK-DAG: ![[PERIOD_META]] = distinct !{![[PERIOD:[0-9]+]], ![[MAYCONST_FIELD]]}
 // CHECK-DAG: ![[PERIOD]] = !{!"ejit_period", !"static"}
@@ -38,3 +46,6 @@ void lc_func(__attribute__((ejit_period_arr_ind("cell"))) int cellIdx) {
 // CHECK-DAG: ![[LC]] = !{!"ejit_period_lc", !"cell"}
 // CHECK-DAG: ![[IND]] = !{!"ejit_period_arr_ind", !"cell", i32 0}
 // CHECK-DAG: ![[MAYCONST]] = !{}
+// CHECK-DAG: ![[BOUND_META]] = distinct !{![[ENTRY]], ![[IND]], ![[BOUND:[0-9]+]]}
+// CHECK-DAG: ![[BOUND]] = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, ![[BOUND_FIELD:[0-9]+]]}
+// CHECK-DAG: ![[BOUND_FIELD]] = !{i64 0, i64 4}
