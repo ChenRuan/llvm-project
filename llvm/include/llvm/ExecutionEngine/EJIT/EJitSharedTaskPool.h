@@ -228,8 +228,8 @@ EJitIcacheRegResult ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
                                            uint32_t numDims);
 
 // Register padCount direct-dispatch pad entry addresses followed by one miss
-// target pointer. Direct pads are only emitted for one-dimensional cell/trp
-// wrappers and currently have a fixed count of 16.
+// target pointer. One-dimensional cell/trp wrappers register 16 pads; the
+// two-dimensional last-pair mode registers a 16x16 table (256 pads).
 EJitIcacheRegResult ejitIcacheRegisterPads(uint32_t funcIndex,
                                            const void *table,
                                            uint32_t padCount);

@@ -2971,6 +2971,44 @@ TEST_F(SharedTaskPoolTest, DirectPadsPublishAndDrainWithTheirCell) {
   EXPECT_EQ(cells[kInst], 0u);
 }
 
+TEST_F(SharedTaskPoolTest, DirectPadsPublishAndDrainTwoDimensionalPair) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  constexpr uint32_t kDim0 = 5;
+  constexpr uint32_t kDim1 = 9;
+  constexpr uint32_t kIndex =
+      kDim0 * kEJitIcacheDirectPadCount + kDim1;
+  uintptr_t cells[kEJitIcacheDirectPadCount2D] = {};
+  uintptr_t pads[kEJitIcacheDirectPadCount2D + 1] = {};
+  for (uint32_t i = 0; i < kEJitIcacheDirectPadCount2D; ++i)
+    pads[i] = 0x200000u + i * 4u;
+  pads[kEJitIcacheDirectPadCount2D] = 0x300000u;
+  registerSlot(kFunc, cells, 2);
+  ASSERT_EQ(ejitIcacheRegisterPads(kFunc, pads,
+                                   kEJitIcacheDirectPadCount2D),
+            EJitIcacheRegResult::Ok);
+
+  PadPatchLog log;
+  log.missTarget =
+      reinterpret_cast<void *>(pads[kEJitIcacheDirectPadCount2D]);
+  pool.setIcachePadPatchCallback(&mockPatchPad, &log);
+  const EJitDimPair dims[2] = {{0, kDim0}, {1, kDim1}};
+  void *fn = codeFor(kFunc);
+  pool.icacheFill(kFunc, fn, dims, 2, pool.icacheBeginResolve());
+
+  ASSERT_EQ(log.patches.size(), 1u);
+  EXPECT_EQ(log.patches[0].first, reinterpret_cast<void *>(pads[kIndex]));
+  EXPECT_EQ(log.patches[0].second, fn);
+  EXPECT_EQ(cells[kIndex], reinterpret_cast<uintptr_t>(fn));
+
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 7, true));
+  ASSERT_EQ(log.patches.size(), 2u);
+  EXPECT_EQ(log.patches[1].first, reinterpret_cast<void *>(pads[kIndex]));
+  EXPECT_EQ(log.patches[1].second, log.missTarget);
+  EXPECT_EQ(cells[kIndex], 0u);
+}
+
 TEST_F(SharedTaskPoolTest, DirectPadsStayOnMissWithPerCorePrepare) {
   EJitSharedTaskPool pool;
   bringUpOwner(pool);

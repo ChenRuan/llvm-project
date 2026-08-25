@@ -106,6 +106,15 @@ static cl::opt<bool> EJitIcacheDirectDispatchPads(
     cl::desc("Tail-branch split 1D cell/trp leaves through patchable AOT "
              "direct-branch pads"));
 
+#ifndef EJIT_ICACHE_LAST_PAIR_CACHE_2D
+#define EJIT_ICACHE_LAST_PAIR_CACHE_2D 0
+#endif
+static cl::opt<bool> EJitIcacheLastPairCache2D(
+    "ejit-icache-last-pair-cache-2d",
+    cl::init(EJIT_ICACHE_LAST_PAIR_CACHE_2D != 0), cl::Hidden,
+    cl::desc("Cache the last 2D cell/trp key per core and dispatch through "
+             "a 16x16 patchable direct-pad table"));
+
 // Section for the per-function @__ejit_icache_fn_<name> cell table. In the
 // inter-core SHARED section (.mc_shared, where the taskpool state blob also
 // lives) the table is ONE object every core reads, so a deactivate zeroes a
@@ -490,8 +499,13 @@ emitIcacheSlotRegistration(Module &M,
   appendToUsed(M, {GV});
 }
 
+struct DirectPadTableInfo {
+  GlobalVariable *GV = nullptr;
+  unsigned Count = 0;
+};
+
 static void emitIcachePadRegistration(
-    Module &M, const std::map<std::string, GlobalVariable *> &Tables) {
+    Module &M, const std::map<std::string, DirectPadTableInfo> &Tables) {
   if (Tables.empty() || M.getGlobalVariable(".ejit.registry.icache_pads"))
     return;
   LLVMContext &Ctx = M.getContext();
@@ -518,8 +532,8 @@ static void emitIcachePadRegistration(
     IRBuilder<> Builder(Ret);
     Value *Name = Builder.CreateGlobalString(KV.first);
     Builder.CreateCall(Register,
-                       {Name, Builder.CreateBitCast(KV.second, PtrTy),
-                        ConstantInt::get(I32Ty, kEJitIcacheDirectPadCount)});
+                       {Name, Builder.CreateBitCast(KV.second.GV, PtrTy),
+                        ConstantInt::get(I32Ty, KV.second.Count)});
   }
 
   StructType *EntryTy = StructType::get(
@@ -536,8 +550,8 @@ static void emitIcachePadRegistration(
     Entries.push_back(ConstantStruct::get(
         EntryTy, {ConstantInt::get(I32Ty, EJIT_REG_ICACHE_PADS),
                   makeStrGV(KV.first), ConstantPointerNull::get(PtrTy),
-                  ConstantExpr::getBitCast(KV.second, PtrTy),
-                  ConstantInt::get(I64Ty, kEJitIcacheDirectPadCount)}));
+                  ConstantExpr::getBitCast(KV.second.GV, PtrTy),
+                  ConstantInt::get(I64Ty, KV.second.Count)}));
   ArrayType *ArrayTy = ArrayType::get(EntryTy, Entries.size());
   auto *GV = new GlobalVariable(
       M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
@@ -678,7 +692,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
   LLVM_DEBUG(dbgs() << "ejit-wrapper-gen: " << EntryFuncs.size()
                     << " entry function(s)\n");
-  std::map<std::string, GlobalVariable *> DirectPadTables;
+  std::map<std::string, DirectPadTableInfo> DirectPadTables;
   bool Changed = false;
   for (Function *F : EntryFuncs) {
     LLVM_DEBUG(dbgs() << "ejit-wrapper-gen: wrapping " << F->getName() << "\n");
@@ -1009,18 +1023,168 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       const bool IsSplitLifecycle =
           NumDims == 1 && (PeriodInds[0].PeriodName == "cell" ||
                            PeriodInds[0].PeriodName == "trp");
+      const bool IsCellTrpPair =
+          NumDims == 2 &&
+          ((PeriodInds[0].PeriodName == "cell" &&
+            PeriodInds[1].PeriodName == "trp") ||
+           (PeriodInds[0].PeriodName == "trp" &&
+            PeriodInds[1].PeriodName == "cell"));
       const bool UseSplitDispatch = EJitIcacheSplitDispatch1D &&
                                     IsSplitLifecycle &&
                                     EJIT_ICACHE_DIM_SIZE >= 16;
       const bool UseDirectPads = UseSplitDispatch &&
                                  EJitIcacheDirectDispatchPads &&
                                  !EJitWrapperTiming;
+      const bool UseLastPair2D =
+          EJitIcacheLastPairCache2D && EJitIcacheDirectDispatchPads &&
+          IsCellTrpPair && EJIT_ICACHE_DIM_SIZE == 16 && !EJitWrapperTiming;
       BasicBlock *JitIcacheDispatch = nullptr;
-      if (!UseSplitDispatch)
+      if (!UseSplitDispatch && !UseLastPair2D)
         JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
       auto *JitMiss = BasicBlock::Create(Ctx, "jit_miss", F);
 
-      if (UseSplitDispatch) {
+      auto CreateDirectPads = [&](unsigned Count) {
+        SmallVector<Function *, 16> Pads;
+        SmallVector<Constant *, 17> PadTable;
+        Pads.reserve(Count);
+        PadTable.reserve(Count + 1);
+        for (unsigned I = 0; I < Count; ++I) {
+          Function *Pad = Function::Create(
+              F->getFunctionType(), GlobalValue::InternalLinkage,
+              "__ejit_icache_pad_" + F->getName() + "_" + Twine(I), &M);
+          Pad->setCallingConv(F->getCallingConv());
+          Pad->setAttributes(F->getAttributes());
+          Pad->addFnAttr(Attribute::NoInline);
+          Pad->setSection(SECT_EJIT_DIRECT_PADS);
+          Pad->setAlignment(Align(4));
+          BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Pad);
+          IRBuilder<> PB(Entry);
+          SmallVector<Value *, 8> Args;
+          for (Argument &A : Pad->args())
+            Args.push_back(&A);
+          CallInst *CI = PB.CreateCall(MissFn->getFunctionType(), MissFn, Args);
+          applyEntryCallABI(CI);
+          CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
+          if (F->getReturnType()->isVoidTy())
+            PB.CreateRetVoid();
+          else
+            PB.CreateRet(CI);
+          Pads.push_back(Pad);
+          PadTable.push_back(ConstantExpr::getBitCast(Pad, PtrTy));
+        }
+        PadTable.push_back(ConstantExpr::getBitCast(MissFn, PtrTy));
+        ArrayType *TableTy = ArrayType::get(PtrTy, PadTable.size());
+        auto *Table = new GlobalVariable(
+            M, TableTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
+            ConstantArray::get(TableTy, PadTable),
+            "__ejit_icache_pad_table_" + F->getName());
+        Table->setAlignment(Align(8));
+        DirectPadTables.emplace(F->getName().str(),
+                                DirectPadTableInfo{Table, Count});
+        return Pads;
+      };
+
+      if (UseLastPair2D) {
+        constexpr unsigned PairCount = kEJitIcacheDirectPadCount2D;
+        auto PadFunctions = CreateDirectPads(PairCount);
+
+        StructType *DescTy = StructType::get(I64Ty, PtrTy);
+        SmallVector<Constant *, PairCount> Descs;
+        for (unsigned I = 0; I < PairCount; ++I) {
+          const uint64_t PairKey =
+              (uint64_t{I / kEJitIcacheDirectPadCount} << 32) |
+              (I % kEJitIcacheDirectPadCount);
+          Descs.push_back(ConstantStruct::get(
+              DescTy, {ConstantInt::get(I64Ty, PairKey),
+                       ConstantExpr::getBitCast(PadFunctions[I], PtrTy)}));
+        }
+        ArrayType *DescTableTy = ArrayType::get(DescTy, PairCount);
+        auto *DescTable = new GlobalVariable(
+            M, DescTableTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
+            ConstantArray::get(DescTableTy, Descs),
+            "__ejit_icache_pair_descs_" + F->getName());
+        DescTable->setAlignment(Align(8));
+        auto *InvalidDesc = new GlobalVariable(
+            M, DescTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
+            ConstantStruct::get(
+                DescTy, {ConstantInt::get(I64Ty, UINT64_MAX),
+                         ConstantExpr::getBitCast(MissFn, PtrTy)}),
+            "__ejit_icache_pair_invalid_" + F->getName());
+        InvalidDesc->setAlignment(Align(8));
+        // Ordinary data is core-private on the SRE target. Keep only this last
+        // descriptor local; the patched pad table remains shared AOT text.
+        auto *LastDesc = new GlobalVariable(
+            M, PtrTy, /*isConstant=*/false, GlobalValue::InternalLinkage,
+            ConstantExpr::getBitCast(InvalidDesc, PtrTy),
+            "__ejit_icache_last_pair_" + F->getName());
+        LastDesc->setAlignment(Align(8));
+
+        auto NormalizeDim = [&](Value *V, const Twine &Name) -> Value * {
+          unsigned BW = cast<IntegerType>(V->getType())->getBitWidth();
+          if (BW > 32)
+            return B.CreateTrunc(V, I32Ty, Name);
+          if (BW < 32)
+            return B.CreateZExt(V, I32Ty, Name);
+          return V;
+        };
+        Value *Dim0 = NormalizeDim(F->getArg(PeriodInds[0].ArgIndex),
+                                   "ejit_pair_dim0");
+        Value *Dim1 = NormalizeDim(F->getArg(PeriodInds[1].ArgIndex),
+                                   "ejit_pair_dim1");
+        Value *FlatIndex = B.CreateAdd(
+            B.CreateShl(Dim0, ConstantInt::get(I32Ty, 4)), Dim1,
+            "ejit_pair_index");
+        Value *PairKey = B.CreateOr(
+            B.CreateShl(B.CreateZExt(Dim0, I64Ty),
+                        ConstantInt::get(I64Ty, 32)),
+            B.CreateZExt(Dim1, I64Ty), "ejit_pair_key");
+        LoadInst *CachedDesc =
+            B.CreateLoad(PtrTy, LastDesc, "ejit_cached_pair_desc");
+        CachedDesc->setAlignment(Align(8));
+        CachedDesc->setAtomic(AtomicOrdering::Monotonic);
+        Value *CachedKeyPtr = B.CreateStructGEP(
+            DescTy, CachedDesc, 0, "ejit_cached_pair_key_ptr");
+        Value *CachedKey =
+            B.CreateLoad(I64Ty, CachedKeyPtr, "ejit_cached_pair_key");
+        Value *PairHit =
+            B.CreateICmpEQ(PairKey, CachedKey, "ejit_pair_cache_hit");
+        PairHit = B.CreateIntrinsic(Intrinsic::expect, {PairHit->getType()},
+                                    {PairHit, ConstantInt::getTrue(Ctx)});
+        BasicBlock *PairHitBB =
+            BasicBlock::Create(Ctx, "jit_pair_cache_hit", F);
+        BasicBlock *PairColdBB =
+            BasicBlock::Create(Ctx, "jit_pair_cache_cold", F);
+        B.CreateCondBr(PairHit, PairHitBB, PairColdBB);
+
+        IRBuilder<> HB(PairHitBB);
+        Value *CachedPadPtr =
+            HB.CreateStructGEP(DescTy, CachedDesc, 1, "ejit_cached_pad_ptr");
+        Value *CachedPad = HB.CreateLoad(PtrTy, CachedPadPtr, "ejit_cached_pad");
+        emitIcacheDispatch(HB, CachedPad, nullptr);
+
+        IRBuilder<> CB(PairColdBB);
+        Value *Dim0InRange = CB.CreateICmpULT(
+            Dim0, ConstantInt::get(I32Ty, kEJitIcacheDirectPadCount));
+        Value *Dim1InRange = CB.CreateICmpULT(
+            Dim1, ConstantInt::get(I32Ty, kEJitIcacheDirectPadCount));
+        Value *PairInRange =
+            CB.CreateAnd(Dim0InRange, Dim1InRange, "ejit_pair_in_range");
+        BasicBlock *PairUpdateBB =
+            BasicBlock::Create(Ctx, "jit_pair_cache_update", F);
+        CB.CreateCondBr(PairInRange, PairUpdateBB, JitMiss);
+
+        IRBuilder<> UB(PairUpdateBB);
+        Value *Desc = UB.CreateInBoundsGEP(
+            DescTableTy, DescTable,
+            {ConstantInt::get(I32Ty, 0), FlatIndex}, "ejit_pair_desc");
+        StoreInst *CacheStore = UB.CreateStore(Desc, LastDesc);
+        CacheStore->setAlignment(Align(8));
+        CacheStore->setAtomic(AtomicOrdering::Monotonic);
+        Value *PadPtr =
+            UB.CreateStructGEP(DescTy, Desc, 1, "ejit_pair_pad_ptr");
+        Value *Pad = UB.CreateLoad(PtrTy, PadPtr, "ejit_pair_pad");
+        emitIcacheDispatch(UB, Pad, nullptr);
+      } else if (UseSplitDispatch) {
         constexpr unsigned SplitInstances = kEJitIcacheDirectPadCount;
         static_assert((SplitInstances & (SplitInstances - 1)) == 0,
                       "bit-test dispatch requires a power-of-two "
@@ -1035,40 +1199,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
         SmallVector<Function *, SplitInstances> PadFunctions;
         if (UseDirectPads) {
-          SmallVector<Constant *, SplitInstances + 1> PadTable;
-          for (unsigned I = 0; I < SplitInstances; ++I) {
-            Function *Pad = Function::Create(
-                F->getFunctionType(), GlobalValue::InternalLinkage,
-                "__ejit_icache_pad_" + F->getName() + "_" + Twine(I), &M);
-            Pad->setCallingConv(F->getCallingConv());
-            Pad->setAttributes(F->getAttributes());
-            Pad->addFnAttr(Attribute::NoInline);
-            Pad->setSection(SECT_EJIT_DIRECT_PADS);
-            Pad->setAlignment(Align(4));
-            BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Pad);
-            IRBuilder<> PB(Entry);
-            SmallVector<Value *, 8> Args;
-            for (Argument &A : Pad->args())
-              Args.push_back(&A);
-            CallInst *CI =
-                PB.CreateCall(MissFn->getFunctionType(), MissFn, Args);
-            applyEntryCallABI(CI);
-            CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
-            if (F->getReturnType()->isVoidTy())
-              PB.CreateRetVoid();
-            else
-              PB.CreateRet(CI);
-            PadFunctions.push_back(Pad);
-            PadTable.push_back(ConstantExpr::getBitCast(Pad, PtrTy));
-          }
-          PadTable.push_back(ConstantExpr::getBitCast(MissFn, PtrTy));
-          ArrayType *TableTy = ArrayType::get(PtrTy, PadTable.size());
-          auto *Table = new GlobalVariable(
-              M, TableTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
-              ConstantArray::get(TableTy, PadTable),
-              "__ejit_icache_pad_table_" + F->getName());
-          Table->setAlignment(Align(8));
-          DirectPadTables.emplace(F->getName().str(), Table);
+          auto Created = CreateDirectPads(SplitInstances);
+          PadFunctions.assign(Created.begin(), Created.end());
         }
 
         SmallVector<BasicBlock *, SplitInstances> LeafBlocks;

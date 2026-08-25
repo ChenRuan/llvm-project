@@ -820,6 +820,13 @@ option(EJIT_ICACHE_DIRECT_DISPATCH_PADS
   "Patch split 1D cell/trp dispatch pads to JIT bodies with direct branches" OFF)
 message(STATUS "EmbeddedJIT: direct 1D cell/trp pads=${EJIT_ICACHE_DIRECT_DISPATCH_PADS}")
 
+# Optional 2D extension of direct pads. A per-core last-(cell,trp) key keeps the
+# stable hot path to one compare and one pad-table load; a changed pair takes
+# the bounded 16x16 descriptor lookup/update path once.
+option(EJIT_ICACHE_LAST_PAIR_CACHE_2D
+  "Cache the last 2D cell/trp pair and dispatch through 256 direct pads" OFF)
+message(STATUS "EmbeddedJIT: 2D cell/trp last-pair cache=${EJIT_ICACHE_LAST_PAIR_CACHE_2D}")
+
 #===-- EmbeddedJIT SRE taskpool compile scheduler -------------------------===#
 # Route ejit_compile_or_get through a unified taskpool (cache + dedup + queue)
 # instead of calling the synchronous compile driver directly. Sync and async

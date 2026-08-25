@@ -93,7 +93,8 @@
         "EJIT_STATS_ENABLE": "ON",
         "EJIT_ICACHE_DIM_SIZE": "16",
         "EJIT_ICACHE_SPLIT_DISPATCH_1D": "ON",
-        "EJIT_ICACHE_DIRECT_DISPATCH_PADS": "ON"
+        "EJIT_ICACHE_DIRECT_DISPATCH_PADS": "ON",
+        "EJIT_ICACHE_LAST_PAIR_CACHE_2D": "ON"
       }
     },
     {

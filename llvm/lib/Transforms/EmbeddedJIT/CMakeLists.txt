@@ -37,3 +37,8 @@ if(EJIT_ICACHE_DIRECT_DISPATCH_PADS)
   target_compile_definitions(LLVMEmbeddedJIT PRIVATE
     EJIT_ICACHE_DIRECT_DISPATCH_PADS=1)
 endif()
+
+if(EJIT_ICACHE_LAST_PAIR_CACHE_2D)
+  target_compile_definitions(LLVMEmbeddedJIT PRIVATE
+    EJIT_ICACHE_LAST_PAIR_CACHE_2D=1)
+endif()

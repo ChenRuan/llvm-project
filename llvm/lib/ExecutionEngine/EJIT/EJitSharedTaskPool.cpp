@@ -178,21 +178,33 @@ struct EJitIcacheSlotReg {
 };
 EJitIcacheSlotReg gIcacheSlots[EJIT_ICACHE_FUNC_SLOTS];
 
-// Optional direct-dispatch companions for one-dimensional cell/trp slots.
+// Optional direct-dispatch companions for one- or two-dimensional cell/trp
+// slots.
 // table[0..count) are AOT pad entry addresses; table[count] is the common miss
 // target each pad contains at link time and is restored to on every drain.
 struct EJitIcachePadReg {
-  const uintptr_t *table;
+  const void *table;
   uint32_t count;
 };
 EJitIcachePadReg gIcachePads[EJIT_ICACHE_FUNC_SLOTS];
 
+inline uintptr_t icachePadWord(const EJitIcachePadReg &reg, uintptr_t idx) {
+  uintptr_t word;
+  const auto *entry = static_cast<const unsigned char *>(reg.table) +
+                      idx * sizeof(uintptr_t);
+  // The AOT object is an LLVM pointer array, not a C++ uintptr_t array. A
+  // fixed-size builtin copy preserves the representation without type-punning
+  // and lowers to one native pointer load on the supported targets.
+  __builtin_memcpy(&word, entry, sizeof(word));
+  return word;
+}
+
 inline void *icachePad(const EJitIcachePadReg &reg, uintptr_t idx) {
-  return reinterpret_cast<void *>(reg.table[idx]);
+  return reinterpret_cast<void *>(icachePadWord(reg, idx));
 }
 
 inline const void *icachePadMiss(const EJitIcachePadReg &reg) {
-  return reinterpret_cast<const void *>(reg.table[reg.count]);
+  return reinterpret_cast<const void *>(icachePadWord(reg, reg.count));
 }
 
 // A cell viewed as the atomic it is: EJitAtomic<uintptr_t> is a standard-layout
@@ -267,11 +279,12 @@ EJitIcacheRegResult llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex,
 EJitIcacheRegResult llvm::ejit::ejitIcacheRegisterPads(uint32_t funcIndex,
                                                        const void *table,
                                                        uint32_t padCount) {
-  if (!table || padCount != kEJitIcacheDirectPadCount)
+  if (!table || (padCount != kEJitIcacheDirectPadCount &&
+                 padCount != kEJitIcacheDirectPadCount2D))
     return EJitIcacheRegResult::Invalid;
   if (funcIndex >= EJIT_ICACHE_FUNC_SLOTS)
     return EJitIcacheRegResult::CapacityMiss;
-  gIcachePads[funcIndex].table = static_cast<const uintptr_t *>(table);
+  gIcachePads[funcIndex].table = table;
   gIcachePads[funcIndex].count = padCount;
   return EJitIcacheRegResult::Ok;
 }
@@ -763,7 +776,7 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   cell.storeRelaxed(reinterpret_cast<uintptr_t>(fnPtr));
   const EJitIcachePadReg &pads = gIcachePads[funcIndex];
   bool padPublished = false;
-  if (numDims == 1 && pads.table && idx < pads.count && icachePadPatchFn_ &&
+  if (pads.table && idx < pads.count && icachePadPatchFn_ &&
       icacheCrossCoreExecutable())
     padPublished =
         icachePadPatchFn_(icachePadPatchCtx_, icachePad(pads, idx), fnPtr);

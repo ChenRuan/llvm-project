@@ -99,6 +99,8 @@ constexpr const char *FN_REGISTER_FUNCINDEX = "ejit_register_funcindex";
 constexpr const char *FN_REGISTER_ICACHE_SLOT = "ejit_register_icache_slot";
 constexpr const char *FN_REGISTER_ICACHE_PADS = "ejit_register_icache_pads";
 constexpr uint32_t kEJitIcacheDirectPadCount = 16;
+constexpr uint32_t kEJitIcacheDirectPadCount2D =
+    kEJitIcacheDirectPadCount * kEJitIcacheDirectPadCount;
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET =
     "ejit_taskpool_compile_or_get";
 // Fixed-dimension fast-path C ABI entries (0-4 dims), emitted by the wrapper

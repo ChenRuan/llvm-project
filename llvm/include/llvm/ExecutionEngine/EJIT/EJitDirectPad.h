@@ -35,7 +35,7 @@ inline bool ejitEncodeAArch64DirectBranch(uintptr_t Site, uintptr_t Target,
   if ((Site & 3u) != 0 || (Target & 3u) != 0 || Delta < MinDelta ||
       Delta > MaxDelta)
     return false;
-  const uint32_t Imm26 = static_cast<uint32_t>(Delta >> 2) & 0x03ffffffu;
+  const uint32_t Imm26 = static_cast<uint32_t>(Delta / 4) & 0x03ffffffu;
   Instruction = 0x14000000u | Imm26;
   return true;
 }

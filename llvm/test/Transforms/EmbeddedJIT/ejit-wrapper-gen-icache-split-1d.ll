@@ -1,6 +1,8 @@
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -ejit-icache-split-dispatch-1d=false -S %s | FileCheck %s --check-prefix=DEFAULT
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -ejit-icache-split-dispatch-1d=true -S %s | FileCheck %s --check-prefix=SPLIT
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -ejit-icache-split-dispatch-1d=true -ejit-icache-direct-dispatch-pads=true -S %s | FileCheck %s --check-prefix=DIRECT
+; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -ejit-icache-split-dispatch-1d=true -ejit-icache-direct-dispatch-pads=true -ejit-icache-last-pair-cache-2d=true -S %s | FileCheck %s --check-prefix=PAIR
+; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -ejit-icache-split-dispatch-1d=true -ejit-icache-direct-dispatch-pads=true -ejit-icache-last-pair-cache-2d=true -S %s | llc -mtriple=aarch64-unknown-none-elf -O2 | FileCheck %s --check-prefix=PAIRASM
 
 ; The default remains the compact, single indirect callsite.
 ; DEFAULT-NOT: jit_icache_probe_0:
@@ -51,6 +53,39 @@
 ; DIRECT: musttail call i32 %ejit_ic_fn
 ; DIRECT-DAG: define internal i32 @__ejit_icache_pad_cell_entry_0({{.*}}) {{.*}}section ".text.ejit_pads" align 4
 ; DIRECT-DAG: musttail call i32 @cell_entry_miss(
+
+; A two-dimensional cell/trp entry keeps one last descriptor in core-private
+; data. A stable pair takes one key comparison and dispatches through its fixed
+; AOT pad; only a changed pair executes both bounds checks and updates the key.
+; PAIR-DAG: @__ejit_icache_pad_table_two_dim_entry = private constant [257 x ptr]
+; PAIR-DAG: @__ejit_icache_pair_descs_two_dim_entry = private constant [256 x { i64, ptr }]
+; PAIR-DAG: { i64 4294967296, ptr @__ejit_icache_pad_two_dim_entry_16 }
+; PAIR-DAG: @__ejit_icache_last_pair_two_dim_entry = internal global ptr @__ejit_icache_pair_invalid_two_dim_entry, align 8
+; PAIR-DAG: @.ejit.registry.icache_pads = private constant {{.*}} ptr @__ejit_icache_pad_table_two_dim_entry, i64 256
+; PAIR-LABEL: define i32 @two_dim_entry(
+; PAIR: %ejit_pair_index = add i32 {{.*}}, %trp
+; PAIR: %ejit_pair_key = or i64
+; PAIR: %ejit_cached_pair_desc = load atomic ptr, ptr @__ejit_icache_last_pair_two_dim_entry monotonic, align 8
+; PAIR: %ejit_cached_pair_key = load i64
+; PAIR: %ejit_pair_cache_hit = icmp eq i64 %ejit_pair_key, %ejit_cached_pair_key
+; PAIR: jit_pair_cache_hit:
+; PAIR: %ejit_cached_pad = load ptr
+; PAIR: musttail call i32 %ejit_cached_pad
+; PAIR: jit_pair_cache_cold:
+; PAIR: icmp ult i32 %cell, 16
+; PAIR: icmp ult i32 %trp, 16
+; PAIR: jit_pair_cache_update:
+; PAIR: store atomic ptr %ejit_pair_desc, ptr @__ejit_icache_last_pair_two_dim_entry monotonic, align 8
+; PAIR: musttail call i32 %ejit_pair_pad
+
+; The stable-pair machine path has one key compare, not a 16x16 selector.
+; PAIRASM-LABEL: two_dim_entry:
+; PAIRASM: ldr x[[DESC:[0-9]+]], [x{{[0-9]+}}, {{.*}}__ejit_icache_last_pair_two_dim_entry]
+; PAIRASM: ldr x[[OLDKEY:[0-9]+]], [x[[DESC]]]
+; PAIRASM: cmp x{{[0-9]+}}, x[[OLDKEY]]
+; PAIRASM-NEXT: b.ne
+; PAIRASM: ldr x[[TARGET:[0-9]+]], [x[[DESC]], #8]
+; PAIRASM: br x[[TARGET]]
 
 ; Other one-dimensional lifecycle names also retain the compact dispatcher.
 ; SPLIT-LABEL: define i32 @other_entry(
