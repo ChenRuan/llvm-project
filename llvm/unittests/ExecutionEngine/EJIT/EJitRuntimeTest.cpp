@@ -1602,6 +1602,7 @@ TEST(EJitStructFieldPass, InstrumentsRuntimeMayConstHitsBeforeReplacement) {
 
   auto Sites = Pass.instrumentMayConstLoadSites(M);
   ASSERT_EQ(Sites.size(), 1u);
+  EXPECT_EQ(Sites[0].siteId, 1u);
   auto *Counters = M.getGlobalVariable(
       EJitStructFieldPass::MayConstCounterName);
   ASSERT_NE(Counters, nullptr);
@@ -1621,6 +1622,9 @@ TEST(EJitStructFieldPass, InstrumentsRuntimeMayConstHitsBeforeReplacement) {
   EJitStructFieldPass::removeMayConstLoadInstrumentation(M);
   EXPECT_EQ(M.getGlobalVariable(EJitStructFieldPass::MayConstCounterName),
             nullptr);
+  auto SurvivingSites = Pass.collectMayConstLoadSites(M);
+  ASSERT_EQ(SurvivingSites.size(), 1u);
+  EXPECT_EQ(SurvivingSites[0].siteId, 1u);
   AtomicAdds = 0;
   for (Instruction &I : instructions(*F))
     AtomicAdds += isa<AtomicRMWInst>(I);
