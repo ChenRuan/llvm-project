@@ -14,7 +14,10 @@
 //     the worker owner, builds the shared state, optionally starts the ONE
 //     worker, and publishes Ready (or Failed). Every other core observes the
 //     outcome with an acquire load and binds — it never creates a second
-//     worker.
+//     worker. A build may instead PIN the worker to one designated core (CMake
+//     EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE, consumed in EJitSharedTaskPool.cpp):
+//     only that core may run the CAS; a non-designated core waits — bounded,
+//     yielding — for the designated core to initialize, then attaches.
 //   * the producer path compileOrGet() operating purely on shared state.
 //   * the consumer path pollOne()/pollBudget() (the worker, or a test, drives
 //     it) with the two version checkpoints and the commit-gated cache publish.
@@ -350,7 +353,10 @@ public:
   /// work to do (waiting on the owner to publish Ready, or Ready with an empty
   /// queue), passed \p ticks=1 for a single yield; (2) after EVERY consumed
   /// compile task as a throttle delay, passed \p ticks = MULT*DELAY_TICKS -- a
-  /// single delay(ticks) call, NOT ticks separate yield() calls. The production
+  /// single delay(ticks) call, NOT ticks separate yield() calls. A producer
+  /// side init() also uses it with \p ticks=1 while waiting on an Initializing
+  /// owner or (fixed worker core build) on the designated core to initialize.
+  /// The production
   /// build injects EJitSreTask::delay(ticks) (delay(1) == yield():
   /// SRE_TaskDelay on freestanding, std::this_thread::yield on host) so a
   /// high-priority worker never busy-spins and starves the core trying to
@@ -370,6 +376,10 @@ public:
     AttachedReady, ///< Bound to an already-Ready shared state.
     OwnerFailed,   ///< State is Failed/Stopping: clean fallback, no wait.
     InitInProgress, ///< Another core still Initializing; bounded retry hit.
+                    ///< Under a fixed worker core build this is also returned
+                    ///< when the designated core has not initialized yet (or
+                    ///< never does) - pending, never a hang, never an election
+                    ///< by a non-designated core.
     AbiMismatch,    ///< magic/version/size mismatch — refuse to use the blob.
     FingerprintMismatch, ///< owner/peer registration mapping differs — clean
                          ///< fail.
@@ -684,6 +694,9 @@ public:
   }
 
   /// Run owner election + bind. Idempotent: re-observes the same outcome.
+  /// Under a fixed worker core build (EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE)
+  /// only the designated core may claim ownership; every other core waits
+  /// bounded for it and then attaches (see the file header).
   InitResult init();
   bool isOwner() const { return isOwner_; }
 

@@ -66,6 +66,24 @@ namespace {
 // symbol, no arch-specific instruction in this layer).
 inline void cpuRelax() { __asm__ __volatile__("" ::: "memory"); }
 
+// Fixed worker core (build policy, spec §11.4): CMake
+// EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE pins the single shared worker to ONE
+// designated core. When set, ONLY that core may win the owner election - it
+// alone runs the Uninitialized->Initializing CAS, builds the engine, and
+// creates the worker task (SRE tasks run on the core that creates them).
+// Every other core, on observing Uninitialized, does NOT attempt the CAS; it
+// waits for the designated core with the same bounded yield protocol as the
+// Initializing case, then attaches as a peer. kEJitInvalidCoreId means "no
+// fixed core": the open election, byte-for-byte unchanged.
+#ifdef EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE
+static_assert(EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE != kEJitInvalidCoreId,
+              "the fixed worker core id collides with the kEJitInvalidCoreId "
+              "sentinel (CMake rejects this; this catches a raw -D compile)");
+constexpr uint32_t kEJitFixedWorkerCore = EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE;
+#else
+constexpr uint32_t kEJitFixedWorkerCore = kEJitInvalidCoreId;
+#endif
+
 //===----------------------------------------------------------------------===//
 // Inline per-bucket reader/writer lock over the two POD words (same protocol as
 // EJitRwLock §3.2, but operating on shared-blob fields directly).
@@ -2030,6 +2048,11 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
   EJIT_DIAG("shared taskpool init: state=%p fingerprint=0x%llx",
             static_cast<void *>(state_),
             static_cast<unsigned long long>(regFingerprint_));
+#ifdef EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE
+  EJIT_DIAG("shared taskpool init: fixed worker core=%u (open election "
+            "disabled; this core=%u)",
+            kEJitFixedWorkerCore, EJitCoreId::current());
+#endif
 
   // Bounded retry so an in-progress peer never deadlocks us.
   constexpr uint32_t kMaxSpins = 1u << 20;
@@ -2037,6 +2060,22 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
     uint32_t st = state_->initState.loadAcquire();
     switch (static_cast<EJitSharedInitState>(st)) {
     case EJitSharedInitState::Uninitialized: {
+      // Fixed worker core: only the designated core may claim the blob. A peer
+      // that activates FIRST (bring-up order is unspecified) must not win the
+      // election - it waits for the designated core to run its own init, with
+      // the same bounded yield protocol the Initializing case uses, so a
+      // high-priority peer never starves the designated core. The budget
+      // expiring means the deployment never activated the designated core: fail
+      // init cleanly (never hang, never silently elect a core the build pinned
+      // the worker away from). A peer never counts as an election attempt.
+      if (kEJitFixedWorkerCore != kEJitInvalidCoreId &&
+          EJitCoreId::current() != kEJitFixedWorkerCore) {
+        if (workerIdle_)
+          workerIdle_(workerIdleCtx_, 1); // single yield while waiting
+        else
+          cpuRelax();
+        break; // re-observe
+      }
       state_->initAttempts.fetchAdd(1);
       uint32_t expected =
           static_cast<uint32_t>(EJitSharedInitState::Uninitialized);
@@ -2160,7 +2199,17 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       return InitResult::OwnerFailed;
     }
   }
+#ifdef EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE
+  // Two causes funnel here under a fixed worker core: the designated core never
+  // activated (pool still Uninitialized), or it won the CAS but never reached
+  // Ready within the budget (engine build too slow). Both are "the designated
+  // owner did not come up" from this peer's point of view.
+  EJIT_DIAG("shared taskpool init FAILED: designated worker core=%u did not "
+            "reach Ready after spins (state=%u)",
+            kEJitFixedWorkerCore, state_->initState.loadAcquire());
+#else
   EJIT_DIAG("shared taskpool init FAILED: peer still initializing after spins");
+#endif
   return InitResult::InitInProgress; // peer still initializing; pending, no
                                      // hang.
 }

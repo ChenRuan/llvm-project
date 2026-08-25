@@ -935,6 +935,30 @@ endif()
 # address or run stale I-cache.
 option(EJIT_SRE_SHARED_CODE_POINTERS
   "Allow non-owner cores to read shared cache fnPtrs (requires platform same-VA + cache coherence)" OFF)
+# Fixed worker core: pin the shared taskpool's single worker to ONE designated
+# core instead of the open CAS election. Empty (default) = first core to
+# activate wins ownership and runs the worker on its own core. When set (to a
+# core id as reported by the platform's ejit_sre_current_core_id), ONLY that
+# core may win the owner election (build the engine + create the worker task);
+# every other core waits - bounded, yielding, never hanging - for the
+# designated core to initialize, then attaches as a peer. Deployment contract:
+# the designated core MUST also activate the JIT (create an EJit instance in
+# Async mode) at bring-up; otherwise every peer's init eventually fails cleanly
+# rather than silently electing a core the build pinned the worker away from.
+set(EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE "" CACHE STRING
+  "Fixed worker core id for the shared taskpool owner election (empty = open CAS election)")
+# Truthiness trap: CMake's if(<var>) treats the string "0" as FALSE, and 0 is a
+# valid (and the most natural) core id - so EVERY check on this variable must
+# test non-EMPTY explicitly, never bare truthiness, or -D...=0 silently builds
+# the open election while the summary prints workerCore=0.
+if(NOT (EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE STREQUAL ""))
+  ejit_require_numeric(EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE)
+  if(EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE GREATER 4294967294)
+    message(FATAL_ERROR
+      "EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE (${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE}) "
+      "must be < 4294967295 (0xFFFFFFFF is the reserved kEJitInvalidCoreId sentinel).")
+  endif()
+endif()
 # Section attribute placing the shared state blob into inter-core shared memory.
 # Empty on host (one address space already). Override per platform, e.g.
 #   -DEJIT_SHARED_SECTION_ATTR=__attribute__((section(\".ejit_shared\")))
@@ -998,6 +1022,7 @@ if(EJIT_SRE_SHARED_TASKPOOL)
   message(STATUS "EmbeddedJIT: cross-core shared taskpool enabled "
                  "(cacheSlots=${EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS}, "
                  "workerStack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}, "
+                 "workerCore=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE}, "
                  "platformCoreId=${EJIT_FREESTANDING}, "
                  "codePointers=${EJIT_SRE_SHARED_CODE_POINTERS}, "
                  "sharedSection=${_ejit_shared_section}, "
@@ -1007,6 +1032,15 @@ endif()
 if(EJIT_SRE_TASKPOOL_NO_RECLAIM AND NOT EJIT_SRE_SHARED_TASKPOOL)
   message(FATAL_ERROR
     "EJIT_SRE_TASKPOOL_NO_RECLAIM requires EJIT_SRE_SHARED_TASKPOOL=ON")
+endif()
+
+# The fixed worker core closes the shared taskpool's owner election to one
+# designated core, so it is meaningless without the shared taskpool. Non-empty
+# test, not truthiness: "0" is a valid core id (see the trap note above).
+if(NOT (EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE STREQUAL "") AND
+   NOT EJIT_SRE_SHARED_TASKPOOL)
+  message(FATAL_ERROR
+    "EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE requires EJIT_SRE_SHARED_TASKPOOL=ON")
 endif()
 
 # The fixed region is process-global, but its bump cursor belongs to one
