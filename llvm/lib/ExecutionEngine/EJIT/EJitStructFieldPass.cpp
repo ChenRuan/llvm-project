@@ -18,8 +18,10 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <limits>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -76,6 +78,7 @@ void EJitStructFieldPass::initFromModule(Module &M) {
       mayConstFieldMap_[&GV] = std::move(offsets);
   }
 
+  initBoundArgumentPropagation(M);
   mapsBuilt_ = true;
 #ifdef EJIT_DIAG_ENABLE
   EJIT_DIAG_DEBUG("struct-field initFromModule module=%s globals=%zu "
@@ -125,55 +128,27 @@ static bool functionBindsArgument(const Function &F, unsigned ArgIndex) {
   return false;
 }
 
-static std::optional<uint64_t> accumulateArgumentOffset(const DataLayout &DL,
-                                                        const Value *PtrOp,
-                                                        const Argument *Root);
-
-static bool isBoundMayConstLoad(LoadInst *LI, const Function &F,
-                                unsigned ArgIndex, const DataLayout &DL) {
-  if (LI->isVolatile() || LI->isAtomic() || ArgIndex >= F.arg_size())
-    return false;
-  const Argument *Root = findRootArgument(LI->getPointerOperand());
-  if (!Root || Root->getArgNo() != ArgIndex)
-    return false;
-  if (LI->hasMetadata(MD_EJIT_MAY_CONST))
-    return true;
-
-  auto Offset = accumulateArgumentOffset(DL, LI->getPointerOperand(), Root);
-  TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
-  if (!Offset || AccessSize.isScalable())
-    return false;
-
+static MDNode *getBoundArgumentMetadata(const Function &F,
+                                        unsigned ArgIndex) {
   MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
   if (!MD)
-    return false;
+    return nullptr;
   for (const MDOperand &Op : MD->operands()) {
     auto *Sub = dyn_cast<MDNode>(Op.get());
     if (!Sub || Sub->getNumOperands() < 4)
       continue;
     auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
     auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
-    if (!Tag || Tag->getString() != TAG_EJIT_BOUND_PTR || !Idx ||
-        Idx->getZExtValue() != ArgIndex)
-      continue;
-    for (unsigned I = 4; I < Sub->getNumOperands(); ++I) {
-      auto *Field = dyn_cast<MDNode>(Sub->getOperand(I));
-      if (!Field || Field->getNumOperands() != 2)
-        continue;
-      auto *FieldOffset =
-          mdconst::dyn_extract<ConstantInt>(Field->getOperand(0));
-      auto *FieldSize = mdconst::dyn_extract<ConstantInt>(Field->getOperand(1));
-      if (FieldOffset && FieldSize) {
-        uint64_t Begin = FieldOffset->getZExtValue();
-        uint64_t Size = FieldSize->getZExtValue();
-        if (*Offset >= Begin && *Offset - Begin <= Size &&
-            AccessSize.getFixedValue() <= Size - (*Offset - Begin))
-          return true;
-      }
-    }
+    if (Tag && Tag->getString() == TAG_EJIT_BOUND_PTR && Idx &&
+        Idx->getZExtValue() == ArgIndex)
+      return Sub;
   }
-  return false;
+  return nullptr;
 }
+
+static std::optional<uint64_t> accumulateArgumentOffset(const DataLayout &DL,
+                                                        const Value *PtrOp,
+                                                        const Argument *Root);
 
 /// If all GEP indices are ConstantInt, compute the cumulative byte offset.
 /// Returns std::nullopt if any index is not constant.
@@ -233,6 +208,173 @@ static std::optional<uint64_t> accumulateArgumentOffset(const DataLayout &DL,
     PtrOp = GEP->getPointerOperand();
   }
   return std::nullopt;
+}
+
+static std::optional<uint64_t> getBoundSnapshotOffset(
+    const Value *V, const DenseMap<const Argument *, uint64_t> &BoundArguments,
+    const DataLayout &DL) {
+  const Argument *Root = findRootArgument(V);
+  if (!Root)
+    return std::nullopt;
+  auto It = BoundArguments.find(Root);
+  if (It == BoundArguments.end())
+    return std::nullopt;
+  auto Relative = accumulateArgumentOffset(DL, V, Root);
+  if (!Relative ||
+      It->second > std::numeric_limits<uint64_t>::max() - *Relative)
+    return std::nullopt;
+  return It->second + *Relative;
+}
+
+static Function *getDirectCallee(CallBase &CB) {
+  return dyn_cast<Function>(CB.getCalledOperand()->stripPointerCasts());
+}
+
+void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
+  boundArguments_.clear();
+  boundMayConstFields_.clear();
+  if (!boundData_ || !boundSize_)
+    return;
+
+  Function *Root = nullptr;
+  if (!boundRootFunction_.empty()) {
+    Root = M.getFunction(boundRootFunction_);
+  } else {
+    // Direct pass users may omit the root name. Infer it only when the module
+    // contains a unique matching bound parameter.
+    for (Function &F : M) {
+      if (!functionBindsArgument(F, boundArgIndex_))
+        continue;
+      if (Root) {
+        Root = nullptr;
+        break;
+      }
+      Root = &F;
+    }
+  }
+  if (!Root || Root->isDeclaration() || boundArgIndex_ >= Root->arg_size() ||
+      !functionBindsArgument(*Root, boundArgIndex_))
+    return;
+
+  Argument *RootArgument = Root->getArg(boundArgIndex_);
+  if (!RootArgument->getType()->isPointerTy())
+    return;
+  boundArguments_[RootArgument] = 0;
+
+  if (MDNode *BoundMD = getBoundArgumentMetadata(*Root, boundArgIndex_)) {
+    for (unsigned I = 4; I < BoundMD->getNumOperands(); ++I) {
+      auto *Field = dyn_cast<MDNode>(BoundMD->getOperand(I));
+      if (!Field || Field->getNumOperands() != 2)
+        continue;
+      auto *Offset = mdconst::dyn_extract<ConstantInt>(Field->getOperand(0));
+      auto *Size = mdconst::dyn_extract<ConstantInt>(Field->getOperand(1));
+      if (Offset && Size)
+        boundMayConstFields_.push_back(
+            {Offset->getZExtValue(), Size->getZExtValue()});
+    }
+  }
+
+  const DataLayout &DL = M.getDataLayout();
+  SmallVector<CallBase *, 32> DirectCalls;
+  DenseMap<const Function *, SmallVector<CallBase *, 4>> CallsByCallee;
+  for (Function &Caller : M) {
+    if (Caller.isDeclaration())
+      continue;
+    for (BasicBlock &BB : Caller) {
+      for (Instruction &I : BB) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB)
+          continue;
+        Function *Callee = getDirectCallee(*CB);
+        if (!Callee || Callee->isDeclaration())
+          continue;
+        DirectCalls.push_back(CB);
+        CallsByCallee[Callee].push_back(CB);
+      }
+    }
+  }
+
+  bool Changed;
+  do {
+    Changed = false;
+    for (CallBase *CB : DirectCalls) {
+      Function *Callee = getDirectCallee(*CB);
+      unsigned Count =
+          std::min<unsigned>(CB->arg_size(), Callee->arg_size());
+      for (unsigned ArgIndex = 0; ArgIndex < Count; ++ArgIndex) {
+        Argument *Formal = Callee->getArg(ArgIndex);
+        if (!Formal->getType()->isPointerTy())
+          continue;
+        auto Offset = getBoundSnapshotOffset(CB->getArgOperand(ArgIndex),
+                                             boundArguments_, DL);
+        if (!Offset || *Offset >= boundSize_)
+          continue;
+        Changed |= boundArguments_.try_emplace(Formal, *Offset).second;
+      }
+    }
+  } while (Changed);
+
+  // A callee is safe only if every call represented in this specialization
+  // module passes the same snapshot-derived pointer to that formal argument.
+  // Prune to a fixed point so ambiguity in an upper helper also removes all
+  // mappings derived through it further down the chain.
+  do {
+    Changed = false;
+    SmallVector<const Argument *, 8> Invalid;
+    for (const auto &[Formal, ExpectedOffset] : boundArguments_) {
+      if (Formal == RootArgument)
+        continue;
+      const Function *Callee = Formal->getParent();
+      if (Callee->hasAddressTaken()) {
+        Invalid.push_back(Formal);
+        continue;
+      }
+      bool SawCall = false;
+      bool AllMatch = true;
+      auto CallsIt = CallsByCallee.find(Callee);
+      if (CallsIt != CallsByCallee.end()) {
+        for (CallBase *CB : CallsIt->second) {
+          SawCall = true;
+          unsigned ArgIndex = Formal->getArgNo();
+          if (ArgIndex >= CB->arg_size()) {
+            AllMatch = false;
+            continue;
+          }
+          auto ActualOffset = getBoundSnapshotOffset(
+              CB->getArgOperand(ArgIndex), boundArguments_, DL);
+          if (!ActualOffset || *ActualOffset != ExpectedOffset)
+            AllMatch = false;
+        }
+      }
+      if (!SawCall || !AllMatch)
+        Invalid.push_back(Formal);
+    }
+    for (const Argument *Formal : Invalid)
+      Changed |= boundArguments_.erase(Formal);
+  } while (Changed);
+}
+
+static bool isBoundMayConstLoad(
+    LoadInst *LI, const DenseMap<const Argument *, uint64_t> &BoundArguments,
+    ArrayRef<std::pair<uint64_t, uint64_t>> MayConstFields,
+    const DataLayout &DL) {
+  if (LI->isVolatile() || LI->isAtomic())
+    return false;
+  auto Offset =
+      getBoundSnapshotOffset(LI->getPointerOperand(), BoundArguments, DL);
+  if (!Offset)
+    return false;
+  if (LI->hasMetadata(MD_EJIT_MAY_CONST))
+    return true;
+
+  TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
+  if (AccessSize.isScalable())
+    return false;
+  for (const auto &[Begin, Size] : MayConstFields)
+    if (*Offset >= Begin && *Offset - Begin <= Size &&
+        AccessSize.getFixedValue() <= Size - (*Offset - Begin))
+      return true;
+  return false;
 }
 
 /// Check whether a load is (or can be treated as) a may_const access.
@@ -516,17 +658,14 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   return nullptr;
 }
 
-static Constant *tryReplaceBoundPointer(LoadInst *LI, const Function &F,
-                                        const uint8_t *Data, uint32_t Size,
-                                        uint32_t ArgIndex,
-                                        const DataLayout &DL) {
-  if (!Data || !Size || ArgIndex >= F.arg_size() ||
-      !functionBindsArgument(F, ArgIndex))
+static Constant *tryReplaceBoundPointer(
+    LoadInst *LI, const uint8_t *Data, uint32_t Size,
+    const DenseMap<const Argument *, uint64_t> &BoundArguments,
+    const DataLayout &DL) {
+  if (!Data || !Size)
     return nullptr;
-  const Argument *Root = findRootArgument(LI->getPointerOperand());
-  if (!Root || Root->getArgNo() != ArgIndex)
-    return nullptr;
-  auto Offset = accumulateArgumentOffset(DL, LI->getPointerOperand(), Root);
+  auto Offset =
+      getBoundSnapshotOffset(LI->getPointerOperand(), BoundArguments, DL);
   TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
   if (!Offset || AccessSize.isScalable() || *Offset > Size ||
       AccessSize.getFixedValue() > Size - *Offset)
@@ -745,7 +884,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
         continue;
       }
 
-      bool BoundMayConst = isBoundMayConstLoad(LI, F, boundArgIndex_, DL);
+      bool BoundMayConst = isBoundMayConstLoad(
+          LI, boundArguments_, boundMayConstFields_, DL);
       if (!BoundMayConst && !isMayConstLoad(LI, mayConstFieldMap_, DL))
         continue;
 #ifdef EJIT_DIAG_ENABLE
@@ -762,8 +902,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       // from the owned snapshot; the pointer argument and all dynamic fields
       // remain live inputs to the specialization.
       if (!C)
-        C = tryReplaceBoundPointer(LI, F, boundData_, boundSize_,
-                                   boundArgIndex_, DL);
+        C = tryReplaceBoundPointer(LI, boundData_, boundSize_, boundArguments_,
+                                   DL);
 
       // Pattern 1: direct GlobalVariable load (scalar static variable).
       if (!C) {
