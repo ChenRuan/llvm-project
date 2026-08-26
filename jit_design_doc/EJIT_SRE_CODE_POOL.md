@@ -46,10 +46,11 @@ Pending 状态切换为 Ready。未封页的地址不会返回给业务核。
 
 Online-PGO 使用分层发布：Tier-1 立即编译到远端临时池并自动封固、发布，以便马上开始
 采样；达到阈值后，Tier-2 立即编译和 JITLink 到近端池，但保持 RW/NX 且仅保存在 owner
-私有队列中。此时共享 cache 和 inline cache 继续指向可执行的 Tier-1。worker 观察到共享
-编译队列排空后，自动封固整批 Tier-2 页面，并在封固成功后将 cache 和 inline cache 原子
-替换为 Tier-2。封固或 cache 发布失败时保留 Tier-1；可调用 `ejit_publish_pending_code()`
-显式重试，不会把不可执行的 Tier-2 地址暴露给业务核。
+私有队列中。此时共享 cache 仍保留可执行的 Tier-1 及其 counters，但采样达到阈值后的
+业务调用临时回退 AOT，不再继续承担整模块原子插桩开销；inline cache 仍不填 Tier-1。
+worker 观察到共享编译队列排空后，自动封固整批 Tier-2 页面，并在封固成功后将 cache 和
+inline cache 原子替换为 Tier-2。封固或 cache 发布失败时保留 Tier-1；可调用
+`ejit_publish_pending_code()` 显式重试，不会把不可执行的 Tier-2 地址暴露给业务核。
 批次封固前会把 bump cursor 推到下一页，因此已经 RX 的尾页不会再被写入；含 GOT、数据
 段或要求超过 16B 对齐的 allocation 自动保持原来的 4K 独占布局。
 

@@ -39,6 +39,8 @@
 
 > **v0.16 变更**:共享 taskpool 的 PGO admission 并发数由构建宏 `EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES` 控制，默认 1，合法范围 1..16。未获准函数不排编译任务，继续执行 AOT fallback；每个 admission slot 独立记录进度，并按 `current/total`（例如 `16/64`）输出里程碑。Tier-2 成功发布后释放对应名额；Tier-2 暂时失败时保留该名额和 Tier-1。共享 ABI 升至 v10。
 
+> **v0.17 变更**:Tier-1 根入口计数达到阈值后不再继续执行插桩版本；Tier-1 代码和 counters 保留给 Tier-2 profile 合成，但后续调用临时回退 AOT，直到 Tier-2 成功发布。`hitCount` 用 CAS 封顶，避免多核同时命中时明显超过配置的 64 次采样窗口。admission 名额仍在 Tier-2 发布后才释放，因此不会提前放入更多 Tier-1。
+
 ---
 
 ## 0. 背景与目标

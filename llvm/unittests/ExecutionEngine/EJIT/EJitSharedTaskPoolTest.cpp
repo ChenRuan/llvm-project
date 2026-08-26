@@ -1140,8 +1140,9 @@ TEST_F(SharedTaskPoolTest, BatchPgoTier2AutoPublishesWhenQueueDrains) {
   ASSERT_EQ(Owner.pendingCount(), 1u);
 
   // Tier-2 compiles and links immediately, but remains owner-private and RW/NX
-  // until the worker observes the compile queue empty. The shared slot keeps
-  // serving the already-executable Tier-1 pointer in the meantime.
+  // until the worker observes the compile queue empty. Tier-1 stays allocated
+  // for counter synthesis, but dispatch falls back to AOT once sampling is
+  // complete instead of continuing atomic instrumentation while waiting.
   ASSERT_TRUE(Owner.pollOne());
   EXPECT_EQ(Batch.flushCalls, 0u);
   ASSERT_EQ(Batch.compileOrder.size(), 2u);
@@ -1150,10 +1151,9 @@ TEST_F(SharedTaskPoolTest, BatchPgoTier2AutoPublishesWhenQueueDrains) {
   EXPECT_EQ(Owner.pendingCount(), 1u);
 
   auto StillTier1 = Owner.tryCacheHit0D(46);
-  ASSERT_EQ(StillTier1.status, EJitCompileOrGetStatus::CacheHit);
-  EXPECT_EQ(StillTier1.fnPtr, Tier1.fnPtr);
-  if (StillTier1.hasReadToken)
-    Owner.releaseRead(StillTier1.bucketIndex);
+  EXPECT_EQ(StillTier1.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(StillTier1.fnPtr, nullptr);
+  EXPECT_TRUE(StillTier1.fastPathTerminal);
 
 #ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
   EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
@@ -5543,6 +5543,21 @@ TEST_F(SharedTaskPoolTest, SharedPgoHitThresholdArmsTier2Recompile) {
     EXPECT_EQ(s->hitCount.loadRelaxed(), 2u);
   }
 
+  // Sampling is complete, but Tier-2 has not compiled yet. Further calls must
+  // use AOT instead of continuing to execute the atomic-instrumented Tier-1.
+  // The counter stays capped at the configured sample count.
+  auto waiting = pool.compileOrGet(5, d0, 1, codeFor(5));
+  EXPECT_EQ(waiting.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(waiting.fnPtr, codeFor(5));
+  EXPECT_EQ(pool.pendingCount(), 1u);
+  {
+    EJitSharedCacheSlot *s = findReadySlot(5);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->hitCount.loadRelaxed(), 2u);
+    EXPECT_EQ(s->tier.loadRelaxed(),
+              static_cast<uint8_t>(kEJitTierInstrumented));
+  }
+
   // The owner worker consumes the shared queue: pollOne() pops the Tier-2
   // request and compiles it (returns true — the Tier-2 travelled through the
   // ring, it is NOT a facade-local inline bypass).  runCompile() derives the
@@ -5560,6 +5575,12 @@ TEST_F(SharedTaskPoolTest, SharedPgoHitThresholdArmsTier2Recompile) {
     EXPECT_EQ(s->tier.loadRelaxed(),
               static_cast<uint8_t>(kEJitTierPgoUse)); // slot now Tier-2
   }
+
+  auto final = pool.compileOrGet(5, d0, 1, codeFor(5));
+  EXPECT_EQ(final.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_NE(final.fnPtr, codeFor(5));
+  if (final.hasReadToken)
+    pool.releaseRead(final.bucketIndex);
 }
 
 TEST_F(SharedTaskPoolTest, SharedPgoProfilesFunctionsSequentially) {
@@ -6327,6 +6348,71 @@ TEST_F(SharedTaskPoolTest, MultiplePeersTriggerOnlyOneTier2) {
   EJitSharedCacheSlot *s = findReadySlot(5);
   ASSERT_NE(s, nullptr);
   EXPECT_EQ(s->tier.loadRelaxed(), static_cast<uint8_t>(kEJitTierPgoUse));
+}
+
+TEST_F(SharedTaskPoolTest, ConcurrentPeersCapTier1AtConfiguredSampleCount) {
+  constexpr uint32_t kThreads = 8;
+  constexpr uint32_t kCallsPerThread = 32;
+  constexpr uint32_t kThreshold = 64;
+
+  EJitSharedTaskPool owner;
+  PgoRecorder rec;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompileRecordPgo, &rec);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setCodeSharingEnabled(true);
+  owner.setPgoEnabled(true, kThreshold);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(owner.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  std::atomic<uint32_t> ready{0};
+  std::atomic<bool> go{false};
+  std::atomic<uint32_t> tier1Calls{0};
+  std::atomic<uint32_t> aotCalls{0};
+  std::atomic<uint32_t> unexpected{0};
+  std::vector<std::thread> peers;
+  for (uint32_t thread = 0; thread < kThreads; ++thread) {
+    peers.emplace_back([&, thread] {
+      EJitCoreId::setCurrentForTest(thread + 1);
+      ready.fetch_add(1, std::memory_order_release);
+      while (!go.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      for (uint32_t call = 0; call < kCallsPerThread; ++call) {
+        auto result = owner.compileOrGet(5, nullptr, 0, codeFor(5));
+        if (result.status == EJitCompileOrGetStatus::CacheHit) {
+          tier1Calls.fetch_add(1, std::memory_order_relaxed);
+          if (result.hasReadToken)
+            owner.releaseRead(result.bucketIndex);
+        } else if (result.status == EJitCompileOrGetStatus::AlreadyPending &&
+                   result.fnPtr == codeFor(5)) {
+          aotCalls.fetch_add(1, std::memory_order_relaxed);
+        } else
+          unexpected.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != kThreads)
+    std::this_thread::yield();
+  go.store(true, std::memory_order_release);
+  for (auto &peer : peers)
+    peer.join();
+
+  EXPECT_EQ(tier1Calls.load(), kThreshold);
+  EXPECT_EQ(aotCalls.load(), kThreads * kCallsPerThread - kThreshold);
+  EXPECT_EQ(unexpected.load(), 0u);
+  EJitSharedCacheSlot *slot = findReadySlot(5);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->hitCount.loadRelaxed(), kThreshold);
+  EXPECT_EQ(slot->tier.loadRelaxed(),
+            static_cast<uint8_t>(kEJitTierInstrumented));
+  EXPECT_EQ(owner.pendingCount(), 1u);
+
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_EQ(rec.tier2, 1);
 }
 
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM

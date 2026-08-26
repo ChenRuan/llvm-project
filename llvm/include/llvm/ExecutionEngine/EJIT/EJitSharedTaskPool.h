@@ -1149,6 +1149,11 @@ private:
     uint32_t bucketIndex = 0;
     bool hasReadToken = false;
     bool readyButNotShareable = false;
+    /// The instrumented Tier-1 has collected its configured number of root
+    /// samples and Tier-2 is queued/compiling. Keep the Tier-1 allocation and
+    /// counters alive for profile synthesis, but route calls back to AOT until
+    /// Tier-2 publication replaces the slot.
+    bool pgoSamplingComplete = false;
     /// EJIT_SRE_TASKPOOL_NO_RECLAIM only: a validated seqlock hit that holds NO
     /// read token. classifyHit() treats it as a CacheHit; bucketIndex is the
     /// out-of-range sentinel (kEJitSharedCacheBuckets) so the wrapper's

@@ -1408,8 +1408,33 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
   if (state_->pgoEnabled.loadAcquire()) {
     uint8_t slotTier = Slot.tier.loadRelaxed();
     if (slotTier < kEJitTierPgoUse) {
-      uint64_t prev = Slot.hitCount.fetchAdd(1);
       uint32_t threshold = state_->tier2Threshold.loadAcquire();
+      uint64_t sampleIndex = 0;
+      if (slotTier == kEJitTierInstrumented && threshold) {
+        // Cap Tier-1 execution at the requested number of root samples. A
+        // plain fetchAdd lets peer cores overshoot, and continuing to dispatch
+        // Tier-1 while a large Tier-2 waits/compiles keeps every instrumented
+        // function in that module doing atomic counter updates for no benefit.
+        uint64_t observed = Slot.hitCount.loadRelaxed();
+        while (observed < threshold &&
+               !Slot.hitCount.compareExchange(observed, observed + 1)) {
+        }
+        if (observed >= threshold) {
+          // Retry the enqueue on every saturated lookup if a previous attempt
+          // lost to queue pressure. dedupMark makes the normal pending case a
+          // cheap no-op. The slot and Tier-1 code remain intact because Tier-2
+          // profile synthesis still reads their counter storage.
+          enqueueTier2FromSlot(Slot);
+#ifndef EJIT_SRE_TASKPOOL_NO_RECLAIM
+          bucketReadRelease(B);
+#endif
+          R.pgoSamplingComplete = true;
+          return R;
+        }
+        sampleIndex = observed + 1;
+      } else {
+        sampleIndex = Slot.hitCount.fetchAdd(1) + 1;
+      }
       uint32_t admissionSlot = kEJitSharedMaxConcurrentProfiles;
       if (slotTier == kEJitTierInstrumented && threshold) {
         const uint32_t encoded = Slot.funcIndex + 1;
@@ -1422,7 +1447,7 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
       }
       if (admissionSlot != kEJitSharedMaxConcurrentProfiles) {
         uint32_t quarter = static_cast<uint32_t>(
-            std::min<uint64_t>(4, ((prev + 1) * 4) / threshold));
+            std::min<uint64_t>(4, (sampleIndex * 4) / threshold));
         uint32_t oldQuarter =
             state_->pgoProgressQuarters[admissionSlot].loadRelaxed();
         while (quarter > oldQuarter &&
@@ -1431,12 +1456,18 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
         }
         if (quarter > oldQuarter)
           EJIT_DIAG("PGO profile progress func=%u: %llu/%u", Slot.funcIndex,
-                    static_cast<unsigned long long>(prev + 1), threshold);
+                    static_cast<unsigned long long>(sampleIndex), threshold);
       }
       // >= (not ==): if the enqueue fails (queue full / already pending),
       // the next hit can still arm — a transient failure is not fatal (§7).
-      if (threshold && prev + 1 >= threshold)
+      if (threshold && sampleIndex >= threshold) {
         enqueueTier2FromSlot(Slot);
+        if (slotTier == kEJitTierInstrumented && sampleIndex == threshold)
+          EJIT_DIAG("PGO sampling complete func=%u: %llu/%u; routing AOT "
+                    "until Tier-2 publish",
+                    Slot.funcIndex,
+                    static_cast<unsigned long long>(sampleIndex), threshold);
+      }
     }
   }
 
@@ -2996,6 +3027,14 @@ EJitSharedTaskPool::classifyHit(const SharedLookup &Hit) {
     // pointer; fall back cleanly WITHOUT re-enqueuing (avoids recompile churn).
     R.status = EJitCompileOrGetStatus::OffMode;
     R.readyButNotShareable = true;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  if (Hit.pgoSamplingComplete) {
+    // Tier-1 has enough data. Do not enter compileOrGet() again: Tier-2 already
+    // owns the per-function dedup claim, and the wrapper should execute its AOT
+    // fallback until the final code is published.
+    R.status = EJitCompileOrGetStatus::AlreadyPending;
     R.fastPathTerminal = true;
     return R;
   }
