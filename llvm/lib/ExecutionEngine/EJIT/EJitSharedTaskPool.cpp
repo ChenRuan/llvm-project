@@ -190,8 +190,7 @@ inline void markPostPublishSeen(EJitSharedCacheSlot &Slot) {
 #ifdef EJIT_STATS_ENABLE
   if (Slot.postPublishSeen.loadRelaxed() != 0)
     return;
-  uint8_t Expected = 0;
-  (void)Slot.postPublishSeen.compareExchange(Expected, 1);
+  Slot.postPublishSeen.storeRelaxed(1);
 #else
   (void)Slot;
 #endif
@@ -3073,7 +3072,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     // All profiling slots are occupied. Keep this miss on the AOT fallback
     // and do not add work to the compiler queue.
     dedupClear(funcIndex, gen);
-    R.status = EJitCompileOrGetStatus::AlreadyPending;
+    R.status = EJitCompileOrGetStatus::PgoAdmissionDeferred;
     return R;
   }
 #ifdef EJIT_SRE_TASKPOOL_TESTING

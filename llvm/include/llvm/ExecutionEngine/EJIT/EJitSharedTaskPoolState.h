@@ -231,10 +231,11 @@ struct EJitSharedCacheSlot {
   /// Used to suppress the Tier-2 auto-trigger on slots that are already
   /// Tier-2 — a Tier-2 hit should never request another Tier-2 compile.
   EJitAtomicU8 tier;
-  /// Diagnostics (v14): set once when this published version successfully
+  /// Diagnostics (v15): set once when this published version successfully
   /// returns its JIT pointer through the taskpool lookup path. The async call
   /// that requested compilation does not set it, so zero identifies a version
-  /// that has not been reused after publish. Compiled out unless stats are on.
+  /// that has not been reused after publish. The ABI field is always present;
+  /// it is meaningful only when EJIT_STATS_ENABLE updates it.
   EJitAtomicU8 postPublishSeen;
 };
 

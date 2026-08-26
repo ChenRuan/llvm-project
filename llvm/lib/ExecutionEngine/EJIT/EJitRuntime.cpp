@@ -796,6 +796,10 @@ static ejit_status_t taskpoolStatus(EJitCompileOrGetStatus s) {
   case EJitCompileOrGetStatus::EnqueuedPending:
   case EJitCompileOrGetStatus::AlreadyPending:
     return EJIT_PENDING;
+  case EJitCompileOrGetStatus::PgoAdmissionDeferred:
+    // No work was queued. Surface a clean resource-limit fallback instead of
+    // claiming that an asynchronous compilation is pending.
+    return EJIT_ERR_QUEUE_FULL;
   case EJitCompileOrGetStatus::QueueFullFallback:
     return EJIT_ERR_QUEUE_FULL;
   case EJitCompileOrGetStatus::OffMode:

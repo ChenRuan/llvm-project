@@ -451,6 +451,12 @@ void detail::renderDumpModuleIR(const Module &M, std::string &out) {
   OS.flush();
 }
 
+bool detail::shouldCaptureDump(CompileTier tier, StringRef filter,
+                               StringRef fnName) {
+  return tier != CompileTier::Instrumented && !filter.empty() &&
+         (filter == "*" || filter == fnName);
+}
+
 /// Clone a diagnostic codegen module with only the requested function body.
 /// Other function definitions become declarations, preserving the target
 /// function's calls while avoiding a second codegen of its whole closure.
@@ -800,9 +806,8 @@ EJitOrcEngine::Create(const Config &config,
             // already expensive diagnostic ASM codegen and lengthens the
             // lifecycle race window before publish. The public dump APIs show
             // executable final code: Baseline when PGO is off, Tier-2 when on.
-            bool finalTier = ctx->tier != CompileTier::Instrumented;
-            bool match = finalTier && hasFilter &&
-                         (DumpFilter == "*" || ctx->fnName == DumpFilter);
+            bool match = hasFilter && detail::shouldCaptureDump(
+                                          ctx->tier, DumpFilter, ctx->fnName);
             EJIT_DIAG_DEBUG("dump check filter=%s fn=%s key_hi=0x%08x "
                             "key_lo=0x%08x match=%d &filter=%p",
                             hasFilter ? DumpFilter.c_str() : "(off)",

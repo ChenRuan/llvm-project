@@ -4919,7 +4919,7 @@ TEST_F(SharedTaskPoolTest, SharedPgoProfilesFunctionsSequentially) {
 
   // A different function stays on its AOT fallback and adds no compiler work.
   auto deferred = pool.compileOrGet(6, nullptr, 0, codeFor(6));
-  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::PgoAdmissionDeferred);
   EXPECT_EQ(deferred.fnPtr, codeFor(6));
   EXPECT_EQ(state_->enqueuePos.loadRelaxed() - state_->dequeuePos.loadRelaxed(),
             1u);
@@ -4973,7 +4973,7 @@ TEST_F(SharedTaskPoolTest, SharedPgoProfilesOneVersionPerFunctionAtATime) {
 
   ASSERT_TRUE(pool.pollOne()); // Publish d0 Tier-1.
   deferred = pool.compileOrGet(5, d1, 1, codeFor(5));
-  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::PgoAdmissionDeferred);
   EXPECT_EQ(pool.pendingCount(), 0u);
   EXPECT_EQ(state_->pgoDeferredMisses.loadRelaxed(), 1u);
 
@@ -5031,7 +5031,7 @@ TEST_F(SharedTaskPoolTest, SharedPgoHonorsConcurrentProfileLimit) {
   EXPECT_EQ(state_->pgoMaxActiveFunctions.loadAcquire(), 2u);
 
   auto deferred = pool.compileOrGet(7, nullptr, 0, codeFor(7));
-  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::PgoAdmissionDeferred);
   EXPECT_EQ(deferred.fnPtr, codeFor(7));
   ASSERT_TRUE(pool.pollOne());
   ASSERT_TRUE(pool.pollOne());
@@ -5108,7 +5108,7 @@ TEST_F(SharedTaskPoolTest,
     if (first[i].status == EJitCompileOrGetStatus::EnqueuedPending) {
       ++admitted;
     } else {
-      EXPECT_EQ(first[i].status, EJitCompileOrGetStatus::AlreadyPending);
+      EXPECT_EQ(first[i].status, EJitCompileOrGetStatus::PgoAdmissionDeferred);
       EXPECT_EQ(first[i].fnPtr, codeFor(kFuncIndices[i]));
       deferred = i;
     }
@@ -5162,7 +5162,7 @@ TEST_F(SharedTaskPoolTest,
     producer.join();
 
   EXPECT_EQ(profile[deferred][0].status,
-            EJitCompileOrGetStatus::AlreadyPending);
+            EJitCompileOrGetStatus::PgoAdmissionDeferred);
   EXPECT_EQ(profile[deferred][0].fnPtr, codeFor(kFuncIndices[deferred]));
   EXPECT_EQ(owner.pendingCount(), 2u);
   uint32_t profilesAtThreshold = 0;

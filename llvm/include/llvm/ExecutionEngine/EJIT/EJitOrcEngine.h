@@ -34,6 +34,7 @@ class PeriodArrayRegistry;
 class EJitRuntimeState;
 struct EJitSharedTaskPoolState;
 struct EJitVpFunctionInfo; // defined in EJitOptimizer.h (value-profile capture)
+enum class CompileTier : uint8_t;
 
 namespace detail {
 /// Render one function definition without the rest of its specialization
@@ -41,6 +42,9 @@ namespace detail {
 /// ejit_dump_* APIs.
 bool renderDumpFunctionIR(const Module &M, StringRef fnName, std::string &out);
 void renderDumpModuleIR(const Module &M, std::string &out);
+/// Return whether a filtered dump should capture this compilation tier.
+/// Instrumented Tier-1 is temporary and must never replace a final dump.
+bool shouldCaptureDump(CompileTier tier, StringRef filter, StringRef fnName);
 } // namespace detail
 
 /// Set a function-name filter for JIT IR+ASM diagnostic capture. When non-
