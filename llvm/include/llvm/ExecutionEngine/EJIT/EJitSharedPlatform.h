@@ -98,7 +98,9 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// the shared blob also records completed-function and deferred-miss counts.
 /// v13: non-owner cores can post a may_const-ranking diagnostic request to the
 /// owner worker and wait for its completion without sharing optimizer objects.
-constexpr uint32_t kEJitSharedAbiVersion = 13u;
+/// v14: each cache slot records whether its published JIT pointer was resolved
+/// by a later taskpool lookup, diagnosing compiled versions with no reuse.
+constexpr uint32_t kEJitSharedAbiVersion = 14u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;
