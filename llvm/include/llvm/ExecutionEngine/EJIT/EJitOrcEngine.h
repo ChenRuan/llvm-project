@@ -47,9 +47,10 @@ void renderDumpModuleIR(const Module &M, std::string &out);
 /// empty, the engine captures (saves in memory) the post-optimization IR and
 /// emitted assembly for both the matching entry function and its complete
 /// specialization module, the next time it is compiled. "*" matches every
-/// specialization. Empty/null disables further capture (already-captured
-/// entries are retained). Use printDumped() for the entry-only view and
-/// printDumpedModule() for the complete module.
+/// specialization. With staged PGO, temporary Instrumented code is skipped and
+/// the final Tier-2 code is captured. Empty/null disables further capture
+/// (already-captured entries are retained). Use printDumped() for the entry-only
+/// view and printDumpedModule() for the complete module.
 void setDumpFuncFilter(const std::string &name);
 
 /// Bind the optional shared taskpool dump state. In a shared-taskpool build

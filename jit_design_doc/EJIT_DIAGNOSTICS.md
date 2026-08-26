@@ -193,7 +193,7 @@ void ejit_print_dumped(const char *name);// 打印 entry 函数视图；NULL/"" 
 void ejit_print_dumped_module(const char *name); // 打印完整特化模块视图
 ```
 
-运行时按函数名过滤捕获后续 JIT 编译产生的**优化后 IR 与汇编**，再通过 RAW 诊断输出逐行回读。`ejit_print_dumped(name)` 只显示指定 entry 函数，便于聚焦单函数；`ejit_print_dumped_module(name)` 显示该 entry 对应的完整特化模块，包括模块中保留的被调函数。
+运行时按函数名过滤捕获后续 JIT 编译产生的**优化后 IR 与汇编**，再通过 RAW 诊断输出逐行回读。在线 PGO 开启时会跳过临时 Tier-1 插桩代码，只捕获最终发布的 Tier-2；这样不会因诊断汇编生成而额外拉长 Tier-1 的生命周期竞争窗口。`ejit_print_dumped(name)` 只显示指定 entry 函数，便于聚焦单函数；`ejit_print_dumped_module(name)` 显示该 entry 对应的完整特化模块，包括模块中保留的被调函数。
 
 > - 捕获为**精确名匹配**，`"*"` 例外（捕获全部）。
 > - 每次捕获同时保存单函数视图和完整模块视图；同名函数重新编译时替换旧记录。

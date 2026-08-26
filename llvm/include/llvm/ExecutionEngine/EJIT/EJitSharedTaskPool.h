@@ -744,7 +744,9 @@ public:
     return pgoEnabled_.loadRelaxed() != 0;
   }
 
-  /// Return true when this miss may start/continue a staged PGO function.
+  /// Return true when this miss may start a staged PGO function. Only one
+  /// specialization of a funcIndex may own admission at a time; later versions
+  /// stay on AOT until the current Tier-2 finishes.
   bool admitPgoFunction(uint32_t funcIndex, bool &newlyAdmitted);
 
   //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
@@ -1263,7 +1265,8 @@ private:
   /// Release staged-PGO ownership if \p funcIndex still owns it. Tier-2
   /// completion and terminal worker failures call this; transient queue-full
   /// leaves ownership intact so the next hit can retry.
-  void finishPgoFunction(uint32_t funcIndex, bool completed);
+  void finishPgoFunction(uint32_t funcIndex, bool completed,
+                         const char *reason = nullptr);
 
   /// Owner-only: snapshot the owner-core code-pool stats via the registered
   /// provider and storeRelaxed them into the shared mirror. Called after every

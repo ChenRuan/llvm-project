@@ -4952,6 +4952,46 @@ TEST_F(SharedTaskPoolTest, SharedPgoProfilesFunctionsSequentially) {
   EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 7u);
 }
 
+TEST_F(SharedTaskPoolTest, SharedPgoProfilesOneVersionPerFunctionAtATime) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setPgoEnabled(true, 2, /*maxConcurrentProfiles=*/2);
+  pool.setInstanceEnabled(1, 4, true);
+  pool.setInstanceEnabled(1, 5, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+  EJitDimPair d1[1] = {dim(1, 5)};
+
+  ASSERT_EQ(pool.compileOrGet(5, d0, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  auto deferred = pool.compileOrGet(5, d1, 1, codeFor(5));
+  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(deferred.fnPtr, codeFor(5));
+  EXPECT_EQ(pool.pendingCount(), 1u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+  EXPECT_EQ(state_->pgoDeferredMisses.loadRelaxed(), 0u);
+
+  ASSERT_TRUE(pool.pollOne()); // Publish d0 Tier-1.
+  deferred = pool.compileOrGet(5, d1, 1, codeFor(5));
+  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(pool.pendingCount(), 0u);
+  EXPECT_EQ(state_->pgoDeferredMisses.loadRelaxed(), 1u);
+
+  for (unsigned i = 0; i < 2; ++i) {
+    auto hit = pool.compileOrGet(5, d0, 1, codeFor(5));
+    ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+    if (hit.hasReadToken)
+      pool.releaseRead(hit.bucketIndex);
+  }
+  ASSERT_EQ(pool.pendingCount(), 1u);
+  ASSERT_TRUE(pool.pollOne()); // Publish d0 Tier-2 and release admission.
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+
+  EXPECT_EQ(pool.compileOrGet(5, d1, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+}
+
 TEST_F(SharedTaskPoolTest, SharedPgoReleasesAdmissionForPreexistingWork) {
   EJitSharedTaskPool pool;
   bringUpOwner(pool);
@@ -4960,9 +5000,14 @@ TEST_F(SharedTaskPoolTest, SharedPgoReleasesAdmissionForPreexistingWork) {
   ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
             EJitCompileOrGetStatus::EnqueuedPending);
   pool.setPgoEnabled(true, 2);
+  uint32_t admissionHooks = 0;
+  pool.setPgoAdmissionTestHook(
+      [](void *ctx) { ++*static_cast<uint32_t *>(ctx); }, &admissionHooks);
 
   EXPECT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
             EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(admissionHooks, 0u)
+      << "an already-pending request must not transiently start PGO";
   EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
   EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 0u);
 

@@ -124,6 +124,47 @@ TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
   }
 }
 
+TEST(EJitDump, SkipsTemporaryPgoTier1Capture) {
+  std::string Bitcode;
+  {
+    LLVMContext Ctx;
+    Module M("dump_pgo_tiers", Ctx);
+    auto *FT = FunctionType::get(Type::getInt32Ty(Ctx), {}, false);
+    auto *F = Function::Create(FT, Function::ExternalLinkage,
+                               "dump_temporary_tier1", &M);
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
+    B.CreateRet(B.getInt32(1));
+    raw_string_ostream OS(Bitcode);
+    WriteBitcodeToFile(M, OS);
+    OS.flush();
+  }
+
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  EJitRuntimeState State;
+  Config Cfg;
+  Cfg.enablePgo = true;
+  auto EngineOrErr = EJitOrcEngine::Create(Cfg, State.getRegistry(), State);
+  ASSERT_TRUE(static_cast<bool>(EngineOrErr));
+  auto Engine = std::move(*EngineOrErr);
+
+  setDumpFuncFilter("*");
+  SpecializationContext Ctx;
+  Ctx.fnName = "dump_temporary_tier1";
+  Ctx.cacheKey = 0xd711;
+  Ctx.tier = CompileTier::Instrumented;
+  Engine->setActiveContext(&Ctx);
+  ASSERT_FALSE(errorToBool(
+      Engine->loadBitcodeModule(Bitcode, Ctx.cacheKey, Ctx.fnName)));
+  auto FnOrErr = Engine->lookup(Ctx.cacheKey, Ctx.fnName);
+  ASSERT_TRUE(static_cast<bool>(FnOrErr));
+  Engine->setActiveContext(nullptr);
+  setDumpFuncFilter("");
+
+  EXPECT_FALSE(printDumped("dump_temporary_tier1"));
+  EXPECT_FALSE(printDumpedModule("dump_temporary_tier1"));
+}
+
 namespace llvm {
 namespace ejit {
 // Test-only accessor. EJitOptimizer deliberately keeps its individual pipeline

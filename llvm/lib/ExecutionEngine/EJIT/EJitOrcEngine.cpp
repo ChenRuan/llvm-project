@@ -256,6 +256,7 @@ static bool getActiveDumpFilter(std::string &out) {
 /// Saved IR+ASM for a captured specialization (latest per function name).
 struct DumpEntry {
   uint64_t cacheKey = 0;
+  CompileTier tier = CompileTier::Baseline;
   std::string FunctionIR;
   std::string FunctionASM;
   std::string ModuleIR;
@@ -405,6 +406,7 @@ static bool printSharedDumpHint(const char *name) {
 /// Called from the IR transform layer when the filter matches: save the
 /// post-optimization IR and emitted ASM for later selective printing.
 static void captureDump(const std::string &fnName, uint64_t cacheKey,
+                        CompileTier tier,
                         std::string FunctionIR, std::string FunctionASM,
                         std::string ModuleIR, std::string ModuleASM) {
   EJIT_DIAG_DEBUG(
@@ -416,7 +418,7 @@ static void captureDump(const std::string &fnName, uint64_t cacheKey,
   std::lock_guard<DumpMutexType> lock(gDumpMutex);
   EJIT_DIAG_DEBUG("capture store_size before=%u", (unsigned)gDumpStore.size());
   gDumpStore[fnName] =
-      DumpEntry{cacheKey, std::move(FunctionIR), std::move(FunctionASM),
+      DumpEntry{cacheKey, tier, std::move(FunctionIR), std::move(FunctionASM),
                 std::move(ModuleIR), std::move(ModuleASM)};
   EJIT_DIAG_DEBUG("capture store_size after=%u", (unsigned)gDumpStore.size());
 #ifdef EJIT_SRE_SHARED_TASKPOOL
@@ -485,10 +487,13 @@ static void printOneDumpSafe(const char *requestedName,
   uint32_t keyLo = (uint32_t)(e.cacheKey & 0xffffffffu);
   (void)keyHi;
   (void)keyLo;
-  EJIT_DIAG_RAW("print_dumped hit requested=%s stored=%s key_hi=0x%08x "
-                "key_lo=0x%08x ir_size=%u asm_size=%u",
+  const char *Tier = e.tier == CompileTier::PGOUse ? "tier2"
+                     : e.tier == CompileTier::Instrumented ? "tier1"
+                                                          : "baseline";
+  EJIT_DIAG_RAW("print_dumped hit requested=%s stored=%s tier=%s "
+                "key_hi=0x%08x key_lo=0x%08x ir_size=%u asm_size=%u",
                 requestedName ? requestedName : "(list)", storedName.c_str(),
-                keyHi, keyLo, (unsigned)e.FunctionIR.size(),
+                Tier, keyHi, keyLo, (unsigned)e.FunctionIR.size(),
                 (unsigned)e.FunctionASM.size());
   if (!e.FunctionIR.empty())
     dumpLinesSafe("dump IR", e.FunctionIR);
@@ -503,10 +508,13 @@ static void printOneModuleDumpSafe(const char *requestedName,
   uint32_t keyLo = (uint32_t)(e.cacheKey & 0xffffffffu);
   (void)keyHi;
   (void)keyLo;
-  EJIT_DIAG_RAW("print_dumped_module hit requested=%s stored=%s "
+  const char *Tier = e.tier == CompileTier::PGOUse ? "tier2"
+                     : e.tier == CompileTier::Instrumented ? "tier1"
+                                                          : "baseline";
+  EJIT_DIAG_RAW("print_dumped_module hit requested=%s stored=%s tier=%s "
                 "key_hi=0x%08x key_lo=0x%08x ir_size=%u asm_size=%u",
                 requestedName ? requestedName : "(list)", storedName.c_str(),
-                keyHi, keyLo, (unsigned)e.ModuleIR.size(),
+                Tier, keyHi, keyLo, (unsigned)e.ModuleIR.size(),
                 (unsigned)e.ModuleASM.size());
   if (!e.ModuleIR.empty())
     dumpLinesSafe("dump module IR", e.ModuleIR);
@@ -788,8 +796,13 @@ EJitOrcEngine::Create(const Config &config,
           {
             std::string DumpFilter;
             bool hasFilter = getActiveDumpFilter(DumpFilter);
-            bool match =
-                hasFilter && (DumpFilter == "*" || ctx->fnName == DumpFilter);
+            // Tier-1 is temporary profiling code. Capturing it doubles the
+            // already expensive diagnostic ASM codegen and lengthens the
+            // lifecycle race window before publish. The public dump APIs show
+            // executable final code: Baseline when PGO is off, Tier-2 when on.
+            bool finalTier = ctx->tier != CompileTier::Instrumented;
+            bool match = finalTier && hasFilter &&
+                         (DumpFilter == "*" || ctx->fnName == DumpFilter);
             EJIT_DIAG_DEBUG("dump check filter=%s fn=%s key_hi=0x%08x "
                             "key_lo=0x%08x match=%d &filter=%p",
                             hasFilter ? DumpFilter.c_str() : "(off)",
@@ -846,7 +859,7 @@ EJitOrcEngine::Create(const Config &config,
                               "EJIT_DUMP_ASM off) fn=%s; IR captured",
                               ctx->fnName.c_str());
 #endif
-              captureDump(ctx->fnName, ctx->cacheKey,
+              captureDump(ctx->fnName, ctx->cacheKey, ctx->tier,
                           std::move(FunctionIR), std::move(FunctionAsm),
                           std::move(ModuleIR), std::move(ModuleAsm));
             }

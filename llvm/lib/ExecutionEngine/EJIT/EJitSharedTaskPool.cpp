@@ -1547,7 +1547,12 @@ bool EJitSharedTaskPool::admitPgoFunction(uint32_t funcIndex,
     uint32_t active = state_->pgoActiveFunctions[i].loadRelaxed();
     if (active == encoded) {
       state_->pgoAdmissionLock.storeRelease(0);
-      return true;
+      // Admission is per function, while cache entries are per specialization.
+      // Letting another identity of the same funcIndex proceed would make both
+      // versions share one progress/ownership slot: either one's failure or
+      // Tier-2 completion could then release the other version prematurely.
+      state_->pgoDeferredMisses.fetchAdd(1);
+      return false;
     }
     if (active == 0 && freeSlot == kEJitSharedMaxConcurrentProfiles)
       freeSlot = i;
@@ -1572,7 +1577,8 @@ bool EJitSharedTaskPool::admitPgoFunction(uint32_t funcIndex,
   return true;
 }
 
-void EJitSharedTaskPool::finishPgoFunction(uint32_t funcIndex, bool completed) {
+void EJitSharedTaskPool::finishPgoFunction(uint32_t funcIndex, bool completed,
+                                           const char *reason) {
   const uint32_t encoded = funcIndex + 1;
   uint32_t expected = 0;
   while (!state_->pgoAdmissionLock.compareExchange(expected, 1))
@@ -1600,8 +1606,8 @@ void EJitSharedTaskPool::finishPgoFunction(uint32_t funcIndex, bool completed) {
               static_cast<unsigned long long>(
                   state_->pgoDeferredMisses.loadRelaxed()));
   } else {
-    EJIT_DIAG("PGO profile aborted func=%u; next function may start",
-              funcIndex);
+    EJIT_DIAG("PGO profile aborted func=%u reason=%s; next function may start",
+              funcIndex, reason ? reason : "unspecified");
   }
 }
 
@@ -3040,12 +3046,33 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     R.status = EJitCompileOrGetStatus::CompileFailed;
     return R;
   }
-  // Dedup + enqueue (§5.2 step 3) — Async path.
-  bool newlyAdmitted = false;
+  // Dedup + enqueue (§5.2 step 3) — Async path. Claim the per-function
+  // in-flight slot BEFORE staged-PGO admission. Otherwise a request already in
+  // the queue makes us log "profile start 0/N", only for dedupMark below to
+  // reject it and immediately log "profile aborted" even though no profiling
+  // ever started.
   const bool pgoForRequest = state_->pgoEnabled.loadAcquire() != 0;
+  const uint32_t gen = state_->generation.loadAcquire();
+  switch (dedupMark(funcIndex, gen)) {
+  case EJitDedupResult::AlreadyPending:
+    EJIT_STAT_INC(state_->counters.alreadyPending);
+    EJIT_DIAG_VERBOSE("shared taskpool coalesced func=%u: already pending",
+                      funcIndex);
+    R.status = EJitCompileOrGetStatus::AlreadyPending;
+    return R;
+  case EJitDedupResult::InvalidFuncIndex:
+    EJIT_DIAG("shared taskpool reject func=%u: out of range", funcIndex);
+    R.status = EJitCompileOrGetStatus::InvalidParam;
+    return R;
+  case EJitDedupResult::Claimed:
+    break;
+  }
+
+  bool newlyAdmitted = false;
   if (pgoForRequest && !admitPgoFunction(funcIndex, newlyAdmitted)) {
     // All profiling slots are occupied. Keep this miss on the AOT fallback
     // and do not add work to the compiler queue.
+    dedupClear(funcIndex, gen);
     R.status = EJitCompileOrGetStatus::AlreadyPending;
     return R;
   }
@@ -3053,7 +3080,6 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   if (pgoForRequest && pgoAdmissionTestHook_)
     pgoAdmissionTestHook_(pgoAdmissionTestHookCtx_);
 #endif
-  uint32_t gen = state_->generation.loadAcquire();
   EJitCompileRequest Req{};
   Req.funcIndex = pgoForRequest
                       ? encodeReqTier(funcIndex, kEJitTierInstrumented)
@@ -3070,33 +3096,19 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   if (boundSize)
     std::memcpy(Req.boundData, boundData, boundSize);
   if (!versionsCurrent(Req) || state_->generation.loadAcquire() != gen) {
+    dedupClear(funcIndex, gen);
+    if (newlyAdmitted)
+      finishPgoFunction(funcIndex, /*completed=*/false,
+                        "lifecycle-changed-during-admission");
     EJIT_DIAG("shared taskpool async snapshot drop func=%u: lifecycle changed",
               funcIndex);
     R.status = EJitCompileOrGetStatus::CompileFailed;
     return R;
   }
-  switch (dedupMark(funcIndex, gen)) {
-  case EJitDedupResult::AlreadyPending:
-    if (newlyAdmitted)
-      finishPgoFunction(funcIndex, /*completed=*/false);
-    EJIT_STAT_INC(state_->counters.alreadyPending);
-    EJIT_DIAG_VERBOSE("shared taskpool coalesced func=%u: already pending",
-                      funcIndex);
-    R.status = EJitCompileOrGetStatus::AlreadyPending;
-    return R;
-  case EJitDedupResult::InvalidFuncIndex:
-    if (newlyAdmitted)
-      finishPgoFunction(funcIndex, /*completed=*/false);
-    EJIT_DIAG("shared taskpool reject func=%u: out of range", funcIndex);
-    R.status = EJitCompileOrGetStatus::InvalidParam;
-    return R;
-  case EJitDedupResult::Claimed:
-    break;
-  }
   if (!queuePush(Req)) {
-    if (newlyAdmitted)
-      finishPgoFunction(funcIndex, /*completed=*/false);
     dedupClear(funcIndex, gen); // queue full → roll back the in-flight slot.
+    if (newlyAdmitted)
+      finishPgoFunction(funcIndex, /*completed=*/false, "tier1-queue-full");
     EJIT_STAT_INC(state_->counters.queueFull);
     EJIT_DIAG("shared taskpool fallback func=%u: queue full", funcIndex);
     R.status = EJitCompileOrGetStatus::QueueFullFallback;
@@ -3155,7 +3167,8 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   const bool pgoClearExclusive = tier == kEJitTierPgoUse;
   auto finishPgoOnFailure = [&]() {
     if (tier == kEJitTierInstrumented) {
-      finishPgoFunction(realFuncIndex, /*completed=*/false);
+      finishPgoFunction(realFuncIndex, /*completed=*/false,
+                        "tier1-compile-or-publish-failed");
     } else if (tier == kEJitTierPgoUse) {
       // Tier-1 is still published and instrumented. Retain admission so a
       // later hit retries Tier-2 instead of freeing this admission slot while
@@ -3179,9 +3192,10 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   }
   // Checkpoint 1: invalidated before compile started.
   if (!versionsCurrent(req)) {
-    if (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse)
-      finishPgoFunction(realFuncIndex, /*completed=*/false);
     dedupClear(req.funcIndex, req.generation);
+    if (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse)
+      finishPgoFunction(realFuncIndex, /*completed=*/false,
+                        "version-changed-before-compile");
     EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG(
         "shared worker compile drop func=%u: version changed before compile",
@@ -3191,8 +3205,8 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   void *fn = nullptr;
   bool ok = compileFn_ && compileFn_(compileCtx_, req, &fn);
   if (!ok || !fn) {
-    finishPgoOnFailure();
     dedupClear(req.funcIndex, req.generation);
+    finishPgoOnFailure();
     EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG("shared worker compile failed func=%u ok=%u fn=%p", req.funcIndex,
               static_cast<unsigned>(ok), fn);
@@ -3212,12 +3226,13 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
       !versionsCurrent(req)) {
     if (publishFn_)
       publishFn_(publishCtx_, req, false);
+    dedupClear(req.funcIndex, req.generation);
     if (req.generation == state_->generation.loadAcquire() &&
         (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse))
-      finishPgoFunction(realFuncIndex, /*completed=*/false);
+      finishPgoFunction(realFuncIndex, /*completed=*/false,
+                        "version-changed-after-compile");
     if (releaseFn_)
       releaseFn_(releaseCtx_, fn);
-    dedupClear(req.funcIndex, req.generation);
     EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG(
         "shared worker compile drop func=%u: version/gen changed after compile",
@@ -3230,6 +3245,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
     EJIT_STAT_INC(state_->counters.asyncCompiles);
     if (publishFn_)
       publishFn_(publishCtx_, req, true);
+    dedupClear(req.funcIndex, req.generation);
     if (tier == kEJitTierInstrumented) {
       EJIT_STAT_INC(state_->counters.tier1Compiles);
       EJIT_DIAG("PGO Tier-1 published func=%u: collecting 0/%u hits",
@@ -3239,19 +3255,19 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
       finishPgoFunction(realFuncIndex, /*completed=*/true);
     }
     publishCodePoolStats();
-    dedupClear(req.funcIndex, req.generation);
     EJIT_DIAG_VERBOSE("shared worker publish ok func=%u fn=%p", req.funcIndex,
                       fn);
     return;
   case EJitPublishStatus::VersionMismatch:
     if (publishFn_)
       publishFn_(publishCtx_, req, false);
+    dedupClear(req.funcIndex, req.generation);
     if (req.generation == state_->generation.loadAcquire() &&
         (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse))
-      finishPgoFunction(realFuncIndex, /*completed=*/false);
+      finishPgoFunction(realFuncIndex, /*completed=*/false,
+                        "version-mismatch-at-publish");
     if (releaseFn_)
       releaseFn_(releaseCtx_, fn);
-    dedupClear(req.funcIndex, req.generation);
     EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG("shared worker publish drop func=%u: version mismatch",
               req.funcIndex);
@@ -3260,10 +3276,10 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   case EJitPublishStatus::Failed:
     if (publishFn_)
       publishFn_(publishCtx_, req, false);
+    dedupClear(req.funcIndex, req.generation);
     finishPgoOnFailure();
     if (releaseFn_)
       releaseFn_(releaseCtx_, fn);
-    dedupClear(req.funcIndex, req.generation);
     EJIT_STAT_INC(state_->counters.publishFailed);
     EJIT_DIAG("shared worker publish failed func=%u status=%u", req.funcIndex,
               static_cast<unsigned>(PS));
