@@ -1098,6 +1098,10 @@ private:
   /// Result of a shared-cache lookup, including the cross-core fnPtr gate.
   struct SharedLookup {
     void *fnPtr = nullptr;
+    /// Matched shared slot for post-validation diagnostics. A token-bearing
+    /// hit keeps it stable; NO_RECLAIM marks it only after the outer seqlock
+    /// validation has accepted the lookup.
+    EJitSharedCacheSlot *slot = nullptr;
     uint32_t bucketIndex = 0;
     bool hasReadToken = false;
     bool readyButNotShareable = false;

@@ -186,6 +186,17 @@ constexpr uint32_t kReady = static_cast<uint32_t>(EJitSharedInitState::Ready);
 /// cacheLookupNd block can also reference it.
 constexpr uint64_t kHashMul = 0x9e3779b97f4a7c15ULL;
 
+inline void markPostPublishSeen(EJitSharedCacheSlot &Slot) {
+#ifdef EJIT_STATS_ENABLE
+  if (Slot.postPublishSeen.loadRelaxed() != 0)
+    return;
+  uint8_t Expected = 0;
+  (void)Slot.postPublishSeen.compareExchange(Expected, 1);
+#else
+  (void)Slot;
+#endif
+}
+
 // Per-function inline-cache slot registry (multi-version direct-indexed). Each
 // entry records the wrapper's per-function @__ejit_icache_fn_<name> global base
 // (a uintptr_t cell, or a [D]^numDims array of them for a multi-version entry)
@@ -1460,6 +1471,7 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
   // publishing). Return directly while holding the read token.
   if (self == owner) {
     R.fnPtr = fn;
+    R.slot = &Slot;
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
     R.noTokenHit = true;
     R.bucketIndex = kEJitSharedCacheBuckets; // sentinel -> releaseRead no-op
@@ -1477,6 +1489,7 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
   const uint64_t CoreBit = CanMemoize ? (uint64_t{1} << self) : uint64_t{0};
   if (CanMemoize && (Slot.executableCoreMask.loadAcquire() & CoreBit) != 0) {
     R.fnPtr = fn;
+    R.slot = &Slot;
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
     R.noTokenHit = true;
     R.bucketIndex = kEJitSharedCacheBuckets; // sentinel -> releaseRead no-op
@@ -1679,6 +1692,7 @@ EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
   if (CanMemoize)
     S2.executableCoreMask.fetchOr(CoreBit);
   R.fnPtr = Snap.fn;
+  R.slot = &S2;
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
   // NO_RECLAIM: this cold path already fully re-validated
   // identity/versions/fnPtr above under a load-only re-read, so it hands back a
@@ -2273,6 +2287,7 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   // slots (§4 repeat-trigger).  Under the write lock + before state=Ready.
   target->hitCount.storeRelaxed(0);
   target->tier.storeRelaxed(static_cast<uint8_t>(tier));
+  target->postPublishSeen.storeRelaxed(0);
   const uint32_t OwnerCore = state_->ownerCoreId.loadAcquire();
   target->executableCoreMask.storeRelease(
       OwnerCore < 64 ? (uint64_t{1} << OwnerCore) : 0);
@@ -2477,6 +2492,7 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
       // hotness state or tier-tracking from a prior generation.
       Slot.hitCount.storeRelaxed(0);
       Slot.tier.storeRelaxed(0);
+      Slot.postPublishSeen.storeRelaxed(0);
     }
   }
 }
@@ -2701,6 +2717,8 @@ __attribute__((always_inline)) EJitSharedTaskPool::CompileOrGetResult
 EJitSharedTaskPool::classifyHit(const SharedLookup &Hit) {
   CompileOrGetResult R;
   if (Hit.hasReadToken && Hit.fnPtr) {
+    if (Hit.slot)
+      markPostPublishSeen(*Hit.slot);
     EJIT_STAT_INC(state_->counters.cacheHits);
     R.status = EJitCompileOrGetStatus::CacheHit;
     R.fnPtr = Hit.fnPtr;
@@ -2714,6 +2732,8 @@ EJitSharedTaskPool::classifyHit(const SharedLookup &Hit) {
   // bucketIndex is the out-of-range sentinel, so the wrapper's releaseRead()
   // cleanly no-ops. Safe because published code is never freed in this build.
   if (Hit.noTokenHit && Hit.fnPtr) {
+    if (Hit.slot)
+      markPostPublishSeen(*Hit.slot);
     EJIT_STAT_INC(state_->counters.cacheHits);
     R.status = EJitCompileOrGetStatus::CacheHit;
     R.fnPtr = Hit.fnPtr;

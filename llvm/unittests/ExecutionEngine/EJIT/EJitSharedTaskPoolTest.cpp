@@ -2371,8 +2371,9 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // address by every core, so a layout change that slips through unversioned is
   // a silent cross-core corruption.
   // v10-v13 add PGO controls, writable ranges, staged admission, and audit
-  // requests; v14 adds the owned bound-pointer snapshot.
-  EXPECT_EQ(kEJitSharedAbiVersion, 14u);
+  // requests; v14 adds the owned bound-pointer snapshot, and v15 adds
+  // per-version post-publish reuse tracking.
+  EXPECT_EQ(kEJitSharedAbiVersion, 15u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -5215,10 +5216,9 @@ TEST_F(SharedTaskPoolTest, SharedPgoTier2DiscardedOnVersionBump) {
   }
 }
 
-// PGO off → no hitCount increment and no Tier-2 enqueue.
-// Baseline guards: compileOrGet hits are ordinary cache hits with zero
-// PGO behaviour when setPgoEnabled was never called.
-TEST_F(SharedTaskPoolTest, SharedPgoOffZeroOverhead) {
+// PGO off → no hitCount increment and no Tier-2 enqueue. Stats builds still
+// set the independent one-shot postPublishSeen diagnostic on the first reuse.
+TEST_F(SharedTaskPoolTest, SharedPgoOffTracksPostPublishReuse) {
   EJitSharedTaskPool pool;
   bringUpOwner(pool);
   EJitCoreId::setCurrentForTest(0);
@@ -5232,6 +5232,9 @@ TEST_F(SharedTaskPoolTest, SharedPgoOffZeroOverhead) {
   ASSERT_EQ(pool.compileOrGet(5, d0, 1, codeFor(5)).status,
             EJitCompileOrGetStatus::EnqueuedPending);
   ASSERT_TRUE(pool.pollOne());
+  EJitSharedCacheSlot *slot = findReadySlot(5);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->postPublishSeen.loadRelaxed(), 0u);
 
   // Hits remain ordinary cache hits and do not enqueue Tier-2.
   for (int i = 0; i < 10; ++i) {
@@ -5243,9 +5246,8 @@ TEST_F(SharedTaskPoolTest, SharedPgoOffZeroOverhead) {
   EXPECT_EQ(pool.pendingCount(), 0u); // no Tier-2 enqueued
 
   // hitCount stays at 0 (threshold was never set).
-  EJitSharedCacheSlot *slot = findReadySlot(5);
-  ASSERT_NE(slot, nullptr);
   EXPECT_EQ(slot->hitCount.loadRelaxed(), 0u);
+  EXPECT_EQ(slot->postPublishSeen.loadRelaxed(), 1u);
 }
 
 // PGO threshold=0 (setPgoEnabled(true,0)) → counting disabled, no trigger.

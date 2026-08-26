@@ -1688,7 +1688,8 @@ void ejit_taskpool_print_compiled() {
   // diverge by the same margin as any walk-based dump.
   struct CountCtx {
     uint32_t byDims[kEJitSharedMaxDims + 1];
-  } count = {{0}};
+    uint32_t postPublishSeen;
+  } count = {{0}, 0};
   EJitSharedTaskPool::ForEachCompiledStats st = sp->forEachCompiled(
       [](const EJitSharedCacheSlot &slot, void *cbCtx) {
         // Valid numDims is 0..kEJitSharedMaxDims; clamp a corrupt slot's
@@ -1696,6 +1697,8 @@ void ejit_taskpool_print_compiled() {
         uint32_t n = slot.numDims < kEJitSharedMaxDims ? slot.numDims
                                                        : kEJitSharedMaxDims;
         ++static_cast<CountCtx *>(cbCtx)->byDims[n];
+        if (slot.postPublishSeen.loadRelaxed() != 0)
+          ++static_cast<CountCtx *>(cbCtx)->postPublishSeen;
       },
       &count);
   // Summary line first (fixed line count, so no throttle): total, cache
@@ -1718,11 +1721,27 @@ void ejit_taskpool_print_compiled() {
                 st.visitedSlots, st.visitedSlots,
                 kEJitSharedCacheBuckets * kEJitSharedCacheSlots,
                 st.skippedBuckets, byDims[0] ? " byDims: " : "", byDims);
+#ifdef EJIT_STATS_ENABLE
+  constexpr bool ReuseTrackingEnabled = true;
+  EJIT_DIAG_RAW("compiled reuse: post_publish_seen=%u unseen=%u",
+                count.postPublishSeen,
+                st.visitedSlots >= count.postPublishSeen
+                    ? st.visitedSlots - count.postPublishSeen
+                    : 0);
+#else
+  constexpr bool ReuseTrackingEnabled = false;
+  EJIT_DIAG_RAW("compiled reuse: disabled (build with EJIT_STATS_ENABLE)");
+#endif
   // Entry lines: one RAW (prefix-free) line per Ready slot, throttled after
   // each printed line.
+  struct PrintCtx {
+    EJitModuleLoader &loader;
+    bool reuseTrackingEnabled;
+  } printCtx{loader, ReuseTrackingEnabled};
   EJitSharedTaskPool::ForEachCompiledStats st2 = sp->forEachCompiled(
       [](const EJitSharedCacheSlot &slot, void *cbCtx) {
-        EJitModuleLoader &ld = *static_cast<EJitModuleLoader *>(cbCtx);
+        PrintCtx &ctx = *static_cast<PrintCtx *>(cbCtx);
+        EJitModuleLoader &ld = ctx.loader;
         const std::string &name =
             ld.getFuncNameByFuncIdx(slot.funcIndex);
         // Per the publish protocol: fnPtr is read with acquire only after
@@ -1745,6 +1764,10 @@ void ejit_taskpool_print_compiled() {
         if (p >= end)
           p = end - 1;
         *p = '\0';
+        const char *PostPublishSeen =
+            !ctx.reuseTrackingEnabled
+                ? "disabled"
+                : (slot.postPublishSeen.loadRelaxed() != 0 ? "yes" : "no");
         if (gEJitDiagLevel >= EJIT_LOG_LVL_VERBOSE) {
           // Same shape for the per-instance version snapshot (uint32 x
           // kEJitSharedMaxDims + separators + NUL).
@@ -1758,21 +1781,23 @@ void ejit_taskpool_print_compiled() {
             p = end - 1;
           *p = '\0';
           EJIT_DIAG_RAW("funcIdx=%u name=%s numDims=%u dims=[%s] fn=%p "
-                        "ver=[%s] size=%llu pool=%u gen=%u",
+                        "post_publish_seen=%s ver=[%s] size=%llu pool=%u "
+                        "gen=%u",
                         slot.funcIndex,
                         name.empty() ? "<unknown>" : name.c_str(),
-                        slot.numDims, dims, fn, ver,
+                        slot.numDims, dims, fn, PostPublishSeen, ver,
                         static_cast<unsigned long long>(slot.codeSize),
                         slot.poolId, slot.generation);
         } else {
-          EJIT_DIAG_RAW("funcIdx=%u name=%s numDims=%u dims=[%s] fn=%p",
+          EJIT_DIAG_RAW("funcIdx=%u name=%s numDims=%u dims=[%s] fn=%p "
+                        "post_publish_seen=%s",
                         slot.funcIndex,
                         name.empty() ? "<unknown>" : name.c_str(),
-                        slot.numDims, dims, fn);
+                        slot.numDims, dims, fn, PostPublishSeen);
         }
         ejitDiagPrintThrottle();
       },
-      &loader);
+      &printCtx);
   // The summary counted the first walk; if the entry walk itself skipped
   // contended buckets, its lines are incomplete relative to it — report the
   // shortfall (fixed line count, so no throttle) instead of dropping it.
