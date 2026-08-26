@@ -2255,6 +2255,7 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
     target->poolBase = info->poolBase;
     target->poolSize = info->poolSize;
     target->poolId = info->poolId;
+    target->poolKind = static_cast<uint32_t>(info->poolKind);
     // Runtime-writable extents (v9): copy the bounded set the peer may need to
     // enable_rw. The over-bound case was already rejected at entry, so this
     // never truncates. requiresPeerEnableRw records whether the peer must
@@ -2278,6 +2279,7 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
     target->poolBase = 0;
     target->poolSize = 0;
     target->poolId = 0;
+    target->poolKind = static_cast<uint32_t>(EJitCodePoolKind::Unknown);
     target->writableCount = 0;
     target->requiresPeerEnableRw = 0;
     for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
@@ -2285,7 +2287,6 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
       target->writableRanges[i].size = 0;
     }
   }
-  target->rangeReserved = 0;
   target->fnPtr.storeRelease(reinterpret_cast<uintptr_t>(fnPtr));
   // PGO: reset hitCount on every publish.  Record the compile tier so
   // resolveMatchedSlot can suppress the Tier-2 trigger on already-Tier-2
@@ -2433,6 +2434,19 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   st->codePoolStats.sealInvocations.storeRelaxed(0);
   st->codePoolStats.splitInvocations.storeRelaxed(0);
   st->codePoolStats.finalizedRangeCount.storeRelaxed(0);
+  auto ClearPoolDetail = [](EJitSharedCodePoolStats::Detail &D) {
+    D.poolCount.storeRelaxed(0);
+    D.sealedCount.storeRelaxed(0);
+    D.activeCount.storeRelaxed(0);
+    D.usedBytes.storeRelaxed(0);
+    D.reservedBytes.storeRelaxed(0);
+    D.wastedBytes.storeRelaxed(0);
+    D.sealInvocations.storeRelaxed(0);
+    D.splitInvocations.storeRelaxed(0);
+    D.finalizedRangeCount.storeRelaxed(0);
+  };
+  ClearPoolDetail(st->codePoolStats.near);
+  ClearPoolDetail(st->codePoolStats.far);
   // Per-core, per-pool 4K split readiness (ABI v5). MUST be cleared on every
   // (re)initialization: a stale splitDone bit from an earlier generation would
   // otherwise make a peer skip split_2m_to_4k for a pool the new generation
@@ -2484,7 +2498,7 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
       Slot.poolBase = 0;
       Slot.poolSize = 0;
       Slot.poolId = 0;
-      Slot.rangeReserved = 0;
+      Slot.poolKind = static_cast<uint32_t>(EJitCodePoolKind::Unknown);
       // Runtime-writable ranges (ABI v9): cleared so a re-init never leaves a
       // stale writable extent a peer could enable_rw for retired code.
       Slot.writableCount = 0;
@@ -3137,6 +3151,20 @@ void EJitSharedTaskPool::publishCodePoolStats() {
   state_->codePoolStats.sealInvocations.storeRelaxed(s.sealInvocations);
   state_->codePoolStats.splitInvocations.storeRelaxed(s.splitInvocations);
   state_->codePoolStats.finalizedRangeCount.storeRelaxed(s.finalizedRangeCount);
+  auto PublishDetail = [](EJitSharedCodePoolStats::Detail &Dst,
+                          const EJitCodePoolStatsOut::Detail &Src) {
+    Dst.poolCount.storeRelaxed(Src.poolCount);
+    Dst.sealedCount.storeRelaxed(Src.sealedCount);
+    Dst.activeCount.storeRelaxed(Src.activeCount);
+    Dst.usedBytes.storeRelaxed(Src.usedBytes);
+    Dst.reservedBytes.storeRelaxed(Src.reservedBytes);
+    Dst.wastedBytes.storeRelaxed(Src.wastedBytes);
+    Dst.sealInvocations.storeRelaxed(Src.sealInvocations);
+    Dst.splitInvocations.storeRelaxed(Src.splitInvocations);
+    Dst.finalizedRangeCount.storeRelaxed(Src.finalizedRangeCount);
+  };
+  PublishDetail(state_->codePoolStats.near, s.near);
+  PublishDetail(state_->codePoolStats.far, s.far);
 }
 
 bool EJitSharedTaskPool::readCodePoolStats(EJitCodePoolStatsOut *out) const {
@@ -3152,6 +3180,20 @@ bool EJitSharedTaskPool::readCodePoolStats(EJitCodePoolStatsOut *out) const {
   out->splitInvocations = state_->codePoolStats.splitInvocations.loadRelaxed();
   out->finalizedRangeCount =
       state_->codePoolStats.finalizedRangeCount.loadRelaxed();
+  auto ReadDetail = [](const EJitSharedCodePoolStats::Detail &Src,
+                       EJitCodePoolStatsOut::Detail &Dst) {
+    Dst.poolCount = Src.poolCount.loadRelaxed();
+    Dst.sealedCount = Src.sealedCount.loadRelaxed();
+    Dst.activeCount = Src.activeCount.loadRelaxed();
+    Dst.usedBytes = Src.usedBytes.loadRelaxed();
+    Dst.reservedBytes = Src.reservedBytes.loadRelaxed();
+    Dst.wastedBytes = Src.wastedBytes.loadRelaxed();
+    Dst.sealInvocations = Src.sealInvocations.loadRelaxed();
+    Dst.splitInvocations = Src.splitInvocations.loadRelaxed();
+    Dst.finalizedRangeCount = Src.finalizedRangeCount.loadRelaxed();
+  };
+  ReadDetail(state_->codePoolStats.near, out->near);
+  ReadDetail(state_->codePoolStats.far, out->far);
   return true;
 }
 

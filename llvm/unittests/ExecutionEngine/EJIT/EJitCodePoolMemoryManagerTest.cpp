@@ -17,6 +17,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCodePool.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
+#include "llvm/ExecutionEngine/JITLink/JITLinkDylib.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/Orc/SymbolStringPool.h"
 #include "llvm/Support/Error.h"
@@ -119,6 +120,51 @@ TEST(EJitCodePoolMemMgr, CodeMemoryComesFromPool) {
 
   auto FA = cantFail(IFA->finalize());
   cantFail(MM.deallocate(std::move(FA)));
+}
+
+TEST(EJitCodePoolMemMgr, RoutesTemporaryTier1ToFarPool) {
+  MockSre M;
+  auto NearOpts = poolOpts(/*PoolSize=*/256 * 1024);
+  NearOpts.kind = EJitCodePoolKind::Near;
+  auto FarOpts = poolOpts(/*PoolSize=*/256 * 1024);
+  FarOpts.kind = EJitCodePoolKind::Far;
+  EJitCodePoolManager Near(
+      NearOpts, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *B) { return M.seal(B); });
+  EJitCodePoolManager Far(
+      FarOpts, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *B) { return M.seal(B); });
+  EJitCodePoolMemoryManager MM(Near, Far, /*PageSize=*/4096);
+
+  JITLinkDylib Tier1("spec_t1_1");
+  auto G1 = makeCodeGraph(64, 0x1000);
+  auto IFA1 = cantFail(MM.allocate(&Tier1, *G1));
+  void *Tier1Addr = firstBlockAddr(*G1);
+  auto FA1 = cantFail(IFA1->finalize());
+
+  EXPECT_FALSE(Near.contains(Tier1Addr));
+  EXPECT_TRUE(Far.contains(Tier1Addr));
+  EXPECT_EQ(Near.getStats().poolCount, 0u);
+  EXPECT_EQ(Far.getStats().poolCount, 1u);
+  EJitCompiledCodeInfo Tier1Info;
+  ASSERT_TRUE(Far.findRange(Tier1Addr, Tier1Info));
+  EXPECT_EQ(Tier1Info.poolKind, EJitCodePoolKind::Far);
+
+  JITLinkDylib Tier2("spec_t2_1");
+  auto G2 = makeCodeGraph(64, 0x2000);
+  auto IFA2 = cantFail(MM.allocate(&Tier2, *G2));
+  void *Tier2Addr = firstBlockAddr(*G2);
+  auto FA2 = cantFail(IFA2->finalize());
+
+  EXPECT_TRUE(Near.contains(Tier2Addr));
+  EXPECT_FALSE(Far.contains(Tier2Addr));
+  EXPECT_EQ(Near.getStats().poolCount, 1u);
+  EJitCompiledCodeInfo Tier2Info;
+  ASSERT_TRUE(Near.findRange(Tier2Addr, Tier2Info));
+  EXPECT_EQ(Tier2Info.poolKind, EJitCodePoolKind::Near);
+
+  cantFail(MM.deallocate(std::move(FA1)));
+  cantFail(MM.deallocate(std::move(FA2)));
 }
 
 // finalize() does NOT seal: the pool stays RW so JITLink can keep writing.

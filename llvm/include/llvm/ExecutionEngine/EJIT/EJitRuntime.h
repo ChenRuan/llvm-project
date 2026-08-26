@@ -137,6 +137,15 @@ typedef struct ejit_code_pool_stats_t {
   uint64_t finalizedRangeCount; ///< distinct executable ranges recorded
 } ejit_code_pool_stats_t;
 
+/// Placement-aware code-pool statistics. The original stats API remains ABI
+/// stable and returns `total`; use this v2 shape to distinguish final code in
+/// the near fixed pool from temporary Tier-1 code in the far dynamic pool.
+typedef struct ejit_code_pool_stats_v2_t {
+  ejit_code_pool_stats_t total;
+  ejit_code_pool_stats_t near;
+  ejit_code_pool_stats_t far;
+} ejit_code_pool_stats_v2_t;
+
 typedef struct {
   int code;
   char message[256];
@@ -430,6 +439,9 @@ void ejit_print_func_meta(const char *funcName);
 /// runtime was built without EJIT_SRE_CODE_POOL (no pool). For monitoring
 /// embedded code-memory exhaustion. Mirrors EJitCodePoolManager::Stats.
 ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out);
+
+/// Placement-aware counterpart of ejit_get_code_pool_stats().
+ejit_status_t ejit_get_code_pool_stats_v2(ejit_code_pool_stats_v2_t *out);
 
 /// Print code pool usage statistics through the platform log. Paired with
 /// ejit_get_code_pool_stats() (human-readable form).

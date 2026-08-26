@@ -183,13 +183,18 @@ unsigned sealAndSyncCache(uintptr_t Va, size_t Size) {
 } // namespace
 
 std::unique_ptr<llvm::ejit::EJitCodePoolManager>
-llvm::ejit::makeSreCodePoolManager() {
+llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
   EJitCodePoolManager::Options Opts;
+  Opts.kind = Placement == EJitCodePoolPlacement::NearFixed
+                  ? EJitCodePoolKind::Near
+                  : EJitCodePoolKind::Far;
   Opts.poolSize = static_cast<size_t>(kSrePoolSize);
   Opts.poolAlign = k2MiB; // large-page / split granularity
   Opts.minCodeAlign = 64;
-  EJIT_DIAG_VERBOSE("makeSreCodePoolManager: poolSize=%llu poolAlign=%zu",
-                    kSrePoolSize, k2MiB);
+  EJIT_DIAG_VERBOSE(
+      "makeSreCodePoolManager: kind=%s poolSize=%llu poolAlign=%zu",
+      Placement == EJitCodePoolPlacement::NearFixed ? "near" : "far",
+      kSrePoolSize, k2MiB);
 #ifdef EJIT_CODE_POOL_4K_SEAL
   // Adapt to the platform's 4K execute-permission interface: the 2MiB pool is
   // split into 4K mappings at creation and sealed one 4KiB page at a time.
@@ -208,7 +213,7 @@ llvm::ejit::makeSreCodePoolManager() {
   // fall back to SRE_MemDbgAlloc (a too-small fixed region would exhaust on
   // every compile). A fixed region gives a stable JIT address range and, when
   // placed within +-128MiB of .text, lets codegen use direct bl/adrp.
-  {
+  if (Placement == EJitCodePoolPlacement::NearFixed) {
     uintptr_t FBase = reinterpret_cast<uintptr_t>(__ejit_code_start);
     uintptr_t FEnd = reinterpret_cast<uintptr_t>(__ejit_code_end);
     uintptr_t AlignedBase =

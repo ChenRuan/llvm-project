@@ -9,6 +9,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
+#include "llvm/ExecutionEngine/JITLink/JITLinkDylib.h"
 #include "llvm/ExecutionEngine/Orc/Shared/AllocationActions.h"
 #include "llvm/ExecutionEngine/Orc/Shared/MemoryFlags.h"
 #include "llvm/Support/MathExtras.h"
@@ -43,11 +44,11 @@ struct EJitCodePoolMemoryManager::FinalizedInfo {
 class EJitCodePoolMemoryManager::InFlightAllocImpl
     : public JITLinkMemoryManager::InFlightAlloc {
 public:
-  InFlightAllocImpl(EJitCodePoolMemoryManager &MM, LinkGraph &G, BasicLayout BL,
+  InFlightAllocImpl(EJitCodePoolManager &Pool, LinkGraph &G, BasicLayout BL,
                     void *Base, size_t Size,
                     std::vector<ExecSegRange> ExecRanges,
                     std::vector<EJitWritableRange> WritableRanges)
-      : Pool(&MM.getPool()), G(&G), BL(std::move(BL)), Base(Base), Size(Size),
+      : Pool(&Pool), G(&G), BL(std::move(BL)), Base(Base), Size(Size),
         ExecRanges(std::move(ExecRanges)),
         WritableRanges(std::move(WritableRanges)) {}
 
@@ -145,10 +146,23 @@ private:
 
 EJitCodePoolMemoryManager::EJitCodePoolMemoryManager(EJitCodePoolManager &Pool,
                                                      size_t PageSize)
-    : Pool_(Pool), PageSize_(PageSize) {}
+    : NearPool_(Pool), PageSize_(PageSize) {}
+
+EJitCodePoolMemoryManager::EJitCodePoolMemoryManager(
+    EJitCodePoolManager &NearPool, EJitCodePoolManager &FarPool,
+    size_t PageSize)
+    : NearPool_(NearPool), FarPool_(&FarPool), PageSize_(PageSize) {}
+
+EJitCodePoolManager &EJitCodePoolMemoryManager::selectPool(
+    const JITLinkDylib *JD) const {
+  if (FarPool_ && JD && StringRef(JD->getName()).starts_with("spec_t1_"))
+    return *FarPool_;
+  return NearPool_;
+}
 
 void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
                                          OnAllocatedFunction OnAllocated) {
+  EJitCodePoolManager &Pool = selectPool(JD);
   BasicLayout BL(G);
 
   auto SegsSizes = BL.getContiguousPageBasedLayoutSizes(PageSize_);
@@ -160,13 +174,14 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   }
 
   uint64_t Total = SegsSizes->total();
-  EJIT_DIAG("allocate: graph=%s total=%llu pageSize=%zu",
-            G.getName().c_str(),
+  const char *Placement = FarPool_ == &Pool ? "far" : "near";
+  EJIT_DIAG("allocate: graph=%s pool=%s total=%llu pageSize=%zu",
+            G.getName().c_str(), Placement,
             static_cast<unsigned long long>(Total), PageSize_);
 
   void *Slab = nullptr;
   if (Total > 0) {
-    auto MemOrErr = Pool_.allocateCode(static_cast<size_t>(Total), PageSize_);
+    auto MemOrErr = Pool.allocateCode(static_cast<size_t>(Total), PageSize_);
     if (!MemOrErr) {
       EJIT_DIAG("allocate FAIL: pool allocateCode total=%llu",
                 static_cast<unsigned long long>(Total));
@@ -178,7 +193,7 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
     // so make its pages writable (RX -> RW via enable_rw) BEFORE any write. In
     // data-region placement this is a no-op (already RW). Failure means the slab
     // is not writable - do not hand it back for JITLink to write into.
-    if (auto Err = Pool_.enableRwRange(Slab, static_cast<size_t>(Total))) {
+    if (auto Err = Pool.enableRwRange(Slab, static_cast<size_t>(Total))) {
       EJIT_DIAG("allocate FAIL: enableRwRange total=%llu",
                 static_cast<unsigned long long>(Total));
       OnAllocated(std::move(Err));
@@ -249,7 +264,7 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
             "EJitCodePool: allocation has more runtime-writable segments than "
             "the fixed cross-core bound",
             inconvertibleErrorCode()),
-        Pool_.restoreRxRange(Slab, static_cast<size_t>(Total))));
+        Pool.restoreRxRange(Slab, static_cast<size_t>(Total))));
     return;
   }
 
@@ -258,7 +273,7 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
               G.getName().c_str());
     OnAllocated(
         joinErrors(std::move(Err),
-                   Pool_.restoreRxRange(Slab, static_cast<size_t>(Total))));
+                   Pool.restoreRxRange(Slab, static_cast<size_t>(Total))));
     return;
   }
 
@@ -266,7 +281,7 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
             Slab, static_cast<unsigned long long>(Total), ExecRanges.size(),
             WritableRanges.size());
   OnAllocated(std::make_unique<InFlightAllocImpl>(
-      *this, G, std::move(BL), Slab, static_cast<size_t>(Total),
+      Pool, G, std::move(BL), Slab, static_cast<size_t>(Total),
       std::move(ExecRanges), std::move(WritableRanges)));
 }
 

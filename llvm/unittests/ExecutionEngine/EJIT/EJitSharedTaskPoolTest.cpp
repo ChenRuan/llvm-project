@@ -167,6 +167,7 @@ struct RangeCtx {
   uintptr_t codeStart = 0x40000000ull;
   uint64_t codeSize = 64;
   uint32_t poolId = 0;
+  EJitCodePoolKind poolKind = EJitCodePoolKind::Near;
   bool provide = true;
   // Runtime-writable ranges (v9): 0 => none (non-PGO / Tier-2). When set,
   // models the Tier-1 __profc_ counter pages a peer core must enable_rw.
@@ -188,6 +189,7 @@ bool mockCodeRange(void *ctx, const void *fnPtr, EJitCompiledCodeInfo *out) {
   out->poolBase = r->poolBase;
   out->poolSize = r->poolSize;
   out->poolId = r->poolId;
+  out->poolKind = r->poolKind;
   out->writableCount = r->writableCount;
   out->requiresPeerEnableRw = r->requiresPeerEnableRw;
   for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
@@ -2372,8 +2374,8 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // a silent cross-core corruption.
   // v10-v13 add PGO controls, writable ranges, staged admission, and audit
   // requests; v14 adds the owned bound-pointer snapshot, and v15 adds
-  // per-version post-publish reuse tracking.
-  EXPECT_EQ(kEJitSharedAbiVersion, 15u);
+  // per-version post-publish reuse tracking; v16 adds near/far placement.
+  EXPECT_EQ(kEJitSharedAbiVersion, 16u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -2404,7 +2406,8 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   EXPECT_EQ(slot->poolBase, 0x40000000ull);
   EXPECT_EQ(slot->poolSize, 0x200000ull);
   EXPECT_EQ(slot->poolId, 7u);
-  EXPECT_EQ(slot->rangeReserved, 0u);
+  EXPECT_EQ(slot->poolKind,
+            static_cast<uint32_t>(EJitCodePoolKind::Near));
   // Runtime-writable ranges (v9): published verbatim from the code-range info.
   EXPECT_EQ(slot->writableCount, 1u);
   EXPECT_EQ(slot->requiresPeerEnableRw, 1u); // RangeCtx default: fixed RX pool
@@ -2503,7 +2506,7 @@ TEST_F(SharedTaskPoolTest, FourKReinitScrubsStaleV5Fields) {
       Slot.poolBase = 0x3333;
       Slot.poolSize = 0x4444;
       Slot.poolId = 0x5555;
-      Slot.rangeReserved = 0x6666;
+      Slot.poolKind = static_cast<uint32_t>(EJitCodePoolKind::Far);
       Slot.writableCount = 0x7777;
       Slot.requiresPeerEnableRw = 0x8888;
       for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
@@ -2536,7 +2539,8 @@ TEST_F(SharedTaskPoolTest, FourKReinitScrubsStaleV5Fields) {
       EXPECT_EQ(Slot.poolBase, 0u);
       EXPECT_EQ(Slot.poolSize, 0u);
       EXPECT_EQ(Slot.poolId, 0u);
-      EXPECT_EQ(Slot.rangeReserved, 0u);
+      EXPECT_EQ(Slot.poolKind,
+                static_cast<uint32_t>(EJitCodePoolKind::Unknown));
       EXPECT_EQ(Slot.writableCount, 0u);
       EXPECT_EQ(Slot.requiresPeerEnableRw, 0u);
       for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {

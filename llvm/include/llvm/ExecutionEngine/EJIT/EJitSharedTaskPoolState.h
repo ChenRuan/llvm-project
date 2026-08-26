@@ -196,8 +196,8 @@ struct EJitSharedCacheSlot {
   uint64_t codeSize;      ///< size in bytes of that allocation (0 = none)
   uintptr_t poolBase;     ///< 2MiB pool base (split_2m_to_4k granule)
   uint64_t poolSize;      ///< usable pool size
-  uint32_t poolId;        ///< stable pool index (diagnostic / convenience key)
-  uint32_t rangeReserved; ///< reserved, keeps the tail explicit (must be 0)
+  uint32_t poolId;   ///< stable pool index within its near/far manager
+  uint32_t poolKind; ///< EJitCodePoolKind: unknown=0, near=1, far=2
   /// Runtime-writable extents of the published code (v9): the pages the JIT
   /// body writes at runtime (e.g. Tier-1 __profc_ counters). A non-owner core
   /// in 4K-seal mode MUST enable_rw exactly these in its own translation
@@ -359,6 +359,17 @@ struct EJitSharedCodePoolStats {
   EJitAtomicU64 sealInvocations;
   EJitAtomicU64 splitInvocations;
   EJitAtomicU64 finalizedRangeCount;
+  struct Detail {
+    EJitAtomicU64 poolCount;
+    EJitAtomicU64 sealedCount;
+    EJitAtomicU64 activeCount;
+    EJitAtomicU64 usedBytes;
+    EJitAtomicU64 reservedBytes;
+    EJitAtomicU64 wastedBytes;
+    EJitAtomicU64 sealInvocations;
+    EJitAtomicU64 splitInvocations;
+    EJitAtomicU64 finalizedRangeCount;
+  } near, far;
 };
 
 /// Plain (non-atomic) snapshot of code-pool stats, used as the callback
@@ -366,6 +377,17 @@ struct EJitSharedCodePoolStats {
 /// Mirrors EJitCodePoolManager::Stats field-for-field but stays decoupled from
 /// the code-pool header so the shared-taskpool ABI does not depend on it.
 struct EJitCodePoolStatsOut {
+  struct Detail {
+    uint64_t poolCount = 0;
+    uint64_t sealedCount = 0;
+    uint64_t activeCount = 0;
+    uint64_t usedBytes = 0;
+    uint64_t reservedBytes = 0;
+    uint64_t wastedBytes = 0;
+    uint64_t sealInvocations = 0;
+    uint64_t splitInvocations = 0;
+    uint64_t finalizedRangeCount = 0;
+  };
   uint64_t poolCount = 0;
   uint64_t sealedCount = 0;
   uint64_t activeCount = 0;
@@ -375,6 +397,8 @@ struct EJitCodePoolStatsOut {
   uint64_t sealInvocations = 0;
   uint64_t splitInvocations = 0;
   uint64_t finalizedRangeCount = 0;
+  Detail near;
+  Detail far;
 };
 
 //===----------------------------------------------------------------------===//

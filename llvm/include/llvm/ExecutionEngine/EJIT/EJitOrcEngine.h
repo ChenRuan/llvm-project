@@ -30,6 +30,14 @@ class Module;
 
 namespace ejit {
 
+#ifdef EJIT_SRE_CODE_POOL
+struct EJitTieredCodePoolStats {
+  EJitCodePoolManager::Stats total;
+  EJitCodePoolManager::Stats near;
+  EJitCodePoolManager::Stats far;
+};
+#endif
+
 class PeriodArrayRegistry;
 class EJitRuntimeState;
 struct EJitSharedTaskPoolState;
@@ -177,6 +185,10 @@ public:
   /// zeroed snapshot if no pool is active. Available only with
   /// EJIT_SRE_CODE_POOL.
   EJitCodePoolManager::Stats getCodePoolStats() const;
+
+  /// Snapshot aggregate and placement-specific statistics. Tier-1 uses the
+  /// far dynamic pool; final Baseline/Tier-2 code uses the near fixed pool.
+  EJitTieredCodePoolStats getTieredCodePoolStats() const;
 
   /// Resolve a compiled function pointer to its real, finalized executable
   /// range + owning code pool (for cross-core 4K execute-permission

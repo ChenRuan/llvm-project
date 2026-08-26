@@ -88,10 +88,11 @@ static void collectReferencedExternalDecls(
 
 struct EJitOrcEngine::Impl {
 #ifdef EJIT_SRE_CODE_POOL
-  /// Dedicated 2MiB code pools backing all JIT machine code. Declared before
-  /// J so it outlives the LLJIT (and the memory manager the object linking
-  /// layer owns, which references it).
-  std::unique_ptr<EJitCodePoolManager> codePool;
+  /// Final Baseline/Tier-2 code stays near AOT .text; temporary instrumented
+  /// Tier-1 code uses the previous dynamic SRE allocation path. Both outlive
+  /// LLJIT and its routing memory manager.
+  std::unique_ptr<EJitCodePoolManager> nearCodePool;
+  std::unique_ptr<EJitCodePoolManager> farCodePool;
 #endif
   std::unique_ptr<orc::LLJIT> J;
   PeriodArrayRegistry *periodReg = nullptr;
@@ -667,19 +668,23 @@ EJitOrcEngine::Create(const Config &config,
   // engine (so it outlives the LLJIT); the object linking layer owns a memory
   // manager that references it. Pages are kept RW here and sealed to RX later,
   // at lookup time, by the pool manager's enable_ex sealing.
-  engine->P->codePool = makeSreCodePoolManager();
+  engine->P->nearCodePool =
+      makeSreCodePoolManager(EJitCodePoolPlacement::NearFixed);
+  engine->P->farCodePool =
+      makeSreCodePoolManager(EJitCodePoolPlacement::FarDynamic);
   {
-    EJitCodePoolManager *Pool = engine->P->codePool.get();
+    EJitCodePoolManager *NearPool = engine->P->nearCodePool.get();
+    EJitCodePoolManager *FarPool = engine->P->farCodePool.get();
     Builder.setObjectLinkingLayerCreator(
-        [Pool](orc::ExecutionSession &ES)
+        [NearPool, FarPool](orc::ExecutionSession &ES)
             -> Expected<std::unique_ptr<orc::ObjectLayer>> {
           // Page size only affects per-segment layout padding; we never apply
           // per-segment protections (sealing is done per 2MiB pool), so a
           // conservative 4KiB is sufficient and portable.
           constexpr size_t JitPageSize = 4096;
           return std::make_unique<orc::ObjectLinkingLayer>(
-              ES, std::make_unique<EJitCodePoolMemoryManager>(*Pool,
-                                                              JitPageSize));
+              ES, std::make_unique<EJitCodePoolMemoryManager>(
+                      *NearPool, *FarPool, JitPageSize));
         });
   }
 #endif
@@ -1002,7 +1007,13 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     P->specDylibs.erase(it);
   }
 
-  auto JDOrErr = P->J->createJITDylib("spec_" + std::to_string(cacheKey));
+  const char *TierTag =
+      P->activeCtx && P->activeCtx->tier == CompileTier::Instrumented
+          ? "t1"
+          : P->activeCtx && P->activeCtx->tier == CompileTier::PGOUse ? "t2"
+                                                                      : "base";
+  auto JDOrErr = P->J->createJITDylib("spec_" + std::string(TierTag) + "_" +
+                                      std::to_string(cacheKey));
   if (!JDOrErr) {
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: create JITDylib error", cacheKey);
     return JDOrErr.takeError();
@@ -1136,9 +1147,13 @@ Expected<void *> EJitOrcEngine::lookup(uint64_t cacheKey,
   //
   // In 4K page-seal mode the seal already happened per-page at finalize (in the
   // code-pool memory manager), so nothing is done here.
-  if (P->codePool && !P->codePool->usesPageSeal() &&
-      P->codePool->contains(Ptr)) {
-    if (auto Err = P->codePool->sealPoolContaining(Ptr)) {
+  EJitCodePoolManager *OwningPool = nullptr;
+  if (P->nearCodePool && P->nearCodePool->contains(Ptr))
+    OwningPool = P->nearCodePool.get();
+  else if (P->farCodePool && P->farCodePool->contains(Ptr))
+    OwningPool = P->farCodePool.get();
+  if (OwningPool && !OwningPool->usesPageSeal()) {
+    if (auto Err = OwningPool->sealPoolContaining(Ptr)) {
       EJIT_DIAG("lookup FAIL key=0x%016lx ptr=%p: seal pool error", cacheKey,
                 Ptr);
       return std::move(Err);
@@ -1190,17 +1205,38 @@ void EJitOrcEngine::addUserSymbol(const std::string &name, void *addr) {
 
 #ifdef EJIT_SRE_CODE_POOL
 EJitCodePoolManager::Stats EJitOrcEngine::getCodePoolStats() const {
-  if (P->codePool)
-    return P->codePool->getStats();
-  return EJitCodePoolManager::Stats{};
+  return getTieredCodePoolStats().total;
+}
+
+EJitTieredCodePoolStats EJitOrcEngine::getTieredCodePoolStats() const {
+  EJitTieredCodePoolStats Out;
+  if (P->nearCodePool)
+    Out.near = P->nearCodePool->getStats();
+  if (P->farCodePool)
+    Out.far = P->farCodePool->getStats();
+#define EJIT_SUM_STAT(Field) Out.total.Field = Out.near.Field + Out.far.Field
+  EJIT_SUM_STAT(poolCount);
+  EJIT_SUM_STAT(sealedCount);
+  EJIT_SUM_STAT(activeCount);
+  EJIT_SUM_STAT(usedBytes);
+  EJIT_SUM_STAT(reservedBytes);
+  EJIT_SUM_STAT(wastedBytes);
+  EJIT_SUM_STAT(sealInvocations);
+  EJIT_SUM_STAT(splitInvocations);
+  EJIT_SUM_STAT(rwEnableInvocations);
+  EJIT_SUM_STAT(finalizedRangeCount);
+#undef EJIT_SUM_STAT
+  return Out;
 }
 
 bool EJitOrcEngine::findCodeRange(const void *FnPtr,
                                   EJitCompiledCodeInfo &Out) const {
-  if (!P->codePool) {
+  if (!P->nearCodePool && !P->farCodePool) {
     EJIT_DIAG("findCodeRange FAIL: no code pool (fnPtr=%p)", FnPtr);
     return false;
   }
-  return P->codePool->findRange(FnPtr, Out);
+  if (P->nearCodePool && P->nearCodePool->findRange(FnPtr, Out))
+    return true;
+  return P->farCodePool && P->farCodePool->findRange(FnPtr, Out);
 }
 #endif

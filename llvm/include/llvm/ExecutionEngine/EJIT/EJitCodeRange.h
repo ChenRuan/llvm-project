@@ -32,6 +32,12 @@
 namespace llvm {
 namespace ejit {
 
+enum class EJitCodePoolKind : uint32_t {
+  Unknown = 0,
+  Near = 1,
+  Far = 2,
+};
+
 /// Maximum number of runtime-writable ranges carried with one finalized
 /// compilation. A finalized allocation normally has a single writable data
 /// segment (the Tier-1 __profc_ counters); the small fixed bound leaves head
@@ -88,8 +94,9 @@ struct EJitCompiledCodeInfo {
   /// The runtime-writable extents a peer core must enable_rw before executing.
   /// Only the first writableCount entries are meaningful.
   EJitWritableRange writableRanges[kEJitMaxWritableRanges] = {};
-  /// Reserved (must be 0). Keeps the struct's tail explicit.
-  uint32_t reserved = 0;
+  /// Placement class of the owning pool. Near is the fixed .text.ejit region;
+  /// Far is the dynamic SRE_MemDbgAlloc region used by temporary Tier-1 code.
+  EJitCodePoolKind poolKind = EJitCodePoolKind::Unknown;
 };
 
 } // namespace ejit

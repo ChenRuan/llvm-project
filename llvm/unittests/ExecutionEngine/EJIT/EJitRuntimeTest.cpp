@@ -796,6 +796,7 @@ extern void ejit_print_func_meta(const char *funcName);
 // (the real ejit_status_t) with literal status values (0=OK, -1=INVALID_PARAM,
 // -2=NOT_ACTIVE, -9=DISABLED) so the test need not include the C API header.
 extern int ejit_get_code_pool_stats(void *out);
+extern int ejit_get_code_pool_stats_v2(void *out);
 extern void ejit_print_code_pool_stats(void);
 extern void ejit_print_mayconst_ranking(void);
 extern void ejit_print_active(void);
@@ -3512,6 +3513,7 @@ TEST(EJitDiagnostics, PrintFuncMetaMissingName) {
 // it deterministically returns INVALID_PARAM (-1) regardless of init state.
 TEST(EJitDiagnostics, CodePoolStatsNullOutRejected) {
   EXPECT_EQ(ejit_get_code_pool_stats(nullptr), -1);
+  EXPECT_EQ(ejit_get_code_pool_stats_v2(nullptr), -1);
 }
 
 // With a valid out pointer the call either succeeds (0) or reports a clean

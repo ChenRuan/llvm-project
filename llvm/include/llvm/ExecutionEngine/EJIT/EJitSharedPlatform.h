@@ -101,7 +101,9 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// v14: EJitCompileRequest owns an inline bound-pointer snapshot.
 /// v15: each cache slot records whether its published JIT pointer was resolved
 /// by a later taskpool lookup, diagnosing compiled versions with no reuse.
-constexpr uint32_t kEJitSharedAbiVersion = 15u;
+/// v16: code ranges identify near/far placement and the shared code-pool
+/// diagnostic mirror publishes aggregate plus placement-specific statistics.
+constexpr uint32_t kEJitSharedAbiVersion = 16u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

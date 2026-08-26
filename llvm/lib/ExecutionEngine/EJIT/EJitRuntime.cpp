@@ -1701,8 +1701,9 @@ void ejit_taskpool_print_compiled() {
   struct CountCtx {
     uint32_t byDims[kEJitSharedMaxDims + 1];
     uint32_t byTier[3];
+    uint32_t byPool[3];
     uint32_t finalPostPublishSeen;
-  } count = {{0}, {0}, 0};
+  } count = {{0}, {0}, {0}, 0};
   EJitSharedTaskPool::ForEachCompiledStats st = sp->forEachCompiled(
       [](const EJitSharedCacheSlot &slot, void *cbCtx) {
         // Valid numDims is 0..kEJitSharedMaxDims; clamp a corrupt slot's
@@ -1713,6 +1714,8 @@ void ejit_taskpool_print_compiled() {
         uint8_t tier = slot.tier.loadRelaxed();
         if (tier <= kEJitTierPgoUse)
           ++static_cast<CountCtx *>(cbCtx)->byTier[tier];
+        if (slot.poolKind <= static_cast<uint32_t>(EJitCodePoolKind::Far))
+          ++static_cast<CountCtx *>(cbCtx)->byPool[slot.poolKind];
         if (tier != kEJitTierInstrumented &&
             slot.postPublishSeen.loadRelaxed() != 0)
           ++static_cast<CountCtx *>(cbCtx)->finalPostPublishSeen;
@@ -1742,6 +1745,10 @@ void ejit_taskpool_print_compiled() {
                 count.byTier[kEJitTierBaseline],
                 count.byTier[kEJitTierInstrumented],
                 count.byTier[kEJitTierPgoUse]);
+  EJIT_DIAG_RAW("compiled pools: near=%u far=%u unknown=%u",
+                count.byPool[static_cast<uint32_t>(EJitCodePoolKind::Near)],
+                count.byPool[static_cast<uint32_t>(EJitCodePoolKind::Far)],
+                count.byPool[static_cast<uint32_t>(EJitCodePoolKind::Unknown)]);
 #ifdef EJIT_STATS_ENABLE
   constexpr bool ReuseTrackingEnabled = true;
   const uint32_t FinalVersions = count.byTier[kEJitTierBaseline] +
@@ -1798,6 +1805,12 @@ void ejit_taskpool_print_compiled() {
                            : SlotTier == kEJitTierInstrumented
                                ? "tier1-collecting"
                                : "baseline";
+        const char *PoolKind =
+            slot.poolKind == static_cast<uint32_t>(EJitCodePoolKind::Near)
+                ? "near"
+                : slot.poolKind == static_cast<uint32_t>(EJitCodePoolKind::Far)
+                      ? "far"
+                      : "unknown";
         if (gEJitDiagLevel >= EJIT_LOG_LVL_VERBOSE) {
           // Same shape for the per-instance version snapshot (uint32 x
           // kEJitSharedMaxDims + separators + NUL).
@@ -1811,19 +1824,20 @@ void ejit_taskpool_print_compiled() {
             p = end - 1;
           *p = '\0';
           EJIT_DIAG_RAW("funcIdx=%u name=%s tier=%s numDims=%u dims=[%s] fn=%p "
-                        "post_publish_seen=%s ver=[%s] size=%llu pool=%u "
+                        "post_publish_seen=%s ver=[%s] size=%llu "
+                        "pool=%s pool_id=%u "
                         "gen=%u",
                         slot.funcIndex,
                         name.empty() ? "<unknown>" : name.c_str(), Tier,
                         slot.numDims, dims, fn, PostPublishSeen, ver,
                         static_cast<unsigned long long>(slot.codeSize),
-                        slot.poolId, slot.generation);
+                        PoolKind, slot.poolId, slot.generation);
         } else {
           EJIT_DIAG_RAW("funcIdx=%u name=%s tier=%s numDims=%u dims=[%s] fn=%p "
-                        "post_publish_seen=%s",
+                        "pool=%s post_publish_seen=%s",
                         slot.funcIndex,
                         name.empty() ? "<unknown>" : name.c_str(), Tier,
-                        slot.numDims, dims, fn, PostPublishSeen);
+                        slot.numDims, dims, fn, PoolKind, PostPublishSeen);
         }
         ejitDiagPrintThrottle();
       },
@@ -1932,6 +1946,23 @@ ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out) {
   }
   if (!gEJIT->getCodePoolStats(out)) {
     EJIT_DIAG("get_code_pool_stats: no code pool (EJIT_SRE_CODE_POOL off or no engine)");
+    return EJIT_ERR_DISABLED;
+  }
+  return EJIT_OK;
+}
+
+ejit_status_t ejit_get_code_pool_stats_v2(ejit_code_pool_stats_v2_t *out) {
+  if (!out) {
+    EJIT_DIAG("get_code_pool_stats_v2: null out pointer");
+    return EJIT_ERR_INVALID_PARAM;
+  }
+  if (!gEJIT) {
+    EJIT_DIAG("get_code_pool_stats_v2: not initialized");
+    return EJIT_ERR_NOT_ACTIVE;
+  }
+  if (!gEJIT->getCodePoolStatsV2(out)) {
+    EJIT_DIAG("get_code_pool_stats_v2: no code pool "
+              "(EJIT_SRE_CODE_POOL off or no engine)");
     return EJIT_ERR_DISABLED;
   }
   return EJIT_OK;
