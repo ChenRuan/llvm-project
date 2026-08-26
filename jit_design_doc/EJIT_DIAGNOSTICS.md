@@ -128,7 +128,7 @@ unsigned      ejit_taskpool_pending_count(void); // 在途数量
 
 > 若 `cacheHits` 等逐调用计数全为零，说明运行库未启用逐调用统计（这些计数有热点路径开销，默认关闭）；`print_compiled()`、`get_worker_core()`、`pending_count()` 不受此影响，始终可用。
 
-`ejit_taskpool_print_compiled()` 的摘要中，`entries` 是本次尽力遍历到的 Ready 特化数，`slots` 是 cache 占用，`buckets skipped` 表示遍历时因并发竞争而跳过的 bucket；因此它不是强一致快照。摘要分别统计 `baseline/tier1_collecting/tier2` 和 `near/far/unknown`。明细中的 `dims=[d:i,...]` 表示 `dimType:instanceId`，`pool=near|far` 表示代码实际落点。VERBOSE 级额外显示各维度版本 `ver`、代码大小 `size`、池内编号 `pool_id` 和发布代数 `gen`。
+`ejit_taskpool_print_compiled()` 的摘要中，`entries` 是本次尽力遍历到的 Ready 特化数，`slots` 是 cache 占用，`buckets skipped` 表示遍历时因并发竞争而跳过的 bucket；因此它不是强一致快照。摘要分别统计 `baseline/tier1_collecting/tier2`、主代码池落点和带 MFS 冷区的版本数。明细中的 `dims=[d:i,...]` 表示 `dimType:instanceId`，`pool=near|far` 表示入口代码实际落点，`mfs_cold=yes` 表示同一版本还有 `.text.ejit_cold` companion range。VERBOSE 级额外显示各维度版本 `ver`、热代码大小 `size`、`cold_size`、池内编号 `pool_id` 和发布代数 `gen`。
 
 ### 2.3 代码池统计
 
@@ -156,7 +156,7 @@ ejit_status_t ejit_get_code_pool_stats_v2(ejit_code_pool_stats_v2_t *out);
 void          ejit_print_code_pool_stats(void);
 ```
 
-**作用**：监控 JIT 代码内存占用与是否趋近耗尽（`usedBytes` vs `reservedBytes`）。旧接口保持 ABI 不变并返回两池合计；v2 接口进一步区分 near/far。`ejit_print_code_pool_stats()` 同时打印 `total`、`near(final)` 和 `far(tier1)`。返回值：`EJIT_OK` 成功；`EJIT_ERR_NOT_ACTIVE` 运行时未初始化；`EJIT_ERR_INVALID_PARAM` 入参为空；`EJIT_ERR_DISABLED` 运行库未含代码池支持。
+**作用**：监控 JIT 代码内存占用与是否趋近耗尽（`usedBytes` vs `reservedBytes`）。旧接口保持 ABI 不变并返回全部池合计；v2 的 `near` 合并 hot/cold 固定池以保持 ABI，v3 进一步拆分 `nearHot/nearCold/farTier1`。`ejit_print_code_pool_stats()` 同时打印 `total`、`near-hot(final)`、`near-cold(mfs)` 和 `far(tier1)`。返回值：`EJIT_OK` 成功；`EJIT_ERR_NOT_ACTIVE` 运行时未初始化；`EJIT_ERR_INVALID_PARAM` 入参为空；`EJIT_ERR_DISABLED` 运行库未含代码池支持。
 
 **结构体解读**：
 

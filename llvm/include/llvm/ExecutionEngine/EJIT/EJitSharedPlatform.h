@@ -103,7 +103,8 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// by a later taskpool lookup, diagnosing compiled versions with no reuse.
 /// v16: code ranges identify near/far placement and the shared code-pool
 /// diagnostic mirror publishes aggregate plus placement-specific statistics.
-constexpr uint32_t kEJitSharedAbiVersion = 16u;
+/// v17: one published compilation may carry a companion MFS cold-code range.
+constexpr uint32_t kEJitSharedAbiVersion = 17u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

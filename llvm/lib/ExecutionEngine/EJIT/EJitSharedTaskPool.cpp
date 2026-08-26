@@ -1642,6 +1642,12 @@ EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
   Snap.codeSize = Slot.codeSize;
   Snap.poolBase = Slot.poolBase;
   Snap.poolSize = Slot.poolSize;
+  Snap.extraCodeCount = Slot.extraCodeCount;
+  uint32_t ExtraCopy = Slot.extraCodeCount > kEJitMaxExtraCodeRanges
+                           ? kEJitMaxExtraCodeRanges
+                           : Slot.extraCodeCount;
+  for (uint32_t I = 0; I < ExtraCopy; ++I)
+    Snap.extraCodeRanges[I] = Slot.extraCodeRanges[I];
   // Snapshot the runtime-writable extents too: the per-core enable_rw must run
   // with NO bucket lock held (like the split/seal below). Keep the raw count so
   // prepareExecForCurrentCore stays the single authority that rejects an
@@ -2043,13 +2049,19 @@ bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
     if (!ok)
       EJIT_DIAG("prepareExec FAIL: core=%u legacy prepareCode fn=%p", self,
                 R.fn);
-    return ok;
+    if (!ok || R.extraCodeCount > kEJitMaxExtraCodeRanges)
+      return false;
+    for (uint32_t I = 0; I < R.extraCodeCount; ++I)
+      if (!prepareCodeFn_(prepareCodeCtx_, reinterpret_cast<void *>(
+                                               R.extraCodeRanges[I].codeStart)))
+        return false;
+    return true;
   }
 
   // 4K page seal needs the real executable extent. A slot with no recorded
   // range (or a malformed one) is a clean fallback, never a guessed seal.
-  if (R.codeStart == 0 || R.codeSize == 0 || R.poolBase == 0 ||
-      R.poolSize == 0) {
+  if (R.extraCodeCount > kEJitMaxExtraCodeRanges || R.codeStart == 0 ||
+      R.codeSize == 0 || R.poolBase == 0 || R.poolSize == 0) {
     EJIT_DIAG_VERBOSE(
         "prepareExec fallback: core=%u fn=%p malformed range "
         "(codeStart=0x%llx codeSize=%llu poolBase=0x%llx poolSize=%llu)",
@@ -2163,6 +2175,26 @@ bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
                 static_cast<unsigned long long>(VA));
       return false; // any page failure -> no callable pointer is returned.
     }
+
+  for (uint32_t I = 0; I < R.extraCodeCount; ++I) {
+    const EJitSharedExecutableRange &Extra = R.extraCodeRanges[I];
+    if (Extra.codeStart == 0 || Extra.codeSize == 0 || Extra.poolBase == 0 ||
+        Extra.poolSize == 0 ||
+        Extra.codeStart + Extra.codeSize < Extra.codeStart ||
+        Extra.poolBase + Extra.poolSize < Extra.poolBase ||
+        Extra.codeStart < Extra.poolBase ||
+        Extra.codeStart + Extra.codeSize > Extra.poolBase + Extra.poolSize)
+      return false;
+    if (!ensurePoolSplitForCurrentCore(self, Extra.poolBase, Extra.poolSize))
+      return false;
+    const uintptr_t ExtraPageStart = Extra.codeStart & ~(Page - 1);
+    const uintptr_t ExtraPageEnd =
+        (Extra.codeStart + static_cast<uintptr_t>(Extra.codeSize) + Page - 1) &
+        ~(Page - 1);
+    for (uintptr_t VA = ExtraPageStart; VA < ExtraPageEnd; VA += Page)
+      if (!sealPageFn_ || !sealPageFn_(sealPageCtx_, VA))
+        return false;
+  }
   EJIT_DIAG_VERBOSE("prepareExec OK: core=%u fn=%p pages=[0x%llx,0x%llx)", self,
                     R.fn, static_cast<unsigned long long>(CodePageStart),
                     static_cast<unsigned long long>(CodePageEnd));
@@ -2179,9 +2211,12 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   // slot). Clamping would drop counter pages a peer must enable_rw, so the peer
   // would under-prepare and fault. Rejecting here means no slot goes Ready, no
   // fnPtr is published, and no executableCoreMask bit is set for this identity.
-  if (info && info->writableCount > kEJitSharedMaxWritableRanges) {
-    EJIT_DIAG("cachePublish REJECT: writableCount=%u > max=%u",
-              info->writableCount, kEJitSharedMaxWritableRanges);
+  if (info && (info->writableCount > kEJitSharedMaxWritableRanges ||
+               info->extraCodeCount > kEJitMaxExtraCodeRanges)) {
+    EJIT_DIAG("cachePublish REJECT: writableCount=%u max=%u "
+              "extraCodeCount=%u max=%u",
+              info->writableCount, kEJitSharedMaxWritableRanges,
+              info->extraCodeCount, kEJitMaxExtraCodeRanges);
     return EJitPublishStatus::InvalidParam;
   }
   uint32_t tier = decodeReqTier(req.funcIndex);
@@ -2256,6 +2291,21 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
     target->poolSize = info->poolSize;
     target->poolId = info->poolId;
     target->poolKind = static_cast<uint32_t>(info->poolKind);
+    target->extraCodeCount = info->extraCodeCount;
+    for (uint32_t I = 0; I < kEJitMaxExtraCodeRanges; ++I) {
+      EJitSharedExecutableRange &Dst = target->extraCodeRanges[I];
+      if (I < info->extraCodeCount) {
+        const EJitExecutableRange &Src = info->extraCodeRanges[I];
+        Dst.codeStart = Src.codeStart;
+        Dst.codeSize = Src.codeSize;
+        Dst.poolBase = Src.poolBase;
+        Dst.poolSize = Src.poolSize;
+        Dst.poolId = Src.poolId;
+        Dst.poolKind = static_cast<uint32_t>(Src.poolKind);
+      } else {
+        Dst = {};
+      }
+    }
     // Runtime-writable extents (v9): copy the bounded set the peer may need to
     // enable_rw. The over-bound case was already rejected at entry, so this
     // never truncates. requiresPeerEnableRw records whether the peer must
@@ -2280,6 +2330,9 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
     target->poolSize = 0;
     target->poolId = 0;
     target->poolKind = static_cast<uint32_t>(EJitCodePoolKind::Unknown);
+    target->extraCodeCount = 0;
+    for (EJitSharedExecutableRange &R : target->extraCodeRanges)
+      R = {};
     target->writableCount = 0;
     target->requiresPeerEnableRw = 0;
     for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
@@ -2446,6 +2499,7 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
     D.finalizedRangeCount.storeRelaxed(0);
   };
   ClearPoolDetail(st->codePoolStats.near);
+  ClearPoolDetail(st->codePoolStats.cold);
   ClearPoolDetail(st->codePoolStats.far);
   // Per-core, per-pool 4K split readiness (ABI v5). MUST be cleared on every
   // (re)initialization: a stale splitDone bit from an earlier generation would
@@ -2499,6 +2553,9 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
       Slot.poolSize = 0;
       Slot.poolId = 0;
       Slot.poolKind = static_cast<uint32_t>(EJitCodePoolKind::Unknown);
+      Slot.extraCodeCount = 0;
+      for (EJitSharedExecutableRange &R : Slot.extraCodeRanges)
+        R = {};
       // Runtime-writable ranges (ABI v9): cleared so a re-init never leaves a
       // stale writable extent a peer could enable_rw for retired code.
       Slot.writableCount = 0;
@@ -3164,6 +3221,7 @@ void EJitSharedTaskPool::publishCodePoolStats() {
     Dst.finalizedRangeCount.storeRelaxed(Src.finalizedRangeCount);
   };
   PublishDetail(state_->codePoolStats.near, s.near);
+  PublishDetail(state_->codePoolStats.cold, s.cold);
   PublishDetail(state_->codePoolStats.far, s.far);
 }
 
@@ -3193,6 +3251,7 @@ bool EJitSharedTaskPool::readCodePoolStats(EJitCodePoolStatsOut *out) const {
     Dst.finalizedRangeCount = Src.finalizedRangeCount.loadRelaxed();
   };
   ReadDetail(state_->codePoolStats.near, out->near);
+  ReadDetail(state_->codePoolStats.cold, out->cold);
   ReadDetail(state_->codePoolStats.far, out->far);
   return true;
 }

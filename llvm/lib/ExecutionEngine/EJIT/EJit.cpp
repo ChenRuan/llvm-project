@@ -957,6 +957,29 @@ bool EJit::getCodePoolStats(ejit_code_pool_stats_t *out) const {
 bool EJit::getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const {
   if (!out)
     return false;
+  ejit_code_pool_stats_v3_t V3{};
+  if (!getCodePoolStatsV3(&V3))
+    return false;
+  out->total = V3.total;
+  out->near = V3.nearHot;
+#define EJIT_ADD_PUBLIC_STAT(Field) out->near.Field += V3.nearCold.Field
+  EJIT_ADD_PUBLIC_STAT(poolCount);
+  EJIT_ADD_PUBLIC_STAT(sealedCount);
+  EJIT_ADD_PUBLIC_STAT(activeCount);
+  EJIT_ADD_PUBLIC_STAT(usedBytes);
+  EJIT_ADD_PUBLIC_STAT(reservedBytes);
+  EJIT_ADD_PUBLIC_STAT(wastedBytes);
+  EJIT_ADD_PUBLIC_STAT(sealInvocations);
+  EJIT_ADD_PUBLIC_STAT(splitInvocations);
+  EJIT_ADD_PUBLIC_STAT(finalizedRangeCount);
+#undef EJIT_ADD_PUBLIC_STAT
+  out->far = V3.farTier1;
+  return true;
+}
+
+bool EJit::getCodePoolStatsV3(ejit_code_pool_stats_v3_t *out) const {
+  if (!out)
+    return false;
 #if defined(EJIT_SRE_SHARED_TASKPOOL) && defined(EJIT_SRE_CODE_POOL)
   auto CopyShared = [](ejit_code_pool_stats_t &Dst,
                        const EJitCodePoolStatsOut::Detail &Src) {
@@ -1004,8 +1027,9 @@ bool EJit::getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const {
       Total.splitInvocations = s.splitInvocations;
       Total.finalizedRangeCount = s.finalizedRangeCount;
       CopyShared(out->total, Total);
-      CopyShared(out->near, s.near);
-      CopyShared(out->far, s.far);
+      CopyShared(out->nearHot, s.near);
+      CopyShared(out->nearCold, s.cold);
+      CopyShared(out->farTier1, s.far);
       return true;
     }
   }
@@ -1018,8 +1042,9 @@ bool EJit::getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const {
     return false;
   EJitTieredCodePoolStats s = engine->getTieredCodePoolStats();
   CopyManager(out->total, s.total);
-  CopyManager(out->near, s.near);
-  CopyManager(out->far, s.far);
+  CopyManager(out->nearHot, s.near);
+  CopyManager(out->nearCold, s.cold);
+  CopyManager(out->farTier1, s.far);
   return true;
 #else
   return false;
@@ -1028,8 +1053,8 @@ bool EJit::getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const {
 
 void EJit::printCodePoolStats() const {
 #ifdef EJIT_SRE_CODE_POOL
-  ejit_code_pool_stats_v2_t s{};
-  if (!getCodePoolStatsV2(&s)) {
+  ejit_code_pool_stats_v3_t s{};
+  if (!getCodePoolStatsV3(&s)) {
     EJIT_DIAG_RAW("code pool: not available (no engine)");
     return;
   }
@@ -1053,8 +1078,9 @@ void EJit::printCodePoolStats() const {
     (void)Permille;
   };
   PrintOne("total", s.total);
-  PrintOne("near(final)", s.near);
-  PrintOne("far(tier1)", s.far);
+  PrintOne("near-hot(final)", s.nearHot);
+  PrintOne("near-cold(mfs)", s.nearCold);
+  PrintOne("far(tier1)", s.farTier1);
 #else
   EJIT_DIAG_RAW("code pool: EJIT_SRE_CODE_POOL not enabled");
 #endif

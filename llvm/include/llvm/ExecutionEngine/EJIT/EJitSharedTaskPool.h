@@ -1214,6 +1214,8 @@ private:
     uint64_t codeSize = 0;
     uintptr_t poolBase = 0;
     uint64_t poolSize = 0;
+    uint32_t extraCodeCount = 0;
+    EJitSharedExecutableRange extraCodeRanges[kEJitMaxExtraCodeRanges] = {};
     /// Runtime-writable extents (e.g. __profc_) this core must enable_rw before
     /// it may execute the code. Snapshotted with the range so the per-core
     /// enable_rw runs with NO bucket lock held. writableCount 0 => none.
