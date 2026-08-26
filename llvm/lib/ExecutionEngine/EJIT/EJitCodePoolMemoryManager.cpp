@@ -57,6 +57,9 @@ struct EJitCodePoolMemoryManager::State {
   struct AllocationRecord {
     std::vector<ExecSegRange> ExecRanges;
   };
+  // Code-pool v1 never reclaims executable storage, so allocation addresses
+  // remain valid for the manager lifetime. If reclamation is introduced,
+  // deallocate() must remove these records and this lookup should be indexed.
   std::vector<AllocationRecord> Allocations;
 #ifndef EJIT_FREESTANDING
   mutable std::mutex Mutex;
@@ -365,10 +368,9 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
     if (auto Err = Pool.enableRwRange(Slab, static_cast<size_t>(Total))) {
       EJIT_DIAG("allocate FAIL: enableRwRange total=%llu",
                 static_cast<unsigned long long>(Total));
-      OnAllocated(joinErrors(
-          std::move(Err),
-          joinErrors(Pool.restoreRxRange(Slab, static_cast<size_t>(Total)),
-                     RestoreAll())));
+      // enableRwRange seals every page it made writable before returning an
+      // error. Only the earlier companion cold allocation remains to restore.
+      OnAllocated(joinErrors(std::move(Err), RestoreAll()));
       return;
     }
     // Zero-fill the whole slab up-front (covers zero-fill segments and any
