@@ -1372,7 +1372,7 @@ Vyukov MPSC，单消费者=唯一 owner worker（§1.3 SC 前提不变）：
 | `EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE` / `--sre-taskpool-worker-stack-size=` | worker 栈字节数（**单一事实源**，`EJIT_SRE_TASKPOOL` 打开即定义；`EJitSreTask_sre.cpp` 直接消费） | 1048576 |
 | `EJIT_SRE_SHARED_CODE_POINTERS` / `--sre-shared-code-pointers` | 允许非 owner 核读共享 cache fnPtr（需平台同 VA + cache coherent；错误开启可致非法执行） | OFF |
 | `EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS` | 每桶固定缓存槽数 | 16 |
-| `EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE` / `--sre-shared-worker-core=<n>` | 固定 worker 核：仅指定核可赢 owner 竞选并运行唯一 worker，非指定核有界等待后 attach（空 = 开放 CAS 竞选；指定核必须在 bring-up 以 Async 激活 EJit） | 空 |
+| `EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE` / `--sre-shared-worker-core=<n>` | 固定 worker 核：仅指定核可赢 owner 竞选并运行唯一 worker，非指定核有界等待后 attach（空 = 开放 CAS 竞选；指定核必须在 bring-up 以 Async 激活 EJit） | 空（生产 preset `ejit-minimal-aarch64_be` 固定为核 6） |
 | `EJIT_SHARED_SECTION_ATTR` → `EJIT_SHARED_SECTION` | 共享 section 放置属性（host 空；平台覆盖） | 空 |
 | `EJIT_SRE_SHARED_TASKPOOL_PLATFORM`（自动） | shared+`EJIT_FREESTANDING` 时由 CMake 自动定义：`EJitCoreId::current()` 绑定**只声明、无 weak fallback** 的平台符号 `ejit_sre_current_core_id`（缺失即链接错误）；host（非 freestanding）保留可设的模拟核 ID | 随 freestanding |
 
