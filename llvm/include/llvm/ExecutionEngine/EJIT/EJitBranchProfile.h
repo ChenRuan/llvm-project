@@ -55,6 +55,8 @@ struct EJitMayConstBenefitSample {
   uint64_t removedHitSites = 0;
   uint64_t sampledEntries = 0;
   uint64_t sampleCycles = 0;
+  /// Finalized executable bytes published for this JIT version.
+  uint64_t publishedHotCodeBytes = 0;
 };
 
 struct EJitMayConstBenefitSummary {
@@ -75,6 +77,9 @@ struct EJitMayConstBenefitSummary {
   uint64_t removedHitSites = 0;
   uint64_t sampledEntries = 0;
   uint64_t sampleCycles = 0;
+  uint64_t publishedHotCodeBytes = 0;
+  /// Sum of per-version ceil(publishedHotCodeBytes / 64).
+  uint64_t publishedHotICacheLines = 0;
   /// Average dynamically-reached may_const sites per unique JIT version,
   /// scaled by 1000 so freestanding diagnostics need no floating point.
   uint64_t averageActiveSitesPermille = 0;
@@ -83,6 +88,9 @@ struct EJitMayConstBenefitSummary {
   /// Removed dynamic load executions per million platform timestamp units,
   /// scaled by 1000 for three decimal places.
   uint64_t benefitPerMillionCyclesMilli = 0;
+  /// benefitPerMillionCycles divided by published hot I-cache lines, scaled
+  /// by 1000 for three decimal places.
+  uint64_t entryBenefitDensityMilli = 0;
 };
 
 /// Summarize the branch weights attached by PGOInstrumentationUse. This is a

@@ -803,6 +803,16 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   if (ctx.tier == CompileTier::PGOUse)
     tier1Counters_.erase(cacheKey);
 
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE) &&         \
+    defined(EJIT_SRE_CODE_POOL)
+  // Mainline publishes one executable range without a separate cold section,
+  // so its finalized code footprint is the current hot-code approximation.
+  EJitCompiledCodeInfo CodeInfo;
+  if (jitEngine_->findCodeRange(funcPtr, CodeInfo))
+    (void)jitEngine_->recordMayConstPublishedCodeSize(
+        funcName, cacheKey, CodeInfo.codeSize);
+#endif
+
   EJIT_DIAG("compile OK key=0x%016lx func=%s → pfn=%p", cacheKey,
             funcName.c_str(), funcPtr);
   return funcPtr;

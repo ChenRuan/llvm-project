@@ -16,6 +16,8 @@ using namespace llvm::ejit;
 
 namespace {
 
+constexpr uint64_t EJitICacheLineBytes = 64;
+
 uint64_t ceilPercent(uint64_t Total, uint32_t Percent) {
   return (Total / 100) * Percent + ((Total % 100) * Percent + 99) / 100;
 }
@@ -37,6 +39,23 @@ uint64_t scaledRatio(uint64_t Numerator, uint64_t Denominator,
   Wide *= APInt(129, Scale);
   Wide += APInt(129, Denominator / 2);
   Wide = Wide.udiv(APInt(129, Denominator));
+  if (Wide.getActiveBits() > 64)
+    return std::numeric_limits<uint64_t>::max();
+  return Wide.getZExtValue();
+}
+
+uint64_t scaledRatioWithProductDenominator(uint64_t Numerator,
+                                           uint64_t DenominatorL,
+                                           uint64_t DenominatorR,
+                                           uint64_t Scale) {
+  if (DenominatorL == 0 || DenominatorR == 0)
+    return 0;
+  APInt Denominator(192, DenominatorL);
+  Denominator *= APInt(192, DenominatorR);
+  APInt Wide(192, Numerator);
+  Wide *= APInt(192, Scale);
+  Wide += Denominator.lshr(1);
+  Wide = Wide.udiv(Denominator);
   if (Wide.getActiveBits() > 64)
     return std::numeric_limits<uint64_t>::max();
   return Wide.getZExtValue();
@@ -69,6 +88,13 @@ EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
         saturatingAdd(Summary.sampledEntries, Sample.sampledEntries);
     Summary.sampleCycles =
         saturatingAdd(Summary.sampleCycles, Sample.sampleCycles);
+    Summary.publishedHotCodeBytes = saturatingAdd(
+        Summary.publishedHotCodeBytes, Sample.publishedHotCodeBytes);
+    const uint64_t VersionICacheLines =
+        Sample.publishedHotCodeBytes / EJitICacheLineBytes +
+        (Sample.publishedHotCodeBytes % EJitICacheLineBytes != 0);
+    Summary.publishedHotICacheLines = saturatingAdd(
+        Summary.publishedHotICacheLines, VersionICacheLines);
     const int64_t Removed = static_cast<int64_t>(Sample.inputMayConstLoads) -
                             static_cast<int64_t>(Sample.finalMayConstLoads);
     if (First) {
@@ -97,6 +123,9 @@ EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
       scaledRatio(Summary.removedRuntimeHits, Summary.sampledEntries, 1000);
   Summary.benefitPerMillionCyclesMilli = scaledRatio(
       Summary.removedRuntimeHits, Summary.sampleCycles, 1000000000);
+  Summary.entryBenefitDensityMilli = scaledRatioWithProductDenominator(
+      Summary.removedRuntimeHits, Summary.sampleCycles,
+      Summary.publishedHotICacheLines, 1000000000);
   if (Summary.inputMayConstLoads != 0)
     Summary.weightedRemovedPermille =
         Summary.totalRemoved * 1000 /

@@ -131,4 +131,31 @@ TEST(EJitBranchProfile, BenefitScalingRoundsToNearestFixedPoint) {
   EXPECT_EQ(Summary.removedHitsPerEntryPermille, 667u);
 }
 
+TEST(EJitBranchProfile, ComputesBenefitDensityFromPerVersionCacheLines) {
+  EJitMayConstBenefitSample First;
+  First.removedRuntimeHits = 200;
+  First.sampleCycles = 500;
+  First.publishedHotCodeBytes = 65;
+  EJitMayConstBenefitSample Second;
+  Second.removedRuntimeHits = 100;
+  Second.sampleCycles = 500;
+  Second.publishedHotCodeBytes = 64;
+
+  EJitMayConstBenefitSummary Summary =
+      summarizeMayConstBenefits({First, Second});
+  EXPECT_EQ(Summary.publishedHotCodeBytes, 129u);
+  EXPECT_EQ(Summary.publishedHotICacheLines, 3u);
+  EXPECT_EQ(Summary.benefitPerMillionCyclesMilli, 300000000u);
+  EXPECT_EQ(Summary.entryBenefitDensityMilli, 100000000u);
+}
+
+TEST(EJitBranchProfile, ZeroCodeFootprintHasZeroBenefitDensity) {
+  EJitMayConstBenefitSample Sample;
+  Sample.removedRuntimeHits = 100;
+  Sample.sampleCycles = 100;
+  EJitMayConstBenefitSummary Summary = summarizeMayConstBenefits({Sample});
+  EXPECT_EQ(Summary.publishedHotICacheLines, 0u);
+  EXPECT_EQ(Summary.entryBenefitDensityMilli, 0u);
+}
+
 } // namespace
