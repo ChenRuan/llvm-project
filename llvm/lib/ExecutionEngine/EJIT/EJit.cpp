@@ -1,7 +1,6 @@
 //===-- EJit.cpp - EmbeddedJIT Main C++ API -------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
-#include "llvm/Config/Targets.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h" // SECT_EJIT_* section names
@@ -24,8 +23,6 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/TargetSelect.h"
-#include "llvm/TargetParser/Triple.h"
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -59,49 +56,6 @@ extern const ejit_reg_entry_t __start_ejit_period[];
 extern const ejit_reg_entry_t __stop_ejit_period[];
 #endif
 }
-
-namespace {
-
-void initializeEJitTargets() {
-#ifdef EJIT_TRIM_LLVM_BACKEND
-#ifdef EJIT_DEFAULT_TRIPLE
-  Triple TT(EJIT_DEFAULT_TRIPLE);
-#if LLVM_HAS_AARCH64_TARGET
-  if (TT.isAArch64()) {
-    LLVMInitializeAArch64TargetInfo();
-    LLVMInitializeAArch64Target();
-    LLVMInitializeAArch64TargetMC();
-    LLVMInitializeAArch64AsmPrinter();
-    LLVMInitializeAArch64AsmParser();
-    return;
-  }
-#endif
-#if LLVM_HAS_X86_TARGET
-  if (TT.isX86()) {
-    LLVMInitializeX86TargetInfo();
-    LLVMInitializeX86Target();
-    LLVMInitializeX86TargetMC();
-    LLVMInitializeX86AsmPrinter();
-    return;
-  }
-#endif
-#endif
-#ifndef EJIT_FREESTANDING
-  if (!InitializeNativeTarget()) {
-    InitializeNativeTargetAsmPrinter();
-    return;
-  }
-#endif
-#endif
-
-  InitializeAllTargetInfos();
-  InitializeAllTargets();
-  InitializeAllTargetMCs();
-  InitializeAllAsmPrinters();
-  InitializeAllAsmParsers();
-}
-
-} // namespace
 
 EJit::EJit(const Config &config) : config_(config) {
   EJIT_DIAG_VERBOSE("constructing: mode=%d opt=%d maxCache=%zu maxEntries=%u",
@@ -293,10 +247,6 @@ EJit::EJit(const Config &config) : config_(config) {
       reg.registerStaticVar(sv.varName, sv.varAddr);
   }
 
-  // Create sync JIT engine (target must be initialized first).
-  // Use InitializeAll* instead of InitializeNative* so that cross-compiled
-  // builds (e.g. AArch64 target built on x86 host) also work correctly.
-  initializeEJitTargets();
   EJIT_DIAG(
       "registered: bitcodes=%zu periodArrays=%zu staticVars=%zu symbols=%zu",
       data.bitcodes.size(), data.periodArrays.size(), data.staticVars.size(),

@@ -40,7 +40,6 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/SourceMgr.h"
-#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
 #ifndef EJIT_FREESTANDING
@@ -95,10 +94,10 @@ TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
     OS.flush();
   }
 
-  llvm::InitializeNativeTarget();
-  llvm::InitializeNativeTargetAsmPrinter();
   EJitRuntimeState State;
   Config Cfg;
+  // Direct engine creation owns target registration just like the shared
+  // worker-owner path; callers and producer-only EJit instances do not.
   auto EngineOrErr = EJitOrcEngine::Create(Cfg, State.getRegistry(), State);
   ASSERT_TRUE(static_cast<bool>(EngineOrErr));
   auto Engine = std::move(*EngineOrErr);
