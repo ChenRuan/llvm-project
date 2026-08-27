@@ -86,6 +86,13 @@ add_llvm_unittest(EJITTaskPoolTests
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSreQueue.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitWorker.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSreTask_host.cpp
+  # Defines gEJitDiagLevel (the level gate behind every EJIT_DIAG* call in the
+  # sources above). Required since "Raise diagnostic print throttle" (2b1aab7)
+  # added EJIT_DIAG* calls to EJitTaskPool.cpp: without it this target fails to
+  # link, since it deliberately links only LLVMSupport and never the full
+  # LLVMEJIT (which carries EJitLogger.cpp) - same pattern as
+  # EJITSharedTaskPoolTests below.
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
 
   PARTIAL_SOURCES_INTENDED
   )
@@ -157,6 +164,24 @@ target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
   EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=100
   )
 
+# Forward the production code-sharing capability from the cache so the test
+# binary compiles EJitSharedTaskPool.cpp with the SAME compile-time fnPtr gate
+# as the LLVMEJIT this suite validates (the peer-path tests - FourK seal, peer
+# prepare, shared fnPtr - exercise the macro-ON gate; the code-sharing-OFF
+# tests are #ifndef-guarded in the test source). The global
+# add_definitions(-DEJIT_SRE_SHARED_CODE_POINTERS) was removed from
+# llvm/CMakeLists.txt precisely because it leaked into this target and pinned
+# the gate ON while the cache said otherwise; the forwarding below restores
+# the intended coupling in both directions. EJIT_TEST_NO_RECLAIM below also
+# turns it on unconditionally for that opt-in configuration. Mirrors the
+# LLVMEJIT-side condition (shared taskpool AND code pointers) so a
+# TASKPOOL=OFF + CODE_POINTERS=ON corner config cannot leave the test binary
+# gated while the library is not.
+if(EJIT_SRE_SHARED_TASKPOOL AND EJIT_SRE_SHARED_CODE_POINTERS)
+  target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
+    EJIT_SRE_SHARED_CODE_POINTERS)
+endif()
+
 # Opt-in: build the shared taskpool tests with the load-only NO_RECLAIM seqlock
 # hit path (and cross-core code sharing, so the peer path is exercised too), to
 # validate the optimization. Configure a separate build dir with
@@ -211,6 +236,13 @@ add_llvm_unittest(EJITTier1WritableIntegrationTests
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
+  # Defines gEJitDiagLevel (the level gate behind every EJIT_DIAG* call in the
+  # sources above). Required since "Harden shared online PGO" (ea80ca36) made
+  # EJitCodePool.cpp emit EJIT_DIAG* calls: without it this target fails to
+  # link, since it deliberately links only JITLink/OrcShared and never the
+  # full LLVMEJIT (which carries EJitLogger.cpp) - same pattern as
+  # EJITSharedTaskPoolTests above.
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
 
   PARTIAL_SOURCES_INTENDED
   )

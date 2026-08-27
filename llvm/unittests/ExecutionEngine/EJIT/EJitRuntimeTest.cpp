@@ -87,6 +87,15 @@ TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
     auto *FT = FunctionType::get(I32, {I32}, false);
     for (StringRef Name : {"dump_a", "dump_b", "dump_c"}) {
       auto *F = Function::Create(FT, Function::ExternalLinkage, Name, &M);
+      // Production modules stamp the entry function with !ejit.metadata
+      // (clang CodeGen: CGEJIT.cpp). Without the tag the JIT pipeline
+      // internalizes every
+      // definition for IPSCCP, an internalized entry nothing calls in-module
+      // is dead, and the compiled object carries none of these symbols - the
+      // lookups below fail with "Missing definitions".
+      Metadata *EntryOps[] = {MDString::get(Ctx, TAG_EJIT_ENTRY)};
+      F->setMetadata(MD_EJIT_METADATA,
+                     MDNode::get(Ctx, {MDNode::get(Ctx, EntryOps)}));
       IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
       B.CreateRet(B.CreateAdd(F->getArg(0), B.getInt32(Name.back())));
     }
@@ -2255,12 +2264,19 @@ TEST(EJitStructFieldPass, MissingPerLoadMetadataGVOffsetFallback) {
 
   IRBuilder<> B(Ctx);
   Type *Int32Ty = B.getInt32Ty();
-  auto *ArrTy = ArrayType::get(Int32Ty, 4);
+  // clang records ejit_may_const_field offsets ELEMENT-RELATIVE: the frontend
+  // strips one array layer before collecting field offsets (CGEJIT.cpp), and
+  // the fallback matches the field coordinate via `Off % ElemSize`
+  // (EJitCommon.h). Model the clang-shaped input: struct S { i32 a, b, c, d; }
+  // g_arr[4] with may_const on S::c, 8 bytes into each 16-byte element.
+  auto *ElemTy =
+      StructType::create(Ctx, {Int32Ty, Int32Ty, Int32Ty, Int32Ty}, "S");
+  auto *ArrTy = ArrayType::get(ElemTy, 4);
   auto *GVar =
       new GlobalVariable(*M, ArrTy, false, GlobalValue::InternalLinkage,
                          ConstantAggregateZero::get(ArrTy), "g_arr");
   // GV metadata: ejit_period_arr "cell" size 4 + ejit_may_const_field offset 8
-  // (offset 8 == element index 2 for i32[4]).
+  // (element-relative: S::c is 8 bytes into each 16-byte element).
   Metadata *ArrOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
                         MDString::get(Ctx, "cell"),
                         ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 4))};
@@ -2276,13 +2292,21 @@ TEST(EJitStructFieldPass, MissingPerLoadMetadataGVOffsetFallback) {
       Function::Create(FT, GlobalValue::ExternalLinkage, "fallback", M.get());
   BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
   B.SetInsertPoint(BB);
+  // g_arr[2].c: total byte offset 2*16+8 = 40, element-relative coordinate 8.
   Value *Idx[] = {B.getInt32(0), B.getInt64(2)};
-  auto *GEP = B.CreateInBoundsGEP(ArrTy, GVar, Idx, "gep");
+  auto *ElemGEP = B.CreateInBoundsGEP(ArrTy, GVar, Idx, "elem");
+  auto *FieldGEP =
+      B.CreateInBoundsGEP(ElemTy, ElemGEP, {B.getInt32(0), B.getInt32(2)},
+                          "field");
   // NOTE: deliberately NO per-load !ejit.may_const metadata here.
-  auto *Load = B.CreateLoad(Int32Ty, GEP, "load");
+  auto *Load = B.CreateLoad(Int32Ty, FieldGEP, "load");
   B.CreateRet(Load);
 
-  int32_t mockArr[4] = {10, 20, 30, 40}; // g_arr[2] = 30
+  struct S {
+    int32_t a, b, c, d;
+  };
+  S mockArr[4] = {{0, 0, 10, 0}, {0, 0, 20, 0}, {0, 0, 30, 0}, {0, 0, 40, 0}};
+  // g_arr[2].c = 30
   PeriodArrayRegistry reg;
   reg.registerArray("cell", "g_arr", mockArr, 4);
 
@@ -2357,6 +2381,14 @@ TEST(EJitStructFieldPass, PointerPeriodRootFeedsNestedMayConstHelper) {
   auto *EntryTy = FunctionType::get(I32Ty, {}, false);
   auto *Entry = Function::Create(EntryTy, GlobalValue::ExternalLinkage,
                                  "read_aaa", M.get());
+  // Production modules stamp the entry with !ejit.metadata (clang CodeGen:
+  // CGEJIT.cpp; EJitWrapperGen only reads the tag).
+  // runInterproceduralPropagation internalizes every definition WITHOUT the
+  // entry tag, and an internalized entry that nothing calls in-module is dead
+  // to IPSCCP - both functions folded to unreachable and the test collapsed.
+  Metadata *EntryOps[] = {MDString::get(Ctx, TAG_EJIT_ENTRY)};
+  Entry->setMetadata(MD_EJIT_METADATA,
+                     MDNode::get(Ctx, {MDNode::get(Ctx, EntryOps)}));
   BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", Entry);
   B.SetInsertPoint(EntryBB);
   // This load has no may_const metadata. It is the address root that must be
@@ -2407,11 +2439,16 @@ TEST(EJitStructFieldPass, MissingPerLoadMetadataWrongOffsetNoReplace) {
 
   IRBuilder<> B(Ctx);
   Type *Int32Ty = B.getInt32Ty();
-  auto *ArrTy = ArrayType::get(Int32Ty, 4);
+  // Same element-relative shape as MissingPerLoadMetadataGVOffsetFallback:
+  // struct S { i32 a, b, c, d; } g_arr[4], may_const on S::a only.
+  auto *ElemTy =
+      StructType::create(Ctx, {Int32Ty, Int32Ty, Int32Ty, Int32Ty}, "S");
+  auto *ArrTy = ArrayType::get(ElemTy, 4);
   auto *GVar =
       new GlobalVariable(*M, ArrTy, false, GlobalValue::InternalLinkage,
                          ConstantAggregateZero::get(ArrTy), "g_arr");
-  // may_const_field offset list contains only 0; the load below is at offset 8.
+  // may_const_field offset list contains only 0 (S::a); the load below reads
+  // S::c, 8 bytes into the element, which is not in the list.
   Metadata *ArrOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
                         MDString::get(Ctx, "cell"),
                         ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 4))};
@@ -2427,9 +2464,12 @@ TEST(EJitStructFieldPass, MissingPerLoadMetadataWrongOffsetNoReplace) {
                              M.get());
   BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
   B.SetInsertPoint(BB);
-  Value *Idx[] = {B.getInt32(0), B.getInt64(2)}; // offset 8, not in {0}
-  auto *GEP = B.CreateInBoundsGEP(ArrTy, GVar, Idx, "gep");
-  auto *Load = B.CreateLoad(Int32Ty, GEP, "load");
+  Value *Idx[] = {B.getInt32(0), B.getInt64(2)};
+  auto *ElemGEP = B.CreateInBoundsGEP(ArrTy, GVar, Idx, "elem");
+  auto *FieldGEP =
+      B.CreateInBoundsGEP(ElemTy, ElemGEP, {B.getInt32(0), B.getInt32(2)},
+                          "field");
+  auto *Load = B.CreateLoad(Int32Ty, FieldGEP, "load");
   B.CreateRet(Load);
 
   int32_t mockArr[4] = {10, 20, 30, 40};

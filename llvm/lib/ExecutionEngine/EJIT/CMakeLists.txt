@@ -271,6 +271,20 @@ if(EJIT_SRE_SHARED_TASKPOOL AND
     EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE})
 endif()
 
+# Cross-core fnPtr sharing capability (option declared in llvm/CMakeLists.txt,
+# only meaningful with the shared taskpool). The consumers are
+# EJitSharedTaskPool.cpp (the peer pointer gate) and EJitCompileDriver.cpp
+# (the resolve path), both inside LLVMEJIT, so scope it to this target like
+# EJIT_CODE_POOL_4K_SEAL above - never a global add_definitions: the
+# EJITSharedTaskPoolTests target compiles EJitSharedTaskPool.cpp directly and
+# deliberately tests the code-sharing-OFF peer rejection, so a leaked
+# -DEJIT_SRE_SHARED_CODE_POINTERS makes the gate always-true and fails 5
+# tests. EJITTier1WritableIntegrationTests / EJITSharedCacheQueryBench define
+# it themselves when they want the sharing path.
+if(EJIT_SRE_SHARED_TASKPOOL AND EJIT_SRE_SHARED_CODE_POINTERS)
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_SRE_SHARED_CODE_POINTERS)
+endif()
+
 # EJIT_FREESTANDING must be visible in LLVMJITLink headers so that
 # std::promise / std::future usage is guarded (bare-metal has no <future>).
 if(EJIT_FREESTANDING)

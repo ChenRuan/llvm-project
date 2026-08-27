@@ -1026,9 +1026,14 @@ if(EJIT_SRE_SHARED_TASKPOOL)
     add_definitions(-DEJIT_SRE_SHARED_TASKPOOL_PLATFORM)
   endif()
   # Cross-core fnPtr sharing capability (only meaningful with the shared pool).
-  if(EJIT_SRE_SHARED_CODE_POINTERS)
-    add_definitions(-DEJIT_SRE_SHARED_CODE_POINTERS)
-  endif()
+  # NOT a global add_definitions: the macro's users are EJitSharedTaskPool.cpp
+  # and EJitCompileDriver.cpp, both inside LLVMEJIT, so it is scoped to that
+  # target (see llvm/lib/ExecutionEngine/EJIT/CMakeLists.txt). A global
+  # definition here leaked into EJITSharedTaskPoolTests, which compiles
+  # EJitSharedTaskPool.cpp directly and deliberately tests the
+  # code-sharing-OFF peer rejection: in a
+  # -DEJIT_SRE_SHARED_CODE_POINTERS=ON build dir the peer pointer gate became
+  # always-true and 5 tests failed.
   # An empty EJIT_ICACHE_SECTION puts the inline-cache cells in per-core .bss,
   # where a period toggle on one core cannot drain another's. Warn rather than
   # fail: -ejit-inline-cache is opt-in per application TU.
