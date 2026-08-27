@@ -1328,6 +1328,34 @@ Uninitialized ──CAS成功──> Initializing ──(建好全部共享状�
 
 - 首个把 `Uninitialized` CAS 成 `Initializing` 的核成为 owner：`initSharedStorage` 逐字段写 → bump `generation` → 写 `ownerCoreId/codeSharingEnabled/header` → 起唯一 worker → **最后 `storeRelease(Ready)`**（发布序：所有内容先就绪，Ready 最后发布）。
 - **固定 worker 核（构建策略 `EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE`，默认空 = 开放竞选）**：配置为核号 N 后竞选关闭——只有核 N 允许执行 `Uninitialized->Initializing` CAS（建引擎、创建 worker 任务；SRE 任务跑在创建它的核上，故"谁赢竞选 = worker 跑在哪个核"）。非指定核观察到 `Uninitialized` 时**绝不尝试 CAS**，以与 `Initializing` 分支相同的有限 yield 等待协议（idle hook / cpuRelax，`kMaxSpins` 预算）等核 N 完成初始化后 attach，bring-up 激活次序无关。预算耗尽（指定核从未激活，违反部署契约：**指定核必须在 bring-up 期间以 Async 模式激活 EJit**；注意预算为 2^20 次 yield，生产注入 idle hook 时即 ~2^20 个调度 tick，指定核若始终不来则各 peer 的 `ejit_init` 会阻塞这么久后才干净失败）返回 `InitInProgress` 干净失败，`EJit.cpp` 的 init 错误消息区分为 "designated worker core never initialized"——**绝不**无界等待挂死，也**绝不**静默改选其它核。`initAttempts` 只计真实 CAS 尝试（非指定核的等待不计）。单一镜像所有核链接同一份库，宏天然全核一致，无需入共享 blob、无 ABI 变化；CMake 定义窄作用域到 LLVMEJIT（消费者：`EJitSharedTaskPool.cpp` 的选举门控 + `EJit.cpp` 的错误消息）。
+
+#### 11.4.1 worker-only LLVM runtime initialization
+
+固定 worker 核的 shared-async 部署允许 producer-only 核跳过 LLVM/EJIT
+专用 `.init_array`：每个核仍必须以 `forceStaticRegistry=true` 调用
+`ejit_init()`，通过静态 registry table 完成本核 wrapper 的 funcIndex、
+lifecycle 和 inline-cache slot 回填；只有指定 worker 核需要在调用
+`ejit_init()` 前完成 LLVM 运行库的 init-array 准备。业务及其它库需要的
+构造函数不属于该豁免范围。
+
+Target 注册位于 `EJitOrcEngine::Create()`，而不是 `EJit::EJit()`。因此：
+
+```
+producer core: ejit_init -> registry fixup -> shared attach
+worker core:   LLVM init-array -> ejit_init -> owner election
+               -> EJitOrcEngine::Create -> target registration -> worker start
+```
+
+普通 baseline、online-PGO Tier-1 和 Tier-2 共用同一个 owner-private ORC
+engine，后两者不会在 producer 核创建额外的 LLVM 编译运行时。Sync 和
+non-shared async 模式不满足这一条件：执行编译的每个核都必须先准备 LLVM
+运行库。开放竞选也不能与“仅一个核准备 LLVM”组合；否则一个未准备的核
+可能合法赢得 owner。AArch64 BE 生产 preset 固定 worker core 后才允许启用
+此启动优化。
+
+EJIT 自身的 dump filter/store 使用按需构造的函数局部状态，不再要求 peer
+核通过 `.init_array` 构造进程级 `std::string`/`std::map`。共享 dump 元数据
+仍是 POD，并继续由 owner 初始化。
 - 其它核 `acquire` 观察：`Ready` 校验 `magic/version/size` 后绑定（`AttachedReady`，**绝不创建第二个 worker**）；`Failed`/`Stopping` → 干净 fallback，**不无限等待**；`Initializing` → 有限自旋后返回 `InitInProgress`（pending，不死锁）。
 - 重复 `init()` 幂等：owner 再次 `init()` 观察到 `Ready` 即 `AttachedReady`，不重选不重建。
 - worker 起动失败传播为 `OwnerFailed`/`Failed` + `lastInitError=WorkerStartFailed`，`ejit_init` 失败并销毁实例，**绝不把 init 失败伪装成 JIT 成功**。
