@@ -375,7 +375,8 @@ def doit_gc_merge(args):
     ]
     optional_api = [
         "ejit_register_lifecycle", "ejit_register_funcindex",
-        "ejit_taskpool_compile_or_get", "ejit_taskpool_release_read",
+        "ejit_taskpool_compile_or_get", "ejit_taskpool_compile_or_get_bound",
+        "ejit_taskpool_release_read",
         "ejit_taskpool_compile_or_get_0d", "ejit_taskpool_compile_or_get_1d",
         "ejit_taskpool_compile_or_get_2d", "ejit_taskpool_compile_or_get_3d",
         "ejit_taskpool_compile_or_get_4d",
@@ -384,7 +385,7 @@ def doit_gc_merge(args):
         "ejit_taskpool_get_stats", "ejit_taskpool_print_stats", "ejit_taskpool_get_worker_core",
         "ejit_taskpool_print_compiled", "ejit_taskpool_trace_now",
         "ejit_taskpool_trace_wrapper", "ejit_dump_func", "ejit_print_dumped",
-        "ejit_dump_all", "ejit_print_mayconst_ranking",
+        "ejit_print_dumped_module", "ejit_dump_all", "ejit_print_mayconst_ranking",
         # Inline-cache: ejit_register_icache_slot is called from
         # ejit_auto_register (AOT) when -ejit-inline-cache is on, not from the
         # runtime, so gc-merge's --gc-sections would discard it without this GC
