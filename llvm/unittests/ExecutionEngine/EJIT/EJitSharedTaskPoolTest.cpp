@@ -1648,7 +1648,11 @@ TEST_F(SharedTaskPoolTest, ForEachCompiledReportsVisitedAndSkipped) {
 // 11/ Cross-core fnPtr sharing gate.
 //===----------------------------------------------------------------------===//
 TEST_F(SharedTaskPoolTest, CrossCoreFnPtrSharingGate) {
-  // codeSharing OFF: a non-owner cleanly rejects the pointer.
+  // codeSharing OFF: a non-owner cleanly rejects the pointer. The OFF contract
+  // is compile-time gated: with EJIT_SRE_SHARED_CODE_POINTERS defined a peer is
+  // handed the pointer regardless of the runtime flag, so this half only runs
+  // in a build configured with the capability OFF.
+#ifndef EJIT_SRE_SHARED_CODE_POINTERS
   {
     EJitSharedTaskPool owner;
     bringUpOwner(owner, /*codeSharing=*/false);
@@ -1670,6 +1674,7 @@ TEST_F(SharedTaskPoolTest, CrossCoreFnPtrSharingGate) {
     EXPECT_TRUE(peerHit.readyButNotShareable);
     EXPECT_EQ(peerHit.fnPtr, codeFor(20)); // fallback
   }
+#endif
   // codeSharing ON: any core reads the SAME fnPtr.
   {
     state_ = std::make_unique<EJitSharedTaskPoolState>();
@@ -2136,6 +2141,10 @@ TEST_F(SharedTaskPoolTest, ConfiguredWorkerStackReachesTaskCreate) {
 
 // 七.5 — code sharing OFF: a non-owner core hits a Ready entry but gets NO
 // fnPtr and does NOT re-enqueue (no recompile churn).
+// The OFF-gate contract below only holds in a build configured with
+// EJIT_SRE_SHARED_CODE_POINTERS=OFF (the gate is compile-time; with the macro
+// ON a peer is handed the pointer unconditionally).
+#ifndef EJIT_SRE_SHARED_CODE_POINTERS
 TEST_F(SharedTaskPoolTest, CodeSharingOffRejectsPeerWithoutReenqueue) {
   EJitSharedTaskPool owner;
   bringUpOwner(owner, /*codeSharing=*/false);
@@ -2158,6 +2167,7 @@ TEST_F(SharedTaskPoolTest, CodeSharingOffRejectsPeerWithoutReenqueue) {
   EXPECT_EQ(after.queueDepth, before.queueDepth); // NOT re-enqueued
   EXPECT_EQ(after.pendingCount, before.pendingCount);
 }
+#endif
 
 // 七.6 — code sharing ON: a non-owner core gets the SAME fnPtr + read token,
 // and the owner can read its own pointer too.
@@ -3112,6 +3122,10 @@ TEST_F(SharedTaskPoolTest, DumpMetadataClearedOnInit) {
 
 // 18/ Code-sharing OFF in 4K mode: a non-owner cleanly rejects and triggers NO
 // platform split/seal call at all.
+// Same compile-time OFF contract as CodeSharingOffRejectsPeerWithoutReenqueue:
+// with EJIT_SRE_SHARED_CODE_POINTERS defined the peer path is always open, so
+// this only runs in a capability-OFF build.
+#ifndef EJIT_SRE_SHARED_CODE_POINTERS
 TEST_F(SharedTaskPoolTest, FourKCodeSharingOffMakesNoPlatformCall) {
   FourKLog fourK;
   RangeCtx range;
@@ -3137,6 +3151,7 @@ TEST_F(SharedTaskPoolTest, FourKCodeSharingOffMakesNoPlatformCall) {
   EXPECT_TRUE(fourK.splits.empty());
   EXPECT_TRUE(fourK.seals.empty());
 }
+#endif
 
 // 19/ Re-init scrubs EVERY ABI-v5 field. A re-initialization runs over the same
 // shared blob, so initSharedStorage must clear the per-pool split table AND the
@@ -3350,6 +3365,9 @@ TEST_F(SharedTaskPoolTest, TryCacheHitDisabledInstanceReturnsDisabled) {
 // 4/ readyButNotShareable: a peer core that may not read the cross-core pointer
 //    gets a clean OffMode fallback with readyButNotShareable set, no read
 //    token, and NO enqueue/dedup.
+// Same compile-time OFF contract as CodeSharingOffRejectsPeerWithoutReenqueue:
+// the clean no-token reject below requires EJIT_SRE_SHARED_CODE_POINTERS=OFF.
+#ifndef EJIT_SRE_SHARED_CODE_POINTERS
 TEST_F(SharedTaskPoolTest, TryCacheHitReadyButNotShareableCleanFallback) {
   EJitSharedTaskPool owner;
   bringUpOwner(owner, /*codeSharing=*/false);
@@ -3377,6 +3395,7 @@ TEST_F(SharedTaskPoolTest, TryCacheHitReadyButNotShareableCleanFallback) {
   EXPECT_EQ(after.asyncEnqueues, before.asyncEnqueues);
   EXPECT_EQ(after.pendingCount, before.pendingCount);
 }
+#endif
 
 // 5/ Mode Off still returns an existing cache hit on the fast path — the cache
 //    lookup is ordered ahead of the Off check, matching compileOrGet.
@@ -3560,6 +3579,9 @@ TEST_F(SharedTaskPoolTest, FixedDimServesHitEvenWhenModeOff) {
 
 // readyButNotShareable: a peer core that may not read the pointer gets a clean
 // OffMode fallback with no read token and no enqueue via a fixed entry.
+// Same compile-time OFF contract as CodeSharingOffRejectsPeerWithoutReenqueue:
+// the clean no-token reject below requires EJIT_SRE_SHARED_CODE_POINTERS=OFF.
+#ifndef EJIT_SRE_SHARED_CODE_POINTERS
 TEST_F(SharedTaskPoolTest, FixedDimReadyButNotShareableCleanFallback) {
   EJitSharedTaskPool owner;
   bringUpOwner(owner, /*codeSharing=*/false);
@@ -3578,6 +3600,7 @@ TEST_F(SharedTaskPoolTest, FixedDimReadyButNotShareableCleanFallback) {
   EXPECT_FALSE(fast.hasReadToken);
   EXPECT_EQ(fast.fnPtr, nullptr);
 }
+#endif
 
 // The specialized cacheLookupNd behind each fixed entry must agree with the
 // generic tryCacheHit()/cacheLookup() for the same identity: same fnPtr, same
