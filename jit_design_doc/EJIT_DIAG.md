@@ -1,7 +1,7 @@
 # EmbeddedJIT 诊断 dump：逐行打印延时
 
 > 适用分支：`ejit-print-compiled-fmt-djq`
-> 开关：`EJIT_DIAG_PRINT_THROTTLE_TICKS`（CMake 缓存变量，默认 20，0 关闭）
+> 开关：`EJIT_DIAG_PRINT_THROTTLE_TICKS`（CMake 缓存变量，默认 50，0 关闭）
 > 目标平台：`aarch64_be`（SRE，shell 环形 buffer 串口日志）
 
 ---
@@ -17,10 +17,10 @@ SRE 串口日志经 shell 环形 buffer 转发，相关平台参数只有两条�
 
 诊断 dump API 的**循环打印**（每个数据项一行）在每打印一行后调用 `ejitDiagPrintThrottle()`（`EJitDiag.h`），即**每循环一轮延时一次**：
 
-- 每次延时 `EJIT_DIAG_PRINT_THROTTLE_TICKS` 个调度 tick（`SRE_TaskDelay`，默认 **20** tick = 20 ms = 2 个消费者排空周期：第一个周期完成排空，第二个周期是吸收消费者抖动与多核日志交错的裕量）
+- 每次延时 `EJIT_DIAG_PRINT_THROTTLE_TICKS` 个调度 tick（`SRE_TaskDelay`，默认 **50** tick = 50 ms = 5 个消费者排空周期，为长 ranking 行、消费者抖动与多核日志交错留出裕量）
 - 仅在 `EJIT_DIAG_ENABLE` + `EJIT_FREESTANDING` 下生效；host 构建与诊断关闭时为零开销 no-op
 - 行未实际打印（日志级别低于 INFO）时不延时
-- 参数经 CMake 缓存变量传递（`llvm/CMakeLists.txt`，非负整数校验，0 关闭），`ejit-minimal-aarch64_be` 预设配 20
+- 参数经 CMake 缓存变量传递（`llvm/CMakeLists.txt`，非负整数校验，0 关闭），`ejit-minimal-aarch64_be` 预设配 50
 
 ## 3. 覆盖的循环
 
@@ -48,5 +48,5 @@ SRE 串口日志经 shell 环形 buffer 转发，相关平台参数只有两条�
 
 - `llvm/include/llvm/ExecutionEngine/EJIT/EJitDiag.h` — `ejitDiagPrintThrottle()`、`EJIT_DIAG_PRINT_THROTTLE_TICKS` 默认值
 - `llvm/CMakeLists.txt` — `EJIT_DIAG_PRINT_THROTTLE_TICKS` 缓存变量与校验
-- `llvm/CMakePresets.json` — `ejit-minimal-aarch64_be` 预设（20）
+- `llvm/CMakePresets.json` — `ejit-minimal-aarch64_be` 预设（50）
 - `llvm/lib/ExecutionEngine/EJIT/` — `EJit.cpp` / `EJitRuntime.cpp` / `EJitOrcEngine.cpp` / `EJitSharedTaskPool.cpp` 中的循环调用点

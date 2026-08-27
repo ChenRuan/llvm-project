@@ -57,15 +57,14 @@ extern int gEJitDiagLevel;
 // 1 ms), so those loops call ejitDiagPrintThrottle() once per printed line:
 // each call delays the producer by EJIT_DIAG_PRINT_THROTTLE_TICKS scheduler
 // ticks (SRE_TaskDelay), letting the consumer drain between lines. The
-// default of 20 ticks buys 2 drain periods per printed line: the first
-// performs the drain, the second is margin for consumer jitter and
-// interleaved multi-core logs (measured: 2 ticks/line drops lines; 50
-// ticks/line is 5 drain periods and needlessly slow).
+// default of 50 ticks buys 5 drain periods per printed line, leaving enough
+// margin for long ranking rows, consumer jitter, and interleaved multi-core
+// logs (measured: 2 ticks/line drops lines).
 // Compile-time configurable; 0 disables. Hosted builds do not delay;
 // diagnostics compiled out (no EJIT_DIAG_ENABLE) => pure no-op.
 
 #ifndef EJIT_DIAG_PRINT_THROTTLE_TICKS
-#define EJIT_DIAG_PRINT_THROTTLE_TICKS 20
+#define EJIT_DIAG_PRINT_THROTTLE_TICKS 50
 #endif
 
 #if defined(EJIT_DIAG_ENABLE) && defined(EJIT_FREESTANDING)
