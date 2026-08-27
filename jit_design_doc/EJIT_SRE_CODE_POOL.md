@@ -4,6 +4,7 @@
 **开关**:
 - `-DEJIT_SRE_CODE_POOL=ON`（默认 OFF，上游默认行为不变）
 - `-DEJIT_CODE_POOL_4K_SEAL=ON`（默认 ON，仅在 `EJIT_SRE_CODE_POOL=ON` 时生效；OFF 回退到旧的整 2MiB 池封固）
+- `-DEJIT_CODE_POOL_BATCHED_PUBLISH=ON`（默认 OFF，实验开关）：纯代码分配按 16B 紧凑排列；普通 EJIT 由 `ejit_publish_pending_code()` 触发批量发布，Online-PGO Tier-2 在编译队列排空时自动发布。
 - `-DEJIT_FIXED_CODE_POOL=ON`（默认 OFF）：代码池改用链接脚本固定区域 `[__ejit_code_start, __ejit_code_end)`（段名 `.text.ejit`，**代码段**），替代动态 `SRE_MemDbgAlloc`，给 JIT 稳定地址（±128MiB 内可直 `bl`/`adrp` 到 AOT）。写前 `enable_rw`（RX->RW）、finalize `enable_ex`（RW->RX）。需平台提供 `enable_rw`。详见 [§14](#14-固定代码池区域ejit_fixed_code_pool)。
 
 **关联代码**:
@@ -34,6 +35,35 @@
   映射，之后才能对其中的 4K 页 `enable_ex`。`base` 必须 2MiB 对齐，`size` 为 2MiB 的整数
   倍，且 `split_2m_to_4k` 必须在 `enable_ex` 之前调用。
 - 一旦某 4K 页被置为 **RX（可执行）**，该页**不能再写**。
+
+### 1.1 实验性批量发布
+
+`EJIT_CODE_POOL_BATCHED_PUBLISH` 只改变 4K 封固模式下的发布时机和纯代码布局。普通
+EJIT 请求先由共享 worker 搬出有界 MPSC 队列，收到显式发布请求后按维度字典序排列
+（第一维 cell、第二维 TRP，最后按函数编号），再依次编译。JITLink allocation 以 16B
+对齐连续写入近端 RW/NX 页面，批量调用 `enable_ex`，随后才把对应函数指针从共享缓存的
+Pending 状态切换为 Ready。未封页的地址不会返回给业务核。
+
+Online-PGO 使用分层发布：Tier-1 立即编译到远端临时池并自动封固、发布，以便马上开始
+采样；达到阈值后，Tier-2 立即编译和 JITLink 到近端池，但保持 RW/NX 且仅保存在 owner
+私有队列中。此时共享 cache 仍保留可执行的 Tier-1 及其 counters，但采样达到阈值后的
+业务调用临时回退 AOT，不再继续承担整模块原子插桩开销；inline cache 仍不填 Tier-1。
+worker 观察到共享编译队列排空后，自动封固整批 Tier-2 页面，并在封固成功后将 cache 和
+inline cache 原子替换为 Tier-2。封固或 cache 发布失败时保留 Tier-1；可调用
+`ejit_publish_pending_code()` 显式重试，不会把不可执行的 Tier-2 地址暴露给业务核。
+批次封固前会把 bump cursor 推到下一页，因此已经 RX 的尾页不会再被写入；含 GOT、数据
+段或要求超过 16B 对齐的 allocation 自动保持原来的 4K 独占布局。
+
+普通 EJIT 的发布由业务侧显式调用 `ejit_publish_pending_code()` 触发；Online-PGO Tier-2
+则在编译队列排空时自动触发。接口仍可用于强制发布或失败重试；返回 `EJIT_OK` 时，近端
+pending code 的 `enable_ex`、共享 cache 发布和 inline-cache 回填均已完成。该模式用于
+验证紧凑布局对 I-cache/L3 冲突的影响，默认关闭。普通 EJIT 请求仍按 cell/TRP 排序后才
+分配真实地址；Tier-2 为缩短采样完成后的等待时间而提前 JITLink，其地址顺序由 profile
+完成顺序决定，队列排空发布只批量封固和回填，不会重新排列已写入的 Tier-2 代码。
+
+显式发布在排空调用前已有请求及执行排序后的 ORC 编译时，仍逐项执行共享 worker 的
+`EJIT_SRE_TASKPOOL_WORKER_THROTTLE_*` 延时。批量发布只改变代码布局和封页时机，不绕过
+原有的编译负载节流；Tier-1 与 Tier-2 始终由同一个 owner worker 串行编译。
 
 EmbeddedJIT 需要在运行期把 JIT 生成的机器码变为可执行。直接的做法（wrap 全局
 `mprotect`）会破坏 ORC/JITLink 的后续写入，因此本方案让 EmbeddedJIT **自己拥有
@@ -189,6 +219,7 @@ cmake -S llvm -B build-ejit-sre-pool \
 |------|------|------|
 | `EJIT_SRE_CODE_POOL` | OFF | 启用 2MiB 对齐代码池 + enable_ex 封固；同时隐含启用 `EJIT_SRE_ENABLE_EX` |
 | `EJIT_CODE_POOL_4K_SEAL` | ON | 仅在 `EJIT_SRE_CODE_POOL=ON` 时生效。开启：池创建时 `split_2m_to_4k`，封固按 **4K 页** `enable_ex`。关闭：回退到整 2MiB 池封固。**唯一新增布尔开关，无新增数值配置**（2MiB/4KiB 为实现内平台常量） |
+| `EJIT_CODE_POOL_BATCHED_PUBLISH` | OFF | 实验性 16B 紧凑纯代码布局与显式批量封页/发布；要求同时开启 SRE code pool、4K seal 和 shared taskpool。 |
 | `EJIT_SRE_CODE_POOL_SIZE` | 2097152 (2MiB) | 每个池的可用字节数；4K 模式下向上取整为 2MiB 整数倍 |
 | `EJIT_SRE_CODE_POOL_PTNO` | 8 | 传给 `SRE_MemDbgAlloc` 的分区号 ptNo |
 | `EJIT_SRE_ENABLE_EX` | 随 `EJIT_SRE_CODE_POOL` | 关闭后代码仍走池，但不做权限翻转（bring-up/测量用） |

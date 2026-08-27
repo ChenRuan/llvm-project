@@ -15,9 +15,10 @@
 //     worker, and publishes Ready (or Failed). Every other core observes the
 //     outcome with an acquire load and binds — it never creates a second
 //     worker. A build may instead PIN the worker to one designated core (CMake
-//     EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE, consumed in EJitSharedTaskPool.cpp):
-//     only that core may run the CAS; a non-designated core waits — bounded,
-//     yielding — for the designated core to initialize, then attaches.
+//     EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE, consumed in
+//     EJitSharedTaskPool.cpp): only that core may run the CAS; a non-designated
+//     core waits — bounded, yielding — for the designated core to initialize,
+//     then attaches.
 //   * the producer path compileOrGet() operating purely on shared state.
 //   * the consumer path pollOne()/pollBudget() (the worker, or a test, drives
 //     it) with the two version checkpoints and the commit-gated cache publish.
@@ -40,6 +41,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <vector>
 
 namespace llvm {
 namespace ejit {
@@ -107,9 +109,10 @@ enum class EJitWorkerStep : uint32_t {
 // .mc_shared) rather than per-core .bss, so ONE table backs every core:
 //
 //  * PARTITIONED, so no locking. A cell's index is icacheLinearize(dims), the
-//    ejit_dim argument values (the ejit_period_lc instance indices). Cores drive
-//    disjoint instance ranges, so they write disjoint cells and the hit path is
-//    what it was when the table was private: no gate, no contention, one load.
+//    ejit_dim argument values (the ejit_period_lc instance indices). Cores
+//    drive disjoint instance ranges, so they write disjoint cells and the hit
+//    path is what it was when the table was private: no gate, no contention,
+//    one load.
 //
 //  * DRAINABLE ACROSS CORES, which a private table is not. activate/deactivate
 //    rewrites every registered cell to its empty value in place (icacheDrainAll
@@ -162,8 +165,8 @@ enum class EJitWorkerStep : uint32_t {
 // The one race that is NOT benign is a fill landing AFTER a drain: the pointer
 // was resolved pre-toggle, so the cell would come back holding a specialization
 // baked from the old period values and nothing would clear it. icacheDrainSeq
-// closes exactly that -- icacheBeginResolve() snapshots it at the taskpool entry
-// point and icacheFill drops the fill if it moved.
+// closes exactly that -- icacheBeginResolve() snapshots it at the taskpool
+// entry point and icacheFill drops the fill if it moved.
 //
 // Lifetime safety: JIT code is never physically freed in production (NO_RECLAIM
 // + no releaser wired), so a cached pointer can never dangle -- including one a
@@ -235,7 +238,8 @@ void ejitIcacheClearAll();
 //
 // Outcome of a slot registration. The two failure kinds must NOT be conflated:
 //
-//   CapacityMiss  past EJIT_ICACHE_FUNC_SLOTS (4096) while the function registry
+//   CapacityMiss  past EJIT_ICACHE_FUNC_SLOTS (4096) while the function
+//   registry
 //                 holds 4096. Normal in a large application: the cell stays
 //                 null and the taskpool serves the function. Callers must
 //                 degrade, never error, or the 65th ejit_entry stops ejit_init.
@@ -349,6 +353,11 @@ public:
   /// pool exists (clean fallback). Optional: when unset, the shared mirror
   /// stays zero and readers fall back to their per-core (empty) view.
   using CodePoolStatsCallback = bool (*)(void *ctx, EJitCodePoolStatsOut *out);
+  /// Batched code-pool hooks. isReady is false while a linked address remains
+  /// RW/NX; flush seals the current owner-private batch and makes every staged
+  /// address resolvable through CodeRangeCallback.
+  using CodeReadyCallback = bool (*)(void *ctx, const void *fnPtr);
+  using CodeBatchFlushCallback = bool (*)(void *ctx);
   /// Per-core platform primitive: split a 2MiB-aligned [poolBase, poolBase +
   /// poolSize) window into 4KiB mappings in the CALLING core's translation
   /// context (split_2m_to_4k). Returns true on success. Used only in 4K
@@ -515,7 +524,8 @@ public:
     // v2 inline cache never reclaims (no HP-scan retire, ever). A wired
     // releaser means code may be freed while a cached fnPtr still pins it ->
     // UAF. Auto-disable the cache while a releaser is wired. Production wires
-    // no releaser, so the gate stays open and the cache is unconditionally safe.
+    // no releaser, so the gate stays open and the cache is unconditionally
+    // safe.
     //
     // The disable state is SHARED, not just this facade's: the cells are one
     // table backing every core, so a peer facade with its own flag still clear
@@ -542,8 +552,9 @@ public:
   }
   /// Whether a resolved fnPtr is callable on EVERY core the instant it exists,
   /// with no per-core work. False when the platform wires per-core execute
-  /// preparation (legacy 2M `prepareCodeFn_`, or 4K-seal mode, where a core must
-  /// split its pool and seal the code's pages before executing a peer's code).
+  /// preparation (legacy 2M `prepareCodeFn_`, or 4K-seal mode, where a core
+  /// must split its pool and seal the code's pages before executing a peer's
+  /// code).
   ///
   /// This is the precondition of a SHARED cell table, and what the per-core
   /// table gave for free: a non-null cell there implied THIS core had resolved,
@@ -595,6 +606,20 @@ public:
   void setCodePoolStatsProvider(CodePoolStatsCallback fn, void *ctx) {
     codePoolStatsFn_ = fn;
     codePoolStatsCtx_ = ctx;
+  }
+  void setCodeBatchCallbacks(CodeReadyCallback ready,
+                             CodeBatchFlushCallback flush, void *ctx) {
+    // Readiness without a flush would leave slots Pending forever. Treat any
+    // partial configuration as batching disabled.
+    if (!ready || !flush) {
+      codeReadyFn_ = nullptr;
+      codeBatchFlushFn_ = nullptr;
+      codeBatchCtx_ = nullptr;
+      return;
+    }
+    codeReadyFn_ = ready;
+    codeBatchFlushFn_ = flush;
+    codeBatchCtx_ = ctx;
   }
   /// Read the shared code-pool stats mirror (last owner-published snapshot).
   /// Returns false if the shared state is not bound. Every core sees the same
@@ -744,7 +769,9 @@ public:
     return pgoEnabled_.loadRelaxed() != 0;
   }
 
-  /// Return true when this miss may start/continue a staged PGO function.
+  /// Return true when this miss may start a staged PGO function. Only one
+  /// specialization of a funcIndex may own admission at a time; later versions
+  /// stay on AOT until the current Tier-2 finishes.
   bool admitPgoFunction(uint32_t funcIndex, bool &newlyAdmitted);
 
   //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
@@ -892,18 +919,19 @@ public:
   /// The shared `enabled` bit is the JIT compile gate and is CAS'd, so only the
   /// first caller in each direction moves it.
   ///
-  /// The INVALIDATIONS (icache drain + L0 dispatchEpoch bump) run on EVERY call.
-  /// Period data is core-private while the specialization is SHARED, so N cores
-  /// each bracket their own writes over one shared bit: a caller that LOST the
-  /// CAS may still have rewritten its own copy, and neither cache stores a
-  /// version.
+  /// The INVALIDATIONS (icache drain + L0 dispatchEpoch bump) run on EVERY
+  /// call. Period data is core-private while the specialization is SHARED, so N
+  /// cores each bracket their own writes over one shared bit: a caller that
+  /// LOST the CAS may still have rewritten its own copy, and neither cache
+  /// stores a version.
   ///
   /// version[] moves ONLY on a real transition. Its consumer is runCompile's
   /// checkpoints, which DISCARD a finished compile when it changes, and nothing
-  /// re-enqueues a dropped compile -- so an unconditional bump would let N cores
-  /// activating the same instance at startup stall the JIT permanently.
+  /// re-enqueues a dropped compile -- so an unconditional bump would let N
+  /// cores activating the same instance at startup stall the JIT permanently.
   ///
-  /// \returns whether the enabled BIT flipped. The invalidations run either way.
+  /// \returns whether the enabled BIT flipped. The invalidations run either
+  /// way.
   bool setInstanceEnabled(uint32_t dimType, uint32_t instanceId, bool enabled);
 
   /// Toggle EVERY instance of \p dimType, draining ONCE at the end.
@@ -1031,9 +1059,9 @@ public:
   /// every core, including one that is permanently hot and would never reach a
   /// runtime entry point of its own.
   ///
-  /// Cost is O(cells registered) -- proportional to the table the build chose to
-  /// allocate. Toggles are rare; paying the refill once per toggle is what buys
-  /// a probe with no freshness check.
+  /// Cost is O(cells registered) -- proportional to the table the build chose
+  /// to allocate. Toggles are rare; paying the refill once per toggle is what
+  /// buys a probe with no freshness check.
   ///
   /// Safe against a concurrent probe on any core: it reads the old pointer (and
   /// calls it once more; the code is never freed under the gate this cache
@@ -1057,6 +1085,18 @@ public:
   uint32_t sharedInitState() const;
   /// In-flight dedup count (used by the taskpool C ABI pending_count).
   uint32_t pendingCount() const;
+  /// Owner-side explicit flush for deterministic tests. Production callers use
+  /// requestCodeBatchFlushAndWait() so enable_ex runs on the owner worker.
+  bool flushCodeBatch() { return flushPendingPublishes(); }
+  size_t pendingPublishCount() const { return pendingPublishes_.size(); }
+  size_t pendingBatchCompileCount() const {
+    return pendingBatchCompiles_.size();
+  }
+
+  /// Ask the owner worker to seal every completed code range and publish its
+  /// Pending cache entries, then wait for completion. Safe on any attached
+  /// core.
+  bool requestCodeBatchFlushAndWait();
 
   /// Ask the owner worker to print its owner-local may_const ranking. Any
   /// attached core may call this; concurrent callers coalesce. The call waits
@@ -1093,14 +1133,27 @@ private:
   /// is a single yield (idle/wait); \p ticks=MULT*DELAY_TICKS is the post-task
   /// throttle delay. Bumps workerIdleYields_ either way.
   void workerIdle(uint32_t ticks);
+  /// Apply the configured post-task throttle through the same hook used by the
+  /// normal worker loop. Batch helpers must call this between internal compile
+  /// operations because they execute more than one operation per worker step.
+  void workerThrottle();
   bool serviceMayConstRankingRequest();
 
   /// Result of a shared-cache lookup, including the cross-core fnPtr gate.
   struct SharedLookup {
     void *fnPtr = nullptr;
+    /// Matched shared slot for post-validation diagnostics. A token-bearing
+    /// hit keeps it stable; NO_RECLAIM marks it only after the outer seqlock
+    /// validation has accepted the lookup.
+    EJitSharedCacheSlot *slot = nullptr;
     uint32_t bucketIndex = 0;
     bool hasReadToken = false;
     bool readyButNotShareable = false;
+    /// The instrumented Tier-1 has collected its configured number of root
+    /// samples and Tier-2 is queued/compiling. Keep the Tier-1 allocation and
+    /// counters alive for profile synthesis, but route calls back to AOT until
+    /// Tier-2 publication replaces the slot.
+    bool pgoSamplingComplete = false;
     /// EJIT_SRE_TASKPOOL_NO_RECLAIM only: a validated seqlock hit that holds NO
     /// read token. classifyHit() treats it as a CacheHit; bucketIndex is the
     /// out-of-range sentinel (kEJitSharedCacheBuckets) so the wrapper's
@@ -1190,6 +1243,16 @@ private:
   EJitPublishStatus cachePublish(const EJitCompileRequest &req, void *fnPtr,
                                  const EJitCompiledCodeInfo *info,
                                  bool pgoClearExclusive = false);
+  EJitPublishStatus cacheStagePending(const EJitCompileRequest &req,
+                                      void *fnPtr);
+  /// Reserve the request's complete identity in the shared cache before the
+  /// owner defers compilation for layout sorting. Unlike cacheStagePending(),
+  /// this never evicts Ready code: a collision simply keeps the coarse
+  /// per-function in-flight claim until the batch is compiled.
+  EJitPublishStatus cacheStageBatchRequest(const EJitCompileRequest &req);
+  void cacheDropPending(const EJitCompileRequest &req, void *fnPtr);
+  bool cacheHasPending(uint32_t funcIndex, const EJitDimPair *dims,
+                       uint32_t numDims);
 
   /// Snapshot of one Ready cache slot taken under the bucket read lock, so the
   /// expensive per-core execute-permission preparation (split + enable_ex)
@@ -1254,12 +1317,18 @@ private:
   /// the arming hit's hitCount RMW while a Tier-1 publish keeps the normal
   /// write lock. No caller-supplied flag: the worker owns this policy (spec
   /// §4.9).
-  void runCompile(const EJitCompileRequest &req);
+  void runCompile(const EJitCompileRequest &req,
+                  bool hasBatchRequestMarker = false);
+  void compilePendingBatchRequests();
+  bool flushPendingPublishes(bool compileBatchRequests = true);
+  bool serviceCodeBatchRequest();
+  bool serviceAutoTier2Publish();
 
   /// Release staged-PGO ownership if \p funcIndex still owns it. Tier-2
   /// completion and terminal worker failures call this; transient queue-full
   /// leaves ownership intact so the next hit can retry.
-  void finishPgoFunction(uint32_t funcIndex, bool completed);
+  void finishPgoFunction(uint32_t funcIndex, bool completed,
+                         const char *reason = nullptr);
 
   /// Owner-only: snapshot the owner-core code-pool stats via the registered
   /// provider and storeRelaxed them into the shared mirror. Called after every
@@ -1282,6 +1351,9 @@ private:
   void *codePoolStatsCtx_ = nullptr;
   MayConstRankingCallback mayConstRankingFn_ = nullptr;
   void *mayConstRankingCtx_ = nullptr;
+  CodeReadyCallback codeReadyFn_ = nullptr;
+  CodeBatchFlushCallback codeBatchFlushFn_ = nullptr;
+  void *codeBatchCtx_ = nullptr;
   SplitPoolCallback splitPoolFn_ = nullptr;
   void *splitPoolCtx_ = nullptr;
   SealPageCallback sealPageFn_ = nullptr;
@@ -1310,6 +1382,19 @@ private:
   IcacheFillMidpointHook icacheFillMidpointHook_ = nullptr;
   void *icacheFillMidpointCtx_ = nullptr;
 #endif
+  struct PendingPublish {
+    EJitCompileRequest req{};
+    void *fn = nullptr;
+  };
+  struct PendingBatchCompile {
+    EJitCompileRequest req{};
+    bool hasSharedMarker = false;
+  };
+  std::vector<PendingBatchCompile> pendingBatchCompiles_;
+  std::vector<PendingPublish> pendingPublishes_;
+  /// Armed when Tier-2 links into the near RW/NX pool. Consumed only after the
+  /// owner worker observes the shared compile queue empty.
+  bool autoTier2PublishPending_ = false;
   // Inline-cache safety gate: true while the cache is safe to use (no releaser
   // wired - the production default). v2 does no HP-scan retire, so a wired
   // releaser (code may be freed) + the cache = UAF; the gate then auto-disables

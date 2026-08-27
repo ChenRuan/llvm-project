@@ -156,6 +156,10 @@ target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
   EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=3
   EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=100
   )
+if(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
+    EJIT_CODE_POOL_BATCHED_PUBLISH)
+endif()
 
 # Opt-in: build the shared taskpool tests with the load-only NO_RECLAIM seqlock
 # hit path (and cross-core code sharing, so the peer path is exercised too), to

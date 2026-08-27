@@ -110,8 +110,7 @@ static_assert(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES >= 1u &&
                   EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES <=
                       kEJitSharedMaxConcurrentProfiles,
               "EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES must be in [1, 16]");
-constexpr uint32_t kEJitSharedDumpNameBytes =
-    EJIT_SRE_SHARED_DUMP_NAME_BYTES;
+constexpr uint32_t kEJitSharedDumpNameBytes = EJIT_SRE_SHARED_DUMP_NAME_BYTES;
 constexpr uint32_t kEJitSharedCacheLine = 64u;
 /// Execute-permission seal granularity (the platform's per-page enable_ex unit)
 /// and the large-page / split granularity. Fixed platform constants.
@@ -157,6 +156,17 @@ enum class EJitSharedSlotState : uint32_t {
   Empty = 0,      ///< Slot free.
   Publishing = 1, ///< Owner is mid-write; readers must skip.
   Ready = 2,      ///< fnPtr/identity/versions valid for an acquiring reader.
+  Pending = 3,    ///< Linked address is RW/NX; callers must keep using AOT.
+};
+
+/// Cross-core handshake for an explicit code-batch publication request. Only
+/// the owner worker performs the transition from Requested to a terminal state.
+enum class EJitCodeBatchRequestState : uint32_t {
+  Idle = 0,
+  Requested = 1,
+  Running = 2,
+  Succeeded = 3,
+  Failed = 4,
 };
 
 //===----------------------------------------------------------------------===//
@@ -173,14 +183,14 @@ struct EJitSharedWritableRange {
 // EJitSharedCacheSlot: one POD result-cache entry.
 //===----------------------------------------------------------------------===//
 struct EJitSharedCacheSlot {
-  EJitAtomicU32 state;  ///< EJitSharedSlotState
-  uint32_t funcIndex;   ///< identity
-  uint32_t numDims;     ///< identity (<= 4)
-  uint32_t generation;  ///< owner generation that wrote this slot
-  EJitDimPair dims[4];  ///< identity
-  uint32_t versions[4]; ///< per-instance version snapshot at publish
+  EJitAtomicU32 state;   ///< EJitSharedSlotState
+  uint32_t funcIndex;    ///< identity
+  uint32_t numDims;      ///< identity (<= 4)
+  uint32_t generation;   ///< owner generation that wrote this slot
+  EJitDimPair dims[4];   ///< identity
+  uint32_t versions[4];  ///< per-instance version snapshot at publish
   uint64_t identityHash; ///< hash(funcIndex, dims) — fast reject before compare
-  EJitAtomicUPtr fnPtr; ///< compiled function pointer (cross-core read gated)
+  EJitAtomicUPtr fnPtr;  ///< compiled function pointer (cross-core read gated)
   /// Bit N means core N has successfully installed execute permission for this
   /// code address. Core ids >= 64 are supported but cannot be memoized here,
   /// so they run the preparation callback on every hit.
@@ -196,8 +206,8 @@ struct EJitSharedCacheSlot {
   uint64_t codeSize;      ///< size in bytes of that allocation (0 = none)
   uintptr_t poolBase;     ///< 2MiB pool base (split_2m_to_4k granule)
   uint64_t poolSize;      ///< usable pool size
-  uint32_t poolId;        ///< stable pool index (diagnostic / convenience key)
-  uint32_t rangeReserved; ///< reserved, keeps the tail explicit (must be 0)
+  uint32_t poolId;   ///< stable pool index within its near/far manager
+  uint32_t poolKind; ///< EJitCodePoolKind: unknown=0, near=1, far=2
   /// Runtime-writable extents of the published code (v9): the pages the JIT
   /// body writes at runtime (e.g. Tier-1 __profc_ counters). A non-owner core
   /// in 4K-seal mode MUST enable_rw exactly these in its own translation
@@ -231,6 +241,12 @@ struct EJitSharedCacheSlot {
   /// Used to suppress the Tier-2 auto-trigger on slots that are already
   /// Tier-2 — a Tier-2 hit should never request another Tier-2 compile.
   EJitAtomicU8 tier;
+  /// Diagnostics (v15): set once when this published version successfully
+  /// returns its JIT pointer through the taskpool lookup path. The async call
+  /// that requested compilation does not set it, so zero identifies a version
+  /// that has not been reused after publish. The ABI field is always present;
+  /// it is meaningful only when EJIT_STATS_ENABLE updates it.
+  EJitAtomicU8 postPublishSeen;
 };
 
 //===----------------------------------------------------------------------===//
@@ -244,12 +260,12 @@ struct alignas(kEJitSharedCacheLine) EJitSharedCacheBucket {
   EJitAtomicU32 readers;   ///< active reader count (token model)
   /// Monotonic publish sequence for the EJIT_SRE_TASKPOOL_NO_RECLAIM seqlock
   /// reader: the publisher makes it ODD before writing a slot and EVEN after
-  /// (see bucketWrite/bucketWriteRelease). A load-only reader captures it before
-  /// its scan and re-checks it after loading fnPtr; an unequal/odd value means a
-  /// publish raced the read, so the reader discards and cleanly falls back. Zero
-  /// per-hit atomic RMW on this line (unlike the token's readers counter). Only
-  /// bumped in a NO_RECLAIM build; stays 0 otherwise, so the default token path
-  /// is byte-for-byte unchanged.
+  /// (see bucketWrite/bucketWriteRelease). A load-only reader captures it
+  /// before its scan and re-checks it after loading fnPtr; an unequal/odd value
+  /// means a publish raced the read, so the reader discards and cleanly falls
+  /// back. Zero per-hit atomic RMW on this line (unlike the token's readers
+  /// counter). Only bumped in a NO_RECLAIM build; stays 0 otherwise, so the
+  /// default token path is byte-for-byte unchanged.
   EJitAtomicU32 publishSeq;
   EJitSharedCacheSlot slots[kEJitSharedCacheSlots];
 };
@@ -322,10 +338,10 @@ struct EJitSharedCounters {
   EJitAtomicU64 compileFailed;
   EJitAtomicU64 publishFailed;
   EJitAtomicU64 instanceDisabled;
-  EJitAtomicU64 instanceDisabledPreActivate; ///< Subset of instanceDisabled that
-                                             ///< occurred before the first
-                                             ///< setInstanceEnabled(true) — i.e.
-                                             ///< the init→activate window.
+  EJitAtomicU64 instanceDisabledPreActivate; ///< Subset of instanceDisabled
+                                             ///< that occurred before the first
+                                             ///< setInstanceEnabled(true) —
+                                             ///< i.e. the init→activate window.
   EJitAtomicU64 executePrepareFailed;
   /// PGO (v7, EJIT_ONLINE_PGO.md §10): Tier-1/Tier-2 compile counts + profile
   /// synthesis failures. Zero when PGO is off; fields always present for ABI.
@@ -353,6 +369,17 @@ struct EJitSharedCodePoolStats {
   EJitAtomicU64 sealInvocations;
   EJitAtomicU64 splitInvocations;
   EJitAtomicU64 finalizedRangeCount;
+  struct Detail {
+    EJitAtomicU64 poolCount;
+    EJitAtomicU64 sealedCount;
+    EJitAtomicU64 activeCount;
+    EJitAtomicU64 usedBytes;
+    EJitAtomicU64 reservedBytes;
+    EJitAtomicU64 wastedBytes;
+    EJitAtomicU64 sealInvocations;
+    EJitAtomicU64 splitInvocations;
+    EJitAtomicU64 finalizedRangeCount;
+  } near, far;
 };
 
 /// Plain (non-atomic) snapshot of code-pool stats, used as the callback
@@ -360,6 +387,17 @@ struct EJitSharedCodePoolStats {
 /// Mirrors EJitCodePoolManager::Stats field-for-field but stays decoupled from
 /// the code-pool header so the shared-taskpool ABI does not depend on it.
 struct EJitCodePoolStatsOut {
+  struct Detail {
+    uint64_t poolCount = 0;
+    uint64_t sealedCount = 0;
+    uint64_t activeCount = 0;
+    uint64_t usedBytes = 0;
+    uint64_t reservedBytes = 0;
+    uint64_t wastedBytes = 0;
+    uint64_t sealInvocations = 0;
+    uint64_t splitInvocations = 0;
+    uint64_t finalizedRangeCount = 0;
+  };
   uint64_t poolCount = 0;
   uint64_t sealedCount = 0;
   uint64_t activeCount = 0;
@@ -369,6 +407,8 @@ struct EJitCodePoolStatsOut {
   uint64_t sealInvocations = 0;
   uint64_t splitInvocations = 0;
   uint64_t finalizedRangeCount = 0;
+  Detail near;
+  Detail far;
 };
 
 //===----------------------------------------------------------------------===//
@@ -410,6 +450,10 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU32 mayConstRankingComplete;
   EJitAtomicU32 mayConstRankingResult;
 
+  //--- manual code-batch publication handshake (own cache line)
+  alignas(kEJitSharedCacheLine) EJitAtomicU32 codeBatchRequestLock;
+  EJitAtomicU32 codeBatchRequestState; ///< EJitCodeBatchRequestState
+
   //--- SwitchController state (own cache line)
   alignas(kEJitSharedCacheLine)
       EJitAtomicU8 enabled[kEJitSharedDimTypes][kEJitSharedInstances];
@@ -425,23 +469,24 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   /// Drains currently zeroing the table. Raised before the first cell store and
   /// lowered after the sequence bump, so the pair brackets the whole drain: a
   /// fill that sees 0 at both ends of its resolve and an unchanged sequence
-  /// provably did not overlap one. Needed because a drain that has passed a cell
-  /// but not yet bumped the sequence would otherwise let a fill slip in behind
-  /// it, and because several cores can drain at once.
+  /// provably did not overlap one. Needed because a drain that has passed a
+  /// cell but not yet bumped the sequence would otherwise let a fill slip in
+  /// behind it, and because several cores can drain at once.
   EJitAtomicU32 icacheDrainsInFlight;
   /// 1 => at least one cell has been armed since the last drain emptied the
   /// table. A drain reads this first and skips the whole walk when it is clear,
-  /// which is what makes bring-up affordable: N cores each calling ejit_activate
-  /// per instance produce N x instances drains, and until something is actually
-  /// cached every one of them writes 0 over 0 across every cell of every
-  /// registered slot (5 slots at dims 0..4 is ~70k cells per drain).
+  /// which is what makes bring-up affordable: N cores each calling
+  /// ejit_activate per instance produce N x instances drains, and until
+  /// something is actually cached every one of them writes 0 over 0 across
+  /// every cell of every registered slot (5 slots at dims 0..4 is ~70k cells
+  /// per drain).
   ///
-  /// Safety does NOT rest on this flag -- the in-flight/sequence bracket and the
-  /// post-store retract already guarantee no cell survives a drain. The flag
-  /// only removes work, and it errs on the side of doing it: icacheFill sets it
-  /// with release BEFORE storing the cell, so any drain that could observe a
-  /// non-null cell observes the flag first. A retracted fill leaves it set,
-  /// which costs one redundant walk and nothing else.
+  /// Safety does NOT rest on this flag -- the in-flight/sequence bracket and
+  /// the post-store retract already guarantee no cell survives a drain. The
+  /// flag only removes work, and it errs on the side of doing it: icacheFill
+  /// sets it with release BEFORE storing the cell, so any drain that could
+  /// observe a non-null cell observes the flag first. A retracted fill leaves
+  /// it set, which costs one redundant walk and nothing else.
   EJitAtomicU32 icacheArmed;
   /// 1 => at least one core needs per-core execute preparation (4K seal, or a
   /// wired prepareCode callback) before it may run JIT code.
@@ -449,15 +494,15 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   /// Must be SHARED, not per-facade: the property gates the 0-dim inline-cache
   /// fill, and a peer facade that was never handed the seal mode would evaluate
   /// its private copy as "no preparation needed" and arm the one shared scalar
-  /// that every core reads. Published by any facade that observes it locally and
-  /// never cleared except by (re)initialization -- "set" is the conservative
-  /// direction, and being monotone means no core can race another into a weaker
-  /// answer.
+  /// that every core reads. Published by any facade that observes it locally
+  /// and never cleared except by (re)initialization -- "set" is the
+  /// conservative direction, and being monotone means no core can race another
+  /// into a weaker answer.
   EJitAtomicU32 icachePerCorePrepare;
-  /// Number of bound facades that currently have a physical-code releaser wired.
-  /// Non-zero disables the inline cache for EVERY core: code may then be freed
-  /// and the probe does no HP-scan retire, so any cell still holding a pointer
-  /// can dangle.
+  /// Number of bound facades that currently have a physical-code releaser
+  /// wired. Non-zero disables the inline cache for EVERY core: code may then be
+  /// freed and the probe does no HP-scan retire, so any cell still holding a
+  /// pointer can dangle.
   ///
   /// Must be SHARED for the same reason, and it is a count rather than a flag
   /// because facades wire and unwire independently: the cache may only re-arm

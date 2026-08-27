@@ -11,6 +11,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -27,19 +28,282 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "gtest/gtest.h"
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
+#if defined(_WIN32) && defined(EJIT_SRE_CODE_POOL)
+#include <windows.h>
+#endif
 
 using namespace llvm;
 using namespace llvm::ejit;
+
+#if defined(_WIN32) && defined(EJIT_SRE_CODE_POOL)
+// Host implementations of the SRE memory primitives for the real ORC stress
+// test. These perform actual Windows virtual-memory allocation and RW->RX page
+// protection; Windows mappings are already backed by 4 KiB pages, so the SRE
+// large-page split operation has no additional host action.
+extern "C" void *SRE_MemDbgAlloc(unsigned int, unsigned char,
+                                 unsigned long Size, const char *,
+                                 unsigned int) {
+  return ::VirtualAlloc(nullptr, Size, MEM_RESERVE | MEM_COMMIT,
+                        PAGE_READWRITE);
+}
+
+extern "C" unsigned split_2m_to_4k(unsigned long long, unsigned long long) {
+  return 0;
+}
+
+extern "C" unsigned enable_ex(unsigned, unsigned long long Va) {
+  DWORD OldProtect = 0;
+  void *Page = reinterpret_cast<void *>(static_cast<uintptr_t>(Va));
+  if (!::VirtualProtect(Page, 4096, PAGE_EXECUTE_READ, &OldProtect))
+    return static_cast<unsigned>(::GetLastError());
+  return ::FlushInstructionCache(::GetCurrentProcess(), Page, 4096) ? 0u : 1u;
+}
+#endif
 
 static void markEJitEntry(Function &F) {
   LLVMContext &Ctx = F.getContext();
   MDNode *Entry = MDNode::get(Ctx, {MDString::get(Ctx, TAG_EJIT_ENTRY)});
   F.setMetadata(MD_EJIT_METADATA, MDNode::get(Ctx, {Entry}));
+}
+
+namespace {
+constexpr uint32_t RealCompileStressFunctions = 20;
+
+struct RealCompileStressCtx {
+  EJitOrcEngine *engine = nullptr;
+  std::string bitcode;
+  std::vector<std::string> names;
+  std::vector<void *> compiled;
+  std::atomic<unsigned> active{0};
+  std::atomic<unsigned> maxActive{0};
+  std::atomic<unsigned> completed{0};
+  std::atomic<bool> published{false};
+};
+
+static void updateAtomicMax(std::atomic<unsigned> &Dst, unsigned Value) {
+  unsigned Old = Dst.load(std::memory_order_relaxed);
+  while (Old < Value &&
+         !Dst.compare_exchange_weak(Old, Value, std::memory_order_relaxed))
+    ;
+}
+
+static bool realOrcStressCompile(void *Opaque, const EJitCompileRequest &Req,
+                                 void **OutFn) {
+  auto *Ctx = static_cast<RealCompileStressCtx *>(Opaque);
+  const uint32_t Func = stripReqTier(Req.funcIndex);
+  if (Func >= Ctx->names.size())
+    return false;
+
+  const unsigned Active =
+      Ctx->active.fetch_add(1, std::memory_order_relaxed) + 1;
+  updateAtomicMax(Ctx->maxActive, Active);
+  auto Finish = [&] { Ctx->active.fetch_sub(1, std::memory_order_relaxed); };
+
+  const uint64_t CacheKey = static_cast<uint64_t>(Func) + 1;
+  SpecializationContext Spec;
+  Spec.fnName = Ctx->names[Func];
+  Spec.cacheKey = CacheKey;
+  Spec.tier = CompileTier::Baseline;
+  Spec.optLevel = OptimizationLevel::L2;
+  Ctx->engine->setActiveContext(&Spec);
+  if (Error Err = Ctx->engine->loadBitcodeModule(Ctx->bitcode, CacheKey,
+                                                 Ctx->names[Func])) {
+    consumeError(std::move(Err));
+    Ctx->engine->setActiveContext(nullptr);
+    Finish();
+    return false;
+  }
+  auto FnOrErr = Ctx->engine->lookup(CacheKey, Ctx->names[Func]);
+  Ctx->engine->setActiveContext(nullptr);
+  if (!FnOrErr) {
+    consumeError(FnOrErr.takeError());
+    Finish();
+    return false;
+  }
+  *OutFn = *FnOrErr;
+  Ctx->compiled[Func] = *OutFn;
+  Ctx->completed.fetch_add(1, std::memory_order_release);
+  Finish();
+  return *OutFn != nullptr;
+}
+
+static bool realOrcStressCodeReady(void *Opaque, const void *Fn) {
+  auto *Ctx = static_cast<RealCompileStressCtx *>(Opaque);
+  return Ctx->engine->isCodeReady(Fn);
+}
+
+static bool realOrcStressFlush(void *Opaque) {
+  auto *Ctx = static_cast<RealCompileStressCtx *>(Opaque);
+  if (Error Err = Ctx->engine->flushPendingCode()) {
+    consumeError(std::move(Err));
+    return false;
+  }
+  Ctx->published.store(true, std::memory_order_release);
+  return true;
+}
+
+struct RealHostDelayCtx {
+  EJitSharedTaskPoolState *state = nullptr;
+  RealCompileStressCtx *compile = nullptr;
+  std::atomic<unsigned> throttleCalls{0};
+  std::atomic<unsigned> waitCalls{0};
+  std::atomic<uint64_t> totalThrottleMilliseconds{0};
+};
+
+static void realHostPlatformDelay(void *Opaque, uint32_t Ticks) {
+  auto *Ctx = static_cast<RealHostDelayCtx *>(Opaque);
+  const uint32_t Milliseconds = Ticks ? Ticks : 1u;
+  if (Ticks == 1u)
+    Ctx->waitCalls.fetch_add(1, std::memory_order_relaxed);
+  else {
+    Ctx->throttleCalls.fetch_add(1, std::memory_order_relaxed);
+    Ctx->totalThrottleMilliseconds.fetch_add(Milliseconds,
+                                             std::memory_order_relaxed);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(Milliseconds));
+  if (Ticks != 1u && Ctx->compile->published.load(std::memory_order_acquire))
+    Ctx->state->initState.storeRelease(
+        static_cast<uint32_t>(EJitSharedInitState::Stopping));
+}
+
+static uint32_t applyStressArithmetic(uint32_t Value, uint32_t Func) {
+  for (uint32_t I = 0; I != 256; ++I)
+    Value = Value * (33u + ((Func + I) & 7u)) + (Func * 17u + I);
+  return Value;
+}
+} // namespace
+
+TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+
+  RealCompileStressCtx Compile;
+  Compile.names.reserve(RealCompileStressFunctions);
+  Compile.compiled.resize(RealCompileStressFunctions, nullptr);
+  {
+    LLVMContext Ctx;
+    Module M("real_orc_twenty_function_stress", Ctx);
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *FT = FunctionType::get(I32, {I32}, false);
+    for (uint32_t Func = 0; Func != RealCompileStressFunctions; ++Func) {
+      std::string Name = "real_stress_" + std::to_string(Func);
+      Compile.names.push_back(Name);
+      auto *F = Function::Create(FT, Function::ExternalLinkage, Name, &M);
+      markEJitEntry(*F);
+      IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
+      Value *V = F->getArg(0);
+      for (uint32_t I = 0; I != 256; ++I) {
+        V = B.CreateMul(V, B.getInt32(33u + ((Func + I) & 7u)));
+        V = B.CreateAdd(V, B.getInt32(Func * 17u + I));
+      }
+      B.CreateRet(V);
+    }
+    raw_string_ostream OS(Compile.bitcode);
+    WriteBitcodeToFile(M, OS);
+    OS.flush();
+  }
+  ASSERT_FALSE(Compile.bitcode.empty());
+
+  EJitRuntimeState Runtime;
+  Config Cfg;
+  auto EngineOrErr = EJitOrcEngine::Create(Cfg, Runtime.getRegistry(), Runtime);
+  ASSERT_TRUE(static_cast<bool>(EngineOrErr));
+  auto Engine = std::move(*EngineOrErr);
+  Compile.engine = Engine.get();
+
+  auto Shared = std::make_unique<EJitSharedTaskPoolState>();
+  EJitSharedTaskPool Pool;
+  Pool.bind(Shared.get());
+  Pool.setCompiler(&realOrcStressCompile, &Compile);
+  Pool.setCodeBatchCallbacks(&realOrcStressCodeReady, &realOrcStressFlush,
+                             &Compile);
+  Pool.setMode(EJitCompileMode::Async);
+  RealHostDelayCtx Delay{Shared.get(), &Compile};
+  Pool.setWorkerIdleHook(&realHostPlatformDelay, &Delay);
+  ASSERT_EQ(Pool.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  for (uint32_t Func = 0; Func != RealCompileStressFunctions; ++Func)
+    ASSERT_EQ(Pool.compileOrGet(Func, nullptr, 0,
+                                reinterpret_cast<void *>(uintptr_t{1}))
+                  .status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+
+  std::atomic<bool> StopHeartbeat{false};
+  std::atomic<unsigned> Heartbeats{0};
+  std::atomic<unsigned> MaxHeartbeatGapUs{0};
+  std::thread Heartbeat([&] {
+    auto Previous = std::chrono::steady_clock::now();
+    while (!StopHeartbeat.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      auto Now = std::chrono::steady_clock::now();
+      auto Gap =
+          std::chrono::duration_cast<std::chrono::microseconds>(Now - Previous)
+              .count();
+      updateAtomicMax(MaxHeartbeatGapUs, static_cast<unsigned>(Gap));
+      Heartbeats.fetch_add(1, std::memory_order_relaxed);
+      Previous = Now;
+    }
+  });
+
+  std::atomic<int> PublishResult{-1};
+  std::thread Publisher([&] {
+    PublishResult.store(Pool.requestCodeBatchFlushAndWait() ? 1 : 0,
+                        std::memory_order_release);
+  });
+  while (Shared->codeBatchRequestState.loadAcquire() !=
+         static_cast<uint32_t>(EJitCodeBatchRequestState::Requested))
+    std::this_thread::yield();
+
+  const auto Start = std::chrono::steady_clock::now();
+  Pool.runWorkerLoop();
+  const auto Elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - Start)
+                           .count();
+  StopHeartbeat.store(true, std::memory_order_release);
+  Heartbeat.join();
+  Publisher.join();
+
+  std::printf("[REAL-STRESS] worker done compiles=%u throttles=%u "
+              "waits=%u elapsed_ms=%lld heartbeats=%u max_gap_us=%u\n",
+              Compile.completed.load(), Delay.throttleCalls.load(),
+              Delay.waitCalls.load(), static_cast<long long>(Elapsed),
+              Heartbeats.load(), MaxHeartbeatGapUs.load());
+  std::fflush(stdout);
+
+  EXPECT_EQ(Compile.completed.load(), RealCompileStressFunctions);
+  EXPECT_EQ(Compile.maxActive.load(), 1u);
+  EXPECT_EQ(PublishResult.load(std::memory_order_acquire), 1);
+  EXPECT_TRUE(Compile.published.load(std::memory_order_acquire));
+  // 20 queue-consume gaps + 20 real ORC compile gaps + one post-publish gap.
+  EXPECT_EQ(Delay.throttleCalls.load(), 41u);
+  EXPECT_GE(static_cast<uint64_t>(Elapsed),
+            Delay.totalThrottleMilliseconds.load());
+  EXPECT_GT(Heartbeats.load(), RealCompileStressFunctions);
+  EXPECT_LT(MaxHeartbeatGapUs.load(), 1000000u);
+
+  using StressFn = uint32_t (*)(uint32_t);
+  for (uint32_t Func = 0; Func != RealCompileStressFunctions; ++Func) {
+    ASSERT_NE(Compile.compiled[Func], nullptr);
+    auto *Fn = reinterpret_cast<StressFn>(Compile.compiled[Func]);
+    EXPECT_EQ(Fn(7u), applyStressArithmetic(7u, Func));
+  }
+
+  RecordProperty("real_orc_compiles", Compile.completed.load());
+  RecordProperty("worker_throttle_calls", Delay.throttleCalls.load());
+  RecordProperty("worker_wait_calls", Delay.waitCalls.load());
+  RecordProperty("worker_throttle_ms", Delay.totalThrottleMilliseconds.load());
+  RecordProperty("elapsed_ms", Elapsed);
+  RecordProperty("heartbeat_count", Heartbeats.load());
+  RecordProperty("heartbeat_max_gap_us", MaxHeartbeatGapUs.load());
 }
 
 static std::string findCapturedPgoName(const EJitOptimizer &Opt,
@@ -92,8 +356,10 @@ TEST(EJitPgo, Tier1InstrumentsAndCapturesCounterNames) {
   sc.tier = CompileTier::Instrumented;
   opt.runPipeline(*M0, sc);
 
-  GlobalVariable *Profc = M0->getGlobalVariable("__profc_foo", /*AllowLocal=*/true);
-  GlobalVariable *Profd = M0->getGlobalVariable("__profd_foo", /*AllowLocal=*/true);
+  GlobalVariable *Profc =
+      M0->getGlobalVariable("__profc_foo", /*AllowLocal=*/true);
+  GlobalVariable *Profd =
+      M0->getGlobalVariable("__profd_foo", /*AllowLocal=*/true);
   ASSERT_NE(Profc, nullptr);
   ASSERT_NE(Profd, nullptr);
   EXPECT_FALSE(Profc->hasLocalLinkage());
@@ -122,14 +388,16 @@ TEST(EJitPgo, Tier2PgoUseAnnotatesBranchWeights) {
   sc1.fnName = "foo";
   sc1.tier = CompileTier::Instrumented;
   opt.runPipeline(*M1, sc1);
-  GlobalVariable *Profd = M1->getGlobalVariable("__profd_foo", /*AllowLocal=*/true);
+  GlobalVariable *Profd =
+      M1->getGlobalVariable("__profd_foo", /*AllowLocal=*/true);
   ASSERT_NE(Profd, nullptr);
   auto *ProfdInit = dyn_cast<ConstantStruct>(Profd->getInitializer());
   ASSERT_NE(ProfdInit, nullptr);
   ASSERT_GE(ProfdInit->getNumOperands(), 2u);
   uint64_t FuncHash =
       cast<ConstantInt>(ProfdInit->getOperand(1))->getZExtValue();
-  GlobalVariable *Profc = M1->getGlobalVariable("__profc_foo", /*AllowLocal=*/true);
+  GlobalVariable *Profc =
+      M1->getGlobalVariable("__profc_foo", /*AllowLocal=*/true);
   ASSERT_NE(Profc, nullptr);
   unsigned NumCounters =
       cast<ArrayType>(Profc->getValueType())->getNumElements();
@@ -298,7 +566,8 @@ std::unique_ptr<Module> makeFooCallsMediumBarModule(LLVMContext &Ctx) {
   // 225 threshold (AOT would skip) but safely below the hot-call-site
   // 3000 threshold (JIT PGO inliner accepts when profile marks call hot).
   auto *BarFnTy = FunctionType::get(I32, {I32}, false);
-  auto *Bar = Function::Create(BarFnTy, Function::ExternalLinkage, "bar", M.get());
+  auto *Bar =
+      Function::Create(BarFnTy, Function::ExternalLinkage, "bar", M.get());
 
   // Helper: add a load−compute−store sequence on slots [0..2] of Arr.
   auto emitComputeOnSlots = [&](IRBuilder<> &B, AllocaInst *Arr, int seed) {
@@ -320,8 +589,7 @@ std::unique_ptr<Module> makeFooCallsMediumBarModule(LLVMContext &Ctx) {
     AllocaInst *Arr = B.CreateAlloca(ArrayType::get(I32, 3));
     for (int i = 0; i < 3; ++i) {
       Value *GEP = B.CreateConstGEP2_32(ArrayType::get(I32, 3), Arr, 0, i);
-      B.CreateStore(B.CreateAdd(Bar->getArg(0), ConstantInt::get(I32, i)),
-                    GEP);
+      B.CreateStore(B.CreateAdd(Bar->getArg(0), ConstantInt::get(I32, i)), GEP);
     }
 
     BasicBlock *CompA = BasicBlock::Create(Ctx, "compA", Bar);
@@ -333,38 +601,59 @@ std::unique_ptr<Module> makeFooCallsMediumBarModule(LLVMContext &Ctx) {
     B.CreateCondBr(Cmp0, CompA, CompB);
 
     // compA (bit 0 == 0): compute on slots, then → merge1.
-    { IRBuilder<> BA(CompA); emitComputeOnSlots(BA, Arr, 1); BA.CreateBr(Merge1); }
+    {
+      IRBuilder<> BA(CompA);
+      emitComputeOnSlots(BA, Arr, 1);
+      BA.CreateBr(Merge1);
+    }
     // compB (bit 0 == 1): compute on slots, then → merge1.
-    { IRBuilder<> BB_(CompB); emitComputeOnSlots(BB_, Arr, 2); BB_.CreateBr(Merge1); }
+    {
+      IRBuilder<> BB_(CompB);
+      emitComputeOnSlots(BB_, Arr, 2);
+      BB_.CreateBr(Merge1);
+    }
 
     // merge1: compute on slots again, then dispatch on bit 1.
     BasicBlock *CompC = BasicBlock::Create(Ctx, "compC", Bar);
     BasicBlock *CompD = BasicBlock::Create(Ctx, "compD", Bar);
-    BasicBlock *Exit  = BasicBlock::Create(Ctx, "exit",  Bar);
+    BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Bar);
 
-    { IRBuilder<> BM1(Merge1);
+    {
+      IRBuilder<> BM1(Merge1);
       emitComputeOnSlots(BM1, Arr, 3);
       Value *Bit1 = BM1.CreateAnd(Bar->getArg(0), ConstantInt::get(I32, 2));
       Value *Cmp1 = BM1.CreateICmpEQ(Bit1, ConstantInt::get(I32, 0));
-      BM1.CreateCondBr(Cmp1, CompC, CompD); }
+      BM1.CreateCondBr(Cmp1, CompC, CompD);
+    }
 
-    { IRBuilder<> BC(CompC); emitComputeOnSlots(BC, Arr, 4); BC.CreateBr(Exit); }
-    { IRBuilder<> BD(CompD); emitComputeOnSlots(BD, Arr, 5); BD.CreateBr(Exit); }
+    {
+      IRBuilder<> BC(CompC);
+      emitComputeOnSlots(BC, Arr, 4);
+      BC.CreateBr(Exit);
+    }
+    {
+      IRBuilder<> BD(CompD);
+      emitComputeOnSlots(BD, Arr, 5);
+      BD.CreateBr(Exit);
+    }
 
     // Exit: load all 3 slots, sum them, add the original argument, return.
-    { IRBuilder<> BX(Exit);
+    {
+      IRBuilder<> BX(Exit);
       Value *Sum = ConstantInt::get(I32, 0);
       for (int i = 0; i < 3; ++i) {
         Value *GEP = BX.CreateConstGEP2_32(ArrayType::get(I32, 3), Arr, 0, i);
         Value *V = BX.CreateLoad(I32, GEP);
         Sum = BX.CreateAdd(Sum, V);
       }
-      BX.CreateRet(BX.CreateAdd(Sum, Bar->getArg(0))); }
+      BX.CreateRet(BX.CreateAdd(Sum, Bar->getArg(0)));
+    }
   }
 
   // foo(i32 %n): calls bar(%n) and returns the result.
   auto *FooFnTy = FunctionType::get(I32, {I32}, false);
-  auto *Foo = Function::Create(FooFnTy, Function::ExternalLinkage, "foo", M.get());
+  auto *Foo =
+      Function::Create(FooFnTy, Function::ExternalLinkage, "foo", M.get());
   markEJitEntry(*Foo);
   {
     BasicBlock *BB = BasicBlock::Create(Ctx, "entry", Foo);
@@ -453,8 +742,8 @@ TEST(EJitPgo, Tier2PgoInlinesAotRejectedCallee) {
 // Contrast test: without the PGO inliner (Baseline tier), the medium-sized
 // callee bar is NOT inlined. The Baseline path does not run any inline pass
 // (AOT pre-inline already handled small callees; medium ones remain as
-// calls). This establishes the baseline against which Tier2PgoInlinesAotRejectedCallee
-// proves PGO inline adds value.
+// calls). This establishes the baseline against which
+// Tier2PgoInlinesAotRejectedCallee proves PGO inline adds value.
 TEST(EJitPgo, BaselineDoesNotInlineMediumCallee) {
   LLVMContext Ctx;
   auto M0 = makeFooCallsMediumBarModule(Ctx);
@@ -605,7 +894,8 @@ TEST(EJitPgo, OrcLookupAndRealAddrProfileMerge) {
   ASSERT_TRUE(static_cast<bool>(fnOrErr)) << "lookup foo failed";
   ASSERT_NE(*fnOrErr, nullptr);
 
-  // ORC lookup of the counter globals (forced External by captureCounterGlobals).
+  // ORC lookup of the counter globals (forced External by
+  // captureCounterGlobals).
   auto profcOrErr = engine->lookup(1, "__profc_foo");
   auto profdOrErr = engine->lookup(1, "__profd_foo");
   ASSERT_TRUE(static_cast<bool>(profcOrErr)) << "lookup __profc_foo failed";
@@ -637,8 +927,8 @@ TEST(EJitPgo, OrcLookupAndRealAddrProfileMerge) {
     uint64_t irHash = 0;
     unsigned irCnt = 0;
     ASSERT_TRUE(readCounterInfo(*M1, "foo", irHash, irCnt));
-    EXPECT_EQ(realHash, irHash);    // offset 8 correct on real memory
-    EXPECT_EQ(realCnt, irCnt);      // offset 48 correct on real memory
+    EXPECT_EQ(realHash, irHash); // offset 8 correct on real memory
+    EXPECT_EQ(realCnt, irCnt);   // offset 48 correct on real memory
   }
 
   // Set counter values at the real __profc_foo (simulate Tier-1 execution).
@@ -691,7 +981,6 @@ TEST(EJitPgo, Tier1ToTier2FullCycle) {
     ctx.tier = CompileTier::Instrumented;
     engine->setActiveContext(&ctx);
     ASSERT_FALSE(errorToBool(engine->loadBitcodeModule(bitcode, 1, "foo")));
-
     auto fnOrErr = engine->lookup(1, "foo");
     ASSERT_TRUE(static_cast<bool>(fnOrErr));
     tier1Fn = *fnOrErr;
@@ -708,7 +997,7 @@ TEST(EJitPgo, Tier1ToTier2FullCycle) {
 
     // Read __llvm_profile_data layout: FuncHash@8, NumCounters@48.
     realHash = *reinterpret_cast<const uint64_t *>(profdAddr + 8);
-    realCnt  = *reinterpret_cast<const uint32_t *>(profdAddr + 48);
+    realCnt = *reinterpret_cast<const uint32_t *>(profdAddr + 48);
     EXPECT_NE(realHash, 0u);
     EXPECT_GT(realCnt, 0u);
   }
@@ -736,7 +1025,6 @@ TEST(EJitPgo, Tier1ToTier2FullCycle) {
     ctx2.profileData = savedProfile;
     engine->setActiveContext(&ctx2);
     ASSERT_FALSE(errorToBool(engine->loadBitcodeModule(bitcode, 1, "foo")));
-
     auto fn2OrErr = engine->lookup(1, "foo");
     ASSERT_TRUE(static_cast<bool>(fn2OrErr));
     void *tier2Fn = *fn2OrErr;
@@ -814,8 +1102,7 @@ TEST(EJitPgo, Tier1CountersUseAtomicRMW) {
 TEST(EJitPgo, Tier1ExplicitlyDisablesOutlinedAtomics) {
   LLVMContext Ctx;
   auto M = makeFooModule(Ctx);
-  M->getFunction("foo")->addFnAttr("target-features",
-                                    "+v8a,+outline-atomics");
+  M->getFunction("foo")->addFnAttr("target-features", "+v8a,+outline-atomics");
   PeriodArrayRegistry Reg;
   EJitOptimizer Opt(Reg);
   SpecializationContext SC;
@@ -902,7 +1189,7 @@ TEST(EJitPgo, ProfileMergePreservesEmptyValueSiteInventory) {
   ASSERT_TRUE(static_cast<bool>(RecOrErr));
   EXPECT_EQ(RecOrErr->getNumValueSites(IPVK_IndirectCallTarget), 2u);
   EXPECT_EQ(RecOrErr->getNumValueSites(IPVK_MemOPSize), 1u);
-  EXPECT_TRUE(RecOrErr->getValueArrayForSite(IPVK_IndirectCallTarget, 0)
-                  .empty());
+  EXPECT_TRUE(
+      RecOrErr->getValueArrayForSite(IPVK_IndirectCallTarget, 0).empty());
   EXPECT_TRUE(RecOrErr->getValueArrayForSite(IPVK_MemOPSize, 0).empty());
 }

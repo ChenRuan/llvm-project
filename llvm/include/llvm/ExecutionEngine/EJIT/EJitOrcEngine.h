@@ -30,10 +30,19 @@ class Module;
 
 namespace ejit {
 
+#ifdef EJIT_SRE_CODE_POOL
+struct EJitTieredCodePoolStats {
+  EJitCodePoolManager::Stats total;
+  EJitCodePoolManager::Stats near;
+  EJitCodePoolManager::Stats far;
+};
+#endif
+
 class PeriodArrayRegistry;
 class EJitRuntimeState;
 struct EJitSharedTaskPoolState;
 struct EJitVpFunctionInfo; // defined in EJitOptimizer.h (value-profile capture)
+enum class CompileTier : uint8_t;
 
 namespace detail {
 /// Render one function definition without the rest of its specialization
@@ -41,15 +50,19 @@ namespace detail {
 /// ejit_dump_* APIs.
 bool renderDumpFunctionIR(const Module &M, StringRef fnName, std::string &out);
 void renderDumpModuleIR(const Module &M, std::string &out);
+/// Return whether a filtered dump should capture this compilation tier.
+/// Instrumented Tier-1 is temporary and must never replace a final dump.
+bool shouldCaptureDump(CompileTier tier, StringRef filter, StringRef fnName);
 } // namespace detail
 
 /// Set a function-name filter for JIT IR+ASM diagnostic capture. When non-
 /// empty, the engine captures (saves in memory) the post-optimization IR and
 /// emitted assembly for both the matching entry function and its complete
 /// specialization module, the next time it is compiled. "*" matches every
-/// specialization. Empty/null disables further capture (already-captured
-/// entries are retained). Use printDumped() for the entry-only view and
-/// printDumpedModule() for the complete module.
+/// specialization. With staged PGO, temporary Instrumented code is skipped and
+/// the final Tier-2 code is captured. Empty/null disables further capture
+/// (already-captured entries are retained). Use printDumped() for the entry-only
+/// view and printDumpedModule() for the complete module.
 void setDumpFuncFilter(const std::string &name);
 
 /// Bind the optional shared taskpool dump state. In a shared-taskpool build
@@ -123,15 +136,13 @@ public:
 
   /// Create a configured engine. Thread-safe to call once.
   static Expected<std::unique_ptr<EJitOrcEngine>>
-  Create(const Config &config,
-         PeriodArrayRegistry &periodReg,
+  Create(const Config &config, PeriodArrayRegistry &periodReg,
          EJitRuntimeState &runtimeState);
 
   /// Load a bitcode module into a per-specialization JITDylib identified
   /// by cacheKey. Each specialization gets its own JITDylib so symbols
   /// from the same TU bitcode can be defined multiple times without conflict.
-  Error loadBitcodeModule(StringRef bitcodeData,
-                          uint64_t cacheKey,
+  Error loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
                           const std::string &origFnName);
 
   /// Look up a compiled function symbol in the specialization JITDylib
@@ -173,11 +184,17 @@ public:
   /// EJIT_SRE_CODE_POOL.
   EJitCodePoolManager::Stats getCodePoolStats() const;
 
+  /// Snapshot aggregate and placement-specific statistics. Tier-1 uses the
+  /// far dynamic pool; final Baseline/Tier-2 code uses the near fixed pool.
+  EJitTieredCodePoolStats getTieredCodePoolStats() const;
+
   /// Resolve a compiled function pointer to its real, finalized executable
   /// range + owning code pool (for cross-core 4K execute-permission
   /// preparation). Returns false if \p FnPtr is not pool-backed code with a
   /// recorded finalized range. Available only with EJIT_SRE_CODE_POOL.
   bool findCodeRange(const void *FnPtr, EJitCompiledCodeInfo &Out) const;
+  bool isCodeReady(const void *FnPtr) const;
+  Error flushPendingCode();
 #endif
 
 private:

@@ -9,6 +9,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCodePool.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/Support/MathExtras.h"
+#include <algorithm>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -22,12 +23,11 @@ inline uintptr_t alignDownAddr(uintptr_t V, size_t A) {
 }
 
 inline uintptr_t alignUpAddr(uintptr_t V, size_t A) {
-  return (V + (static_cast<uintptr_t>(A) - 1)) & ~(static_cast<uintptr_t>(A) - 1);
+  return (V + (static_cast<uintptr_t>(A) - 1)) &
+         ~(static_cast<uintptr_t>(A) - 1);
 }
 
-inline uintptr_t addr(const void *P) {
-  return reinterpret_cast<uintptr_t>(P);
-}
+inline uintptr_t addr(const void *P) { return reinterpret_cast<uintptr_t>(P); }
 
 bool rangeFitsPool(const CodePool &P, const void *Start, size_t Size) {
   uintptr_t A = addr(Start);
@@ -57,6 +57,11 @@ EJitCodePoolManager::EJitCodePoolManager(Options Opts, RawAllocFn Alloc,
     if (Opts_.poolSize == 0)
       Opts_.poolSize = Opts_.poolAlign;
   }
+  if (Opts_.batchedPageSeal && !Opts_.fourKSeal) {
+    EJIT_DIAG("code pool ctor WARNING: batchedPageSeal requires fourKSeal; "
+              "disabling batching");
+    Opts_.batchedPageSeal = false;
+  }
   // sealPageSize is the per-page granularity for BOTH 4K sealing and enable_rw
   // (RX->RW). Validate it whenever either is active - enableRwRange uses it
   // regardless of fourKSeal, and a 0 / non-power-of-2 value would cause
@@ -78,10 +83,12 @@ EJitCodePoolManager::EJitCodePoolManager(Options Opts, RawAllocFn Alloc,
               "per-page W^X (data pages stay RW) requires 4K seal mode; "
               "legacy mode seals the whole pool RX at lookup");
   }
-  EJIT_DIAG_VERBOSE("code pool ctor: poolSize=%zu poolAlign=%zu minCodeAlign=%zu "
-                    "fourKSeal=%u sealPage=%zu",
-                    Opts_.poolSize, Opts_.poolAlign, Opts_.minCodeAlign,
-            static_cast<unsigned>(Opts_.fourKSeal), Opts_.sealPageSize);
+  EJIT_DIAG_VERBOSE(
+      "code pool ctor: poolSize=%zu poolAlign=%zu minCodeAlign=%zu "
+      "fourKSeal=%u batched=%u sealPage=%zu",
+      Opts_.poolSize, Opts_.poolAlign, Opts_.minCodeAlign,
+      static_cast<unsigned>(Opts_.fourKSeal),
+      static_cast<unsigned>(Opts_.batchedPageSeal), Opts_.sealPageSize);
 }
 
 EJitCodePoolManager::~EJitCodePoolManager() = default;
@@ -109,8 +116,7 @@ Error EJitCodePoolManager::newActivePoolLocked() {
     // there is intentionally NO fallback to RawAllocFn, which would break the
     // fixed-address guarantee (the specialization falls back to AOT instead).
     uintptr_t RegionEnd = Opts_.fixedBase + Opts_.fixedSize;
-    uintptr_t Next =
-        alignUpAddr(Opts_.fixedBase + FixedUsed_, Opts_.poolAlign);
+    uintptr_t Next = alignUpAddr(Opts_.fixedBase + FixedUsed_, Opts_.poolAlign);
     if (Next + Opts_.poolSize > RegionEnd) {
       EJIT_DIAG("newActivePool FAIL: fixed region exhausted next=0x%llx +%zu > "
                 "end=0x%llx (used=%zu of %zu)",
@@ -140,23 +146,25 @@ Error EJitCodePoolManager::newActivePoolLocked() {
               Opts_.poolSize, static_cast<unsigned>(Opts_.fourKSeal), RawSize);
     void *Raw = Alloc_ ? Alloc_(RawSize) : nullptr;
     if (!Raw) {
-      EJIT_DIAG("newActivePool FAIL: raw alloc %zu bytes returned null (hasAlloc=%u)",
-                RawSize, static_cast<unsigned>(static_cast<bool>(Alloc_)));
-      return make_error<StringError>(
-          "EJitCodePool: raw allocation of " + Twine(RawSize) + " bytes failed",
-          inconvertibleErrorCode());
+      EJIT_DIAG(
+          "newActivePool FAIL: raw alloc %zu bytes returned null (hasAlloc=%u)",
+          RawSize, static_cast<unsigned>(static_cast<bool>(Alloc_)));
+      return make_error<StringError>("EJitCodePool: raw allocation of " +
+                                         Twine(RawSize) + " bytes failed",
+                                     inconvertibleErrorCode());
     }
     EJIT_DIAG("newActivePool: rawAlloc=%p size=%zu", Raw, RawSize);
     RawBytes = static_cast<uint8_t *>(Raw);
-    Base = reinterpret_cast<uint8_t *>(
-        alignUp(addr(RawBytes), Opts_.poolAlign));
+    Base =
+        reinterpret_cast<uint8_t *>(alignUp(addr(RawBytes), Opts_.poolAlign));
     EJIT_DIAG("newActivePool: alignedBase=%p", static_cast<void *>(Base));
     if (Opts_.fourKSeal) {
       // The 2MiB-aligned usable window must stay inside the raw allocation.
       if (addr(Base) + Opts_.poolSize > addr(RawBytes) + RawSize) {
-        EJIT_DIAG("newActivePool FAIL: aligned window base=%p +%zu > raw %p +%zu",
-                  static_cast<void *>(Base), Opts_.poolSize,
-                  static_cast<void *>(RawBytes), RawSize);
+        EJIT_DIAG(
+            "newActivePool FAIL: aligned window base=%p +%zu > raw %p +%zu",
+            static_cast<void *>(Base), Opts_.poolSize,
+            static_cast<void *>(RawBytes), RawSize);
         return make_error<StringError>(
             "EJitCodePool: aligned pool window exceeds raw allocation",
             inconvertibleErrorCode());
@@ -224,24 +232,24 @@ Expected<void *> EJitCodePoolManager::allocateCode(size_t Size, size_t Align) {
                                    inconvertibleErrorCode());
   }
 
-  EJIT_DIAG("allocateCode req: size=%zu align=%zu", Size, Align);
+  EJIT_DIAG_DEBUG("allocateCode req: size=%zu align=%zu", Size, Align);
 
   size_t EffAlign = std::max(Align, Opts_.minCodeAlign);
   if (!isPowerOf2_64(EffAlign))
     EffAlign = alignUp(EffAlign, Opts_.minCodeAlign);
-  // In 4K seal mode every allocation must start on a fresh seal page so a later
-  // allocation never lands on an already-RX page.
-  if (Opts_.fourKSeal)
+  // Immediate 4K sealing needs one fresh page per allocation. Batched sealing
+  // keeps all staged pages RW/NX, so allocations may share them until flush.
+  if (Opts_.fourKSeal && !Opts_.batchedPageSeal)
     EffAlign = std::max(EffAlign, Opts_.sealPageSize);
 
   // A single allocation can never span pools; reject oversize requests cleanly.
   if (Size > Opts_.poolSize) {
     EJIT_DIAG("allocateCode FAIL: size=%zu exceeds poolSize=%zu", Size,
               Opts_.poolSize);
-    return make_error<StringError>(
-        "EJitCodePool: request of " + Twine(Size) +
-            " bytes exceeds pool size " + Twine(Opts_.poolSize),
-        inconvertibleErrorCode());
+    return make_error<StringError>("EJitCodePool: request of " + Twine(Size) +
+                                       " bytes exceeds pool size " +
+                                       Twine(Opts_.poolSize),
+                                   inconvertibleErrorCode());
   }
 
 #ifndef EJIT_FREESTANDING
@@ -259,11 +267,11 @@ Expected<void *> EJitCodePoolManager::allocateCode(size_t Size, size_t Align) {
     }
     size_t Off = alignUp(Active_->used, EffAlign);
     uint8_t *Ptr = Active_->base + Off;
-    // Round the bump cursor up to a whole seal page so the next allocation
-    // starts on a page this one does not share.
-    Active_->used = alignUp(Off + Size, Opts_.sealPageSize);
-    EJIT_DIAG("allocateCode res4k: ptr=%p size=%zu", static_cast<void *>(Ptr),
-              Size);
+    Active_->used = Opts_.batchedPageSeal
+                        ? Off + Size
+                        : alignUp(Off + Size, Opts_.sealPageSize);
+    EJIT_DIAG_DEBUG("allocateCode res4k: ptr=%p size=%zu",
+                    static_cast<void *>(Ptr), Size);
     return static_cast<void *>(Ptr);
   }
 
@@ -285,8 +293,8 @@ Expected<void *> EJitCodePoolManager::allocateCode(size_t Size, size_t Align) {
   size_t Off = alignUp(Active_->used, EffAlign);
   uint8_t *Ptr = Active_->base + Off;
   Active_->used = Off + Size;
-  EJIT_DIAG("allocateCode res: ptr=%p size=%zu", static_cast<void *>(Ptr),
-            Size);
+  EJIT_DIAG_DEBUG("allocateCode res: ptr=%p size=%zu", static_cast<void *>(Ptr),
+                  Size);
   return static_cast<void *>(Ptr);
 }
 
@@ -319,10 +327,9 @@ Error EJitCodePoolManager::sealPoolContaining(const void *Ptr) {
   CodePool *P = findPoolLocked(Ptr);
   if (!P) {
     EJIT_DIAG("sealPoolContaining FAIL: ptr=%p not owned by any pool", Ptr);
-    return make_error<StringError>(
-        "EJitCodePool: address " + Twine(addr(Ptr)) +
-            " is not owned by any code pool",
-        inconvertibleErrorCode());
+    return make_error<StringError>("EJitCodePool: address " + Twine(addr(Ptr)) +
+                                       " is not owned by any code pool",
+                                   inconvertibleErrorCode());
   }
   return sealPoolLocked(*P);
 }
@@ -361,10 +368,10 @@ Error EJitCodePoolManager::sealCodeRange(const void *Start, size_t Size) {
   if (!P) {
     EJIT_DIAG("sealCodeRange FAIL: start=%p size=%zu not owned by any pool",
               Start, Size);
-    return make_error<StringError>(
-        "EJitCodePool: address " + Twine(addr(Start)) +
-            " is not owned by any code pool",
-        inconvertibleErrorCode());
+    return make_error<StringError>("EJitCodePool: address " +
+                                       Twine(addr(Start)) +
+                                       " is not owned by any code pool",
+                                   inconvertibleErrorCode());
   }
   if (!rangeFitsPool(*P, Start, Size)) {
     EJIT_DIAG("sealCodeRange FAIL: range start=%p size=%zu crosses pool end",
@@ -387,15 +394,14 @@ Error EJitCodePoolManager::sealCodeRange(const void *Start, size_t Size) {
     if (Rc != 0) {
       EJIT_DIAG("sealCodeRange FAIL: enable_ex page=0x%llx rc=%u",
                 static_cast<unsigned long long>(VA), Rc);
-      return make_error<StringError>(
-          "EJitCodePool: enable_ex failed (rc=" + Twine(Rc) + ") for page " +
-              Twine(VA),
-          inconvertibleErrorCode());
+      return make_error<StringError>("EJitCodePool: enable_ex failed (rc=" +
+                                         Twine(Rc) + ") for page " + Twine(VA),
+                                     inconvertibleErrorCode());
     }
     ++SealInvocations_;
   }
-  EJIT_DIAG("sealCodeRange OK: start=%p size=%zu (invocations=%zu)", Start, Size,
-            SealInvocations_);
+  EJIT_DIAG("sealCodeRange OK: start=%p size=%zu (invocations=%zu)", Start,
+            Size, SealInvocations_);
   // The SRE seal callback (sealAndSyncCache) makes the page executable and
   // synchronizes caches; the code pool layer does not call
   // __builtin___clear_cache itself.
@@ -415,10 +421,10 @@ Error EJitCodePoolManager::enableRwRange(const void *Start, size_t Size) {
   if (!P) {
     EJIT_DIAG("enableRwRange FAIL: start=%p size=%zu not owned by any pool",
               Start, Size);
-    return make_error<StringError>(
-        "EJitCodePool: address " + Twine(addr(Start)) +
-            " is not owned by any code pool",
-        inconvertibleErrorCode());
+    return make_error<StringError>("EJitCodePool: address " +
+                                       Twine(addr(Start)) +
+                                       " is not owned by any code pool",
+                                   inconvertibleErrorCode());
   }
   if (!rangeFitsPool(*P, Start, Size)) {
     EJIT_DIAG("enableRwRange FAIL: range start=%p size=%zu crosses pool end",
@@ -431,9 +437,10 @@ Error EJitCodePoolManager::enableRwRange(const void *Start, size_t Size) {
   size_t Page = Opts_.sealPageSize;
   uintptr_t PageStart = alignDownAddr(addr(Start), Page);
   uintptr_t PageEnd = alignUp(addr(Start) + Size, Page);
-  EJIT_DIAG("enableRwRange: start=%p size=%zu pageStart=0x%llx pageEnd=0x%llx",
-            Start, Size, static_cast<unsigned long long>(PageStart),
-            static_cast<unsigned long long>(PageEnd));
+  EJIT_DIAG_DEBUG(
+      "enableRwRange: start=%p size=%zu pageStart=0x%llx pageEnd=0x%llx", Start,
+      Size, static_cast<unsigned long long>(PageStart),
+      static_cast<unsigned long long>(PageEnd));
   for (uintptr_t VA = PageStart; VA < PageEnd; VA += Page) {
     unsigned Rc = EnableRw_ ? EnableRw_(reinterpret_cast<void *>(VA)) : 1;
     if (Rc != 0) {
@@ -467,14 +474,23 @@ Error EJitCodePoolManager::enableRwRange(const void *Start, size_t Size) {
     }
     ++RwEnableInvocations_;
   }
-  EJIT_DIAG("enableRwRange OK: start=%p size=%zu (invocations=%zu)", Start, Size,
-            RwEnableInvocations_);
+  EJIT_DIAG_DEBUG("enableRwRange OK: start=%p size=%zu (invocations=%zu)",
+                  Start, Size, RwEnableInvocations_);
   return Error::success();
 }
 
 Error EJitCodePoolManager::restoreRxRange(const void *Start, size_t Size) {
   if (!Opts_.needsEnableRw || Size == 0)
     return Error::success();
+  // A batched allocation may share its first or last page with neighboring
+  // linked code. Sealing an abandoned sub-range here could make those
+  // neighbors RX while the batch is still being filled. The bump allocator
+  // does not reclaim these bytes, so leaving them RW/NX is the safe outcome.
+  if (Opts_.batchedPageSeal) {
+    EJIT_DIAG_DEBUG("restoreRxRange batched defer: start=%p size=%zu", Start,
+                    Size);
+    return Error::success();
+  }
 #ifndef EJIT_FREESTANDING
   std::lock_guard<std::mutex> Lock(Mutex_);
 #endif
@@ -508,6 +524,123 @@ Error EJitCodePoolManager::restoreRxRange(const void *Start, size_t Size) {
   return Err;
 }
 
+bool EJitCodePoolManager::recordPendingRange(const void *Base, size_t Size,
+                                             const EJitWritableRange *Writables,
+                                             uint32_t WritableCount) {
+  if (!Opts_.batchedPageSeal || !Base || Size == 0)
+    return true;
+  if (WritableCount > kEJitMaxWritableRanges ||
+      (WritableCount != 0 && !Writables))
+    return false;
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(Mutex_);
+#endif
+  const uintptr_t Start = addr(Base);
+  if (Start + Size < Start)
+    return false;
+  CodePool *Owner = findPoolLocked(Base);
+  if (!Owner || !rangeFitsPool(*Owner, Base, Size))
+    return false;
+  for (uint32_t I = 0; I < WritableCount; ++I) {
+    const uintptr_t WStart = Writables[I].addr;
+    const uint64_t WSize = Writables[I].size;
+    if (WSize == 0 || WStart + static_cast<uintptr_t>(WSize) < WStart ||
+        !rangeFitsPool(*Owner, reinterpret_cast<const void *>(WStart),
+                       static_cast<size_t>(WSize)))
+      return false;
+  }
+  for (const FinalizedRange &R : PendingRanges_)
+    if (R.start == Start && R.size == Size)
+      return true;
+  FinalizedRange Rec{Start, static_cast<uint64_t>(Size)};
+  Rec.writableCount = WritableCount;
+  for (uint32_t I = 0; I < WritableCount; ++I)
+    Rec.writables[I] = Writables[I];
+  PendingRanges_.push_back(Rec);
+  return true;
+}
+
+void EJitCodePoolManager::notePendingAllocation() {
+  if (!Opts_.batchedPageSeal)
+    return;
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(Mutex_);
+#endif
+  ++PendingAllocations_;
+}
+
+size_t EJitCodePoolManager::pendingRangeCount() const {
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(Mutex_);
+#endif
+  return PendingRanges_.size();
+}
+
+Error EJitCodePoolManager::flushPendingRanges() {
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(Mutex_);
+#endif
+  if (!Opts_.batchedPageSeal || PendingRanges_.empty())
+    return Error::success();
+
+  // The batch's final partial page becomes RX and must never be allocated
+  // again. Only Active_ can receive a future bump allocation, so advancing its
+  // live tail is sufficient; the per-range walk below still seals ranges that
+  // belong to every older pool crossed by this batch.
+  if (Active_)
+    Active_->used = alignUp(Active_->used, Opts_.sealPageSize);
+
+  std::vector<uintptr_t> Pages;
+  [[maybe_unused]] size_t Bytes = 0;
+  for (const FinalizedRange &R : PendingRanges_) {
+    CodePool *P = findPoolLocked(reinterpret_cast<void *>(R.start));
+    if (!P || !rangeFitsPool(*P, reinterpret_cast<void *>(R.start),
+                             static_cast<size_t>(R.size)))
+      return make_error<StringError>(
+          "EJitCodePool: pending range is outside its code pool",
+          inconvertibleErrorCode());
+    Bytes += static_cast<size_t>(R.size);
+    uintptr_t Begin = alignDownAddr(R.start, Opts_.sealPageSize);
+    uintptr_t End = alignUpAddr(R.start + R.size, Opts_.sealPageSize);
+    for (uintptr_t VA = Begin; VA < End; VA += Opts_.sealPageSize)
+      Pages.push_back(VA);
+  }
+  std::sort(Pages.begin(), Pages.end());
+  Pages.erase(std::unique(Pages.begin(), Pages.end()), Pages.end());
+
+  for (uintptr_t VA : Pages) {
+    unsigned Rc = Seal_ ? Seal_(reinterpret_cast<void *>(VA)) : 1;
+    if (Rc != 0) {
+      EJIT_DIAG("batch enable FAIL: page=0x%llx rc=%u ranges=%zu",
+                static_cast<unsigned long long>(VA), Rc, PendingRanges_.size());
+      return make_error<StringError>(
+          "EJitCodePool: batched enable_ex failed (rc=" + Twine(Rc) +
+              ") for page " + Twine(VA),
+          inconvertibleErrorCode());
+    }
+    ++SealInvocations_;
+  }
+
+  for (const FinalizedRange &R : PendingRanges_) {
+    bool Duplicate = false;
+    for (const FinalizedRange &F : FinalizedRanges_)
+      if (F.start == R.start && F.size == R.size) {
+        Duplicate = true;
+        break;
+      }
+    if (!Duplicate)
+      FinalizedRanges_.push_back(R);
+  }
+
+  EJIT_DIAG_DEBUG("batch enable OK: allocations=%zu ranges=%zu pages=%zu "
+                  "codeBytes=%zu",
+                  PendingAllocations_, PendingRanges_.size(), Pages.size(),
+                  Bytes);
+  PendingRanges_.clear();
+  PendingAllocations_ = 0;
+  return Error::success();
+}
+
 bool EJitCodePoolManager::contains(const void *Ptr) const {
 #ifndef EJIT_FREESTANDING
   std::lock_guard<std::mutex> Lock(Mutex_);
@@ -525,7 +658,7 @@ bool EJitCodePoolManager::recordFinalizedRange(
     const void *Base, size_t Size, const EJitWritableRange *Writables,
     uint32_t WritableCount) {
   if (!Base || Size == 0) {
-    EJIT_DIAG("recordFinalizedRange skip: base=%p size=%zu", Base, Size);
+    EJIT_DIAG_DEBUG("recordFinalizedRange skip: base=%p size=%zu", Base, Size);
     return true; // benign no-op (no executable extent to record).
   }
   // Over-bound writable set: REJECT (do not record). Truncating to zero would
@@ -545,8 +678,8 @@ bool EJitCodePoolManager::recordFinalizedRange(
               Base, WritableCount);
     return false;
   }
-  EJIT_DIAG("recordFinalizedRange: base=%p size=%zu writable=%u", Base, Size,
-            WritableCount);
+  EJIT_DIAG_DEBUG("recordFinalizedRange: base=%p size=%zu writable=%u", Base,
+                  Size, WritableCount);
 #ifndef EJIT_FREESTANDING
   std::lock_guard<std::mutex> Lock(Mutex_);
 #endif
@@ -590,8 +723,9 @@ bool EJitCodePoolManager::recordFinalizedRange(
   // in append order wins).
   for (const FinalizedRange &R : FinalizedRanges_)
     if (R.start == Start && R.size == static_cast<uint64_t>(Size)) {
-      EJIT_DIAG("recordFinalizedRange dup: base=%p size=%zu (already recorded)",
-                Base, Size);
+      EJIT_DIAG_DEBUG(
+          "recordFinalizedRange dup: base=%p size=%zu (already recorded)", Base,
+          Size);
       return true;
     }
   FinalizedRange Rec{Start, static_cast<uint64_t>(Size)};
@@ -599,8 +733,9 @@ bool EJitCodePoolManager::recordFinalizedRange(
   for (uint32_t I = 0; I < WritableCount; ++I)
     Rec.writables[I] = Writables[I];
   FinalizedRanges_.push_back(Rec);
-  EJIT_DIAG("recordFinalizedRange OK: base=%p size=%zu writable=%u total=%zu",
-            Base, Size, Rec.writableCount, FinalizedRanges_.size());
+  EJIT_DIAG_DEBUG(
+      "recordFinalizedRange OK: base=%p size=%zu writable=%u total=%zu", Base,
+      Size, Rec.writableCount, FinalizedRanges_.size());
   return true;
 }
 
@@ -621,7 +756,7 @@ bool EJitCodePoolManager::findRange(const void *Ptr,
     }
   }
   if (!Found) {
-    EJIT_DIAG("findRange miss: ptr=%p not in any finalized range", Ptr);
+    EJIT_DIAG_DEBUG("findRange miss: ptr=%p not in any finalized range", Ptr);
     return false;
   }
 
@@ -650,16 +785,19 @@ bool EJitCodePoolManager::findRange(const void *Ptr,
       // dynamic SRE_MemDbgAlloc pool is already RW, so the ranges are then
       // diagnostic only.
       Out.requiresPeerEnableRw = Opts_.needsEnableRw ? 1u : 0u;
-      Out.reserved = 0;
-      EJIT_DIAG("findRange OK: ptr=%p codeStart=0x%llx codeSize=%llu poolId=%u "
-                "writable=%u peerRw=%u",
-                Ptr, static_cast<unsigned long long>(Out.codeStart),
-                static_cast<unsigned long long>(Out.codeSize), Out.poolId,
-                Out.writableCount, Out.requiresPeerEnableRw);
+      Out.poolKind = Opts_.kind;
+      EJIT_DIAG_DEBUG(
+          "findRange OK: ptr=%p codeStart=0x%llx codeSize=%llu poolId=%u "
+          "kind=%u writable=%u peerRw=%u",
+          Ptr, static_cast<unsigned long long>(Out.codeStart),
+          static_cast<unsigned long long>(Out.codeSize), Out.poolId,
+          static_cast<unsigned>(Out.poolKind), Out.writableCount,
+          Out.requiresPeerEnableRw);
       return true;
     }
   }
-  EJIT_DIAG("findRange miss: ptr=%p in finalized range but not in any pool", Ptr);
+  EJIT_DIAG_DEBUG(
+      "findRange miss: ptr=%p in finalized range but not in any pool", Ptr);
   return false;
 }
 

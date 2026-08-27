@@ -14,9 +14,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/ExecutionEngine/EJIT/EJitCodePool.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCodePool.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
+#include "llvm/ExecutionEngine/JITLink/JITLinkDylib.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/Orc/SymbolStringPool.h"
 #include "llvm/Support/Error.h"
@@ -33,6 +34,23 @@ using namespace llvm::ejit;
 using namespace llvm::jitlink;
 
 namespace {
+
+void *testAlignedAlloc(size_t Alignment, size_t Size) {
+  if (Alignment < alignof(void *) || (Alignment & (Alignment - 1)) != 0)
+    return nullptr;
+  void *Raw = std::malloc(Size + Alignment - 1 + sizeof(void *));
+  if (!Raw)
+    return nullptr;
+  uintptr_t Start = reinterpret_cast<uintptr_t>(Raw) + sizeof(void *);
+  uintptr_t Aligned = (Start + Alignment - 1) & ~(Alignment - 1);
+  reinterpret_cast<void **>(Aligned)[-1] = Raw;
+  return reinterpret_cast<void *>(Aligned);
+}
+
+void testAlignedFree(void *P) {
+  if (P)
+    std::free(reinterpret_cast<void **>(P)[-1]);
+}
 
 struct MockSre {
   std::vector<void *> Raws;
@@ -121,6 +139,51 @@ TEST(EJitCodePoolMemMgr, CodeMemoryComesFromPool) {
   cantFail(MM.deallocate(std::move(FA)));
 }
 
+TEST(EJitCodePoolMemMgr, RoutesTemporaryTier1ToFarPool) {
+  MockSre M;
+  auto NearOpts = poolOpts(/*PoolSize=*/256 * 1024);
+  NearOpts.kind = EJitCodePoolKind::Near;
+  auto FarOpts = poolOpts(/*PoolSize=*/256 * 1024);
+  FarOpts.kind = EJitCodePoolKind::Far;
+  EJitCodePoolManager Near(
+      NearOpts, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *B) { return M.seal(B); });
+  EJitCodePoolManager Far(
+      FarOpts, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *B) { return M.seal(B); });
+  EJitCodePoolMemoryManager MM(Near, Far, /*PageSize=*/4096);
+
+  JITLinkDylib Tier1("spec_t1_1");
+  auto G1 = makeCodeGraph(64, 0x1000);
+  auto IFA1 = cantFail(MM.allocate(&Tier1, *G1));
+  void *Tier1Addr = firstBlockAddr(*G1);
+  auto FA1 = cantFail(IFA1->finalize());
+
+  EXPECT_FALSE(Near.contains(Tier1Addr));
+  EXPECT_TRUE(Far.contains(Tier1Addr));
+  EXPECT_EQ(Near.getStats().poolCount, 0u);
+  EXPECT_EQ(Far.getStats().poolCount, 1u);
+  EJitCompiledCodeInfo Tier1Info;
+  ASSERT_TRUE(Far.findRange(Tier1Addr, Tier1Info));
+  EXPECT_EQ(Tier1Info.poolKind, EJitCodePoolKind::Far);
+
+  JITLinkDylib Tier2("spec_t2_1");
+  auto G2 = makeCodeGraph(64, 0x2000);
+  auto IFA2 = cantFail(MM.allocate(&Tier2, *G2));
+  void *Tier2Addr = firstBlockAddr(*G2);
+  auto FA2 = cantFail(IFA2->finalize());
+
+  EXPECT_TRUE(Near.contains(Tier2Addr));
+  EXPECT_FALSE(Far.contains(Tier2Addr));
+  EXPECT_EQ(Near.getStats().poolCount, 1u);
+  EJitCompiledCodeInfo Tier2Info;
+  ASSERT_TRUE(Near.findRange(Tier2Addr, Tier2Info));
+  EXPECT_EQ(Tier2Info.poolKind, EJitCodePoolKind::Near);
+
+  cantFail(MM.deallocate(std::move(FA1)));
+  cantFail(MM.deallocate(std::move(FA2)));
+}
+
 // finalize() does NOT seal: the pool stays RW so JITLink can keep writing.
 // Sealing happens out-of-band (the engine does it at lookup).
 TEST(EJitCodePoolMemMgr, FinalizeKeepsPoolWritable) {
@@ -148,7 +211,8 @@ TEST(EJitCodePoolMemMgr, FinalizeKeepsPoolWritable) {
 }
 
 // Sealing the pool that backs a finalized function is idempotent: a repeated
-// seal (e.g. a second lookup of the same function) does not re-invoke enable_ex.
+// seal (e.g. a second lookup of the same function) does not re-invoke
+// enable_ex.
 TEST(EJitCodePoolMemMgr, RepeatedSealNoDuplicateEnableEx) {
   MockSre M;
   EJitCodePoolManager Pool(
@@ -205,7 +269,8 @@ TEST(EJitCodePoolMemMgr, SecondFunctionUsesNewPoolAfterSeal) {
 
   // The two functions live in different 64KiB pools.
   auto poolOf = [](void *P) {
-    return reinterpret_cast<uintptr_t>(P) & ~static_cast<uintptr_t>(kPoolSize - 1);
+    return reinterpret_cast<uintptr_t>(P) &
+           ~static_cast<uintptr_t>(kPoolSize - 1);
   };
   EXPECT_NE(poolOf(Addr1), poolOf(Addr2));
 
@@ -235,17 +300,18 @@ struct MockSre4K {
   unsigned SealFailRc = 7;
   std::vector<uintptr_t> RwEnabledPages;
   size_t RwEnableCalls = 0;
-  unsigned RwEnableRc = 0;     // 0 = success; non-zero simulates enable_rw failure
-  int FailRwOnCall = -1;       // 1-based enable_rw index to fail; -1 = never
+  unsigned RwEnableRc = 0; // 0 = success; non-zero simulates enable_rw failure
+  int FailRwOnCall = -1;   // 1-based enable_rw index to fail; -1 = never
 
   ~MockSre4K() {
     for (void *P : Origs)
-      std::free(P);
+      testAlignedFree(P);
   }
   void *rawAlloc(size_t Bytes) {
     void *Base = nullptr;
     // 2MiB-aligned over-allocation; return a deliberately misaligned pointer.
-    if (posix_memalign(&Base, kTwoMiB, Bytes + kTwoMiB) != 0)
+    Base = testAlignedAlloc(kTwoMiB, Bytes + kTwoMiB);
+    if (!Base)
       return nullptr;
     Origs.push_back(Base);
     return static_cast<char *>(Base) + kFourKiB;
@@ -282,8 +348,8 @@ EJitCodePoolManager::Options fourKMemMgrOpts() {
   return O;
 }
 
-// Backing buffer large enough for a multi-page content block (avoids the 64-byte
-// CodeBytes overread for big graphs).
+// Backing buffer large enough for a multi-page content block (avoids the
+// 64-byte CodeBytes overread for big graphs).
 const char BigCode[16 * 1024] = {0};
 
 std::unique_ptr<LinkGraph> makeBackedCodeGraph(const char *Buf, size_t Size,
@@ -423,7 +489,8 @@ TEST(EJitCodePoolMemMgr4K, SecondFunctionUsesFreshPageSamePool) {
   EXPECT_EQ(S.splitInvocations, 1u); // split once for the one pool
 
   auto pageOf = [](void *P) {
-    return reinterpret_cast<uintptr_t>(P) & ~static_cast<uintptr_t>(kFourKiB - 1);
+    return reinterpret_cast<uintptr_t>(P) &
+           ~static_cast<uintptr_t>(kFourKiB - 1);
   };
   EXPECT_NE(pageOf(Addr1), pageOf(Addr2)); // different 4K pages
 
@@ -721,9 +788,9 @@ TEST(EJitCodePoolMemMgr4K, FixedCodeSegmentEnablesRwThenSealsExecOnly) {
   // A 2MiB-aligned 2MiB region stands in for the linker-script .text.ejit block
   // [__ejit_code_start, __ejit_code_end). Exactly one pool is carved from it.
   constexpr size_t kRegion = kTwoMiB;
-  void *Region = nullptr;
-  ASSERT_EQ(posix_memalign(&Region, kTwoMiB, kRegion), 0);
-  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+  void *Region = testAlignedAlloc(kTwoMiB, kRegion);
+  ASSERT_NE(Region, nullptr);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, testAlignedFree);
 
   MockSre4K M;
   auto O = fourKMemMgrOpts();
@@ -784,9 +851,9 @@ TEST(EJitCodePoolMemMgr4K, FixedCodeSegmentEnablesRwThenSealsExecOnly) {
 // intentionally not reclaimed, but no writable hole may remain in .text.ejit.
 TEST(EJitCodePoolMemMgr4K, AbandonRestoresWholeSlabToRx) {
   constexpr size_t kRegion = kTwoMiB;
-  void *Region = nullptr;
-  ASSERT_EQ(posix_memalign(&Region, kTwoMiB, kRegion), 0);
-  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+  void *Region = testAlignedAlloc(kTwoMiB, kRegion);
+  ASSERT_NE(Region, nullptr);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, testAlignedFree);
 
   MockSre4K M;
   auto O = fourKMemMgrOpts();
@@ -818,4 +885,93 @@ TEST(EJitCodePoolMemMgr4K, AbandonRestoresWholeSlabToRx) {
   EXPECT_FALSE(AbandonFailed);
   EXPECT_EQ(M.SealCalls, WritablePages);
   EXPECT_EQ(M.SealedPages.size(), WritablePages);
+}
+
+TEST(EJitCodePoolMemMgrBatch, AbandonLeavesDeadSharedPageRwNxAndUnreused) {
+  constexpr size_t kRegion = kTwoMiB;
+  void *Region = testAlignedAlloc(kTwoMiB, kRegion);
+  ASSERT_NE(Region, nullptr);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, testAlignedFree);
+
+  MockSre4K M;
+  auto O = fourKMemMgrOpts();
+  O.fixedBase = reinterpret_cast<uintptr_t>(Region);
+  O.fixedSize = kRegion;
+  O.needsEnableRw = true;
+  O.minCodeAlign = 16;
+  O.batchedPageSeal = true;
+  EJitCodePoolManager Pool(
+      O, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); },
+      [&M](void *V) { return M.enableRw(V); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G0 = makeCodeGraph(64, 0x3000);
+  auto IFA0 = cantFail(MM.allocate(nullptr, *G0));
+  void *Addr0 = firstBlockAddr(*G0);
+  ASSERT_NE(Addr0, nullptr);
+  ASSERT_GT(M.RwEnableCalls, 0u);
+
+  bool AbandonFailed = false;
+  IFA0->abandon([&](Error Err) {
+    AbandonFailed = static_cast<bool>(Err);
+    consumeError(std::move(Err));
+  });
+  EXPECT_FALSE(AbandonFailed);
+  EXPECT_EQ(M.SealCalls, 0u)
+      << "a shared batch page must stay RW/NX until the batch is complete";
+  EXPECT_EQ(Pool.pendingRangeCount(), 0u);
+
+  auto G1 = makeCodeGraph(64, 0x4000);
+  auto IFA1 = cantFail(MM.allocate(nullptr, *G1));
+  void *Addr1 = firstBlockAddr(*G1);
+  ASSERT_NE(Addr1, nullptr);
+  EXPECT_GT(reinterpret_cast<uintptr_t>(Addr1),
+            reinterpret_cast<uintptr_t>(Addr0))
+      << "the abandoned bump allocation must never be reused";
+  IFA1->abandon([](Error Err) { consumeError(std::move(Err)); });
+}
+
+TEST(EJitCodePoolMemMgrBatch, PureCodeAllocationsSharePageUntilFlush) {
+  MockSre4K M;
+  auto O = fourKMemMgrOpts();
+  O.minCodeAlign = 16;
+  O.batchedPageSeal = true;
+  EJitCodePoolManager Pool(
+      O, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G0 = makeCodeGraph(64, 0x1000);
+  auto IFA0 = cantFail(MM.allocate(nullptr, *G0));
+  void *Addr0 = firstBlockAddr(*G0);
+  auto FA0 = cantFail(IFA0->finalize());
+
+  auto G1 = makeCodeGraph(64, 0x2000);
+  auto IFA1 = cantFail(MM.allocate(nullptr, *G1));
+  void *Addr1 = firstBlockAddr(*G1);
+  auto FA1 = cantFail(IFA1->finalize());
+
+  auto PageOf = [](void *P) {
+    return reinterpret_cast<uintptr_t>(P) &
+           ~static_cast<uintptr_t>(kFourKiB - 1);
+  };
+  EXPECT_EQ(PageOf(Addr0), PageOf(Addr1));
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(Addr1) -
+                reinterpret_cast<uintptr_t>(Addr0),
+            64u);
+  EXPECT_EQ(M.SealCalls, 0u);
+  EXPECT_EQ(Pool.pendingRangeCount(), 2u);
+  EJitCompiledCodeInfo Info{};
+  EXPECT_FALSE(Pool.findRange(Addr0, Info));
+
+  cantFail(Pool.flushPendingRanges());
+  EXPECT_EQ(M.SealCalls, 1u);
+  EXPECT_TRUE(Pool.findRange(Addr0, Info));
+  EXPECT_TRUE(Pool.findRange(Addr1, Info));
+
+  cantFail(MM.deallocate(std::move(FA0)));
+  cantFail(MM.deallocate(std::move(FA1)));
 }

@@ -78,6 +78,35 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
 #endif
 }
 
+[[maybe_unused]] bool sharedCodeReadyThunk(void *ctx, const void *fnPtr) {
+#if defined(EJIT_SRE_CODE_POOL) && defined(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  auto *drv = static_cast<EJitCompileDriver *>(ctx);
+  EJitOrcEngine *eng = drv->getJitEngine();
+  return eng && eng->isCodeReady(fnPtr);
+#else
+  (void)ctx;
+  (void)fnPtr;
+  return true;
+#endif
+}
+
+[[maybe_unused]] bool sharedCodeBatchFlushThunk(void *ctx) {
+#if defined(EJIT_SRE_CODE_POOL) && defined(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  auto *drv = static_cast<EJitCompileDriver *>(ctx);
+  EJitOrcEngine *eng = drv->getJitEngine();
+  if (!eng)
+    return false;
+  if (auto Err = eng->flushPendingCode()) {
+    EJIT_DIAG("batch enable failed: %s", toString(std::move(Err)).c_str());
+    return false;
+  }
+  return true;
+#else
+  (void)ctx;
+  return true;
+#endif
+}
+
 /// Owner-private provider: snapshot the owner-core code-pool manager stats for
 /// the shared taskpool to mirror cross-core (see CodePoolStatsCallback). The
 /// pools are owner-private, so without this a non-owner core's
@@ -88,7 +117,8 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
   auto *drv = static_cast<EJitCompileDriver *>(ctx);
   EJitOrcEngine *eng = drv->getJitEngine();
   if (eng && out) {
-    EJitCodePoolManager::Stats s = eng->getCodePoolStats();
+    EJitTieredCodePoolStats tiered = eng->getTieredCodePoolStats();
+    const EJitCodePoolManager::Stats &s = tiered.total;
     out->poolCount = s.poolCount;
     out->sealedCount = s.sealedCount;
     out->activeCount = s.activeCount;
@@ -98,6 +128,20 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
     out->sealInvocations = s.sealInvocations;
     out->splitInvocations = s.splitInvocations;
     out->finalizedRangeCount = s.finalizedRangeCount;
+    auto CopyDetail = [](EJitCodePoolStatsOut::Detail &Dst,
+                         const EJitCodePoolManager::Stats &Src) {
+      Dst.poolCount = Src.poolCount;
+      Dst.sealedCount = Src.sealedCount;
+      Dst.activeCount = Src.activeCount;
+      Dst.usedBytes = Src.usedBytes;
+      Dst.reservedBytes = Src.reservedBytes;
+      Dst.wastedBytes = Src.wastedBytes;
+      Dst.sealInvocations = Src.sealInvocations;
+      Dst.splitInvocations = Src.splitInvocations;
+      Dst.finalizedRangeCount = Src.finalizedRangeCount;
+    };
+    CopyDetail(out->near, tiered.near);
+    CopyDetail(out->far, tiered.far);
     return true;
   }
   return false;
@@ -229,6 +273,10 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   // Mirror the owner-core code-pool stats into the shared state so every core's
   // ejit_print_code_pool_stats is consistent (the pools are owner-private).
   sharedPool_.setCodePoolStatsProvider(&sharedCodePoolStatsThunk, this);
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
+  sharedPool_.setCodeBatchCallbacks(&sharedCodeReadyThunk,
+                                    &sharedCodeBatchFlushThunk, this);
+#endif
 #endif
 #ifdef EJIT_SRE_SHARED_CODE_POINTERS
   sharedPool_.setCodeSharingEnabled(true);
@@ -484,8 +532,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   // consumes ctx.profileData during the JIT transform).
   const bool RunProfileStages =
       config_.enablePgo ||
-      (config_.enableProfileAudit &&
-       config_.compileMode == CompileMode::Async);
+      (config_.enableProfileAudit && config_.compileMode == CompileMode::Async);
   if (RunProfileStages) {
     if (static_cast<CompileTier>(tier) == CompileTier::PGOUse) {
       ctx.tier = CompileTier::PGOUse;
@@ -502,8 +549,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
             mayConstIt->second.counterBase);
         if (Counters) {
           for (size_t I = 0; I < ctx.mayConstLoadSites.size(); ++I)
-            mayConstIt->second.sites[I].runtimeHits =
-                Counters[I].loadAcquire();
+            mayConstIt->second.sites[I].runtimeHits = Counters[I].loadAcquire();
           mayConstIt->second.counterBase = 0;
           ctx.mayConstLoadSites = mayConstIt->second.sites;
         }

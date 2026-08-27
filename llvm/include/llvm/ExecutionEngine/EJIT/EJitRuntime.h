@@ -45,20 +45,20 @@
 #define ejit_period_lc(x)
 #else
 // New names (preferred)
-#define EJIT_PERIOD_CONST       __attribute__((ejit_period_const))
-#define EJIT_IN_PERIOD(x)       __attribute__((ejit_in_period(#x)))
+#define EJIT_PERIOD_CONST __attribute__((ejit_period_const))
+#define EJIT_IN_PERIOD(x) __attribute__((ejit_in_period(#x)))
 #define EJIT_IN_PERIOD_ARRAY(x) __attribute__((ejit_in_period_array(#x)))
 #define EJIT_DIM(x)             __attribute__((ejit_dim(#x)))
 #define EJIT_BOUND_PTR(x) __attribute__((ejit_bound_ptr(#x)))
 #define EJIT_ENTRY              __attribute__((ejit_entry))
 #define EJIT_PERIOD_GUARD(x)    __attribute__((ejit_period_guard(#x)))
 // Old names (aliases — use new macros to avoid double expansion)
-#define ejit_may_const          EJIT_PERIOD_CONST
-#define ejit_period(x)          EJIT_IN_PERIOD(x)
-#define ejit_period_arr(x)      EJIT_IN_PERIOD_ARRAY(x)
-#define ejit_period_arr_ind(x)  EJIT_DIM(x)
-#define ejit_entry              EJIT_ENTRY
-#define ejit_period_lc(x)       EJIT_PERIOD_GUARD(x)
+#define ejit_may_const EJIT_PERIOD_CONST
+#define ejit_period(x) EJIT_IN_PERIOD(x)
+#define ejit_period_arr(x) EJIT_IN_PERIOD_ARRAY(x)
+#define ejit_period_arr_ind(x) EJIT_DIM(x)
+#define ejit_entry EJIT_ENTRY
+#define ejit_period_lc(x) EJIT_PERIOD_GUARD(x)
 #endif
 
 #ifdef __cplusplus
@@ -126,16 +126,26 @@ typedef struct {
 /// the layout is stable across the aarch64_be target and a host reader.
 /// Mirrors EJitCodePoolManager::Stats.
 typedef struct ejit_code_pool_stats_t {
-  uint64_t poolCount;          ///< total 2MiB pools created
-  uint64_t sealedCount;        ///< pools currently sealed (RX)
-  uint64_t activeCount;        ///< pools still RW
-  uint64_t usedBytes;          ///< sum of bump offsets across all pools
-  uint64_t reservedBytes;      ///< sum of pool sizes across all pools
-  uint64_t wastedBytes;        ///< unused tail bytes inside sealed pools
-  uint64_t sealInvocations;    ///< successful enable_ex calls (per 4K page in 4K mode)
-  uint64_t splitInvocations;   ///< successful split_2m_to_4k calls (4K mode)
+  uint64_t poolCount;     ///< total 2MiB pools created
+  uint64_t sealedCount;   ///< pools currently sealed (RX)
+  uint64_t activeCount;   ///< pools still RW
+  uint64_t usedBytes;     ///< sum of bump offsets across all pools
+  uint64_t reservedBytes; ///< sum of pool sizes across all pools
+  uint64_t wastedBytes;   ///< unused tail bytes inside sealed pools
+  uint64_t
+      sealInvocations; ///< successful enable_ex calls (per 4K page in 4K mode)
+  uint64_t splitInvocations;    ///< successful split_2m_to_4k calls (4K mode)
   uint64_t finalizedRangeCount; ///< distinct executable ranges recorded
 } ejit_code_pool_stats_t;
+
+/// Placement-aware code-pool statistics. The original stats API remains ABI
+/// stable and returns `total`; use this v2 shape to distinguish final code in
+/// the near fixed pool from temporary Tier-1 code in the far dynamic pool.
+typedef struct ejit_code_pool_stats_v2_t {
+  ejit_code_pool_stats_t total;
+  ejit_code_pool_stats_t near;
+  ejit_code_pool_stats_t far;
+} ejit_code_pool_stats_v2_t;
 
 typedef struct {
   int code;
@@ -262,6 +272,15 @@ void ejit_taskpool_release_read(uint32_t bucketIndex);
 
 unsigned ejit_taskpool_pending_count(void);
 
+/// Seal and publish all completed asynchronous specializations staged in the
+/// compact near code pool. Under online PGO, Tier-1 is already executable in
+/// the far pool and linked Tier-2 batches normally publish automatically when
+/// the compile queue drains. This call forces publication or retries a failed
+/// automatic publication.
+/// EJIT_OK guarantees enable_ex completed and the shared cache / inline-cache
+/// entries were backfilled by the owner worker.
+ejit_status_t ejit_publish_pending_code(void);
+
 // Diagnostic wrapper timing helpers. AOT wrappers only call these when built
 // with -ejit-wrapper-timing. Runtime aggregates repeated calls and prints one
 // summary per EJIT_WRAPPER_TIMING_REPORT_EVERY samples (default 10000; set to 0
@@ -318,26 +337,29 @@ unsigned ejit_taskpool_poll_budget(unsigned maxItems);
 // pipeline used when EJIT_SRE_TASKPOOL is built. Fixed layout
 // (uint64_t/uint32_t only) for stable ABI across the aarch64_be target.
 typedef struct {
-  uint64_t cacheHits;       ///< Calls served from the taskpool cache.
-  uint64_t asyncCompiles;   ///< Successful compiles via the worker.
-  uint64_t asyncEnqueues;   ///< Requests pushed onto the async queue.
-  uint64_t alreadyPending;  ///< Duplicate submissions coalesced.
-  uint64_t queueFull;       ///< Enqueues rejected because the queue was full.
-  uint64_t compileFailed;   ///< Compiles that failed, were cancelled or dropped.
-  uint64_t publishFailed;   ///< Results that could not enter the cache.
+  uint64_t cacheHits;      ///< Calls served from the taskpool cache.
+  uint64_t asyncCompiles;  ///< Successful compiles via the worker.
+  uint64_t asyncEnqueues;  ///< Requests pushed onto the async queue.
+  uint64_t alreadyPending; ///< Duplicate submissions coalesced.
+  uint64_t queueFull;      ///< Enqueues rejected because the queue was full.
+  uint64_t compileFailed;  ///< Compiles that failed, were cancelled or dropped.
+  uint64_t publishFailed;  ///< Results that could not enter the cache.
   uint64_t instanceDisabled; ///< Per-instance disable fast-path hits.
   uint64_t instanceDisabledPreActivate; ///< Subset of instanceDisabled that hit
                                         ///< before the first activate (init→
                                         ///< activate window). 0 in non-shared.
-  uint32_t readyEntries;     ///< Live ready cache entries.
-  uint32_t pendingEntries;   ///< Live in-flight dedup slots.
-  uint32_t queueApproxSize;  ///< Approximate async queue depth.
-  uint32_t reserved;         ///< Padding/reserved; always 0.
+  uint32_t readyEntries;                ///< Live ready cache entries.
+  uint32_t pendingEntries;              ///< Live in-flight dedup slots.
+  uint32_t queueApproxSize;             ///< Approximate async queue depth.
+  uint32_t reserved;                    ///< Padding/reserved; always 0.
 } ejit_taskpool_stats_t;
 
 ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
 
 void ejit_taskpool_print_stats();
+/// Print every published shared-cache version and its dimensions. Stats builds
+/// also report whether a later taskpool lookup reused each published version;
+/// wrapper inline-cache calls after that first reuse remain intentionally free.
 void ejit_taskpool_print_compiled();
 uint32_t ejit_taskpool_get_worker_core();
 
@@ -428,15 +450,19 @@ void ejit_print_func_meta(const char *funcName);
 /// embedded code-memory exhaustion. Mirrors EJitCodePoolManager::Stats.
 ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out);
 
+/// Placement-aware counterpart of ejit_get_code_pool_stats().
+ejit_status_t ejit_get_code_pool_stats_v2(ejit_code_pool_stats_v2_t *out);
+
 /// Print code pool usage statistics through the platform log. Paired with
 /// ejit_get_code_pool_stats() (human-readable form).
 void ejit_print_code_pool_stats(void);
 
 /// Print a ranking for every sampled ejit_entry function. The ranking is
-/// ordered by the average number of may_const loads removed across its JIT
-/// specializations. Call this explicitly after the audit sampling windows have
-/// completed. In a shared-taskpool build, a non-owner core forwards the request
-/// to the compile-owner worker and waits for printing to finish.
+/// ordered by dynamically removed may_const load executions per million
+/// platform timestamp units (removed work per entry times entry frequency).
+/// Call this explicitly after the audit sampling windows have completed. In a
+/// shared-taskpool build, a non-owner core forwards the request to the
+/// compile-owner worker and waits for printing to finish.
 void ejit_print_mayconst_ranking(void);
 
 /// Print the currently-active time-window instances through the platform log:

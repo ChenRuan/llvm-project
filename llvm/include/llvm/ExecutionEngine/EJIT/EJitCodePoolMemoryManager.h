@@ -36,6 +36,8 @@ namespace ejit {
 class EJitCodePoolMemoryManager : public jitlink::JITLinkMemoryManager {
 public:
   EJitCodePoolMemoryManager(EJitCodePoolManager &Pool, size_t PageSize);
+  EJitCodePoolMemoryManager(EJitCodePoolManager &NearPool,
+                            EJitCodePoolManager &FarPool, size_t PageSize);
 
   void allocate(const jitlink::JITLinkDylib *JD, jitlink::LinkGraph &G,
                 OnAllocatedFunction OnAllocated) override;
@@ -47,13 +49,16 @@ public:
   using JITLinkMemoryManager::allocate;
   using JITLinkMemoryManager::deallocate;
 
-  EJitCodePoolManager &getPool() { return Pool_; }
+  EJitCodePoolManager &getPool() { return NearPool_; }
 
 private:
   class InFlightAllocImpl;
   struct FinalizedInfo;
 
-  EJitCodePoolManager &Pool_;
+  EJitCodePoolManager &selectPool(const jitlink::JITLinkDylib *JD) const;
+
+  EJitCodePoolManager &NearPool_;
+  EJitCodePoolManager *FarPool_ = nullptr;
   size_t PageSize_;
 };
 

@@ -366,7 +366,8 @@ def doit_gc_merge(args):
         # EJIT_SRE_TASKPOOL ifdef in EJitRuntime.cpp).
         "ejit_set_log_level", "ejit_get_log_level",
         "ejit_print_registry", "ejit_print_func_meta",
-        "ejit_get_code_pool_stats", "ejit_print_code_pool_stats",
+        "ejit_get_code_pool_stats", "ejit_get_code_pool_stats_v2",
+        "ejit_print_code_pool_stats",
         "ejit_print_active",
         # Build identity (LLVM version + git commit). Called from user app
         # code, never from AOT, so it needs a GC root to survive --gc-sections.
@@ -379,6 +380,7 @@ def doit_gc_merge(args):
         "ejit_taskpool_compile_or_get_2d", "ejit_taskpool_compile_or_get_3d",
         "ejit_taskpool_compile_or_get_4d",
         "ejit_taskpool_set_instance_enabled", "ejit_taskpool_pending_count",
+        "ejit_publish_pending_code",
         "ejit_taskpool_get_stats", "ejit_taskpool_print_stats", "ejit_taskpool_get_worker_core",
         "ejit_taskpool_print_compiled", "ejit_taskpool_trace_now",
         "ejit_taskpool_trace_wrapper", "ejit_dump_func", "ejit_print_dumped",
