@@ -408,7 +408,12 @@ struct EjitFuncDiagInfo {
 /// metadata survived clone + preOptimize).
 struct EjitEntryDiag {
   std::string Name;
-  SmallVector<std::string, 4> DeclaredDims;
+  // (period name, parameter index) per ejit_period_arr_ind declaration.
+  SmallVector<std::pair<std::string, unsigned>, 4> DeclaredDims;
+  // Period names an ejit_bound_ptr parameter is bound to. EJitWrapperGen
+  // requires exactly one matching ejit_period_arr_ind for each, so the
+  // dimension cannot be removed - #2 must not advise removing it.
+  SmallVector<std::string, 4> BoundPtrPeriods;
 };
 
 } // namespace
@@ -490,8 +495,9 @@ computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKi
 /// AOT specialization diagnostics on the extracted bitcode (post-preOptimize),
 /// which is exactly what the JIT will specialize.
 ///   #1: ejit_entry whose specialization closure reads no ejit_may_const field.
-///   #2: ejit_entry that declares ejit_period_arr_ind(P) but its closure never
-///       indexes an ejit_period_arr(P).
+///   #2: ejit_entry that declares ejit_period_arr_ind(P) but whose closure
+///       neither reads that parameter nor indexes an ejit_period_arr(P), and
+///       has no ejit_bound_ptr bound to P.
 /// The closure is the direct-call reachability within the extracted module.
 /// External calls (declarations) and indirect calls (function pointers) do NOT
 /// count: the JIT cannot inline them, so their may_const reads never enter this
@@ -513,10 +519,21 @@ runSpecializationDiagnostic(Module &Extracted,
         if (!Sub || Sub->getNumOperands() < 2)
           continue;
         auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-        if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
+        if (!Tag)
           continue;
-        if (auto *PN = dyn_cast<MDString>(Sub->getOperand(1)))
-          ED.DeclaredDims.push_back(PN->getString().str());
+        if (Tag->getString() == TAG_EJIT_PERIOD_ARR_IND) {
+          if (Sub->getNumOperands() < 3)
+            continue;
+          auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
+          auto *IdxC = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+          if (PN && IdxC)
+            ED.DeclaredDims.push_back(
+                {PN->getString().str(),
+                 static_cast<unsigned>(IdxC->getZExtValue())});
+        } else if (Tag->getString() == TAG_EJIT_BOUND_PTR) {
+          if (auto *PN = dyn_cast<MDString>(Sub->getOperand(1)))
+            ED.BoundPtrPeriods.push_back(PN->getString().str());
+        }
       }
     Entries.push_back(std::move(ED));
   }
@@ -583,16 +600,32 @@ runSpecializationDiagnostic(Module &Extracted,
                 "closure; no JIT specialization value, consider removing "
                 "ejit_entry\n";
 
-    // #2: declared dimension never referenced by the closure.
+    // #2: declared dimension neither consumed by the JIT nor required by
+    // another mechanism. The runtime substitutes the index parameter with
+    // the current period value and folds EVERY use
+    // (EJitOptimizer::preReplacePeriodIndices), so a parameter read anywhere
+    // in the closure - plain arithmetic, not just period-array indexing - is
+    // a real specialization use. The dimension is also used when the closure
+    // references the period array: its folded may_const values are refreshed
+    // by recompiling when the dimension's period advances. And a dimension
+    // bound to an ejit_bound_ptr parameter must stay declared: EJitWrapperGen
+    // rejects a bound pointer without exactly one matching dimension. Warn
+    // only when none of these hold.
     if (EJitWarnUnusedDim)
-      for (const std::string &P : ED.DeclaredDims)
-        if (RefIt->second.count(P) == 0)
-          errs() << "EJit warning: ejit_entry function '" << EF->getName()
-                 << "' declares ejit_period_arr_ind('" << P
-                 << "') but its specialization closure never indexes an "
-                    "ejit_period_arr('"
-                 << P << "'); unused specialization dimension, consider "
-                        "removing it\n";
+      for (const auto &[P, ArgIdx] : ED.DeclaredDims) {
+        if (is_contained(ED.BoundPtrPeriods, P))
+          continue;
+        if (RefIt->second.count(P) != 0)
+          continue;
+        if (ArgIdx < EF->arg_size() && !EF->getArg(ArgIdx)->use_empty())
+          continue;
+        errs() << "EJit warning: ejit_entry function '" << EF->getName()
+               << "' declares ejit_period_arr_ind('" << P
+               << "') but its specialization closure neither reads that "
+                  "parameter nor indexes an ejit_period_arr('"
+               << P << "'); unused specialization dimension, consider "
+                          "removing it\n";
+      }
   }
 
   // Per-entry may_const read counts over the specialization closure (BFS).
