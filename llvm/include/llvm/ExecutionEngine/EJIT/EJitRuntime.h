@@ -463,6 +463,10 @@ void ejit_print_code_pool_stats(void);
 /// Call this explicitly after the audit sampling windows have completed. In a
 /// shared-taskpool build, a non-owner core forwards the request to the
 /// compile-owner worker and waits for printing to finish.
+/// The same rows include a Partial JIT audit based on matching non-zero
+/// 64-byte code fingerprints across different versions. Candidate lines are
+/// diagnostic evidence, not guaranteed extractable savings; relocations and
+/// shifted code may cause the audit to undercount similar regions.
 void ejit_print_mayconst_ranking(void);
 
 /// Print the currently-active time-window instances through the platform log:

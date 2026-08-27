@@ -2,11 +2,14 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ProfDataUtils.h"
+#include "llvm/Support/xxhash.h"
 
 #include <algorithm>
 #include <limits>
@@ -63,6 +66,27 @@ uint64_t scaledRatioWithProductDenominator(uint64_t Numerator,
 
 } // namespace
 
+std::vector<uint64_t> llvm::ejit::fingerprintPublishedHotICacheLines(
+    ArrayRef<uint8_t> CodeBytes) {
+  std::vector<uint64_t> Fingerprints;
+  Fingerprints.reserve(CodeBytes.size() / EJitICacheLineBytes +
+                       (CodeBytes.size() % EJitICacheLineBytes != 0));
+  for (size_t Offset = 0; Offset < CodeBytes.size();
+       Offset += EJitICacheLineBytes) {
+    const size_t LineSize =
+        std::min<size_t>(EJitICacheLineBytes, CodeBytes.size() - Offset);
+    ArrayRef<uint8_t> Line = CodeBytes.slice(Offset, LineSize);
+    if (std::all_of(Line.begin(), Line.end(),
+                    [](uint8_t Byte) { return Byte == 0; }))
+      continue;
+    uint64_t Fingerprint = xxHash64(Line);
+    // Keep a short tail distinct from an equal prefix of a full cache line.
+    Fingerprint ^= static_cast<uint64_t>(LineSize) * 0x9e3779b97f4a7c15ULL;
+    Fingerprints.push_back(Fingerprint);
+  }
+  return Fingerprints;
+}
+
 EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
     ArrayRef<EJitMayConstBenefitSample> Samples) {
   EJitMayConstBenefitSummary Summary;
@@ -71,6 +95,11 @@ EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
     return Summary;
 
   bool First = true;
+  struct FingerprintCounts {
+    uint64_t occurrences = 0;
+    uint64_t versions = 0;
+  };
+  DenseMap<uint64_t, FingerprintCounts> Fingerprints;
   for (const EJitMayConstBenefitSample &Sample : Samples) {
     Summary.inputMayConstLoads =
         saturatingAdd(Summary.inputMayConstLoads, Sample.inputMayConstLoads);
@@ -95,6 +124,15 @@ EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
         (Sample.publishedHotCodeBytes % EJitICacheLineBytes != 0);
     Summary.publishedHotICacheLines = saturatingAdd(
         Summary.publishedHotICacheLines, VersionICacheLines);
+    DenseSet<uint64_t> SeenInVersion;
+    for (uint64_t Fingerprint : Sample.publishedHotLineFingerprints) {
+      Summary.fingerprintedHotICacheLines =
+          saturatingAdd(Summary.fingerprintedHotICacheLines, 1);
+      FingerprintCounts &Counts = Fingerprints[Fingerprint];
+      Counts.occurrences = saturatingAdd(Counts.occurrences, 1);
+      if (SeenInVersion.insert(Fingerprint).second)
+        Counts.versions = saturatingAdd(Counts.versions, 1);
+    }
     const int64_t Removed = static_cast<int64_t>(Sample.inputMayConstLoads) -
                             static_cast<int64_t>(Sample.finalMayConstLoads);
     if (First) {
@@ -126,6 +164,18 @@ EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
   Summary.entryBenefitDensityMilli = scaledRatioWithProductDenominator(
       Summary.removedRuntimeHits, Summary.sampleCycles,
       Summary.publishedHotICacheLines, 1000000000);
+  for (const auto &Entry : Fingerprints) {
+    const FingerprintCounts &Counts = Entry.second;
+    if (Counts.versions < 2)
+      continue;
+    Summary.crossVersionMatchingICacheLines = saturatingAdd(
+        Summary.crossVersionMatchingICacheLines, Counts.occurrences);
+    Summary.partialJitCandidateICacheLines = saturatingAdd(
+        Summary.partialJitCandidateICacheLines, Counts.occurrences - 1);
+  }
+  Summary.partialJitCandidatePermille =
+      scaledRatio(Summary.partialJitCandidateICacheLines,
+                  Summary.publishedHotICacheLines, 1000);
   if (Summary.inputMayConstLoads != 0)
     Summary.weightedRemovedPermille =
         Summary.totalRemoved * 1000 /
