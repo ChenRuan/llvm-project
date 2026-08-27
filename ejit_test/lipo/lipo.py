@@ -60,8 +60,7 @@ COMMON_LIBS = [
     "libLLVMipo.a", "libLLVMTransformUtils.a", "libLLVMCodeGen.a",
     "libLLVMCodeGenTypes.a", "libLLVMTarget.a", "libLLVMTargetParser.a",
     "libLLVMSelectionDAG.a", "libLLVMAsmPrinter.a", "libLLVMMC.a",
-    "libLLVMObject.a", "libLLVMProfileData.a", "libLLVMInstrumentation.a",
-    "libLLVMExecutionEngine.a",
+    "libLLVMObject.a", "libLLVMProfileData.a", "libLLVMExecutionEngine.a",
     "libLLVMOrcJIT.a", "libLLVMOrcShared.a", "libLLVMJITLink.a",
     "libLLVMRemarks.a", "libLLVMOption.a", "libLLVMMCDisassembler.a",
     "libLLVMIRPrinter.a",
@@ -355,7 +354,7 @@ def doit_gc_merge(args):
     # Optional roots are retained only when the input runtime defines them, so
     # taskpool-OFF archives do not acquire unresolved taskpool symbols.
     ejit_api = [
-        "ejit_init", "ejit_init_pgo", "ejit_shutdown", "ejit_activate", "ejit_deactivate",
+        "ejit_init", "ejit_shutdown", "ejit_activate", "ejit_deactivate",
         "ejit_activate_all", "ejit_deactivate_all", "ejit_is_active",
         "ejit_get_stats",
         "ejit_register_symbol", "ejit_register_bitcode",
@@ -374,7 +373,8 @@ def doit_gc_merge(args):
     ]
     optional_api = [
         "ejit_register_lifecycle", "ejit_register_funcindex",
-        "ejit_taskpool_compile_or_get", "ejit_taskpool_release_read",
+        "ejit_taskpool_compile_or_get", "ejit_taskpool_compile_or_get_bound",
+        "ejit_taskpool_release_read",
         "ejit_taskpool_compile_or_get_0d", "ejit_taskpool_compile_or_get_1d",
         "ejit_taskpool_compile_or_get_2d", "ejit_taskpool_compile_or_get_3d",
         "ejit_taskpool_compile_or_get_4d",
@@ -382,7 +382,7 @@ def doit_gc_merge(args):
         "ejit_taskpool_get_stats", "ejit_taskpool_print_stats", "ejit_taskpool_get_worker_core",
         "ejit_taskpool_print_compiled", "ejit_taskpool_trace_now",
         "ejit_taskpool_trace_wrapper", "ejit_dump_func", "ejit_print_dumped",
-        "ejit_dump_all", "ejit_print_mayconst_ranking",
+        "ejit_print_dumped_module", "ejit_dump_all",
         # Inline-cache: ejit_register_icache_slot is called from
         # ejit_auto_register (AOT) when -ejit-inline-cache is on, not from the
         # runtime, so gc-merge's --gc-sections would discard it without this GC
