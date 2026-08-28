@@ -233,6 +233,8 @@ attributes #1 = { inlinehint }
 ; MOD-NOT: ptr @ext_helper_small
 ; MOD-NOT: ptr @kept_15inst
 ; MOD: define internal void @ejit_auto_register() {
+; MOD-DAG: call void @ejit_register_symbol(ptr @{{.*}}, ptr @entry)
+; MOD-DAG: call void @ejit_register_symbol(ptr @{{.*}}, ptr @entry_big)
 ; MOD-DAG: call void @ejit_register_symbol(ptr @{{.*}}, ptr @st_helper_big)
 ; MOD-DAG: call void @ejit_register_symbol(ptr @{{.*}}, ptr @ext_helper_big)
 ; MOD-DAG: call void @ejit_register_symbol(ptr @{{.*}}, ptr @hint_big)
@@ -240,7 +242,6 @@ attributes #1 = { inlinehint }
 ; MOD-NOT: @st_helper_small
 ; MOD-NOT: @ext_helper_small
 ; MOD-NOT: @kept_15inst
-; MOD-NOT: @entry_big
 ; MOD: }
 
 ; EXT side: the extracted bitcode. Big helpers are declarations (the static
