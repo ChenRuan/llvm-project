@@ -1332,11 +1332,14 @@ Uninitialized ──CAS成功──> Initializing ──(建好全部共享状�
 #### 11.4.1 worker-only LLVM runtime initialization
 
 固定 worker 核的 shared-async 部署允许 producer-only 核跳过 LLVM/EJIT
-专用 `.init_array`：每个核仍必须以 `forceStaticRegistry=true` 调用
-`ejit_init()`，通过静态 registry table 完成本核 wrapper 的 funcIndex、
-lifecycle 和 inline-cache slot 回填；只有指定 worker 核需要在调用
-`ejit_init()` 前完成 LLVM 运行库的 init-array 准备。业务及其它库需要的
-构造函数不属于该豁免范围。
+专用 `.init_array`。固定 worker 构建会在 `ejit_init()` 和
+`ejit_init_pgo()` 内部强制 `forceStaticRegistry=true`；业务可继续调用
+`ejit_init(NULL)`，每个核都会通过静态 registry table 完成本核 wrapper 的
+funcIndex、lifecycle 和 inline-cache slot 回填。调用方传入的
+`forceStaticRegistry=false` 在该构建模式下也会被覆盖，避免 worker 的
+constructor 路径与 producer 的静态路径产生不同 registration fingerprint。
+只有指定 worker 核需要在调用 `ejit_init()` 前完成 LLVM 运行库的
+init-array 准备。业务及其它库需要的构造函数不属于该豁免范围。
 
 Target 注册位于 `EJitOrcEngine::Create()`，而不是 `EJit::EJit()`。因此：
 
