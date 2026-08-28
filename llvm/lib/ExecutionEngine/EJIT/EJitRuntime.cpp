@@ -367,6 +367,14 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
 
   Config cfg;
   parseConfig(config, cfg);
+#if defined(EJIT_SRE_SHARED_TASKPOOL) &&                                  \
+    defined(EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE)
+  // Fixed-worker deployments may skip EJIT constructors on producer cores.
+  // Force every core through the linker-backed registry so funcIndex and
+  // lifecycle fingerprints remain identical even when callers use
+  // ejit_init(nullptr) and only the worker runs the LLVM init array.
+  cfg.forceStaticRegistry = true;
+#endif
   if (forcePgo)
     cfg.enablePgo = true;
 
@@ -393,9 +401,11 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   bindDumpSharedStateFromRuntime();
 #endif
-  EJIT_DIAG("initialized: mode=%d opt=%d cache=%zu entries=%u pgo=%d",
+  EJIT_DIAG("initialized: mode=%d opt=%d cache=%zu entries=%u pgo=%d "
+            "static_registry=%d",
             (int)cfg.compileMode, (int)cfg.optLevel, cfg.maxCacheSize,
-            (unsigned)cfg.maxCacheEntries, (int)cfg.enablePgo);
+            (unsigned)cfg.maxCacheEntries, (int)cfg.enablePgo,
+            (int)cfg.forceStaticRegistry);
   return EJIT_OK;
 }
 
