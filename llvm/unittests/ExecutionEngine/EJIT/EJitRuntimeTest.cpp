@@ -147,6 +147,7 @@ TEST(EJitDump, SkipsTemporaryPgoTier1Capture) {
 }
 
 static int nestedEntryWrapper(int X) { return X + 100; }
+static int wrongNestedEntryWrapper(int X) { return X + 1000; }
 
 TEST(EJitOrcEngine, NestedEntryResolvesThroughRegisteredWrapper) {
   std::string Bitcode;
@@ -162,9 +163,11 @@ TEST(EJitOrcEngine, NestedEntryResolvesThroughRegisteredWrapper) {
       return MDNode::getDistinct(Ctx, {Entry});
     };
 
-    auto *Nested = Function::Create(FT, Function::ExternalLinkage,
+    auto *Nested = Function::Create(FT, Function::InternalLinkage,
                                     "nested_entry_b", &M);
     Nested->setMetadata(MD_EJIT_METADATA, EntryMD());
+    Nested->addFnAttr(ATTR_EJIT_WRAPPER_SYMBOL,
+                      "ejit_static.nested_entries.test.nested_entry_b");
     IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Nested));
     B.CreateRet(B.CreateAdd(Nested->getArg(0), B.getInt32(1)));
 
@@ -185,6 +188,8 @@ TEST(EJitOrcEngine, NestedEntryResolvesThroughRegisteredWrapper) {
   ASSERT_TRUE(static_cast<bool>(EngineOrErr));
   auto Engine = std::move(*EngineOrErr);
   Engine->addUserSymbol("nested_entry_b",
+                        reinterpret_cast<void *>(&wrongNestedEntryWrapper));
+  Engine->addUserSymbol("ejit_static.nested_entries.test.nested_entry_b",
                         reinterpret_cast<void *>(&nestedEntryWrapper));
 
   SpecializationContext Ctx;
