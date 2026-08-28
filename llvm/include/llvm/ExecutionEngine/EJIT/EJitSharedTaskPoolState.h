@@ -179,6 +179,15 @@ struct EJitSharedWritableRange {
   uint64_t size;  ///< size in bytes of that extent (0 = unused entry)
 };
 
+struct EJitSharedExecutableRange {
+  uintptr_t codeStart;
+  uint64_t codeSize;
+  uintptr_t poolBase;
+  uint64_t poolSize;
+  uint32_t poolId;
+  uint32_t poolKind;
+};
+
 //===----------------------------------------------------------------------===//
 // EJitSharedCacheSlot: one POD result-cache entry.
 //===----------------------------------------------------------------------===//
@@ -206,8 +215,10 @@ struct EJitSharedCacheSlot {
   uint64_t codeSize;      ///< size in bytes of that allocation (0 = none)
   uintptr_t poolBase;     ///< 2MiB pool base (split_2m_to_4k granule)
   uint64_t poolSize;      ///< usable pool size
-  uint32_t poolId;   ///< stable pool index within its near/far manager
-  uint32_t poolKind; ///< EJitCodePoolKind: unknown=0, near=1, far=2
+  uint32_t poolId;        ///< stable pool index within its hot/cold/far manager
+  uint32_t poolKind; ///< EJitCodePoolKind: unknown=0, near=1, far=2, cold=3
+  uint32_t extraCodeCount;
+  EJitSharedExecutableRange extraCodeRanges[kEJitMaxExtraCodeRanges];
   /// Runtime-writable extents of the published code (v9): the pages the JIT
   /// body writes at runtime (e.g. Tier-1 __profc_ counters). A non-owner core
   /// in 4K-seal mode MUST enable_rw exactly these in its own translation
@@ -379,7 +390,7 @@ struct EJitSharedCodePoolStats {
     EJitAtomicU64 sealInvocations;
     EJitAtomicU64 splitInvocations;
     EJitAtomicU64 finalizedRangeCount;
-  } near, far;
+  } near, cold, far;
 };
 
 /// Plain (non-atomic) snapshot of code-pool stats, used as the callback
@@ -408,6 +419,7 @@ struct EJitCodePoolStatsOut {
   uint64_t splitInvocations = 0;
   uint64_t finalizedRangeCount = 0;
   Detail near;
+  Detail cold;
   Detail far;
 };
 

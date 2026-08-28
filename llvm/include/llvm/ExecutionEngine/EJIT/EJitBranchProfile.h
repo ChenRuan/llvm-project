@@ -55,6 +55,11 @@ struct EJitMayConstBenefitSample {
   uint64_t removedHitSites = 0;
   uint64_t sampledEntries = 0;
   uint64_t sampleCycles = 0;
+  /// Finalized executable bytes published for this JIT version.
+  uint64_t publishedHotCodeBytes = 0;
+  /// Fingerprints of non-zero 64-byte executable lines. Used only by the
+  /// diagnostic cross-version Partial JIT audit.
+  std::vector<uint64_t> publishedHotLineFingerprints;
 };
 
 struct EJitMayConstBenefitSummary {
@@ -75,6 +80,17 @@ struct EJitMayConstBenefitSummary {
   uint64_t removedHitSites = 0;
   uint64_t sampledEntries = 0;
   uint64_t sampleCycles = 0;
+  uint64_t publishedHotCodeBytes = 0;
+  /// Sum of per-version ceil(publishedHotCodeBytes / 64).
+  uint64_t publishedHotICacheLines = 0;
+  /// Non-zero executable lines included in the cross-version audit.
+  uint64_t fingerprintedHotICacheLines = 0;
+  /// Line instances whose fingerprint occurs in at least two JIT versions.
+  uint64_t crossVersionMatchingICacheLines = 0;
+  /// Matching line instances beyond one retained copy per fingerprint.
+  uint64_t partialJitCandidateICacheLines = 0;
+  /// partialJitCandidateICacheLines / publishedHotICacheLines, permille.
+  uint64_t partialJitCandidatePermille = 0;
   /// Average dynamically-reached may_const sites per unique JIT version,
   /// scaled by 1000 so freestanding diagnostics need no floating point.
   uint64_t averageActiveSitesPermille = 0;
@@ -83,6 +99,9 @@ struct EJitMayConstBenefitSummary {
   /// Removed dynamic load executions per million platform timestamp units,
   /// scaled by 1000 for three decimal places.
   uint64_t benefitPerMillionCyclesMilli = 0;
+  /// benefitPerMillionCycles divided by published hot I-cache lines, scaled
+  /// by 1000 for three decimal places.
+  uint64_t entryBenefitDensityMilli = 0;
 };
 
 /// Summarize the branch weights attached by PGOInstrumentationUse. This is a
@@ -93,6 +112,10 @@ analyzeBranchProfiles(const Module &M, const std::string &rootName);
 /// Aggregate unique specialization samples for one EJIT entry.
 EJitMayConstBenefitSummary
 summarizeMayConstBenefits(ArrayRef<EJitMayConstBenefitSample> Samples);
+
+/// Fingerprint non-zero 64-byte executable lines for the Partial JIT audit.
+std::vector<uint64_t>
+fingerprintPublishedHotICacheLines(ArrayRef<uint8_t> CodeBytes);
 
 } // namespace ejit
 } // namespace llvm

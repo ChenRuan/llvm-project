@@ -8,6 +8,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include <cassert>
+#include <cstring>
 #ifndef EJIT_FREESTANDING
 #include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
 #endif
@@ -31,6 +32,24 @@ using namespace llvm::ejit;
 
 #ifdef EJIT_SRE_TASKPOOL
 namespace {
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+bool sameAuditRequest(const EJitCompileRequest &L,
+                      const EJitCompileRequest &R) {
+  if (L.funcIndex != R.funcIndex || L.numDims != R.numDims ||
+      L.fallbackPtr != R.fallbackPtr || L.generation != R.generation ||
+      L.boundArgIndex != R.boundArgIndex || L.boundSize != R.boundSize ||
+      L.boundSize > EJIT_BOUND_PTR_MAX_BYTES)
+    return false;
+  for (uint32_t I = 0; I < 4; ++I)
+    if (L.dims[I].dimType != R.dims[I].dimType ||
+        L.dims[I].instanceId != R.dims[I].instanceId ||
+        L.versions[I] != R.versions[I])
+      return false;
+  return L.boundSize == 0 ||
+         std::memcmp(L.boundData, R.boundData, L.boundSize) == 0;
+}
+#endif
+
 /// Adapter so the taskpool can call back into the driver's cold compile path
 /// through a plain function pointer (never std::function). The produced JIT
 /// pointer still comes from the OrcJIT engine (SRE code pool when enabled).
@@ -141,6 +160,7 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
       Dst.finalizedRangeCount = Src.finalizedRangeCount;
     };
     CopyDetail(out->near, tiered.near);
+    CopyDetail(out->cold, tiered.cold);
     CopyDetail(out->far, tiered.far);
     return true;
   }
@@ -803,6 +823,26 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   if (ctx.tier == CompileTier::PGOUse)
     tier1Counters_.erase(cacheKey);
 
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE) &&         \
+    defined(EJIT_SRE_CODE_POOL)
+  // The current pipeline emits one executable range without a separate cold
+  // section, so its finalized footprint is the hot-code approximation.
+  EJitCompiledCodeInfo CodeInfo;
+  if (ctx.tier != CompileTier::Instrumented &&
+      jitEngine_->findCodeRange(funcPtr, CodeInfo)) {
+    if (request) {
+      pendingMayConstCodeAudits_.push_back(
+          {*request, funcName, cacheKey, CodeInfo.codeStart,
+           CodeInfo.codeSize});
+    } else {
+      (void)jitEngine_->recordMayConstPublishedCode(
+          funcName, cacheKey,
+          reinterpret_cast<const void *>(CodeInfo.codeStart),
+          CodeInfo.codeSize);
+    }
+  }
+#endif
+
   EJIT_DIAG("compile OK key=0x%016lx func=%s → pfn=%p", cacheKey,
             funcName.c_str(), funcPtr);
   return funcPtr;
@@ -890,6 +930,19 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
 void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
                                                 bool published) {
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  auto CodeAudit = llvm::find_if(
+      pendingMayConstCodeAudits_, [&](const PendingMayConstCodeAudit &Pending) {
+        return sameAuditRequest(Pending.request, req);
+      });
+  if (CodeAudit != pendingMayConstCodeAudits_.end()) {
+    if (published && jitEngine_)
+      (void)jitEngine_->recordMayConstPublishedCode(
+          CodeAudit->entry, CodeAudit->cacheKey,
+          reinterpret_cast<const void *>(CodeAudit->codeStart),
+          CodeAudit->codeSize);
+    pendingMayConstCodeAudits_.erase(CodeAudit);
+  }
+
   const uint32_t AuditTier = decodeReqTier(req.funcIndex);
   if (AuditTier == kEJitTierInstrumented) {
     if (published && hasPendingTier1MayConstKey_) {

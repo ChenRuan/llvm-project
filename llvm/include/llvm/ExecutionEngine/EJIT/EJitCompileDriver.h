@@ -203,6 +203,17 @@ private:
   /// can use this key to timestamp the Tier-1 sample window exactly at publish.
   uint64_t pendingTier1MayConstKey_ = 0;
   bool hasPendingTier1MayConstKey_ = false;
+  struct PendingMayConstCodeAudit {
+    EJitCompileRequest request{};
+    std::string entry;
+    uint64_t cacheKey = 0;
+    uintptr_t codeStart = 0;
+    uint64_t codeSize = 0;
+  };
+  /// Batch mode may link several Tier-2 versions before publishing them. Keep
+  /// their readable ranges private until the matching publish callback says
+  /// the code is dispatch-visible.
+  std::vector<PendingMayConstCodeAudit> pendingMayConstCodeAudits_;
 #endif
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
   /// Value-profile capture per cacheKey (EJIT_VALUE_PROFILE.md §5.1): the

@@ -542,6 +542,44 @@ void EJitOptimizer::recordMayConstBenefit(
 }
 #endif
 
+bool EJitOptimizer::recordMayConstPublishedCode(StringRef Entry,
+                                                uint64_t CacheKey,
+                                                const void *CodeStart,
+                                                uint64_t CodeBytes) {
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  const auto *Bytes = static_cast<const uint8_t *>(CodeStart);
+  std::vector<uint64_t> Fingerprints;
+  if (Bytes && CodeBytes <= std::numeric_limits<size_t>::max())
+    Fingerprints = fingerprintPublishedHotICacheLines(
+        ArrayRef<uint8_t>(Bytes, static_cast<size_t>(CodeBytes)));
+
+  uint32_t Expected = 0;
+  while (!mayConstBenefitLock_.compareExchange(Expected, 1))
+    Expected = 0;
+  auto EntryIt = mayConstBenefitSamples_.find(Entry);
+  if (EntryIt == mayConstBenefitSamples_.end()) {
+    mayConstBenefitLock_.storeRelease(0);
+    return false;
+  }
+  auto VersionIt = EntryIt->second.find(CacheKey);
+  if (VersionIt == EntryIt->second.end()) {
+    mayConstBenefitLock_.storeRelease(0);
+    return false;
+  }
+  VersionIt->second.publishedHotCodeBytes = CodeBytes;
+  VersionIt->second.publishedHotLineFingerprints.assign(Fingerprints.begin(),
+                                                        Fingerprints.end());
+  mayConstBenefitLock_.storeRelease(0);
+  return true;
+#else
+  (void)Entry;
+  (void)CacheKey;
+  (void)CodeStart;
+  (void)CodeBytes;
+  return false;
+#endif
+}
+
 bool EJitOptimizer::printMayConstRanking() const {
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   struct RankingRow {
@@ -596,8 +634,15 @@ bool EJitOptimizer::printMayConstRanking() const {
     const uint64_t RemovedPerEntry =
         Row.summary.removedHitsPerEntryPermille;
     const uint64_t Benefit = Row.summary.benefitPerMillionCyclesMilli;
+    const uint64_t Density = Row.summary.entryBenefitDensityMilli;
+    const uint64_t PartialJitRatio =
+        Row.summary.partialJitCandidatePermille;
     EJIT_DIAG_RAW(
         "rank=%u entry=%s versions=%llu benefit_per_mcycle=%llu.%03llu "
+        "entry_benefit_density=%llu.%03llu hot_code_bytes=%llu "
+        "hot_icache_lines=%llu fingerprinted_lines=%llu "
+        "cross_version_matching_lines=%llu partial_jit_candidate_lines=%llu "
+        "partial_jit_candidate_ratio=%llu.%01llu%% "
         "removed_per_entry=%llu.%03llu removed_runtime_hits=%llu "
         "sampled_entries=%llu sample_cycles=%llu avg_active_sites=%llu.%03llu "
         "hit_sites=%llu runtime_hits=%llu avg_removed=%lld "
@@ -606,6 +651,18 @@ bool EJitOptimizer::printMayConstRanking() const {
         static_cast<unsigned long long>(Row.summary.versions),
         static_cast<unsigned long long>(Benefit / 1000),
         static_cast<unsigned long long>(Benefit % 1000),
+        static_cast<unsigned long long>(Density / 1000),
+        static_cast<unsigned long long>(Density % 1000),
+        static_cast<unsigned long long>(Row.summary.publishedHotCodeBytes),
+        static_cast<unsigned long long>(Row.summary.publishedHotICacheLines),
+        static_cast<unsigned long long>(
+            Row.summary.fingerprintedHotICacheLines),
+        static_cast<unsigned long long>(
+            Row.summary.crossVersionMatchingICacheLines),
+        static_cast<unsigned long long>(
+            Row.summary.partialJitCandidateICacheLines),
+        static_cast<unsigned long long>(PartialJitRatio / 10),
+        static_cast<unsigned long long>(PartialJitRatio % 10),
         static_cast<unsigned long long>(RemovedPerEntry / 1000),
         static_cast<unsigned long long>(RemovedPerEntry % 1000),
         static_cast<unsigned long long>(Row.summary.removedRuntimeHits),
