@@ -49,6 +49,32 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+TEST(EJitRegistry, ForcedStaticWalkDropsConstructorOrderAssignments) {
+  auto &Functions = EJitFuncRegistry::instance();
+  auto &Lifecycles = EJitLifecycleRegistry::instance();
+  Functions.reset();
+  Lifecycles.reset();
+
+  // Model a worker core that ran application constructors before ejit_init().
+  // Hosted unit tests have empty weak static-registry ranges, so a forced walk
+  // must leave both registries empty.  Before the fix these assignments leaked
+  // through and made the worker fingerprint differ from producer cores.
+  EXPECT_EQ(Functions.resolveAssign("ctor_second"), 0u);
+  EXPECT_EQ(Functions.resolveAssign("ctor_first"), 1u);
+  EXPECT_EQ(Lifecycles.resolveAssign("trp"), 0u);
+  EXPECT_EQ(Lifecycles.resolveAssign("cell"), 1u);
+
+  Config Cfg;
+  Cfg.compileMode = CompileMode::Off;
+  Cfg.forceStaticRegistry = true;
+  { EJit Runtime(Cfg); }
+
+  EXPECT_EQ(Functions.count(), 0u);
+  EXPECT_EQ(Lifecycles.count(), 0u);
+  Functions.reset();
+  Lifecycles.reset();
+}
+
 TEST(EJitDump, FunctionAndModuleViewsHaveDifferentScopes) {
   LLVMContext Ctx;
   Module M("dump_selective", Ctx);
