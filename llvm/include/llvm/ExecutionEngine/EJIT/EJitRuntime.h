@@ -367,6 +367,9 @@ void ejit_taskpool_print_stats();
 /// Print every published shared-cache version and its dimensions. Stats builds
 /// also report whether a later taskpool lookup reused each published version;
 /// wrapper inline-cache calls after that first reuse remain intentionally free.
+/// Entries are sorted by the exact JIT function address and include the owning
+/// executable allocation start/end/size. The allocation size may cover helper
+/// code, stubs, or multiple entry symbols; it is not an exact symbol size.
 void ejit_taskpool_print_compiled();
 uint32_t ejit_taskpool_get_worker_core();
 
