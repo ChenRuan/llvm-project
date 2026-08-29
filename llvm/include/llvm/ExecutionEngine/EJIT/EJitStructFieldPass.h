@@ -10,9 +10,11 @@
 #define LLVM_EXECUTIONENGINE_EJIT_EJITSTRUCTFIELDPASS_H
 
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
+#include "llvm/ExecutionEngine/EJIT/EJitBoundSnapshot.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
@@ -40,12 +42,21 @@ using MayConstOffsetMap =
 class EJitStructFieldPass : public PassInfoMixin<EJitStructFieldPass> {
 public:
   EJitStructFieldPass(PeriodArrayRegistry &reg,
+                      ArrayRef<EJitBoundPointerView> boundPointers,
+                      StringRef boundRootFunction = {})
+      : registry_(reg), boundPointers_(boundPointers.begin(),
+                                       boundPointers.end()),
+        boundRootFunction_(boundRootFunction.str()) {}
+
+  /// Compatibility constructor for direct pass users and older tests.
+  EJitStructFieldPass(PeriodArrayRegistry &reg,
                       const uint8_t *boundData = nullptr,
                       uint32_t boundSize = 0, uint32_t boundArgIndex = 0,
                       StringRef boundRootFunction = {})
-      : registry_(reg), boundData_(boundData), boundSize_(boundSize),
-        boundArgIndex_(boundArgIndex),
-        boundRootFunction_(boundRootFunction.str()) {}
+      : registry_(reg), boundRootFunction_(boundRootFunction.str()) {
+    if (boundData && boundSize)
+      boundPointers_.push_back({boundData, boundSize, boundArgIndex});
+  }
 
   /// Pre-build GV metadata maps from the Module (call once before run()).
   void initFromModule(Module &M);
@@ -74,16 +85,18 @@ public:
 
 private:
   PeriodArrayRegistry &registry_;
-  const uint8_t *boundData_ = nullptr;
-  uint32_t boundSize_ = 0;
-  uint32_t boundArgIndex_ = 0;
+  SmallVector<EJitBoundPointerView, 4> boundPointers_;
   std::string boundRootFunction_;
 
-  // A specialization owns one pointee snapshot. Track which formal arguments
-  // are proven to receive that snapshot, and their byte offset into it, across
-  // direct calls from the entry. Ambiguous or indirect flows are omitted.
-  DenseMap<const Argument *, uint64_t> boundArguments_;
-  SmallVector<std::pair<uint64_t, uint64_t>, 4> boundMayConstFields_;
+  struct BoundSnapshotState {
+    EJitBoundPointerView view;
+    // A specialization owns one pointee snapshot. Track which formal
+    // arguments are proven to receive that snapshot, and their byte offset
+    // into it, across direct calls from the entry.
+    DenseMap<const Argument *, uint64_t> boundArguments;
+    SmallVector<std::pair<uint64_t, uint64_t>, 4> mayConstFields;
+  };
+  SmallVector<BoundSnapshotState, 4> boundSnapshots_;
   void initBoundArgumentPropagation(Module &M);
 
   // Cached metadata maps — built once per module, reused across functions.

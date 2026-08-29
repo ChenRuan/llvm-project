@@ -56,6 +56,22 @@ static_assert(EJIT_ICACHE_MAX_DIMS == llvm::ejit::kEJitSharedMaxDims,
 using namespace llvm;
 using namespace llvm::ejit;
 
+namespace {
+struct BoundSnapshotGuard {
+  llvm::ejit::EJitBoundSnapshot *snapshot = nullptr;
+  ~BoundSnapshotGuard() {
+    if (snapshot)
+      llvm::ejit::destroyEJitBoundSnapshot(snapshot);
+  }
+  void release() { snapshot = nullptr; }
+};
+
+static EJitCompileRequest requestWithoutBoundSnapshot(EJitCompileRequest req) {
+  req.boundSnapshotPtr = 0;
+  return req;
+}
+} // namespace
+
 #ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT
 #define EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT 1u
 #endif
@@ -2812,6 +2828,13 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       uint32_t self = EJitCoreId::current();
       uint32_t nextGen = state_->generation.loadRelaxed() + 1;
       // Owner-private batch state must never cross a generation boundary.
+      for (PendingBatchCompile &P : pendingBatchCompiles_)
+        destroyEJitBoundSnapshot(P.req.boundSnapshotPtr);
+      for (PendingPublish &P : pendingPublishes_)
+        destroyEJitBoundSnapshot(P.req.boundSnapshotPtr);
+      EJitCompileRequest StaleRequest{};
+      while (queuePop(StaleRequest))
+        destroyEJitBoundSnapshot(StaleRequest.boundSnapshotPtr);
       pendingBatchCompiles_.clear();
       pendingPublishes_.clear();
       autoTier2PublishPending_ = false;
@@ -2968,9 +2991,16 @@ void EJitSharedTaskPool::ownerShutdown() {
   // A failed enable_ex may leave linked, non-executable objects queued after
   // the worker's final flush attempt. Drop their owner-private metadata before
   // destroying the engine; shared Pending slots were already drained above.
-  for (PendingPublish &P : pendingPublishes_)
+  for (PendingPublish &P : pendingPublishes_) {
+    destroyEJitBoundSnapshot(P.req.boundSnapshotPtr);
     if (releaseFn_)
       releaseFn_(releaseCtx_, P.fn);
+  }
+  for (PendingBatchCompile &P : pendingBatchCompiles_)
+    destroyEJitBoundSnapshot(P.req.boundSnapshotPtr);
+  EJitCompileRequest StaleRequest{};
+  while (queuePop(StaleRequest))
+    destroyEJitBoundSnapshot(StaleRequest.boundSnapshotPtr);
   pendingBatchCompiles_.clear();
   pendingPublishes_.clear();
   autoTier2PublishPending_ = false;
@@ -3207,6 +3237,16 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
                                  uint32_t numDims, void *fallback,
                                  const void *boundData, uint32_t boundSize,
                                  uint32_t boundArgIndex) {
+  if (boundSize == 0)
+    return compileOrGetBound(funcIndex, dims, numDims, fallback, nullptr, 0);
+  EJitBoundPtrInput Bound{boundData, boundSize, boundArgIndex};
+  return compileOrGetBound(funcIndex, dims, numDims, fallback, &Bound, 1);
+}
+
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::compileOrGetBound(
+    uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+    void *fallback, const EJitBoundPtrInput *boundPtrs, uint32_t boundCount) {
   EJIT_DIAG_VERBOSE("shared taskpool request func=%u dims=%u fallback=%p",
                     funcIndex, numDims, fallback);
   // Parameter check already done by the C API layer.
@@ -3223,6 +3263,11 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   }
   // True miss: continue the slow path with the caller's fallback.
   R.fnPtr = fallback;
+  if (boundCount != 0 &&
+      (boundCount > kEJitMaxBoundPointers || !boundPtrs)) {
+    R.status = EJitCompileOrGetStatus::InvalidParam;
+    return R;
+  }
   // Batched baseline compilation releases the coarse per-function in-flight
   // claim after installing an exact-identity Pending marker. Coalesce only an
   // identical request here so another cell/TRP version of the same function
@@ -3230,13 +3275,6 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   if (cacheHasPending(funcIndex, dims, numDims)) {
     EJIT_STAT_INC(state_->counters.alreadyPending);
     R.status = EJitCompileOrGetStatus::AlreadyPending;
-    return R;
-  }
-  if ((boundSize != 0 && !boundData) || boundSize > EJIT_BOUND_PTR_MAX_BYTES) {
-    EJIT_DIAG("shared taskpool bound snapshot reject func=%u size=%u max=%u",
-              funcIndex, boundSize,
-              static_cast<unsigned>(EJIT_BOUND_PTR_MAX_BYTES));
-    R.status = EJitCompileOrGetStatus::InvalidParam;
     return R;
   }
   // Off mode (§5.2 step 2).
@@ -3258,6 +3296,15 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
       R.status = EJitCompileOrGetStatus::OffMode;
       return R;
     }
+    BoundSnapshotGuard SnapshotGuard{
+        createEJitBoundSnapshot(boundPtrs, boundCount,
+                                boundSnapshotAllocator_)};
+    if (boundCount != 0 && !SnapshotGuard.snapshot) {
+      EJIT_DIAG("shared taskpool sync bound snapshot reject func=%u count=%u",
+                funcIndex, boundCount);
+      R.status = EJitCompileOrGetStatus::InvalidParam;
+      return R;
+    }
     // Build request with current instance versions, then compile inline.
     EJitCompileRequest ReqLocal{};
     ReqLocal.funcIndex = funcIndex;
@@ -3267,10 +3314,8 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
       ReqLocal.versions[i] =
           instanceVersion(dims[i].dimType, dims[i].instanceId);
     }
-    ReqLocal.boundArgIndex = boundArgIndex;
-    ReqLocal.boundSize = boundSize;
-    if (boundSize)
-      std::memcpy(ReqLocal.boundData, boundData, boundSize);
+    ReqLocal.boundSnapshotPtr =
+        reinterpret_cast<uintptr_t>(SnapshotGuard.snapshot);
     if (!versionsCurrent(ReqLocal)) {
       EJIT_DIAG("shared taskpool sync snapshot drop func=%u: version changed",
                 funcIndex);
@@ -3384,6 +3429,18 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   if (pgoForRequest && pgoAdmissionTestHook_)
     pgoAdmissionTestHook_(pgoAdmissionTestHookCtx_);
 #endif
+  BoundSnapshotGuard SnapshotGuard{
+      createEJitBoundSnapshot(boundPtrs, boundCount, boundSnapshotAllocator_)};
+  if (boundCount != 0 && !SnapshotGuard.snapshot) {
+    dedupClear(funcIndex, gen);
+    if (newlyAdmitted)
+      finishPgoFunction(funcIndex, /*completed=*/false,
+                        "bound-snapshot-allocation-failed");
+    EJIT_DIAG("shared taskpool async bound snapshot reject func=%u count=%u",
+              funcIndex, boundCount);
+    R.status = EJitCompileOrGetStatus::InvalidParam;
+    return R;
+  }
   EJitCompileRequest Req{};
   Req.funcIndex = pgoForRequest
                       ? encodeReqTier(funcIndex, kEJitTierInstrumented)
@@ -3395,10 +3452,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     Req.dims[i] = dims[i];
     Req.versions[i] = instanceVersion(dims[i].dimType, dims[i].instanceId);
   }
-  Req.boundArgIndex = boundArgIndex;
-  Req.boundSize = boundSize;
-  if (boundSize)
-    std::memcpy(Req.boundData, boundData, boundSize);
+  Req.boundSnapshotPtr = reinterpret_cast<uintptr_t>(SnapshotGuard.snapshot);
   if (!versionsCurrent(Req) || state_->generation.loadAcquire() != gen) {
     dedupClear(funcIndex, gen);
     if (newlyAdmitted)
@@ -3418,6 +3472,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     R.status = EJitCompileOrGetStatus::QueueFullFallback;
     return R;
   }
+  SnapshotGuard.release(); // ownership moved into the shared queue
   EJIT_STAT_INC(state_->counters.asyncEnqueues);
   EJIT_DIAG_VERBOSE("shared taskpool enqueued func=%u gen=%u", funcIndex, gen);
   R.status = EJitCompileOrGetStatus::EnqueuedPending;
@@ -3737,6 +3792,7 @@ bool EJitSharedTaskPool::readCodePoolStats(EJitCodePoolStatsOut *out) const {
 
 void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
                                     bool hasBatchRequestMarker) {
+  BoundSnapshotGuard SnapshotGuard{getEJitBoundSnapshot(req.boundSnapshotPtr)};
   // PGO (§4.9): the aarch64 exclusive-monitor workaround is a property of the
   // Tier-2 publish, not a caller flag. A Tier-2 (PGOUse) request always follows
   // an arming hit whose hitCount.fetchAdd primed the monitor on this bucket, so
@@ -3833,7 +3889,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
       // must not replace the live Tier-1 slot until the worker observes the
       // compile queue empty and seals the batch. Keep only owner-private state
       // and retain the in-flight claim.
-      pendingPublishes_.push_back({req, fn});
+      pendingPublishes_.push_back({requestWithoutBoundSnapshot(req), fn});
       autoTier2PublishPending_ = true;
       EJIT_DIAG_DEBUG("PGO Tier-2 linked pending queue-drain publish func=%u "
                       "fn=%p pending=%zu",
@@ -3857,7 +3913,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     }
     EJitPublishStatus Staged = cacheStagePending(req, fn);
     if (Staged == EJitPublishStatus::Published) {
-      pendingPublishes_.push_back({req, fn});
+      pendingPublishes_.push_back({requestWithoutBoundSnapshot(req), fn});
       dedupClear(req.funcIndex, req.generation);
       EJIT_DIAG_DEBUG("shared worker batch staged func=%u fn=%p pending=%zu",
                       req.funcIndex, fn, pendingPublishes_.size());
@@ -3869,7 +3925,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     // A bucket containing only other Pending identities has no safe eviction
     // victim. Keep the result owner-private with its coarse in-flight claim;
     // the explicit publish call seals all code and then inserts this identity.
-    pendingPublishes_.push_back({req, fn});
+    pendingPublishes_.push_back({requestWithoutBoundSnapshot(req), fn});
     EJIT_DIAG_VERBOSE(
         "shared worker batch retained unstaged func=%u pending=%zu",
         req.funcIndex, pendingPublishes_.size());
@@ -3941,6 +3997,7 @@ bool EJitSharedTaskPool::pollOne() {
       decodeReqTier(Req.funcIndex) == kEJitTierBaseline) {
     if (pendingBatchCompiles_.size() >= kEJitSharedQueueSlots) {
       dedupClear(Req.funcIndex, Req.generation);
+      destroyEJitBoundSnapshot(Req.boundSnapshotPtr);
       EJIT_STAT_INC(state_->counters.queueFull);
       EJIT_DIAG("shared worker batch backlog full func=%u capacity=%u",
                 stripReqTier(Req.funcIndex), kEJitSharedQueueSlots);

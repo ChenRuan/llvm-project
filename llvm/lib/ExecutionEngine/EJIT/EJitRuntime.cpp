@@ -145,6 +145,8 @@ static_assert(kEJitMaxFuncIndex == kEJitSharedMaxFuncIndex,
 #endif // EJIT_SRE_SHARED_TASKPOOL
 
 static EJit *gEJIT = nullptr;
+static EJitBoundSnapshotAllocator gEJitBoundSnapshotAllocator =
+    getDefaultEJitBoundSnapshotAllocator();
 
 #ifdef EJIT_DIAG_ENABLE
 EJitAtomicU64 gIcacheNullFillSkips;
@@ -367,6 +369,7 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
 
   Config cfg;
   parseConfig(config, cfg);
+  cfg.boundSnapshotAllocator = gEJitBoundSnapshotAllocator;
   if (forcePgo)
     cfg.enablePgo = true;
 
@@ -400,6 +403,25 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
 }
 
 extern "C" {
+
+void ejit_set_bound_snapshot_allocator(ejit_bound_snapshot_alloc_fn allocFn,
+                                       ejit_bound_snapshot_free_fn freeFn,
+                                       void *ctx) {
+  if (gEJIT) {
+    EJIT_DIAG("bound snapshot allocator rejected: runtime already initialized");
+    return;
+  }
+  if ((allocFn == nullptr) != (freeFn == nullptr)) {
+    EJIT_DIAG("bound snapshot allocator rejected: alloc/free must be paired");
+    return;
+  }
+  if (!allocFn) {
+    gEJitBoundSnapshotAllocator =
+        getDefaultEJitBoundSnapshotAllocator();
+    return;
+  }
+  gEJitBoundSnapshotAllocator = {allocFn, freeFn, ctx};
+}
 
 ejit_status_t ejit_init(const ejit_config_t *config) {
   return ejitInitImpl(config, /*forcePgo=*/false);
@@ -903,8 +925,8 @@ inline void ejitIcacheFillOnSuccess(uint32_t funcIndex, void *fnPtr,
 
 static ejit_status_t
 taskpoolCompileOrGetImpl(uint32_t funcIndex, const ejit_dim_pair_t *dims,
-                         uint32_t numDims, const void *snapshotData,
-                         uint32_t snapshotSize, uint32_t boundArgIndex,
+                         uint32_t numDims, const EJitBoundPtrInput *boundPtrs,
+                         uint32_t boundCount,
                          void **outFn, uint32_t *outBucket) {
   if (outFn)
     *outFn = nullptr;
@@ -984,9 +1006,8 @@ taskpoolCompileOrGetImpl(uint32_t funcIndex, const ejit_dim_pair_t *dims,
     return taskpoolStatus(fast.status);
   }
 
-  auto r = tp->compileOrGet(funcIndex, dimsCast, numDims,
-                            /*fallback=*/nullptr, snapshotData, snapshotSize,
-                            boundArgIndex);
+  auto r = tp->compileOrGetBound(funcIndex, dimsCast, numDims,
+                                 /*fallback=*/nullptr, boundPtrs, boundCount);
   if (outFn)
     *outFn = r.fnPtr;
   if (outBucket)
@@ -1003,17 +1024,41 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
                                            const ejit_dim_pair_t *dims,
                                            uint32_t numDims, void **outFn,
                                            uint32_t *outBucket) {
-  return taskpoolCompileOrGetImpl(funcIndex, dims, numDims, nullptr, 0, 0,
-                                  outFn, outBucket);
+  return taskpoolCompileOrGetImpl(funcIndex, dims, numDims, nullptr, 0, outFn,
+                                  outBucket);
 }
 
 ejit_status_t ejit_taskpool_compile_or_get_bound(
     uint32_t funcIndex, const ejit_dim_pair_t *dims, uint32_t numDims,
     const void *snapshotData, uint32_t snapshotSize, uint32_t boundArgIndex,
     void **outFn, uint32_t *outBucket) {
-  return taskpoolCompileOrGetImpl(funcIndex, dims, numDims, snapshotData,
-                                  snapshotSize, boundArgIndex, outFn,
+  EJitBoundPtrInput Bound{snapshotData, snapshotSize, boundArgIndex};
+  return taskpoolCompileOrGetImpl(funcIndex, dims, numDims, &Bound, 1, outFn,
                                   outBucket);
+}
+
+ejit_status_t ejit_taskpool_compile_or_get_bound_v(
+    uint32_t funcIndex, const ejit_dim_pair_t *dims, uint32_t numDims,
+    const ejit_bound_ptr_t *bounds, uint32_t numBounds, void **outFn,
+    uint32_t *outBucket) {
+  if (numBounds == 0)
+    return taskpoolCompileOrGetImpl(funcIndex, dims, numDims, nullptr, 0,
+                                    outFn, outBucket);
+  static_assert(sizeof(ejit_bound_ptr_t) == sizeof(EJitBoundPtrInput),
+                "C and C++ bound-pointer descriptors must have one layout");
+  static_assert(offsetof(ejit_bound_ptr_t, data) ==
+                    offsetof(EJitBoundPtrInput, data),
+                "bound-pointer data offset drift");
+  static_assert(offsetof(ejit_bound_ptr_t, size) ==
+                    offsetof(EJitBoundPtrInput, size),
+                "bound-pointer size offset drift");
+  static_assert(offsetof(ejit_bound_ptr_t, argIndex) ==
+                    offsetof(EJitBoundPtrInput, argIndex),
+                "bound-pointer argument offset drift");
+  return taskpoolCompileOrGetImpl(
+      funcIndex, dims, numDims,
+      reinterpret_cast<const EJitBoundPtrInput *>(bounds), numBounds, outFn,
+      outBucket);
 }
 
 //===----------------------------------------------------------------------===//

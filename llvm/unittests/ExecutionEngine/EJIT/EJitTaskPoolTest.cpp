@@ -30,6 +30,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -88,16 +89,39 @@ struct PublishObserver {
 struct SnapshotCompiler {
   uint32_t first = 0;
   uint32_t second = 0;
+  uint32_t middle = 0;
   uint32_t argIndex = 0;
+  uint32_t entryCount = 0;
+  uint32_t secondArgIndex = 0;
 
   static bool compile(void *ctx, const EJitCompileRequest &req, void **outFn) {
     auto *self = static_cast<SnapshotCompiler *>(ctx);
-    if (req.boundSize >= 2 * sizeof(uint32_t)) {
-      std::memcpy(&self->first, req.boundData, sizeof(uint32_t));
-      std::memcpy(&self->second, req.boundData + sizeof(uint32_t),
-                  sizeof(uint32_t));
+    const auto *snapshot = getEJitBoundSnapshot(req.boundSnapshotPtr);
+    if (isValidEJitBoundSnapshot(snapshot)) {
+      self->entryCount = snapshot->entryCount;
+      const auto *entries = getEJitBoundSnapshotEntries(snapshot);
+      const auto *bytes = getEJitBoundSnapshotBytes(snapshot);
+      if (entries[0].size >= sizeof(uint32_t))
+        std::memcpy(&self->first, bytes + entries[0].offset,
+                    sizeof(uint32_t));
+      // Preserve the legacy single-buffer check while also checking that a
+      // large payload was copied beyond its initial bytes.
+      if (snapshot->entryCount == 1 &&
+          entries[0].size >= 2 * sizeof(uint32_t))
+        std::memcpy(&self->second, bytes + entries[0].offset + sizeof(uint32_t),
+                    sizeof(uint32_t));
+      if (snapshot->entryCount == 1 &&
+          entries[0].size >= 2048 + sizeof(uint32_t))
+        std::memcpy(&self->middle, bytes + entries[0].offset + 2048,
+                    sizeof(uint32_t));
+      self->argIndex = entries[0].argIndex;
+      if (snapshot->entryCount > 1) {
+        self->secondArgIndex = entries[1].argIndex;
+        if (entries[1].size >= sizeof(uint32_t))
+          std::memcpy(&self->second, bytes + entries[1].offset,
+                      sizeof(uint32_t));
+      }
     }
-    self->argIndex = req.boundArgIndex;
     *outFn = reinterpret_cast<void *>(&DummyFn0);
     return true;
   }
@@ -125,11 +149,11 @@ TEST(EJitTaskPoolLayout, RequestIsFlatPod) {
   static_assert(std::is_standard_layout<EJitCompileRequest>::value,
                 "EJitCompileRequest must be standard layout");
   EXPECT_LE(alignof(EJitCompileRequest), 8u);
-  // The fixed request owns its optional bound-pointer bytes inline. See the
+  // The request owns only a pointer-sized snapshot handle. See the
   // cross-pointer-width layout assertion in EJitSreQueue.h.
   EXPECT_EQ(sizeof(EJitCompileRequest), sizeof(uintptr_t) == 8
-                                            ? 80u + EJIT_BOUND_PTR_MAX_BYTES
-                                            : 72u + EJIT_BOUND_PTR_MAX_BYTES);
+                                            ? 80u
+                                            : 68u);
 }
 
 //===----------------------------------------------------------------------===//
@@ -981,11 +1005,85 @@ TEST(EJitTaskPoolTest, BoundSnapshotOutlivesCallerObject) {
 TEST(EJitTaskPoolTest, OversizeBoundSnapshotFallsBack) {
   EJitTaskPool P(8, false);
   P.switchController().setMode(EJitCompileMode::Async);
-  uint8_t Data[EJIT_BOUND_PTR_MAX_BYTES + 1] = {};
+  SnapshotCompiler C;
+  P.setCompiler(&SnapshotCompiler::compile, &C);
+  std::vector<uint8_t> Data(4096, 0);
+  uint32_t Expected = 0xA5A5A5A5u;
+  std::memcpy(Data.data() + 2048, &Expected, sizeof(Expected));
   EJitDimPair D[1] = {{0, 3}};
-  auto R = P.compileOrGet(18, D, 1, nullptr, Data, sizeof(Data), 1);
+  auto R = P.compileOrGet(18, D, 1, nullptr, Data.data(),
+                          static_cast<uint32_t>(Data.size()), 1);
+  ASSERT_EQ(R.status, EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(P.pollOne());
+  EXPECT_EQ(C.first, 0u);
+  EXPECT_EQ(C.entryCount, 1u);
+  EXPECT_EQ(C.middle, Expected);
+
+  // A malformed input fails without leaving an owned allocation or a pending
+  // dedup claim, and a later valid request still works.
+  auto Bad = P.compileOrGet(19, D, 1, nullptr, nullptr, 4096, 1);
+  EXPECT_EQ(Bad.status, EJitCompileOrGetStatus::InvalidParam);
+  EXPECT_EQ(P.pendingCount(), 0u);
+  auto Good = P.compileOrGet(19, D, 1, nullptr, Data.data(),
+                             static_cast<uint32_t>(Data.size()), 1);
+  EXPECT_EQ(Good.status, EJitCompileOrGetStatus::EnqueuedPending);
+}
+
+TEST(EJitTaskPoolTest, MultipleBoundSnapshotsAreIndependent) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  SnapshotCompiler C;
+  P.setCompiler(&SnapshotCompiler::compile, &C);
+  uint32_t First = 17;
+  uint32_t Second = 29;
+  EJitBoundPtrInput Bounds[] = {{&First, sizeof(First), 1},
+                                {&Second, sizeof(Second), 3}};
+  EJitDimPair D[1] = {{0, 4}};
+  auto R = P.compileOrGetBound(20, D, 1, nullptr, Bounds, 2);
+  ASSERT_EQ(R.status, EJitCompileOrGetStatus::EnqueuedPending);
+  First = 100;
+  Second = 200;
+  ASSERT_TRUE(P.pollOne());
+  EXPECT_EQ(C.entryCount, 2u);
+  EXPECT_EQ(C.first, 17u);
+  EXPECT_EQ(C.second, 29u);
+  EXPECT_EQ(C.argIndex, 1u);
+  EXPECT_EQ(C.secondArgIndex, 3u);
+}
+
+TEST(EJitTaskPoolTest, TooManyBoundPointersRejected) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  SnapshotCompiler C;
+  P.setCompiler(&SnapshotCompiler::compile, &C);
+  uint32_t Values[kEJitMaxBoundPointers + 1] = {};
+  EJitBoundPtrInput Bounds[kEJitMaxBoundPointers + 1] = {};
+  for (uint32_t I = 0; I < kEJitMaxBoundPointers + 1; ++I)
+    Bounds[I] = {&Values[I], sizeof(Values[I]), I};
+  EJitDimPair D[1] = {{0, 5}};
+
+  auto R = P.compileOrGetBound(21, D, 1, nullptr, Bounds,
+                               kEJitMaxBoundPointers + 1);
   EXPECT_EQ(R.status, EJitCompileOrGetStatus::InvalidParam);
   EXPECT_EQ(P.pendingCount(), 0u);
+  EXPECT_EQ(C.entryCount, 0u);
+}
+
+TEST(EJitTaskPoolTest, DuplicateBoundPointerArgumentRejected) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  SnapshotCompiler C;
+  P.setCompiler(&SnapshotCompiler::compile, &C);
+  uint32_t First = 1;
+  uint32_t Second = 2;
+  EJitBoundPtrInput Bounds[] = {{&First, sizeof(First), 4},
+                                {&Second, sizeof(Second), 4}};
+  EJitDimPair D[1] = {{0, 6}};
+
+  auto R = P.compileOrGetBound(22, D, 1, nullptr, Bounds, 2);
+  EXPECT_EQ(R.status, EJitCompileOrGetStatus::InvalidParam);
+  EXPECT_EQ(P.pendingCount(), 0u);
+  EXPECT_EQ(C.entryCount, 0u);
 }
 
 TEST(EJitTaskPoolTest, OutOfRangeFuncIndexRejected) {

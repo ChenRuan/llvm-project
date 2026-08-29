@@ -10,6 +10,7 @@
 #define LLVM_EXECUTIONENGINE_EJIT_EJITORCENGINE_H
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ExecutionEngine/EJIT/EJitBoundSnapshot.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
@@ -100,8 +101,9 @@ struct SpecializationContext {
     uint8_t cellIdx;
   };
   SmallVector<DimInfo, 4> dimensions;
-  uint32_t boundArgIndex = 0;
-  SmallVector<uint8_t, 256> boundData;
+  /// Non-owning views into the request-owned snapshot. The taskpool keeps the
+  /// snapshot alive for the complete compile callback.
+  SmallVector<EJitBoundPointerView, 4> boundPointers;
   OptimizationLevel optLevel = OptimizationLevel::L2;
   /// PGO tier (Baseline when PGO is disabled or for the first compile).
   CompileTier tier = CompileTier::Baseline;

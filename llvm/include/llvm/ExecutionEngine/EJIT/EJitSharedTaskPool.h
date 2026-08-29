@@ -513,6 +513,12 @@ public:
     publishFn_ = fn;
     publishCtx_ = ctx;
   }
+  /// Install the allocator used for snapshots copied on a producer core and
+  /// released by the owner worker. Call before submitting work; every
+  /// snapshot retains its own free hook.
+  void setBoundSnapshotAllocator(EJitBoundSnapshotAllocator allocator) {
+    boundSnapshotAllocator_ = allocator;
+  }
   void setMayConstRankingCallback(MayConstRankingCallback fn, void *ctx) {
     mayConstRankingFn_ = fn;
     mayConstRankingCtx_ = ctx;
@@ -874,6 +880,14 @@ public:
                                   const void *boundData = nullptr,
                                   uint32_t boundSize = 0,
                                   uint32_t boundArgIndex = 0);
+  /// Multi-pointer form. The producer owns a single dynamic snapshot until
+  /// the owner worker finishes compilation; no caller pointer crosses the
+  /// shared queue. Bound objects are keyed by the dimension tuple and must be
+  /// stable for that lifecycle instance.
+  CompileOrGetResult compileOrGetBound(
+      uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+      void *fallback, const EJitBoundPtrInput *boundPtrs,
+      uint32_t boundCount);
   /// Flattened fast cache-hit path (spec §5.2 steps 0-1). Performs ONLY the
   /// terminal front half of compileOrGet(): the Ready check, the
   /// instance-enabled check, and the cache lookup, then classifies the outcome:
@@ -1341,6 +1355,8 @@ private:
   void *compileCtx_ = nullptr;
   PublishCallback publishFn_ = nullptr;
   void *publishCtx_ = nullptr;
+  EJitBoundSnapshotAllocator boundSnapshotAllocator_ =
+      getDefaultEJitBoundSnapshotAllocator();
   ReleaseCallback releaseFn_ = nullptr;
   void *releaseCtx_ = nullptr;
   PrepareCodeCallback prepareCodeFn_ = nullptr;

@@ -9514,16 +9514,28 @@ may be marked with this attribute.
 def EjitBoundPtrDocs : Documentation {
   let Category = DocCatFunction;
   let Content = [{
-EmbeddedJIT: binds a pointer parameter's pointee to a specialization dimension.
+EmbeddedJIT: binds one or more pointer parameters' pointees to specialization
+dimensions.
 
 On a JIT cache miss, the runtime snapshots the complete pointee before the
 call returns. Loads of ``ejit_may_const`` fields through the parameter may then
 be specialized from that snapshot. The function must also have exactly one
 ``ejit_period_arr_ind`` parameter with the same period name.
 
-Only a pointer to a complete object type is accepted. The first implementation
-supports one bound pointer per function and performs a shallow object copy;
-pointers contained inside the object are not followed.
+Only a pointer to a complete object type is accepted. Every bound pointer is
+copied independently into an owned, shallow snapshot; pointers contained
+inside an object are not followed. The snapshot is allocated only on a real
+compile miss and is released after the compile attempt, so the caller may use
+stack storage, but it must not mutate the object concurrently with the entry
+call's copy. A null pointer with a non-zero object size, allocation failure, or
+an invalid lifecycle binding keeps execution on the AOT path. The specialization
+cache is keyed by the dimension tuple, not by object bytes: each object must
+remain stable for its associated lifecycle instance and should be updated only
+through the normal deactivate/update/reactivate sequence.
+
+At most 8 pointer parameters may be bound on one entry. This bounds only the
+small descriptor table emitted in the wrapper; there is no fixed byte-size cap
+on an individual snapshot.
 
 .. code-block:: c
 

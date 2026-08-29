@@ -10,6 +10,7 @@
 #define LLVM_EXECUTIONENGINE_EJIT_EJITTASKPOOL_H
 
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
+#include "llvm/ExecutionEngine/EJIT/EJitBoundSnapshot.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRwLock.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h"
 #include "llvm/ExecutionEngine/EJIT/EJitWorker.h"
@@ -349,6 +350,11 @@ public:
     publishFn_ = fn;
     publishCtx_ = ctx;
   }
+  /// Install the allocator used for caller-owned bound-pointer snapshots.
+  /// Call before submitting work; each snapshot retains its own free hook.
+  void setBoundSnapshotAllocator(EJitBoundSnapshotAllocator allocator) {
+    boundSnapshotAllocator_ = allocator;
+  }
 
   /// Install the optional physical-code release callback used when publish
   /// overwrites an existing cache entry (see EJitTaskPoolCache::setReleaser).
@@ -371,6 +377,15 @@ public:
                                   const void *boundData = nullptr,
                                   uint32_t boundSize = 0,
                                   uint32_t boundArgIndex = 0);
+
+  /// Multi-pointer form. Each input is copied into one owned snapshot before
+  /// an asynchronous request is published; the worker never dereferences a
+  /// caller-owned pointer. The cache identity remains the dimension tuple, so
+  /// bound objects must be stable for that tuple's lifecycle instance.
+  CompileOrGetResult compileOrGetBound(
+      uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+      void *fallback, const EJitBoundPtrInput *boundPtrs,
+      uint32_t boundCount);
 
   /// Flattened fast cache-hit path (spec §5.2 steps 0-1). Performs ONLY the
   /// terminal front half of compileOrGet(): the instance-enabled check and the
@@ -436,6 +451,8 @@ private:
   EJitTaskQueue queue_;
   EJitTaskPoolCache cache_;
   bool pgoEnabled_ = false; // PGO (§6): gates the Tier-2 trigger
+  EJitBoundSnapshotAllocator boundSnapshotAllocator_ =
+      getDefaultEJitBoundSnapshotAllocator();
   CompileCallback compileFn_ = nullptr;
   void *compileCtx_ = nullptr;
   PublishCallback publishFn_ = nullptr;

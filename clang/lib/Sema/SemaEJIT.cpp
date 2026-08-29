@@ -24,6 +24,7 @@
 
 using llvm::ejit::MAX_PERIOD_ARR_IND_PARAMS;
 using llvm::ejit::MAX_PERIOD_ARR_SIZE;
+using llvm::ejit::MAX_BOUND_PTR_PARAMS;
 
 using namespace clang;
 
@@ -323,30 +324,29 @@ void checkEjitBoundPtrIndex(Sema &S, const FunctionDecl *FD) {
   if (!FD)
     return;
 
-  unsigned BoundCount = 0;
-  const EjitBoundPtrAttr *LastBound = nullptr;
-  for (const ParmVarDecl *P : FD->parameters())
-    if (const auto *A = P->getAttr<EjitBoundPtrAttr>()) {
-      ++BoundCount;
-      LastBound = A;
-    }
-
-  if (BoundCount > 1 && LastBound) {
-    S.Diag(LastBound->getLocation(), diag::err_ejit_bound_ptr_too_many)
-        << FD << BoundCount;
-    return;
+  unsigned Count = 0;
+  const ParmVarDecl *OverflowPVD = nullptr;
+  for (const ParmVarDecl *BoundParam : FD->parameters()) {
+    const auto *Bound = BoundParam->getAttr<EjitBoundPtrAttr>();
+    if (!Bound)
+      continue;
+    ++Count;
+    if (Count > MAX_BOUND_PTR_PARAMS)
+      OverflowPVD = BoundParam;
+    unsigned MatchingDims = 0;
+    for (const ParmVarDecl *P : FD->parameters())
+      if (const auto *D = P->getAttr<EjitPeriodArrIndAttr>())
+        if (D->getPeriodName() == Bound->getPeriodName())
+          ++MatchingDims;
+    if (MatchingDims != 1)
+      S.Diag(Bound->getLocation(), diag::err_ejit_bound_ptr_missing_dim)
+          << Bound->getPeriodName();
   }
-
-  if (!LastBound)
-    return;
-  unsigned MatchingDims = 0;
-  for (const ParmVarDecl *P : FD->parameters())
-    if (const auto *D = P->getAttr<EjitPeriodArrIndAttr>())
-      if (D->getPeriodName() == LastBound->getPeriodName())
-        ++MatchingDims;
-  if (MatchingDims != 1)
-    S.Diag(LastBound->getLocation(), diag::err_ejit_bound_ptr_missing_dim)
-        << LastBound->getPeriodName();
+  if (Count > MAX_BOUND_PTR_PARAMS && OverflowPVD) {
+    if (auto *A = OverflowPVD->getAttr<EjitBoundPtrAttr>())
+      S.Diag(A->getLocation(), diag::err_ejit_bound_ptr_too_many)
+          << FD << Count;
+  }
 }
 
 /// checkEjitEntryLcConflict - ejit_entry and ejit_period_lc are mutually

@@ -1734,6 +1734,55 @@ TEST(EJitStructFieldPass, BoundPointerUsesOwnedSnapshot) {
   EXPECT_TRUE(SawSnapshotConstant);
 }
 
+TEST(EJitStructFieldPass, MultipleBoundPointersRemainIndependent) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    define i32 @bound_multi(i32 %cell, ptr %a, ptr %b) !ejit.metadata !0 {
+    entry:
+      %ap = getelementptr i32, ptr %a, i32 0
+      %av = load i32, ptr %ap, !ejit.may_const !4
+      %bp = getelementptr i32, ptr %b, i32 0
+      %bv = load i32, ptr %bp, !ejit.may_const !4
+      %sum = add i32 %av, %bv
+      ret i32 %sum
+    }
+    !0 = distinct !{!1, !2, !3, !5}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !6}
+    !4 = !{!"ejit"}
+    !5 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !7}
+    !6 = !{i64 0, i64 4}
+    !7 = !{i64 0, i64 4}
+  )",
+                               Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+
+  uint32_t A = 7;
+  uint32_t B = 11;
+  EJitBoundPointerView Views[] = {
+      {reinterpret_cast<const uint8_t *>(&A), sizeof(A), 1},
+      {reinterpret_cast<const uint8_t *>(&B), sizeof(B), 2}};
+  PeriodArrayRegistry Registry;
+  EJitStructFieldPass Pass(Registry, Views, "bound_multi");
+  Pass.initFromModule(*M);
+  FunctionAnalysisManager FAM;
+  Pass.run(*M->getFunction("bound_multi"), FAM);
+
+  Function *F = M->getFunction("bound_multi");
+  ASSERT_NE(F, nullptr);
+  EXPECT_EQ(std::count_if(inst_begin(F), inst_end(F),
+                          [](Instruction &I) { return isa<LoadInst>(I); }),
+            0);
+  auto *Ret = dyn_cast<ReturnInst>(F->getEntryBlock().getTerminator());
+  ASSERT_NE(Ret, nullptr);
+  auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(Value, nullptr);
+  EXPECT_EQ(Value->getZExtValue(), 18u);
+}
+
 TEST(EJitStructFieldPass, BoundPointerPropagatesThroughDirectHelpers) {
   LLVMContext Ctx;
   SMDiagnostic Err;

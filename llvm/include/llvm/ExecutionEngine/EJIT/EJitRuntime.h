@@ -154,6 +154,20 @@ typedef struct {
 } ejit_error_t;
 
 // Initialization
+typedef void *(*ejit_bound_snapshot_alloc_fn)(void *ctx, size_t size);
+typedef void (*ejit_bound_snapshot_free_fn)(void *ctx, void *ptr);
+
+/// Configure the allocator for bound-pointer snapshots. Must be called before
+/// ejit_init() when producer and worker may run on different cores. Pass both
+/// callbacks, or pass both NULL to restore the hosted default. Freestanding
+/// builds have no default allocator, so no injection causes bound-pointer
+/// compilation to fall back to AOT cleanly. An incomplete pair is rejected
+/// and leaves the previous configuration unchanged. The callbacks and ctx
+/// must remain valid until all queued snapshots have drained.
+void ejit_set_bound_snapshot_allocator(ejit_bound_snapshot_alloc_fn allocFn,
+                                       ejit_bound_snapshot_free_fn freeFn,
+                                       void *ctx);
+
 ejit_status_t ejit_init(const ejit_config_t *config);
 /// Initialize with online PGO enabled (Tier-1 instrumentation + lazy Tier-2
 /// PGOUse recompile). Additive, ABI-compatible entry point: `ejit_config_t`
@@ -224,18 +238,37 @@ typedef struct {
   uint32_t instanceId;
 } ejit_dim_pair_t;
 
+// One shallow object snapshot associated with a pointer parameter in an
+// ejit_entry function. The runtime copies data before returning, including for
+// asynchronous compilation; the caller may release or mutate data afterwards.
+// A non-zero size requires a non-null data pointer. Descriptors are processed
+// in array order and never share storage.
+typedef struct {
+  const void *data;
+  uint32_t size;
+  uint32_t argIndex;
+} ejit_bound_ptr_t;
+
 ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
                                            const ejit_dim_pair_t *dims,
                                            uint32_t numDims, void **outFn,
                                            uint32_t *outBucket);
 
-// Slow-path variant used by wrappers with EJIT_BOUND_PTR. The runtime copies
+// Compatibility slow-path variant for one EJIT_BOUND_PTR. The runtime copies
 // snapshotData before returning; asynchronous compilation never retains the
-// caller's pointer. Oversize/null snapshots fail cleanly and execute AOT.
+// caller's pointer. There is no fixed snapshot-size cap.
 ejit_status_t ejit_taskpool_compile_or_get_bound(
     uint32_t funcIndex, const ejit_dim_pair_t *dims, uint32_t numDims,
     const void *snapshotData, uint32_t snapshotSize, uint32_t boundArgIndex,
     void **outFn, uint32_t *outBucket);
+
+// Multi-pointer slow path. Each descriptor is copied independently into an
+// owned snapshot. Invalid descriptors or allocation failure return a failure
+// status and leave the caller on its AOT path.
+ejit_status_t ejit_taskpool_compile_or_get_bound_v(
+    uint32_t funcIndex, const ejit_dim_pair_t *dims, uint32_t numDims,
+    const ejit_bound_ptr_t *bounds, uint32_t numBounds, void **outFn,
+    uint32_t *outBucket);
 
 // Fixed-dimension fast paths (0-4 dims). Additive alternatives to
 // ejit_taskpool_compile_or_get that pass the dim identity as scalar arguments

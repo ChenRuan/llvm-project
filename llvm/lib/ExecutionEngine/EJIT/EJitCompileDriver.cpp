@@ -225,6 +225,7 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   // calls startTaskPoolWorker() once everything is ready (spec §3.4).
   taskPool_ = std::make_unique<EJitTaskPool>(EJIT_SRE_TASKPOOL_QUEUE_CAPACITY,
                                              /*autoStartWorker=*/false);
+  taskPool_->setBoundSnapshotAllocator(config_.boundSnapshotAllocator);
   taskPool_->setCompiler(&taskpoolCompileThunk, this);
   taskPool_->setPublishCallback(&taskpoolPublishThunk, this);
   taskPool_->switchController().setMode(
@@ -239,6 +240,7 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   // ORC engine is installed). Cross-core fnPtr sharing is OFF by default until
   // a platform asserts same-VA, sealed, I/D-coherent code (spec §11).
   sharedPool_.bind(&gEJitSharedTaskPoolState);
+  sharedPool_.setBoundSnapshotAllocator(config_.boundSnapshotAllocator);
   sharedPool_.setCompiler(&taskpoolCompileThunk, this);
   sharedPool_.setPublishCallback(&taskpoolPublishThunk, this);
   sharedPool_.setMayConstRankingCallback(&sharedMayConstRankingThunk, this);
@@ -514,15 +516,23 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   ctx.optLevel = config_.optLevel;
   for (unsigned i = 0; i < dimCount; ++i)
     ctx.dimensions.push_back({periodNames[i], dims[i]});
-  if (request && request->boundSize) {
-    if (request->boundSize > EJIT_BOUND_PTR_MAX_BYTES) {
-      EJIT_DIAG("compile FAIL key=0x%016lx func=%s: bound snapshot too large",
+  if (request && request->boundSnapshotPtr) {
+    const auto *snapshot =
+        getEJitBoundSnapshot(request->boundSnapshotPtr);
+    if (!isValidEJitBoundSnapshot(snapshot)) {
+      EJIT_DIAG("compile FAIL key=0x%016lx func=%s: invalid bound snapshot",
                 cacheKey, funcName.c_str());
       return nullptr;
     }
-    ctx.boundArgIndex = request->boundArgIndex;
-    ctx.boundData.append(request->boundData,
-                         request->boundData + request->boundSize);
+    const uint8_t *bytes = getEJitBoundSnapshotBytes(snapshot);
+    const EJitBoundSnapshotEntry *entries =
+        getEJitBoundSnapshotEntries(snapshot);
+    for (uint32_t i = 0; i < snapshot->entryCount; ++i) {
+      const auto &entry = entries[i];
+      ctx.boundPointers.push_back(
+          {bytes + static_cast<size_t>(entry.offset), entry.size,
+           entry.argIndex});
+    }
   }
 
   // PGO tier (EJIT_ONLINE_PGO.md §4). Gated by Config::enablePgo: off => the

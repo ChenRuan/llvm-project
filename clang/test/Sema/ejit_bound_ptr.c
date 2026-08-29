@@ -26,4 +26,17 @@ __attribute__((ejit_entry))
 void two_bound(__attribute__((ejit_period_arr_ind("cell"))) int cell,
                __attribute__((ejit_bound_ptr("cell"))) struct Cfg *a,
                __attribute__((ejit_bound_ptr("cell"))) struct Cfg *b);
-// expected-error@-1 {{function 'two_bound' has 2 ejit_bound_ptr parameters; at most one is supported}}
+
+__attribute__((ejit_entry))
+void too_many_bound(
+    __attribute__((ejit_period_arr_ind("cell"))) int cell,
+    __attribute__((ejit_bound_ptr("cell"))) struct Cfg *p0,
+    __attribute__((ejit_bound_ptr("cell"))) struct Cfg *p1,
+    __attribute__((ejit_bound_ptr("cell"))) struct Cfg *p2,
+    __attribute__((ejit_bound_ptr("cell"))) struct Cfg *p3,
+    __attribute__((ejit_bound_ptr("cell"))) struct Cfg *p4,
+    __attribute__((ejit_bound_ptr("cell"))) struct Cfg *p5,
+    __attribute__((ejit_bound_ptr("cell"))) struct Cfg *p6,
+    __attribute__((ejit_bound_ptr("cell"))) struct Cfg *p7,
+    __attribute__((ejit_bound_ptr("cell"))) struct Cfg *p8);
+// expected-error@-1 {{function 'too_many_bound' has 9 ejit_bound_ptr parameters; at most 8 are supported}}

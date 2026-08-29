@@ -10,6 +10,17 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+namespace {
+struct BoundSnapshotGuard {
+  llvm::ejit::EJitBoundSnapshot *snapshot = nullptr;
+  ~BoundSnapshotGuard() {
+    if (snapshot)
+      llvm::ejit::destroyEJitBoundSnapshot(snapshot);
+  }
+  void release() { snapshot = nullptr; }
+};
+} // namespace
+
 //===----------------------------------------------------------------------===//
 // EJitSwitchController (§5.1)
 //
@@ -360,6 +371,9 @@ EJitTaskPool::~EJitTaskPool() {
   // cache down, then drain each bucket (write lock waits readers → 0) and
   // clear.
   stopWorker();
+  EJitCompileRequest Pending{};
+  while (queue_.tryDequeue(Pending))
+    destroyEJitBoundSnapshot(Pending.boundSnapshotPtr);
   cache_.shutdown();
 }
 
@@ -491,6 +505,17 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
                            uint32_t numDims, void *fallback,
                            const void *boundData, uint32_t boundSize,
                            uint32_t boundArgIndex) {
+  if (boundSize == 0)
+    return compileOrGetBound(funcIndex, dims, numDims, fallback, nullptr, 0);
+  EJitBoundPtrInput Bound{boundData, boundSize, boundArgIndex};
+  return compileOrGetBound(funcIndex, dims, numDims, fallback, &Bound, 1);
+}
+
+EJitTaskPool::CompileOrGetResult
+EJitTaskPool::compileOrGetBound(uint32_t funcIndex, const EJitDimPair *dims,
+                                uint32_t numDims, void *fallback,
+                                const EJitBoundPtrInput *boundPtrs,
+                                uint32_t boundCount) {
   EJIT_DIAG_VERBOSE("taskpool request func=%u dims=%u fallback=%p", funcIndex,
                     numDims, fallback);
 
@@ -528,10 +553,8 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   // True miss: continue the slow path with the caller's fallback.
   R.fnPtr = fallback;
 
-  if ((boundSize != 0 && !boundData) || boundSize > EJIT_BOUND_PTR_MAX_BYTES) {
-    EJIT_DIAG("taskpool bound snapshot reject func=%u size=%u max=%u",
-              funcIndex, boundSize,
-              static_cast<unsigned>(EJIT_BOUND_PTR_MAX_BYTES));
+  if (boundCount != 0 &&
+      (boundCount > kEJitMaxBoundPointers || !boundPtrs)) {
     R.status = EJitCompileOrGetStatus::InvalidParam;
     return R;
   }
@@ -551,6 +574,14 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
       R.status = EJitCompileOrGetStatus::CompileFailed;
       return R;
     }
+    BoundSnapshotGuard SnapshotGuard{createEJitBoundSnapshot(
+        boundPtrs, boundCount, boundSnapshotAllocator_)};
+    if (boundCount != 0 && !SnapshotGuard.snapshot) {
+      EJIT_DIAG("taskpool sync bound snapshot reject func=%u count=%u",
+                funcIndex, boundCount);
+      R.status = EJitCompileOrGetStatus::InvalidParam;
+      return R;
+    }
     EJitCompileRequest Req{};
     Req.funcIndex = funcIndex;
     Req.numDims = numDims;
@@ -560,10 +591,7 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
       Req.versions[i] =
           switch_.getInstanceVersion(dims[i].dimType, dims[i].instanceId);
     }
-    Req.boundArgIndex = boundArgIndex;
-    Req.boundSize = boundSize;
-    if (boundSize)
-      std::memcpy(Req.boundData, boundData, boundSize);
+    Req.boundSnapshotPtr = reinterpret_cast<uintptr_t>(SnapshotGuard.snapshot);
     if (!versionsMatch(Req)) {
       EJIT_DIAG("taskpool sync snapshot drop func=%u: version changed",
                 funcIndex);
@@ -615,6 +643,14 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   }
 
   // 5. Dedup + enqueue (§5.2 step 3) — Async path.
+  BoundSnapshotGuard SnapshotGuard{
+      createEJitBoundSnapshot(boundPtrs, boundCount, boundSnapshotAllocator_)};
+  if (boundCount != 0 && !SnapshotGuard.snapshot) {
+    EJIT_DIAG("taskpool async bound snapshot reject func=%u count=%u",
+              funcIndex, boundCount);
+    R.status = EJitCompileOrGetStatus::InvalidParam;
+    return R;
+  }
   EJitCompileRequest Req{};
   Req.funcIndex = funcIndex;
   Req.numDims = numDims;
@@ -624,10 +660,7 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     Req.versions[i] =
         switch_.getInstanceVersion(dims[i].dimType, dims[i].instanceId);
   }
-  Req.boundArgIndex = boundArgIndex;
-  Req.boundSize = boundSize;
-  if (boundSize)
-    std::memcpy(Req.boundData, boundData, boundSize);
+  Req.boundSnapshotPtr = reinterpret_cast<uintptr_t>(SnapshotGuard.snapshot);
   if (!versionsMatch(Req)) {
     EJIT_DIAG("taskpool async snapshot drop func=%u: version changed",
               funcIndex);
@@ -637,6 +670,7 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
 
   EJitTaskQueue::EnqueueResult EQ = queue_.tryEnqueue(Req);
   if (EQ == EJitTaskQueue::EnqueueResult::Enqueued) {
+    SnapshotGuard.release(); // ownership moved into the queue request
     EJIT_STAT_INC(counters_.asyncEnqueues);
     EJIT_DIAG_VERBOSE("taskpool enqueued func=%u", funcIndex);
     R.status = EJitCompileOrGetStatus::EnqueuedPending;
@@ -671,6 +705,7 @@ bool EJitTaskPool::versionsMatch(const EJitCompileRequest &req) const {
 }
 
 void EJitTaskPool::runCompile(const EJitCompileRequest &req) {
+  BoundSnapshotGuard SnapshotGuard{getEJitBoundSnapshot(req.boundSnapshotPtr)};
   EJIT_DIAG_VERBOSE("worker compile begin func=%u dims=%u", req.funcIndex,
                     req.numDims);
   // Checkpoint 1 (§5.3): drop a request invalidated before compilation started.

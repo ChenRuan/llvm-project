@@ -22,6 +22,7 @@
 #include <cassert>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -231,48 +232,9 @@ static Function *getDirectCallee(CallBase &CB) {
 }
 
 void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
-  boundArguments_.clear();
-  boundMayConstFields_.clear();
-  if (!boundData_ || !boundSize_)
+  boundSnapshots_.clear();
+  if (boundPointers_.empty())
     return;
-
-  Function *Root = nullptr;
-  if (!boundRootFunction_.empty()) {
-    Root = M.getFunction(boundRootFunction_);
-  } else {
-    // Direct pass users may omit the root name. Infer it only when the module
-    // contains a unique matching bound parameter.
-    for (Function &F : M) {
-      if (!functionBindsArgument(F, boundArgIndex_))
-        continue;
-      if (Root) {
-        Root = nullptr;
-        break;
-      }
-      Root = &F;
-    }
-  }
-  if (!Root || Root->isDeclaration() || boundArgIndex_ >= Root->arg_size() ||
-      !functionBindsArgument(*Root, boundArgIndex_))
-    return;
-
-  Argument *RootArgument = Root->getArg(boundArgIndex_);
-  if (!RootArgument->getType()->isPointerTy())
-    return;
-  boundArguments_[RootArgument] = 0;
-
-  if (MDNode *BoundMD = getBoundArgumentMetadata(*Root, boundArgIndex_)) {
-    for (unsigned I = 4; I < BoundMD->getNumOperands(); ++I) {
-      auto *Field = dyn_cast<MDNode>(BoundMD->getOperand(I));
-      if (!Field || Field->getNumOperands() != 2)
-        continue;
-      auto *Offset = mdconst::dyn_extract<ConstantInt>(Field->getOperand(0));
-      auto *Size = mdconst::dyn_extract<ConstantInt>(Field->getOperand(1));
-      if (Offset && Size)
-        boundMayConstFields_.push_back(
-            {Offset->getZExtValue(), Size->getZExtValue()});
-    }
-  }
 
   const DataLayout &DL = M.getDataLayout();
   SmallVector<CallBase *, 32> DirectCalls;
@@ -294,64 +256,111 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
     }
   }
 
-  bool Changed;
-  do {
-    Changed = false;
-    for (CallBase *CB : DirectCalls) {
-      Function *Callee = getDirectCallee(*CB);
-      unsigned Count =
-          std::min<unsigned>(CB->arg_size(), Callee->arg_size());
-      for (unsigned ArgIndex = 0; ArgIndex < Count; ++ArgIndex) {
-        Argument *Formal = Callee->getArg(ArgIndex);
-        if (!Formal->getType()->isPointerTy())
+  for (const EJitBoundPointerView &View : boundPointers_) {
+    if (!View.data || !View.size)
+      continue;
+
+    BoundSnapshotState State;
+    State.view = View;
+    Function *Root = nullptr;
+    if (!boundRootFunction_.empty()) {
+      Root = M.getFunction(boundRootFunction_);
+    } else {
+      // Direct pass users may omit the root name. Infer it only when the
+      // module contains a unique matching bound parameter.
+      for (Function &F : M) {
+        if (!functionBindsArgument(F, View.argIndex))
           continue;
-        auto Offset = getBoundSnapshotOffset(CB->getArgOperand(ArgIndex),
-                                             boundArguments_, DL);
-        if (!Offset || *Offset >= boundSize_)
-          continue;
-        Changed |= boundArguments_.try_emplace(Formal, *Offset).second;
+        if (Root) {
+          Root = nullptr;
+          break;
+        }
+        Root = &F;
       }
     }
-  } while (Changed);
+    if (!Root || Root->isDeclaration() || View.argIndex >= Root->arg_size() ||
+        !functionBindsArgument(*Root, View.argIndex))
+      continue;
 
-  // A callee is safe only if every call represented in this specialization
-  // module passes the same snapshot-derived pointer to that formal argument.
-  // Prune to a fixed point so ambiguity in an upper helper also removes all
-  // mappings derived through it further down the chain.
-  do {
-    Changed = false;
-    SmallVector<const Argument *, 8> Invalid;
-    for (const auto &[Formal, ExpectedOffset] : boundArguments_) {
-      if (Formal == RootArgument)
-        continue;
-      const Function *Callee = Formal->getParent();
-      if (Callee->hasAddressTaken()) {
-        Invalid.push_back(Formal);
-        continue;
+    Argument *RootArgument = Root->getArg(View.argIndex);
+    if (!RootArgument->getType()->isPointerTy())
+      continue;
+    State.boundArguments[RootArgument] = 0;
+
+    if (MDNode *BoundMD = getBoundArgumentMetadata(*Root, View.argIndex)) {
+      for (unsigned I = 4; I < BoundMD->getNumOperands(); ++I) {
+        auto *Field = dyn_cast<MDNode>(BoundMD->getOperand(I));
+        if (!Field || Field->getNumOperands() != 2)
+          continue;
+        auto *Offset =
+            mdconst::dyn_extract<ConstantInt>(Field->getOperand(0));
+        auto *Size = mdconst::dyn_extract<ConstantInt>(Field->getOperand(1));
+        if (Offset && Size)
+          State.mayConstFields.push_back(
+              {Offset->getZExtValue(), Size->getZExtValue()});
       }
-      bool SawCall = false;
-      bool AllMatch = true;
-      auto CallsIt = CallsByCallee.find(Callee);
-      if (CallsIt != CallsByCallee.end()) {
-        for (CallBase *CB : CallsIt->second) {
-          SawCall = true;
-          unsigned ArgIndex = Formal->getArgNo();
-          if (ArgIndex >= CB->arg_size()) {
-            AllMatch = false;
+    }
+
+    bool Changed;
+    do {
+      Changed = false;
+      for (CallBase *CB : DirectCalls) {
+        Function *Callee = getDirectCallee(*CB);
+        unsigned Count =
+            std::min<unsigned>(CB->arg_size(), Callee->arg_size());
+        for (unsigned ArgIndex = 0; ArgIndex < Count; ++ArgIndex) {
+          Argument *Formal = Callee->getArg(ArgIndex);
+          if (!Formal->getType()->isPointerTy())
             continue;
-          }
-          auto ActualOffset = getBoundSnapshotOffset(
-              CB->getArgOperand(ArgIndex), boundArguments_, DL);
-          if (!ActualOffset || *ActualOffset != ExpectedOffset)
-            AllMatch = false;
+          auto Offset = getBoundSnapshotOffset(
+              CB->getArgOperand(ArgIndex), State.boundArguments, DL);
+          if (!Offset || *Offset >= View.size)
+            continue;
+          Changed |=
+              State.boundArguments.try_emplace(Formal, *Offset).second;
         }
       }
-      if (!SawCall || !AllMatch)
-        Invalid.push_back(Formal);
-    }
-    for (const Argument *Formal : Invalid)
-      Changed |= boundArguments_.erase(Formal);
-  } while (Changed);
+    } while (Changed);
+
+    // A callee is safe only if every call represented in this specialization
+    // module passes the same snapshot-derived pointer to that formal argument.
+    do {
+      Changed = false;
+      SmallVector<const Argument *, 8> Invalid;
+      for (const auto &[Formal, ExpectedOffset] : State.boundArguments) {
+        if (Formal == RootArgument)
+          continue;
+        const Function *Callee = Formal->getParent();
+        if (Callee->hasAddressTaken()) {
+          Invalid.push_back(Formal);
+          continue;
+        }
+        bool SawCall = false;
+        bool AllMatch = true;
+        auto CallsIt = CallsByCallee.find(Callee);
+        if (CallsIt != CallsByCallee.end()) {
+          for (CallBase *CB : CallsIt->second) {
+            SawCall = true;
+            unsigned ArgIndex = Formal->getArgNo();
+            if (ArgIndex >= CB->arg_size()) {
+              AllMatch = false;
+              continue;
+            }
+            auto ActualOffset = getBoundSnapshotOffset(
+                CB->getArgOperand(ArgIndex), State.boundArguments, DL);
+            if (!ActualOffset || *ActualOffset != ExpectedOffset)
+              AllMatch = false;
+          }
+        }
+        if (!SawCall || !AllMatch)
+          Invalid.push_back(Formal);
+      }
+      for (const Argument *Formal : Invalid)
+        Changed |= State.boundArguments.erase(Formal);
+    } while (Changed);
+
+    boundSnapshots_.push_back(std::move(State));
+  }
 }
 
 static bool isBoundMayConstLoad(
@@ -884,8 +893,10 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
         continue;
       }
 
-      bool BoundMayConst = isBoundMayConstLoad(
-          LI, boundArguments_, boundMayConstFields_, DL);
+      bool BoundMayConst = false;
+      for (const BoundSnapshotState &Snapshot : boundSnapshots_)
+        BoundMayConst |= isBoundMayConstLoad(
+            LI, Snapshot.boundArguments, Snapshot.mayConstFields, DL);
       if (!BoundMayConst && !isMayConstLoad(LI, mayConstFieldMap_, DL))
         continue;
 #ifdef EJIT_DIAG_ENABLE
@@ -901,9 +912,14 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       // Pattern 0: an ejit_bound_ptr parameter. Only the marked load is read
       // from the owned snapshot; the pointer argument and all dynamic fields
       // remain live inputs to the specialization.
-      if (!C)
-        C = tryReplaceBoundPointer(LI, boundData_, boundSize_, boundArguments_,
-                                   DL);
+      if (!C) {
+        for (const BoundSnapshotState &Snapshot : boundSnapshots_) {
+          C = tryReplaceBoundPointer(LI, Snapshot.view.data, Snapshot.view.size,
+                                     Snapshot.boundArguments, DL);
+          if (C)
+            break;
+        }
+      }
 
       // Pattern 1: direct GlobalVariable load (scalar static variable).
       if (!C) {

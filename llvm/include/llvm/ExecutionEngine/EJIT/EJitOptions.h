@@ -9,6 +9,7 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITOPTIONS_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITOPTIONS_H
 
+#include "llvm/ExecutionEngine/EJIT/EJitBoundSnapshot.h"
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -53,6 +54,12 @@ struct Config {
 #else
   bool enableProfileAudit = false;
 #endif
+  /// Allocator for bound-pointer snapshots crossing producer/worker cores.
+  /// Hosted builds default to malloc/free; freestanding builds default to an
+  /// invalid pair and therefore cleanly fall back to AOT until the platform
+  /// injects a cross-core-safe allocator.
+  EJitBoundSnapshotAllocator boundSnapshotAllocator =
+      getDefaultEJitBoundSnapshotAllocator();
 };
 
 } // namespace ejit

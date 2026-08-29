@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <thread>
@@ -60,17 +61,51 @@ struct BoundSnapshotLog {
   uint32_t argIndex = 0;
   uint32_t size = 0;
   uint32_t value = 0;
+  uint32_t entryCount = 0;
+  uint32_t secondArgIndex = 0;
+  uint32_t secondValue = 0;
 };
 bool mockCompileBoundSnapshot(void *ctx, const EJitCompileRequest &req,
                               void **outFn) {
   auto *log = static_cast<BoundSnapshotLog *>(ctx);
-  log->argIndex = req.boundArgIndex;
-  log->size = req.boundSize;
-  if (req.boundSize >= sizeof(log->value))
-    std::memcpy(&log->value, req.boundData, sizeof(log->value));
+  const auto *snapshot = getEJitBoundSnapshot(req.boundSnapshotPtr);
+  if (isValidEJitBoundSnapshot(snapshot)) {
+    log->entryCount = snapshot->entryCount;
+    const auto *entries = getEJitBoundSnapshotEntries(snapshot);
+    const auto *bytes = getEJitBoundSnapshotBytes(snapshot);
+    log->argIndex = entries[0].argIndex;
+    log->size = entries[0].size;
+    if (entries[0].size >= sizeof(log->value))
+      std::memcpy(&log->value, bytes + entries[0].offset, sizeof(log->value));
+    if (snapshot->entryCount > 1) {
+      log->secondArgIndex = entries[1].argIndex;
+      if (entries[1].size >= sizeof(log->secondValue))
+        std::memcpy(&log->secondValue, bytes + entries[1].offset,
+                    sizeof(log->secondValue));
+    }
+  }
   *outFn = codeFor(req.funcIndex);
   return true;
 }
+
+struct SnapshotAllocatorProbe {
+  uint32_t allocations = 0;
+  uint32_t frees = 0;
+  bool fail = false;
+
+  static void *allocate(void *ctx, size_t size) {
+    auto *probe = static_cast<SnapshotAllocatorProbe *>(ctx);
+    ++probe->allocations;
+    if (probe->fail)
+      return nullptr;
+    return std::malloc(size);
+  }
+  static void deallocate(void *ctx, void *ptr) {
+    auto *probe = static_cast<SnapshotAllocatorProbe *>(ctx);
+    ++probe->frees;
+    std::free(ptr);
+  }
+};
 
 // Compiler that toggles an instance mid-compile to model a deactivate landing
 // during compilation (ctx = the pool).
@@ -927,6 +962,76 @@ TEST_F(SharedTaskPoolTest, BoundSnapshotOwnedAcrossCores) {
   EXPECT_EQ(log.argIndex, 3u);
   EXPECT_EQ(log.size, sizeof(callerValue));
   EXPECT_EQ(log.value, 0x12345678u);
+}
+
+TEST_F(SharedTaskPoolTest, MultipleLargeBoundSnapshotsSurviveQueueHandoff) {
+  SnapshotAllocatorProbe allocator;
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  owner.setBoundSnapshotAllocator({&SnapshotAllocatorProbe::allocate,
+                                   &SnapshotAllocatorProbe::deallocate,
+                                   &allocator});
+  BoundSnapshotLog log;
+  owner.setCompiler(&mockCompileBoundSnapshot, &log);
+
+  std::vector<uint8_t> first(2048, 0);
+  std::vector<uint8_t> second(3072, 0);
+  uint32_t firstValue = 0x11112222u;
+  uint32_t secondValue = 0x33334444u;
+  std::memcpy(first.data(), &firstValue, sizeof(firstValue));
+  std::memcpy(second.data(), &secondValue, sizeof(secondValue));
+  EJitBoundPtrInput bounds[] = {
+      {first.data(), static_cast<uint32_t>(first.size()), 1},
+      {second.data(), static_cast<uint32_t>(second.size()), 4}};
+  // This test isolates snapshot ownership; using a dimension would add an
+  // unrelated instance-enable precondition to the shared-pool fixture.
+  const EJitDimPair *dims = nullptr;
+  EJitCoreId::setCurrentForTest(2);
+  // Keep this key isolated from the older cross-core tests in the same
+  // process; a stale pending claim must not turn this regression into a
+  // dedup assertion.
+  auto r = owner.compileOrGetBound(3001, dims, 0, codeFor(3001), bounds, 2);
+  ASSERT_EQ(r.status, EJitCompileOrGetStatus::EnqueuedPending);
+  first[0] = 0;
+  second[0] = 0;
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_EQ(log.entryCount, 2u);
+  EXPECT_EQ(log.size, first.size());
+  EXPECT_EQ(log.argIndex, 1u);
+  EXPECT_EQ(log.value, firstValue);
+  EXPECT_EQ(log.secondArgIndex, 4u);
+  EXPECT_EQ(log.secondValue, secondValue);
+  EXPECT_EQ(allocator.allocations, 1u);
+  EXPECT_EQ(allocator.frees, 1u);
+}
+
+TEST_F(SharedTaskPoolTest, BoundSnapshotFailureRollsBackDedupAndPgoAdmission) {
+  SnapshotAllocatorProbe allocator;
+  allocator.fail = true;
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  owner.setPgoEnabled(true, 8);
+  owner.setBoundSnapshotAllocator({&SnapshotAllocatorProbe::allocate,
+                                   &SnapshotAllocatorProbe::deallocate,
+                                   &allocator});
+
+  uint32_t first = 0x11111111u;
+  EJitBoundPtrInput valid[] = {{&first, sizeof(first), 2}};
+  // A deterministic allocator failure is reported after the async path has
+  // claimed dedup and PGO admission. This covers the same rollback window as
+  // duplicate-argument validation without depending on host memory pressure.
+  const uint32_t activeBefore = state_->pgoActiveFunctionCount.loadAcquire();
+  auto bad = owner.compileOrGetBound(3002, nullptr, 0, codeFor(3002), valid, 1);
+  EXPECT_EQ(bad.status, EJitCompileOrGetStatus::InvalidParam);
+  EXPECT_EQ(owner.pendingCount(), 0u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), activeBefore);
+
+  allocator.fail = false;
+  auto good =
+      owner.compileOrGetBound(3002, nullptr, 0, codeFor(3002), valid, 1);
+  EXPECT_EQ(good.status, EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), activeBefore + 1);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3032,8 +3137,9 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // v10-v13 add PGO controls, writable ranges, staged admission, and audit
   // requests; v14 adds the owned bound-pointer snapshot, and v15 adds
   // per-version post-publish reuse tracking; v16 adds near/far placement.
-  // v17 adds explicit batch publish state.
-  EXPECT_EQ(kEJitSharedAbiVersion, 17u);
+  // v17 adds explicit batch publish state; v18 moves bound snapshots out of
+  // the fixed queue cell into an owned same-address-space allocation.
+  EXPECT_EQ(kEJitSharedAbiVersion, 18u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(

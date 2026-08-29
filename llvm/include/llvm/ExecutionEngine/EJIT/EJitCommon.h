@@ -15,6 +15,7 @@
 #define LLVM_EXECUTIONENGINE_EJIT_EJITCOMMON_H
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ExecutionEngine/EJIT/EJitBoundSnapshot.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -105,6 +106,8 @@ constexpr const char *FN_TASKPOOL_COMPILE_OR_GET =
     "ejit_taskpool_compile_or_get";
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_BOUND =
     "ejit_taskpool_compile_or_get_bound";
+constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_BOUND_V =
+    "ejit_taskpool_compile_or_get_bound_v";
 // Fixed-dimension fast-path C ABI entries (0-4 dims), emitted by the wrapper
 // when -ejit-wrapper-fixed-dim-entry is enabled and the entry has <= 4 dims.
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_0D =
@@ -153,6 +156,10 @@ constexpr unsigned EJIT_CTOR_PRIORITY = 65535;
 // together with these values.
 constexpr unsigned MAX_PERIOD_ARR_IND_PARAMS = 4;
 constexpr unsigned MAX_PERIOD_ARR_SIZE = 100;
+// The wrapper materializes only this fixed-size descriptor table on its
+// stack. Payload bytes remain runtime-owned and dynamically allocated, so this
+// limit does not cap the size of any bound object.
+constexpr unsigned MAX_BOUND_PTR_PARAMS = kEJitMaxBoundPointers;
 
 //===----------------------------------------------------------------------===//
 // Metadata utility functions (shared across AOT passes)
