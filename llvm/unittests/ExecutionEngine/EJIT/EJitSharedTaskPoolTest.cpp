@@ -181,6 +181,8 @@ struct RangeCtx {
   uint64_t codeSize = 64;
   uint32_t poolId = 0;
   EJitCodePoolKind poolKind = EJitCodePoolKind::Near;
+  uint32_t extraCodeCount = 0;
+  EJitExecutableRange extraCodeRanges[kEJitMaxExtraCodeRanges] = {};
   bool provide = true;
   // Runtime-writable ranges (v9): 0 => none (non-PGO / Tier-2). When set,
   // models the Tier-1 __profc_ counter pages a peer core must enable_rw.
@@ -203,6 +205,9 @@ bool mockCodeRange(void *ctx, const void *fnPtr, EJitCompiledCodeInfo *out) {
   out->poolSize = r->poolSize;
   out->poolId = r->poolId;
   out->poolKind = r->poolKind;
+  out->extraCodeCount = r->extraCodeCount;
+  for (uint32_t I = 0; I < kEJitMaxExtraCodeRanges; ++I)
+    out->extraCodeRanges[I] = r->extraCodeRanges[I];
   out->writableCount = r->writableCount;
   out->requiresPeerEnableRw = r->requiresPeerEnableRw;
   for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
@@ -2383,6 +2388,32 @@ TEST_F(SharedTaskPoolTest, FourKPeerSplitsOnceSealsSinglePage) {
   EXPECT_EQ(fourK.seals[0].second, 3u);
 }
 
+TEST_F(SharedTaskPoolTest, FourKPeerPreparesMfsColdCompanionRange) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.extraCodeCount = 1;
+  range.extraCodeRanges[0].codeStart = 0x40401200ull;
+  range.extraCodeRanges[0].codeSize = 0x80;
+  range.extraCodeRanges[0].poolBase = 0x40400000ull;
+  range.extraCodeRanges[0].poolSize = 0x200000ull;
+  range.extraCodeRanges[0].poolKind = EJitCodePoolKind::Cold;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(4);
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(hit.bucketIndex);
+
+  ASSERT_EQ(fourK.splits.size(), 2u);
+  EXPECT_EQ(fourK.splits[0].first, 0x40000000ull);
+  EXPECT_EQ(fourK.splits[1].first, 0x40400000ull);
+  ASSERT_EQ(fourK.seals.size(), 2u);
+  EXPECT_EQ(fourK.seals[0].first, 0x40000000ull);
+  EXPECT_EQ(fourK.seals[1].first, 0x40401000ull);
+}
+
 // 2/3 Range spanning two pages with an unaligned start/end: seal BOTH pages.
 TEST_F(SharedTaskPoolTest, FourKPeerSealsEveryCoveredPageUnaligned) {
   FourKLog fourK;
@@ -3041,9 +3072,10 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // a silent cross-core corruption.
   // v10-v13 add PGO controls, writable ranges, staged admission, and audit
   // requests; v14 adds the owned bound-pointer snapshot, and v15 adds
-  // per-version post-publish reuse tracking; v16 adds near/far placement.
-  // v17 adds explicit batch publish state.
-  EXPECT_EQ(kEJitSharedAbiVersion, 17u);
+  // per-version post-publish reuse tracking; v16 adds near/far placement and
+  // v17 carries an MFS cold companion executable range.
+  // v18 combines the MFS cold range with explicit batch publish state.
+  EXPECT_EQ(kEJitSharedAbiVersion, 18u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -3059,6 +3091,13 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   range.poolBase = 0x40000000ull;
   range.poolSize = 0x200000ull;
   range.poolId = 7;
+  range.extraCodeCount = 1;
+  range.extraCodeRanges[0].codeStart = 0x40402000ull;
+  range.extraCodeRanges[0].codeSize = 0x321;
+  range.extraCodeRanges[0].poolBase = 0x40400000ull;
+  range.extraCodeRanges[0].poolSize = 0x200000ull;
+  range.extraCodeRanges[0].poolId = 2;
+  range.extraCodeRanges[0].poolKind = EJitCodePoolKind::Cold;
   range.writableCount = 1;
   range.writableAddr[0] = 0x40080000ull;
   range.writableSize[0] = 0x40;
@@ -3074,7 +3113,12 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   EXPECT_EQ(slot->poolBase, 0x40000000ull);
   EXPECT_EQ(slot->poolSize, 0x200000ull);
   EXPECT_EQ(slot->poolId, 7u);
-  EXPECT_EQ(slot->poolKind, static_cast<uint32_t>(EJitCodePoolKind::Near));
+  EXPECT_EQ(slot->poolKind,
+            static_cast<uint32_t>(EJitCodePoolKind::Near));
+  ASSERT_EQ(slot->extraCodeCount, 1u);
+  EXPECT_EQ(slot->extraCodeRanges[0].codeStart, 0x40402000ull);
+  EXPECT_EQ(slot->extraCodeRanges[0].poolKind,
+            static_cast<uint32_t>(EJitCodePoolKind::Cold));
   // Runtime-writable ranges (v9): published verbatim from the code-range info.
   EXPECT_EQ(slot->writableCount, 1u);
   EXPECT_EQ(slot->requiresPeerEnableRw, 1u); // RangeCtx default: fixed RX pool

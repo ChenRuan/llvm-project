@@ -105,7 +105,9 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// diagnostic mirror publishes aggregate plus placement-specific statistics.
 /// v17: cache slots can remain Pending while compact code waits for an explicit
 /// owner-worker batch publish request.
-constexpr uint32_t kEJitSharedAbiVersion = 17u;
+/// v17: one published compilation may carry a companion MFS cold-code range.
+/// v18 combines both layouts: pending batch publication and MFS cold ranges.
+constexpr uint32_t kEJitSharedAbiVersion = 18u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;
