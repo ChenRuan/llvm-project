@@ -18,6 +18,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitIpcLock.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
@@ -2724,7 +2725,13 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   st->counters.tier2Compiles.storeRelaxed(0);
   st->counters.profileMergeFails.storeRelaxed(0);
   // Code-pool stats mirror: zero until the owner publishes the first snapshot
-  // after a successful compile (the pools are owner-private and empty at init).
+  // at a compile/flush boundary (the pools are owner-private and empty at
+  // init).
+  st->codePoolStats.snapshotSeq.storeRelaxed(0);
+  st->codePoolStats.refreshRequest.storeRelaxed(0);
+  st->codePoolStats.refreshResult.storeRelaxed(0);
+  st->codePoolStats.refreshComplete.storeRelaxed(0);
+  st->codePoolStats.dirty.storeRelaxed(0);
   st->codePoolStats.poolCount.storeRelaxed(0);
   st->codePoolStats.sealedCount.storeRelaxed(0);
   st->codePoolStats.activeCount.storeRelaxed(0);
@@ -2734,6 +2741,10 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   st->codePoolStats.sealInvocations.storeRelaxed(0);
   st->codePoolStats.splitInvocations.storeRelaxed(0);
   st->codePoolStats.finalizedRangeCount.storeRelaxed(0);
+  st->codePoolStats.finalizedExecBytes.storeRelaxed(0);
+  st->codePoolStats.pendingExecBytes.storeRelaxed(0);
+  st->codePoolStats.pendingRangeCount.storeRelaxed(0);
+  st->codePoolStats.pendingAllocationCount.storeRelaxed(0);
   auto ClearPoolDetail = [](EJitSharedCodePoolStats::Detail &D) {
     D.poolCount.storeRelaxed(0);
     D.sealedCount.storeRelaxed(0);
@@ -2744,6 +2755,10 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
     D.sealInvocations.storeRelaxed(0);
     D.splitInvocations.storeRelaxed(0);
     D.finalizedRangeCount.storeRelaxed(0);
+    D.finalizedExecBytes.storeRelaxed(0);
+    D.pendingExecBytes.storeRelaxed(0);
+    D.pendingRangeCount.storeRelaxed(0);
+    D.pendingAllocationCount.storeRelaxed(0);
   };
   ClearPoolDetail(st->codePoolStats.near);
   ClearPoolDetail(st->codePoolStats.cold);
@@ -2871,6 +2886,7 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       // Owner-private batch state must never cross a generation boundary.
       pendingBatchCompiles_.clear();
       pendingPublishes_.clear();
+      codePoolStatsDirty_ = false;
       autoTier2PublishPending_ = false;
       initSharedStorage(state_, static_cast<uint32_t>(configuredMode_),
                         pgoEnabled_.loadRelaxed(),
@@ -3490,6 +3506,20 @@ void EJitSharedTaskPool::publishCodePoolStats() {
   EJitCodePoolStatsOut s{};
   if (!codePoolStatsFn_(codePoolStatsCtx_, &s))
     return;
+  // Only the owner writes this mirror. This is a seqcount, not merely a pair
+  // of release/acquire operations: the full barriers make the odd marker
+  // visible before any relaxed payload store, and make every payload store
+  // visible before the even marker. That ordering is required on weakly
+  // ordered AArch64/SRE as well as on the host.
+  uint32_t Seq = state_->codePoolStats.snapshotSeq.loadRelaxed();
+  if (Seq & 1u)
+    ++Seq;
+  state_->codePoolStats.snapshotSeq.storeRelease(Seq + 1u);
+  EJitSharedBarrier::fenceFull();
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  if (codePoolStatsPublishHook_)
+    codePoolStatsPublishHook_(codePoolStatsPublishHookCtx_, 1);
+#endif
   state_->codePoolStats.poolCount.storeRelaxed(s.poolCount);
   state_->codePoolStats.sealedCount.storeRelaxed(s.sealedCount);
   state_->codePoolStats.activeCount.storeRelaxed(s.activeCount);
@@ -3499,6 +3529,11 @@ void EJitSharedTaskPool::publishCodePoolStats() {
   state_->codePoolStats.sealInvocations.storeRelaxed(s.sealInvocations);
   state_->codePoolStats.splitInvocations.storeRelaxed(s.splitInvocations);
   state_->codePoolStats.finalizedRangeCount.storeRelaxed(s.finalizedRangeCount);
+  state_->codePoolStats.finalizedExecBytes.storeRelaxed(s.finalizedExecBytes);
+  state_->codePoolStats.pendingExecBytes.storeRelaxed(s.pendingExecBytes);
+  state_->codePoolStats.pendingRangeCount.storeRelaxed(s.pendingRangeCount);
+  state_->codePoolStats.pendingAllocationCount.storeRelaxed(
+      s.pendingAllocationCount);
   auto PublishDetail = [](EJitSharedCodePoolStats::Detail &Dst,
                           const EJitCodePoolStatsOut::Detail &Src) {
     Dst.poolCount.storeRelaxed(Src.poolCount);
@@ -3510,10 +3545,34 @@ void EJitSharedTaskPool::publishCodePoolStats() {
     Dst.sealInvocations.storeRelaxed(Src.sealInvocations);
     Dst.splitInvocations.storeRelaxed(Src.splitInvocations);
     Dst.finalizedRangeCount.storeRelaxed(Src.finalizedRangeCount);
+    Dst.finalizedExecBytes.storeRelaxed(Src.finalizedExecBytes);
+    Dst.pendingExecBytes.storeRelaxed(Src.pendingExecBytes);
+    Dst.pendingRangeCount.storeRelaxed(Src.pendingRangeCount);
+    Dst.pendingAllocationCount.storeRelaxed(Src.pendingAllocationCount);
   };
   PublishDetail(state_->codePoolStats.near, s.near);
   PublishDetail(state_->codePoolStats.cold, s.cold);
   PublishDetail(state_->codePoolStats.far, s.far);
+  EJitSharedBarrier::fenceFull();
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  if (codePoolStatsPublishHook_)
+    codePoolStatsPublishHook_(codePoolStatsPublishHookCtx_, 2);
+#endif
+  state_->codePoolStats.snapshotSeq.storeRelease(Seq + 2u);
+  state_->codePoolStats.dirty.storeRelease(0);
+  codePoolStatsDirty_ = false;
+}
+
+void EJitSharedTaskPool::markCodePoolStatsDirty() {
+  if (!state_ || !codePoolStatsFn_)
+    return;
+  codePoolStatsDirty_ = true;
+  state_->codePoolStats.dirty.storeRelease(1);
+}
+
+void EJitSharedTaskPool::publishCodePoolStatsIfDirty() {
+  if (codePoolStatsDirty_)
+    publishCodePoolStats();
 }
 
 void EJitSharedTaskPool::compilePendingBatchRequests(bool tier2Only) {
@@ -3587,6 +3646,9 @@ void EJitSharedTaskPool::compilePendingBatchRequests(bool tier2Only) {
     // between expensive ORC compilations just as the normal queue loop does.
     workerThrottle();
   }
+  // The provider may union/sort every pending/finalized range. Refresh once
+  // after the whole compile batch, rather than once for every staged entry.
+  publishCodePoolStatsIfDirty();
 }
 
 bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests) {
@@ -3784,16 +3846,69 @@ bool EJitSharedTaskPool::requestCodeBatchFlushAndWait() {
 bool EJitSharedTaskPool::readCodePoolStats(EJitCodePoolStatsOut *out) const {
   if (!state_ || !out)
     return false;
-  out->poolCount = state_->codePoolStats.poolCount.loadRelaxed();
-  out->sealedCount = state_->codePoolStats.sealedCount.loadRelaxed();
-  out->activeCount = state_->codePoolStats.activeCount.loadRelaxed();
-  out->usedBytes = state_->codePoolStats.usedBytes.loadRelaxed();
-  out->reservedBytes = state_->codePoolStats.reservedBytes.loadRelaxed();
-  out->wastedBytes = state_->codePoolStats.wastedBytes.loadRelaxed();
-  out->sealInvocations = state_->codePoolStats.sealInvocations.loadRelaxed();
-  out->splitInvocations = state_->codePoolStats.splitInvocations.loadRelaxed();
-  out->finalizedRangeCount =
-      state_->codePoolStats.finalizedRangeCount.loadRelaxed();
+
+  const uint32_t Generation = state_->generation.loadAcquire();
+  if (state_->initState.loadAcquire() !=
+      static_cast<uint32_t>(EJitSharedInitState::Ready))
+    return false;
+
+  // A peer may ask for a diagnostic snapshot while the owner has staged code
+  // since its last batch boundary. The owner can refresh synchronously; a
+  // peer posts a monotonic request and yields until the owner acknowledges it.
+  // This path is diagnostic-only and therefore may wait, unlike the compile
+  // hot path. If the owner cannot produce a snapshot, leave the dirty bit set
+  // and report failure rather than returning stale data as current.
+  if (state_->codePoolStats.dirty.loadAcquire() != 0) {
+    if (isOwner_) {
+      auto *Self = const_cast<EJitSharedTaskPool *>(this);
+      if (Self->state_->generation.loadAcquire() != Generation ||
+          Self->state_->initState.loadAcquire() !=
+              static_cast<uint32_t>(EJitSharedInitState::Ready))
+        return false;
+      Self->publishCodePoolStatsIfDirty();
+      if (Self->codePoolStatsDirty_)
+        return false;
+    } else {
+      uint32_t ServiceGeneration = 0;
+      if (!asyncServiceAvailable(&ServiceGeneration) ||
+          ServiceGeneration != Generation)
+        return false;
+      const uint32_t Request =
+          state_->codePoolStats.refreshRequest.fetchAdd(1u) + 1u;
+      // A diagnostic call must not turn a stopped/missing worker into a
+      // million-tick delay on the product. This is deliberately bounded well
+      // below the compile request wait budget.
+      constexpr uint32_t MaxWaits = 1u << 12;
+      bool Complete = false;
+      for (uint32_t Wait = 0; Wait != MaxWaits; ++Wait) {
+        if (state_->generation.loadAcquire() != Generation ||
+            state_->initState.loadAcquire() !=
+                static_cast<uint32_t>(EJitSharedInitState::Ready))
+          return false;
+        if (state_->ownerCoreId.loadAcquire() == kEJitInvalidCoreId ||
+            state_->workerTaskId.loadAcquire() == 0)
+          return false;
+        const uint32_t Done =
+            state_->codePoolStats.refreshComplete.loadAcquire();
+        if (static_cast<int32_t>(Done - Request) >= 0) {
+          if (state_->codePoolStats.refreshResult.loadAcquire() == 0 ||
+              state_->codePoolStats.dirty.loadAcquire() != 0)
+            return false;
+          Complete = true;
+          break;
+        }
+        const_cast<EJitSharedTaskPool *>(this)->workerIdle(1);
+      }
+      if (!Complete)
+        return false;
+    }
+  }
+
+  if (state_->generation.loadAcquire() != Generation ||
+      state_->initState.loadAcquire() !=
+          static_cast<uint32_t>(EJitSharedInitState::Ready))
+    return false;
+
   auto ReadDetail = [](const EJitSharedCodePoolStats::Detail &Src,
                        EJitCodePoolStatsOut::Detail &Dst) {
     Dst.poolCount = Src.poolCount.loadRelaxed();
@@ -3805,11 +3920,53 @@ bool EJitSharedTaskPool::readCodePoolStats(EJitCodePoolStatsOut *out) const {
     Dst.sealInvocations = Src.sealInvocations.loadRelaxed();
     Dst.splitInvocations = Src.splitInvocations.loadRelaxed();
     Dst.finalizedRangeCount = Src.finalizedRangeCount.loadRelaxed();
+    Dst.finalizedExecBytes = Src.finalizedExecBytes.loadRelaxed();
+    Dst.pendingExecBytes = Src.pendingExecBytes.loadRelaxed();
+    Dst.pendingRangeCount = Src.pendingRangeCount.loadRelaxed();
+    Dst.pendingAllocationCount = Src.pendingAllocationCount.loadRelaxed();
   };
-  ReadDetail(state_->codePoolStats.near, out->near);
-  ReadDetail(state_->codePoolStats.cold, out->cold);
-  ReadDetail(state_->codePoolStats.far, out->far);
-  return true;
+  for (unsigned Attempt = 0; Attempt != 32; ++Attempt) {
+    const uint32_t Begin = state_->codePoolStats.snapshotSeq.loadAcquire();
+    if (Begin & 1u)
+      continue;
+    // Pair with the writer-side full barrier after the odd marker. Without
+    // this barrier a weakly ordered reader could observe an old even marker
+    // around a partially copied relaxed payload.
+    EJitSharedBarrier::fenceFull();
+    EJitCodePoolStatsOut Candidate{};
+    Candidate.poolCount = state_->codePoolStats.poolCount.loadRelaxed();
+    Candidate.sealedCount = state_->codePoolStats.sealedCount.loadRelaxed();
+    Candidate.activeCount = state_->codePoolStats.activeCount.loadRelaxed();
+    Candidate.usedBytes = state_->codePoolStats.usedBytes.loadRelaxed();
+    Candidate.reservedBytes =
+        state_->codePoolStats.reservedBytes.loadRelaxed();
+    Candidate.wastedBytes = state_->codePoolStats.wastedBytes.loadRelaxed();
+    Candidate.sealInvocations =
+        state_->codePoolStats.sealInvocations.loadRelaxed();
+    Candidate.splitInvocations =
+        state_->codePoolStats.splitInvocations.loadRelaxed();
+    Candidate.finalizedRangeCount =
+        state_->codePoolStats.finalizedRangeCount.loadRelaxed();
+    Candidate.finalizedExecBytes =
+        state_->codePoolStats.finalizedExecBytes.loadRelaxed();
+    Candidate.pendingExecBytes =
+        state_->codePoolStats.pendingExecBytes.loadRelaxed();
+    Candidate.pendingRangeCount =
+        state_->codePoolStats.pendingRangeCount.loadRelaxed();
+    Candidate.pendingAllocationCount =
+        state_->codePoolStats.pendingAllocationCount.loadRelaxed();
+    ReadDetail(state_->codePoolStats.near, Candidate.near);
+    ReadDetail(state_->codePoolStats.cold, Candidate.cold);
+    ReadDetail(state_->codePoolStats.far, Candidate.far);
+    // Keep all relaxed payload loads before the validation sequence load.
+    EJitSharedBarrier::fenceFull();
+    const uint32_t End = state_->codePoolStats.snapshotSeq.loadAcquire();
+    if (Begin == End && !(End & 1u)) {
+      *out = Candidate;
+      return true;
+    }
+  }
+  return false;
 }
 
 void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
@@ -3911,6 +4068,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
       // compile queue empty and seals the batch. Keep only owner-private state
       // and retain the in-flight claim.
       pendingPublishes_.push_back({req, fn});
+      markCodePoolStatsDirty();
       EJIT_DIAG_DEBUG("PGO Tier-2 linked pending queue-drain publish func=%u "
                       "fn=%p pending=%zu",
                       realFuncIndex, fn, pendingPublishes_.size());
@@ -3935,6 +4093,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     if (Staged == EJitPublishStatus::Published) {
       pendingPublishes_.push_back({req, fn});
       dedupClear(req.funcIndex, req.generation);
+      markCodePoolStatsDirty();
       EJIT_DIAG_DEBUG("shared worker batch staged func=%u fn=%p pending=%zu",
                       req.funcIndex, fn, pendingPublishes_.size());
       return;
@@ -3946,6 +4105,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     // victim. Keep the result owner-private with its coarse in-flight claim;
     // the explicit publish call seals all code and then inserts this identity.
     pendingPublishes_.push_back({req, fn});
+    markCodePoolStatsDirty();
     EJIT_DIAG_VERBOSE(
         "shared worker batch retained unstaged func=%u pending=%zu",
         req.funcIndex, pendingPublishes_.size());
@@ -4063,6 +4223,23 @@ bool EJitSharedTaskPool::serviceMayConstRankingRequest() {
   return true;
 }
 
+bool EJitSharedTaskPool::serviceCodePoolStatsRequest() {
+  if (!state_ || !isOwner_)
+    return false;
+  const uint32_t Request = state_->codePoolStats.refreshRequest.loadAcquire();
+  if (Request == state_->codePoolStats.refreshComplete.loadAcquire())
+    return false;
+
+  // A request is a diagnostic consistency point, not a per-function hook. If
+  // a batch boundary already published the dirty snapshot, just acknowledge
+  // the request without invoking the O(ranges log ranges) provider again.
+  publishCodePoolStatsIfDirty();
+  const bool Success = !codePoolStatsDirty_;
+  state_->codePoolStats.refreshResult.storeRelease(Success ? 1u : 0u);
+  state_->codePoolStats.refreshComplete.storeRelease(Request);
+  return true;
+}
+
 unsigned EJitSharedTaskPool::pollBudget(unsigned maxItems) {
   unsigned n = 0;
   while (n < maxItems && pollOne())
@@ -4083,6 +4260,8 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
     if (serviceCodeBatchRequest())
       return EJitWorkerStep::Consumed;
     if (serviceMayConstRankingRequest())
+      return EJitWorkerStep::Consumed;
+    if (serviceCodePoolStatsRequest())
       return EJitWorkerStep::Consumed;
     if (pollOne())
       return EJitWorkerStep::Consumed;

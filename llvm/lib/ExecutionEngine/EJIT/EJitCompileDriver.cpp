@@ -128,6 +128,10 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
     out->sealInvocations = s.sealInvocations;
     out->splitInvocations = s.splitInvocations;
     out->finalizedRangeCount = s.finalizedRangeCount;
+    out->finalizedExecBytes = s.finalizedExecBytes;
+    out->pendingExecBytes = s.pendingExecBytes;
+    out->pendingRangeCount = s.pendingRangeCount;
+    out->pendingAllocationCount = s.pendingAllocationCount;
     auto CopyDetail = [](EJitCodePoolStatsOut::Detail &Dst,
                          const EJitCodePoolManager::Stats &Src) {
       Dst.poolCount = Src.poolCount;
@@ -139,6 +143,10 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
       Dst.sealInvocations = Src.sealInvocations;
       Dst.splitInvocations = Src.splitInvocations;
       Dst.finalizedRangeCount = Src.finalizedRangeCount;
+      Dst.finalizedExecBytes = Src.finalizedExecBytes;
+      Dst.pendingExecBytes = Src.pendingExecBytes;
+      Dst.pendingRangeCount = Src.pendingRangeCount;
+      Dst.pendingAllocationCount = Src.pendingAllocationCount;
     };
     CopyDetail(out->near, tiered.near);
     CopyDetail(out->cold, tiered.cold);

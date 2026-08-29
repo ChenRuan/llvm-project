@@ -14,6 +14,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h" // ejit_reg_entry_t layout
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRuntimeDiagnostics.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h" // EJitDimPair layout
 // Build-time-generated: EJIT_GIT_COMMIT / EJIT_GIT_BRANCH (git HEAD of the
 // llvm-project source tree). Lives in the LLVMEJIT build directory.
@@ -1874,8 +1875,8 @@ void ejit_taskpool_print_compiled() {
         Entry.extraCodeCount = slot.extraCodeCount > kEJitMaxExtraCodeRanges
                                    ? kEJitMaxExtraCodeRanges
                                    : slot.extraCodeCount;
-        for (uint32_t i = 0; i < Entry.extraCodeCount; ++i)
-          Entry.extraCodeRanges[i] = slot.extraCodeRanges[i];
+        for (uint32_t I = 0; I < Entry.extraCodeCount; ++I)
+          Entry.extraCodeRanges[I] = slot.extraCodeRanges[I];
         ctx.layout.push_back(Entry);
       },
       &printCtx);
@@ -1898,6 +1899,32 @@ void ejit_taskpool_print_compiled() {
                 return A.codeStart < B.codeStart;
               return A.funcIndex < B.funcIndex;
             });
+  std::vector<ejit::detail::EJitCompiledExecRange> ExecRanges;
+  for (const LayoutEntry &Entry : printCtx.layout) {
+    ExecRanges.push_back({Entry.poolKind, Entry.poolId, Entry.codeStart,
+                          Entry.codeSize});
+    for (uint32_t I = 0; I < Entry.extraCodeCount; ++I) {
+      const EJitSharedExecutableRange &R = Entry.extraCodeRanges[I];
+      ExecRanges.push_back({R.poolKind, R.poolId, R.codeStart, R.codeSize});
+    }
+  }
+  const ejit::detail::EJitCompiledExecSummary ExecSummary =
+      ejit::detail::summarizeCompiledExecRanges(ExecRanges);
+  EJIT_DIAG_RAW(
+      "compiled exec summary: ready_entry_exec_bytes=%llu "
+      "ready_unique_exec_bytes=%llu ready_unique_exec_ranges=%llu "
+      "shared_slot_exec_bytes=%llu invalid_exec_ranges=%llu "
+      "near_hot_unique_exec_bytes=%llu near_cold_unique_exec_bytes=%llu "
+      "far_unique_exec_bytes=%llu unknown_unique_exec_bytes=%llu",
+      static_cast<unsigned long long>(ExecSummary.readyEntryExecBytes),
+      static_cast<unsigned long long>(ExecSummary.readyUniqueExecBytes),
+      static_cast<unsigned long long>(ExecSummary.readyUniqueExecRanges),
+      static_cast<unsigned long long>(ExecSummary.sharedSlotExecBytes),
+      static_cast<unsigned long long>(ExecSummary.invalidExecRanges),
+      static_cast<unsigned long long>(ExecSummary.nearHotUniqueExecBytes),
+      static_cast<unsigned long long>(ExecSummary.nearColdUniqueExecBytes),
+      static_cast<unsigned long long>(ExecSummary.farUniqueExecBytes),
+      static_cast<unsigned long long>(ExecSummary.unknownUniqueExecBytes));
   EJIT_DIAG_RAW("compiled layout: %zu entries sorted by fn address",
                 printCtx.layout.size());
   {
@@ -1933,12 +1960,16 @@ void ejit_taskpool_print_compiled() {
                          : Entry.tier == kEJitTierInstrumented
                              ? "tier1-collecting"
                              : "baseline";
-      const char *PoolKind =
-          Entry.poolKind == static_cast<uint32_t>(EJitCodePoolKind::Near)
-              ? "near"
-          : Entry.poolKind == static_cast<uint32_t>(EJitCodePoolKind::Far)
-              ? "far"
-              : "unknown";
+      auto PoolKindName = [](uint32_t Kind) {
+        return Kind == static_cast<uint32_t>(EJitCodePoolKind::Near)
+                   ? "near-hot"
+               : Kind == static_cast<uint32_t>(EJitCodePoolKind::Far)
+                   ? "far-tier1"
+               : Kind == static_cast<uint32_t>(EJitCodePoolKind::Cold)
+                   ? "near-cold"
+                   : "unknown";
+      };
+      const char *PoolKind = PoolKindName(Entry.poolKind);
       const uintptr_t CodeEnd =
           Entry.codeStart + static_cast<uintptr_t>(Entry.codeSize);
       const bool RangeValid = Entry.codeStart != 0 && Entry.codeSize != 0 &&
@@ -1954,25 +1985,62 @@ void ejit_taskpool_print_compiled() {
               ? "unknown"
               : (Entry.fn >= Entry.codeStart && Entry.fn < CodeEnd ? "yes"
                                                                    : "no");
+      uint64_t ExtraExecBytes = 0;
+      uint64_t EntryExecBytes = RangeValid ? Entry.codeSize : 0;
+      char ExtraRanges[kEJitMaxExtraCodeRanges * 80 + 1];
+      char *ExtraPos = ExtraRanges;
+      char *ExtraEnd = ExtraRanges + sizeof(ExtraRanges);
+      for (uint32_t I = 0; I < Entry.extraCodeCount && ExtraPos < ExtraEnd;
+           ++I) {
+        const EJitSharedExecutableRange &R = Entry.extraCodeRanges[I];
+        const uintptr_t REnd =
+            R.codeStart + static_cast<uintptr_t>(R.codeSize);
+        const bool Valid = R.codeStart != 0 && R.codeSize != 0 &&
+                           REnd >= R.codeStart;
+        if (Valid)
+          ExtraExecBytes += R.codeSize;
+        if (Valid)
+          EntryExecBytes += R.codeSize;
+        const int Written = snprintf(
+            ExtraPos, static_cast<size_t>(ExtraEnd - ExtraPos),
+            "%s%s:%u@0x%llx+%llu", ExtraPos == ExtraRanges ? "" : ";",
+            PoolKindName(R.poolKind), R.poolId,
+            static_cast<unsigned long long>(R.codeStart),
+            static_cast<unsigned long long>(R.codeSize));
+        if (Written > 0)
+          ExtraPos += std::min(static_cast<size_t>(Written),
+                               static_cast<size_t>(ExtraEnd - ExtraPos));
+      }
+      if (ExtraPos >= ExtraEnd)
+        ExtraPos = ExtraEnd - 1;
+      *ExtraPos = '\0';
       const char *PostPublishSeen =
           !ReuseTrackingEnabled ? "disabled"
                                 : (Entry.postPublishSeen != 0 ? "yes" : "no");
       if (gEJitDiagLevel < EJIT_LOG_LVL_VERBOSE) {
         EJIT_DIAG_RAW(
-            "layout[%zu] fn=0x%llx alloc_start=0x%llx alloc_size=%llu "
+            "layout[%zu] fn=0x%llx exec_start=0x%llx exec_size=%llu "
             "pool=%s:%u funcIdx=%u name=%s tier=%s dims=[%s] "
-            "fn_in_alloc=%s post_publish_seen=%s",
+            "fn_in_exec=%s extra_count=%u entry_exec_bytes=%llu "
+            "extra_exec_bytes=%llu "
+            "extra_ranges=[%s] "
+            "post_publish_seen=%s",
             Index, static_cast<unsigned long long>(Entry.fn),
             static_cast<unsigned long long>(Entry.codeStart),
             static_cast<unsigned long long>(Entry.codeSize), PoolKind,
             Entry.poolId, Entry.funcIndex,
             Name.empty() ? "<unknown>" : Name.c_str(), Tier, Dims,
-            FnInAllocation, PostPublishSeen);
+            FnInAllocation, Entry.extraCodeCount,
+            static_cast<unsigned long long>(EntryExecBytes),
+            static_cast<unsigned long long>(ExtraExecBytes), ExtraRanges,
+            PostPublishSeen);
       } else if (!SamePool || !RangeValid) {
         EJIT_DIAG_RAW(
-            "layout[%zu] fn=0x%llx alloc_start=0x%llx alloc_end=0x%llx "
-            "alloc_size=%llu gap=n/a pool=%s:%u funcIdx=%u name=%s tier=%s "
-            "dims=[%s] ver=[%s] gen=%u fn_in_alloc=%s "
+            "layout[%zu] fn=0x%llx exec_start=0x%llx exec_end=0x%llx "
+            "exec_size=%llu gap=n/a pool=%s:%u funcIdx=%u name=%s tier=%s "
+            "dims=[%s] ver=[%s] gen=%u fn_in_exec=%s "
+            "extra_count=%u entry_exec_bytes=%llu extra_exec_bytes=%llu "
+            "extra_ranges=[%s] "
             "post_publish_seen=%s",
             Index, static_cast<unsigned long long>(Entry.fn),
             static_cast<unsigned long long>(Entry.codeStart),
@@ -1980,12 +2048,17 @@ void ejit_taskpool_print_compiled() {
             static_cast<unsigned long long>(Entry.codeSize), PoolKind,
             Entry.poolId, Entry.funcIndex,
             Name.empty() ? "<unknown>" : Name.c_str(), Tier, Dims, Versions,
-            Entry.generation, FnInAllocation, PostPublishSeen);
+            Entry.generation, FnInAllocation, Entry.extraCodeCount,
+            static_cast<unsigned long long>(EntryExecBytes),
+            static_cast<unsigned long long>(ExtraExecBytes), ExtraRanges,
+            PostPublishSeen);
       } else if (SameAllocation) {
         EJIT_DIAG_RAW(
-            "layout[%zu] fn=0x%llx alloc_start=0x%llx alloc_end=0x%llx "
-            "alloc_size=%llu gap=shared_alloc pool=%s:%u funcIdx=%u name=%s "
-            "tier=%s dims=[%s] ver=[%s] gen=%u fn_in_alloc=%s "
+            "layout[%zu] fn=0x%llx exec_start=0x%llx exec_end=0x%llx "
+            "exec_size=%llu gap=shared_alloc pool=%s:%u funcIdx=%u name=%s "
+            "tier=%s dims=[%s] ver=[%s] gen=%u fn_in_exec=%s "
+            "extra_count=%u entry_exec_bytes=%llu extra_exec_bytes=%llu "
+            "extra_ranges=[%s] "
             "post_publish_seen=%s",
             Index, static_cast<unsigned long long>(Entry.fn),
             static_cast<unsigned long long>(Entry.codeStart),
@@ -1993,12 +2066,17 @@ void ejit_taskpool_print_compiled() {
             static_cast<unsigned long long>(Entry.codeSize), PoolKind,
             Entry.poolId, Entry.funcIndex,
             Name.empty() ? "<unknown>" : Name.c_str(), Tier, Dims, Versions,
-            Entry.generation, FnInAllocation, PostPublishSeen);
+            Entry.generation, FnInAllocation, Entry.extraCodeCount,
+            static_cast<unsigned long long>(EntryExecBytes),
+            static_cast<unsigned long long>(ExtraExecBytes), ExtraRanges,
+            PostPublishSeen);
       } else if (Entry.codeStart >= PreviousEnd) {
         EJIT_DIAG_RAW(
-            "layout[%zu] fn=0x%llx alloc_start=0x%llx alloc_end=0x%llx "
-            "alloc_size=%llu gap=%llu pool=%s:%u funcIdx=%u name=%s tier=%s "
-            "dims=[%s] ver=[%s] gen=%u fn_in_alloc=%s "
+            "layout[%zu] fn=0x%llx exec_start=0x%llx exec_end=0x%llx "
+            "exec_size=%llu gap=%llu pool=%s:%u funcIdx=%u name=%s tier=%s "
+            "dims=[%s] ver=[%s] gen=%u fn_in_exec=%s "
+            "extra_count=%u entry_exec_bytes=%llu extra_exec_bytes=%llu "
+            "extra_ranges=[%s] "
             "post_publish_seen=%s",
             Index, static_cast<unsigned long long>(Entry.fn),
             static_cast<unsigned long long>(Entry.codeStart),
@@ -2007,12 +2085,17 @@ void ejit_taskpool_print_compiled() {
             static_cast<unsigned long long>(Entry.codeStart - PreviousEnd),
             PoolKind, Entry.poolId, Entry.funcIndex,
             Name.empty() ? "<unknown>" : Name.c_str(), Tier, Dims, Versions,
-            Entry.generation, FnInAllocation, PostPublishSeen);
+            Entry.generation, FnInAllocation, Entry.extraCodeCount,
+            static_cast<unsigned long long>(EntryExecBytes),
+            static_cast<unsigned long long>(ExtraExecBytes), ExtraRanges,
+            PostPublishSeen);
       } else {
         EJIT_DIAG_RAW(
-            "layout[%zu] fn=0x%llx alloc_start=0x%llx alloc_end=0x%llx "
-            "alloc_size=%llu OVERLAP=%llu pool=%s:%u funcIdx=%u name=%s "
-            "tier=%s dims=[%s] ver=[%s] gen=%u fn_in_alloc=%s "
+            "layout[%zu] fn=0x%llx exec_start=0x%llx exec_end=0x%llx "
+            "exec_size=%llu OVERLAP=%llu pool=%s:%u funcIdx=%u name=%s "
+            "tier=%s dims=[%s] ver=[%s] gen=%u fn_in_exec=%s "
+            "extra_count=%u entry_exec_bytes=%llu extra_exec_bytes=%llu "
+            "extra_ranges=[%s] "
             "post_publish_seen=%s",
             Index, static_cast<unsigned long long>(Entry.fn),
             static_cast<unsigned long long>(Entry.codeStart),
@@ -2021,7 +2104,10 @@ void ejit_taskpool_print_compiled() {
             static_cast<unsigned long long>(PreviousEnd - Entry.codeStart),
             PoolKind, Entry.poolId, Entry.funcIndex,
             Name.empty() ? "<unknown>" : Name.c_str(), Tier, Dims, Versions,
-            Entry.generation, FnInAllocation, PostPublishSeen);
+            Entry.generation, FnInAllocation, Entry.extraCodeCount,
+            static_cast<unsigned long long>(EntryExecBytes),
+            static_cast<unsigned long long>(ExtraExecBytes), ExtraRanges,
+            PostPublishSeen);
       }
       PreviousStart = Entry.codeStart;
       PreviousEnd = CodeEnd;

@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCodePool.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "gtest/gtest.h"
 #include <algorithm>
@@ -126,6 +127,18 @@ void driveOwnerOnRequesterIdle(void *ctx, uint32_t /*ticks*/) {
   EJitCoreId::setCurrentForTest(0);
   (void)drive->owner->workerPollOnce();
   EJitCoreId::setCurrentForTest(drive->requesterCore);
+}
+
+struct BumpGenerationOnIdleCtx {
+  EJitSharedTaskPoolState *state = nullptr;
+  bool bumped = false;
+};
+void bumpGenerationOnIdle(void *ctx, uint32_t /*ticks*/) {
+  auto *B = static_cast<BumpGenerationOnIdleCtx *>(ctx);
+  if (!B->bumped) {
+    B->state->generation.fetchAdd(1u);
+    B->bumped = true;
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -275,6 +288,118 @@ struct BatchTimelineIdleCtx {
   BatchPublishCtx *batch = nullptr;
   EJitSharedTaskPoolState *state = nullptr;
 };
+
+// Real code-pool-backed callbacks for the mirror regression. Unlike the other
+// batch tests, this deliberately obtains pending/finalized counters from an
+// EJitCodePoolManager instead of filling an artificial stats struct.
+struct RealPendingPoolCtx {
+  std::vector<void *> raws;
+  EJitCodePoolManager *manager = nullptr;
+  EJitSharedTaskPool *peer = nullptr;
+  EJitCodePoolStatsOut beforeFlushStats{};
+  uint32_t statsCalls = 0;
+  bool failStatsOnce = false;
+  bool failStatsAlways = false;
+  bool failFlush = false;
+  bool capturedBeforeFlush = false;
+  bool flushed = false;
+
+  ~RealPendingPoolCtx() {
+    for (void *Raw : raws)
+      std::free(Raw);
+  }
+
+  void *allocate(size_t Bytes) {
+    void *Raw = std::malloc(Bytes);
+    if (Raw)
+      raws.push_back(Raw);
+    return Raw;
+  }
+};
+
+unsigned realPendingSeal(void * /*ctx*/, void * /*page*/) { return 0; }
+
+bool realPendingCompile(void *ctx, const EJitCompileRequest & /*req*/,
+                        void **outFn) {
+  auto *P = static_cast<RealPendingPoolCtx *>(ctx);
+  auto Code = P->manager->allocateCode(96, 16);
+  if (!Code)
+    return false;
+  *outFn = llvm::cantFail(std::move(Code));
+  if (!P->manager->recordPendingRange(*outFn, 96))
+    return false;
+  P->manager->notePendingAllocation();
+  return true;
+}
+
+bool realPendingReady(void *ctx, const void * /*fnPtr*/) {
+  return static_cast<RealPendingPoolCtx *>(ctx)->flushed;
+}
+
+bool realPendingFlush(void *ctx) {
+  auto *P = static_cast<RealPendingPoolCtx *>(ctx);
+  if (P->failFlush)
+    return false;
+  // Observe the shared mirror while the compiled range is still staged in the
+  // owner's pending-publish list. The manager is deliberately flushed only
+  // after this read, so the test covers the pre-flush peer-visible state.
+  if (P->peer)
+    P->capturedBeforeFlush = P->peer->readCodePoolStats(&P->beforeFlushStats);
+  if (auto Err = P->manager->flushPendingRanges()) {
+    llvm::consumeError(std::move(Err));
+    return false;
+  }
+  P->flushed = true;
+  return true;
+}
+
+bool realPendingRange(void *ctx, const void *fnPtr,
+                     EJitCompiledCodeInfo *outInfo) {
+  return static_cast<RealPendingPoolCtx *>(ctx)->manager->findRange(fnPtr,
+                                                                     *outInfo);
+}
+
+bool realPendingStats(void *ctx, EJitCodePoolStatsOut *out) {
+  auto *P = static_cast<RealPendingPoolCtx *>(ctx);
+  if (!out)
+    return false;
+  ++P->statsCalls;
+  if (P->failStatsAlways || P->failStatsOnce) {
+    P->failStatsOnce = false;
+    return false;
+  }
+  const auto S = P->manager->getStats();
+  out->poolCount = S.poolCount;
+  out->sealedCount = S.sealedCount;
+  out->activeCount = S.activeCount;
+  out->usedBytes = S.usedBytes;
+  out->reservedBytes = S.reservedBytes;
+  out->wastedBytes = S.wastedBytes;
+  out->sealInvocations = S.sealInvocations;
+  out->splitInvocations = S.splitInvocations;
+  out->finalizedRangeCount = S.finalizedRangeCount;
+  out->finalizedExecBytes = S.finalizedExecBytes;
+  out->pendingExecBytes = S.pendingExecBytes;
+  out->pendingRangeCount = S.pendingRangeCount;
+  out->pendingAllocationCount = S.pendingAllocationCount;
+  return true;
+}
+
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+struct StatsPublishPauseCtx {
+  std::atomic<uint32_t> entered{0};
+  std::atomic<uint32_t> release{0};
+};
+
+void pauseStatsPublishAfterOdd(void *ctx, uint32_t phase) {
+  auto *P = static_cast<StatsPublishPauseCtx *>(ctx);
+  if (phase != 1)
+    return;
+  P->entered.store(1, std::memory_order_release);
+  while (P->release.load(std::memory_order_acquire) == 0)
+    std::this_thread::yield();
+}
+#endif
 
 void mockBatchTimelineIdle(void *ctx, uint32_t ticks) {
   auto *T = static_cast<BatchTimelineIdleCtx *>(ctx);
@@ -3234,10 +3359,11 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // a silent cross-core corruption.
   // v10-v13 add PGO controls, writable ranges, staged admission, and audit
   // requests; v14 adds the owned bound-pointer snapshot, and v15 adds
-  // per-version post-publish reuse tracking; v16 adds near/far placement and
-  // v17 carries an MFS cold companion executable range.
-  // v18 combines the MFS cold range with explicit batch publish state.
-  EXPECT_EQ(kEJitSharedAbiVersion, 18u);
+  // per-version post-publish reuse tracking; v16 adds near/far placement.
+  // The two source branches both used v17 for incompatible additions. This
+  // integration uses v18 for explicit batch state plus the MFS cold companion
+  // executable range.
+  EXPECT_EQ(kEJitSharedAbiVersion, 19u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -7100,5 +7226,381 @@ TEST_F(SharedTaskPoolTest, AsyncServiceUnavailableWithoutAWorker) {
             static_cast<uint32_t>(EJitSharedInitState::Ready));
   EXPECT_FALSE(owner.asyncServiceAvailable());
 }
+
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
+TEST_F(SharedTaskPoolTest, CodePoolStatsMirrorTracksPendingThenFinalized) {
+  RealPendingPoolCtx Backing;
+  EJitCodePoolManager::Options Options;
+  Options.poolSize = 4096;
+  Options.poolAlign = 4096;
+  Options.minCodeAlign = 16;
+  Options.fourKSeal = true;
+  Options.batchedPageSeal = true;
+  Options.sealPageSize = 4096;
+  EJitCodePoolManager Manager(
+      Options, [&Backing](size_t Bytes) { return Backing.allocate(Bytes); },
+      [](void *Page) { return realPendingSeal(nullptr, Page); },
+      [](void *, size_t) { return 0u; });
+  Backing.manager = &Manager;
+
+  EJitSharedTaskPool Owner;
+  EJitSharedTaskPool Peer;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&realPendingCompile, &Backing);
+  Owner.setCodeRangeProvider(&realPendingRange, &Backing);
+  Owner.setCodePoolStatsProvider(&realPendingStats, &Backing);
+  Owner.setCodeBatchCallbacks(&realPendingReady, &realPendingFlush, &Backing);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setCodeSharingEnabled(true);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EJitCoreId::setCurrentForTest(1);
+  Peer.bind(state_.get());
+  Peer.setMode(EJitCompileMode::Async);
+  Peer.setCodeSharingEnabled(true);
+  ASSERT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+  Backing.peer = &Peer;
+
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(Owner.compileOrGet(901, nullptr, 0, codeFor(901)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  ASSERT_EQ(Owner.pendingBatchCompileCount(), 1u);
+
+  EJitCodePoolStatsOut Initial;
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_TRUE(Peer.readCodePoolStats(&Initial));
+  EXPECT_EQ(Initial.pendingExecBytes, 0u);
+  EXPECT_EQ(Initial.finalizedExecBytes, 0u);
+
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_TRUE(Owner.flushCodeBatch());
+  EXPECT_EQ(Backing.statsCalls, 2u)
+      << "one merged refresh at batch completion and one at flush completion";
+  ASSERT_TRUE(Backing.capturedBeforeFlush);
+  EXPECT_EQ(Backing.beforeFlushStats.pendingExecBytes, 96u);
+  EXPECT_EQ(Backing.beforeFlushStats.pendingRangeCount, 1u);
+  EXPECT_EQ(Backing.beforeFlushStats.pendingAllocationCount, 1u);
+  EXPECT_EQ(Backing.beforeFlushStats.finalizedExecBytes, 0u);
+  EXPECT_TRUE(Backing.flushed);
+
+  EJitCodePoolStatsOut Final;
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_TRUE(Peer.readCodePoolStats(&Final));
+  EXPECT_EQ(Final.pendingExecBytes, 0u);
+  EXPECT_EQ(Final.pendingRangeCount, 0u);
+  EXPECT_EQ(Final.pendingAllocationCount, 0u);
+  EXPECT_EQ(Final.finalizedExecBytes, 96u);
+  EXPECT_EQ(Final.finalizedRangeCount, 1u);
+}
+
+TEST_F(SharedTaskPoolTest, CodePoolStatsMirrorBatchesProviderRefreshes) {
+  RealPendingPoolCtx Backing;
+  EJitCodePoolManager::Options Options;
+  Options.poolSize = 4096;
+  Options.poolAlign = 4096;
+  Options.minCodeAlign = 16;
+  Options.fourKSeal = true;
+  Options.batchedPageSeal = true;
+  Options.sealPageSize = 4096;
+  EJitCodePoolManager Manager(
+      Options, [&Backing](size_t Bytes) { return Backing.allocate(Bytes); },
+      [](void *Page) { return realPendingSeal(nullptr, Page); },
+      [](void *, size_t) { return 0u; });
+  Backing.manager = &Manager;
+
+  EJitSharedTaskPool Owner;
+  EJitSharedTaskPool Peer;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&realPendingCompile, &Backing);
+  Owner.setCodeRangeProvider(&realPendingRange, &Backing);
+  Owner.setCodePoolStatsProvider(&realPendingStats, &Backing);
+  Owner.setCodeBatchCallbacks(&realPendingReady, &realPendingFlush, &Backing);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setCodeSharingEnabled(true);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EJitCoreId::setCurrentForTest(1);
+  Peer.bind(state_.get());
+  Peer.setMode(EJitCompileMode::Async);
+  Peer.setCodeSharingEnabled(true);
+  ASSERT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+  Backing.peer = &Peer;
+
+  constexpr uint32_t Count = 24;
+  EJitCoreId::setCurrentForTest(0);
+  for (uint32_t I = 0; I != Count; ++I) {
+    ASSERT_EQ(Owner.compileOrGet(1200 + I, nullptr, 0, codeFor(1200 + I))
+                  .status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Owner.pollOne());
+  }
+  ASSERT_EQ(Owner.pendingBatchCompileCount(), Count);
+  EXPECT_EQ(Backing.statsCalls, 0u)
+      << "staging requests must not snapshot all code-pool ranges";
+
+  EJitCodePoolStatsOut Initial;
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_TRUE(Peer.readCodePoolStats(&Initial));
+  EXPECT_EQ(Initial.pendingExecBytes, 0u);
+
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_TRUE(Owner.flushCodeBatch());
+  EXPECT_EQ(Backing.statsCalls, 2u)
+      << "provider work is coalesced to batch and flush boundaries";
+  ASSERT_TRUE(Backing.capturedBeforeFlush);
+  EXPECT_EQ(Backing.beforeFlushStats.pendingExecBytes,
+            static_cast<uint64_t>(Count) * 96u);
+  EXPECT_EQ(Backing.beforeFlushStats.pendingRangeCount, Count);
+  EXPECT_EQ(Backing.beforeFlushStats.pendingAllocationCount, Count);
+  EXPECT_EQ(Backing.beforeFlushStats.finalizedExecBytes, 0u);
+
+  EJitCodePoolStatsOut Final;
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_TRUE(Peer.readCodePoolStats(&Final));
+  EXPECT_EQ(Final.pendingExecBytes, 0u);
+  EXPECT_EQ(Final.pendingRangeCount, 0u);
+  EXPECT_EQ(Final.pendingAllocationCount, 0u);
+  EXPECT_EQ(Final.finalizedExecBytes, static_cast<uint64_t>(Count) * 96u);
+  EXPECT_EQ(Final.finalizedRangeCount, Count);
+}
+
+TEST_F(SharedTaskPoolTest, CodePoolStatsPeerReadRequestsDirtyOwnerRefresh) {
+  RealPendingPoolCtx Backing;
+  EJitCodePoolManager::Options Options;
+  Options.poolSize = 4096;
+  Options.poolAlign = 4096;
+  Options.minCodeAlign = 16;
+  Options.fourKSeal = true;
+  Options.batchedPageSeal = true;
+  Options.sealPageSize = 4096;
+  EJitCodePoolManager Manager(
+      Options, [&Backing](size_t Bytes) { return Backing.allocate(Bytes); },
+      [](void *Page) { return realPendingSeal(nullptr, Page); },
+      [](void *, size_t) { return 0u; });
+  Backing.manager = &Manager;
+  Backing.failStatsOnce = true;
+  Backing.failFlush = true;
+
+  WorkerHooks OwnerHooks;
+  EJitSharedTaskPool Owner;
+  EJitSharedTaskPool Peer;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&realPendingCompile, &Backing);
+  Owner.setCodeRangeProvider(&realPendingRange, &Backing);
+  Owner.setCodePoolStatsProvider(&realPendingStats, &Backing);
+  Owner.setCodeBatchCallbacks(&realPendingReady, &realPendingFlush, &Backing);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setCodeSharingEnabled(true);
+  Owner.setWorkerHooks(&mockWorkerStart, &mockWorkerStop, &OwnerHooks);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EJitCoreId::setCurrentForTest(1);
+  Peer.bind(state_.get());
+  Peer.setMode(EJitCompileMode::Async);
+  Peer.setCodeSharingEnabled(true);
+  ASSERT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(Owner.compileOrGet(1300, nullptr, 0, codeFor(1300)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  ASSERT_FALSE(Owner.flushCodeBatch());
+  ASSERT_EQ(Backing.statsCalls, 1u);
+  ASSERT_EQ(Owner.pendingPublishCount(), 1u);
+
+  // The failed first boundary leaves dirty=1. A peer diagnostic read asks the
+  // owner worker to retry the provider instead of returning stale zero stats.
+  DriveOwnerCtx Drive{&Owner, 1};
+  Peer.setWorkerIdleHook(&driveOwnerOnRequesterIdle, &Drive);
+  Backing.failFlush = false;
+  EJitCodePoolStatsOut Pending;
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_TRUE(Peer.readCodePoolStats(&Pending));
+  EXPECT_EQ(Backing.statsCalls, 2u);
+  EXPECT_EQ(Pending.pendingExecBytes, 96u);
+  EXPECT_EQ(Pending.pendingRangeCount, 1u);
+  EXPECT_EQ(Pending.finalizedExecBytes, 0u);
+
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_TRUE(Owner.flushCodeBatch());
+  EXPECT_EQ(Backing.statsCalls, 3u);
+  EJitCodePoolStatsOut Final;
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_TRUE(Peer.readCodePoolStats(&Final));
+  EXPECT_EQ(Final.pendingExecBytes, 0u);
+  EXPECT_EQ(Final.finalizedExecBytes, 96u);
+}
+
+TEST_F(SharedTaskPoolTest, CodePoolStatsPeerReadFailsFastWithoutOwnerWorker) {
+  EJitSharedTaskPool Owner;
+  bringUpOwner(Owner);
+
+  EJitSharedTaskPool Peer;
+  EJitCoreId::setCurrentForTest(1);
+  Peer.bind(state_.get());
+  Peer.setMode(EJitCompileMode::Async);
+  Peer.setCodeSharingEnabled(true);
+  ASSERT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+
+  // Model a staged owner update while no worker was ever started. The peer
+  // must reject before posting a request, rather than yielding 4096 rounds.
+  state_->codePoolStats.dirty.storeRelease(1);
+  EJitCodePoolStatsOut Stats;
+  EXPECT_FALSE(Peer.readCodePoolStats(&Stats));
+  EXPECT_EQ(state_->codePoolStats.refreshRequest.loadAcquire(), 0u);
+  EXPECT_EQ(Peer.workerIdleYields(), 0u);
+}
+
+TEST_F(SharedTaskPoolTest, CodePoolStatsPeerReadStopsOnGenerationChange) {
+  EJitSharedTaskPool Owner;
+  bringUpOwner(Owner);
+
+  EJitSharedTaskPool Peer;
+  EJitCoreId::setCurrentForTest(1);
+  Peer.bind(state_.get());
+  Peer.setMode(EJitCompileMode::Async);
+  Peer.setCodeSharingEnabled(true);
+  ASSERT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+
+  // Install the minimum published worker identity so the request passes the
+  // preflight gate; then model a re-election during the first wait yield.
+  state_->workerTaskId.storeRelease(0xABCDu);
+  state_->codePoolStats.dirty.storeRelease(1);
+  BumpGenerationOnIdleCtx Bump{state_.get(), false};
+  Peer.setWorkerIdleHook(&bumpGenerationOnIdle, &Bump);
+
+  EJitCodePoolStatsOut Stats;
+  EXPECT_FALSE(Peer.readCodePoolStats(&Stats));
+  EXPECT_TRUE(Bump.bumped);
+  EXPECT_EQ(state_->codePoolStats.refreshRequest.loadAcquire(), 1u);
+}
+
+TEST_F(SharedTaskPoolTest, CodePoolStatsPermanentProviderFailureIsAcknowledged) {
+  RealPendingPoolCtx Backing;
+  EJitCodePoolManager::Options Options;
+  Options.poolSize = 4096;
+  Options.poolAlign = 4096;
+  Options.minCodeAlign = 16;
+  Options.fourKSeal = true;
+  Options.batchedPageSeal = true;
+  Options.sealPageSize = 4096;
+  EJitCodePoolManager Manager(
+      Options, [&Backing](size_t Bytes) { return Backing.allocate(Bytes); },
+      [](void *Page) { return realPendingSeal(nullptr, Page); },
+      [](void *, size_t) { return 0u; });
+  Backing.manager = &Manager;
+  Backing.failStatsAlways = true;
+  Backing.failFlush = true;
+
+  WorkerHooks Hooks;
+  EJitSharedTaskPool Owner;
+  EJitSharedTaskPool Peer;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&realPendingCompile, &Backing);
+  Owner.setCodeRangeProvider(&realPendingRange, &Backing);
+  Owner.setCodePoolStatsProvider(&realPendingStats, &Backing);
+  Owner.setCodeBatchCallbacks(&realPendingReady, &realPendingFlush, &Backing);
+  Owner.setWorkerHooks(&mockWorkerStart, &mockWorkerStop, &Hooks);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setCodeSharingEnabled(true);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EJitCoreId::setCurrentForTest(1);
+  Peer.bind(state_.get());
+  Peer.setMode(EJitCompileMode::Async);
+  Peer.setCodeSharingEnabled(true);
+  ASSERT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(Owner.compileOrGet(1400, nullptr, 0, codeFor(1400)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  ASSERT_FALSE(Owner.flushCodeBatch());
+  ASSERT_EQ(Backing.statsCalls, 1u)
+      << "the failed batch boundary leaves one dirty snapshot request";
+
+  const uint32_t CallsBeforePeerRequest = Backing.statsCalls;
+  DriveOwnerCtx Drive{&Owner, 1};
+  Peer.setWorkerIdleHook(&driveOwnerOnRequesterIdle, &Drive);
+  EJitCodePoolStatsOut Stats;
+  EJitCoreId::setCurrentForTest(1);
+  EXPECT_FALSE(Peer.readCodePoolStats(&Stats));
+  EXPECT_EQ(Backing.statsCalls, CallsBeforePeerRequest + 1u)
+      << "one provider attempt is made for one diagnostic ticket";
+  EXPECT_EQ(state_->codePoolStats.refreshComplete.loadAcquire(), 1u);
+  EXPECT_EQ(state_->codePoolStats.refreshResult.loadAcquire(), 0u);
+
+  // The failed ticket is acknowledged, so idle worker polls do not create a
+  // provider retry storm. A later diagnostic ticket is the explicit retry.
+  EJitCoreId::setCurrentForTest(0);
+  for (unsigned I = 0; I != 4; ++I)
+    EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Idle);
+  EXPECT_EQ(Backing.statsCalls, CallsBeforePeerRequest + 1u);
+}
+
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+TEST_F(SharedTaskPoolTest, CodePoolStatsSeqcountRejectsInterruptedWriter) {
+  RealPendingPoolCtx Backing;
+  EJitCodePoolManager::Options Options;
+  Options.poolSize = 4096;
+  Options.poolAlign = 4096;
+  Options.minCodeAlign = 16;
+  Options.fourKSeal = true;
+  Options.batchedPageSeal = true;
+  Options.sealPageSize = 4096;
+  EJitCodePoolManager Manager(
+      Options, [&Backing](size_t Bytes) { return Backing.allocate(Bytes); },
+      [](void *Page) { return realPendingSeal(nullptr, Page); },
+      [](void *, size_t) { return 0u; });
+  Backing.manager = &Manager;
+
+  EJitSharedTaskPool Owner;
+  EJitSharedTaskPool Peer;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&realPendingCompile, &Backing);
+  Owner.setCodeRangeProvider(&realPendingRange, &Backing);
+  Owner.setCodePoolStatsProvider(&realPendingStats, &Backing);
+  Owner.setCodeBatchCallbacks(&realPendingReady, &realPendingFlush, &Backing);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setCodeSharingEnabled(true);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EJitCoreId::setCurrentForTest(1);
+  Peer.bind(state_.get());
+  Peer.setMode(EJitCompileMode::Async);
+  Peer.setCodeSharingEnabled(true);
+  ASSERT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+  Backing.peer = &Peer;
+
+  StatsPublishPauseCtx Pause;
+  Owner.setCodePoolStatsPublishHook(&pauseStatsPublishAfterOdd, &Pause);
+  std::atomic<int> WriterResult{-1};
+  std::thread Writer([&] {
+    EJitCoreId::setCurrentForTest(0);
+    WriterResult.store(Owner.flushCodeBatch() ? 1 : 0,
+                       std::memory_order_release);
+  });
+
+  while (Pause.entered.load(std::memory_order_acquire) == 0)
+    std::this_thread::yield();
+  EJitCodePoolStatsOut During;
+  EXPECT_FALSE(Peer.readCodePoolStats(&During))
+      << "reader must reject the odd seqcount while writer is interrupted";
+  Pause.release.store(1, std::memory_order_release);
+  Writer.join();
+  ASSERT_EQ(WriterResult.load(std::memory_order_acquire), 1);
+
+  EJitCodePoolStatsOut After;
+  ASSERT_TRUE(Peer.readCodePoolStats(&After));
+  EXPECT_EQ(After.pendingExecBytes, 0u);
+}
+#endif
+#endif
 
 } // namespace

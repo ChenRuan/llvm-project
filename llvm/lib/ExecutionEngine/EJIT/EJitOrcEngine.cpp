@@ -1352,6 +1352,10 @@ EJitTieredCodePoolStats EJitOrcEngine::getTieredCodePoolStats() const {
   EJIT_SUM_STAT(splitInvocations);
   EJIT_SUM_STAT(rwEnableInvocations);
   EJIT_SUM_STAT(finalizedRangeCount);
+  EJIT_SUM_STAT(finalizedExecBytes);
+  EJIT_SUM_STAT(pendingExecBytes);
+  EJIT_SUM_STAT(pendingRangeCount);
+  EJIT_SUM_STAT(pendingAllocationCount);
 #undef EJIT_SUM_STAT
   return Out;
 }
