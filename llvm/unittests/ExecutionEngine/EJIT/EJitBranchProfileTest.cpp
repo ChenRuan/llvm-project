@@ -131,4 +131,63 @@ TEST(EJitBranchProfile, BenefitScalingRoundsToNearestFixedPoint) {
   EXPECT_EQ(Summary.removedHitsPerEntryPermille, 667u);
 }
 
+TEST(EJitBranchProfile, ComputesBenefitDensityFromPerVersionCacheLines) {
+  EJitMayConstBenefitSample First;
+  First.removedRuntimeHits = 200;
+  First.sampleCycles = 500;
+  First.publishedHotCodeBytes = 65;
+  EJitMayConstBenefitSample Second;
+  Second.removedRuntimeHits = 100;
+  Second.sampleCycles = 500;
+  Second.publishedHotCodeBytes = 64;
+
+  EJitMayConstBenefitSummary Summary =
+      summarizeMayConstBenefits({First, Second});
+  EXPECT_EQ(Summary.publishedHotCodeBytes, 129u);
+  EXPECT_EQ(Summary.publishedHotICacheLines, 3u);
+  EXPECT_EQ(Summary.benefitPerMillionCyclesMilli, 300000000u);
+  EXPECT_EQ(Summary.entryBenefitDensityMilli, 100000000u);
+}
+
+TEST(EJitBranchProfile, ZeroCodeFootprintHasZeroBenefitDensity) {
+  EJitMayConstBenefitSample Sample;
+  Sample.removedRuntimeHits = 100;
+  Sample.sampleCycles = 100;
+  EJitMayConstBenefitSummary Summary = summarizeMayConstBenefits({Sample});
+  EXPECT_EQ(Summary.publishedHotICacheLines, 0u);
+  EXPECT_EQ(Summary.entryBenefitDensityMilli, 0u);
+}
+
+TEST(EJitBranchProfile, AuditsCrossVersionPartialJitCandidates) {
+  EJitMayConstBenefitSample First;
+  First.publishedHotCodeBytes = 5 * 64;
+  First.publishedHotLineFingerprints = {1, 2, 3, 9, 9};
+  EJitMayConstBenefitSample Second;
+  Second.publishedHotCodeBytes = 3 * 64;
+  Second.publishedHotLineFingerprints = {2, 3, 4};
+  EJitMayConstBenefitSample Third;
+  Third.publishedHotCodeBytes = 2 * 64;
+  Third.publishedHotLineFingerprints = {2, 5};
+
+  EJitMayConstBenefitSummary Summary =
+      summarizeMayConstBenefits({First, Second, Third});
+  EXPECT_EQ(Summary.fingerprintedHotICacheLines, 10u);
+  EXPECT_EQ(Summary.crossVersionMatchingICacheLines, 5u);
+  EXPECT_EQ(Summary.partialJitCandidateICacheLines, 3u);
+  EXPECT_EQ(Summary.partialJitCandidatePermille, 300u);
+}
+
+TEST(EJitBranchProfile, FingerprintsPublishedCodeLinesAndSkipsZeroPadding) {
+  std::vector<uint8_t> Code(64 * 3 + 8, 0);
+  std::fill(Code.begin(), Code.begin() + 64, 0x5a);
+  std::fill(Code.begin() + 128, Code.begin() + 192, 0x5a);
+  std::fill(Code.begin() + 192, Code.end(), 0x5a);
+
+  std::vector<uint64_t> Fingerprints =
+      fingerprintPublishedHotICacheLines(Code);
+  ASSERT_EQ(Fingerprints.size(), 3u);
+  EXPECT_EQ(Fingerprints[0], Fingerprints[1]);
+  EXPECT_NE(Fingerprints[0], Fingerprints[2]);
+}
+
 } // namespace

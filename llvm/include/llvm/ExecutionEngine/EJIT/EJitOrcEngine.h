@@ -172,6 +172,10 @@ public:
   /// runtime-active sites per specialization.
   bool printMayConstRanking() const;
 
+  /// Attach finalized executable bytes to a completed may_const sample.
+  bool recordMayConstPublishedCode(const std::string &Entry, uint64_t CacheKey,
+                                   const void *CodeStart, uint64_t CodeBytes);
+
   /// Register a user-defined external symbol (function or global) that the
   /// JIT can resolve when compiling bitcode modules. Required for bare-metal
   /// environments where dynamic symbol lookup is unavailable.
