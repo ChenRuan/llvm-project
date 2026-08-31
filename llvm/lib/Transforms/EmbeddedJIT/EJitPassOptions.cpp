@@ -31,8 +31,9 @@ cl::opt<bool> EJitWarnNoSpecialization(
 cl::opt<bool> EJitWarnUnusedDim(
     "ejit-warn-unused-dim", cl::init(true), cl::Hidden,
     cl::desc("Warn when an ejit_entry declares ejit_period_arr_ind(P) but its "
-             "specialization closure never indexes an ejit_period_arr(P) "
-             "(unused specialization dimension)."));
+             "specialization closure neither reads that parameter nor "
+             "indexes an ejit_period_arr(P), and no ejit_bound_ptr is bound "
+             "to P (unused specialization dimension)."));
 
 // Optional info-level report (not a warning): per ejit_entry, count the
 // ejit_may_const reads in its specialization closure and how many sit inside
