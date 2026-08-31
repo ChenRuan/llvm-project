@@ -74,6 +74,15 @@ static void markEJitEntry(Function &F) {
   F.setMetadata(MD_EJIT_METADATA, MDNode::get(Ctx, {Entry}));
 }
 
+// The real-ORC stress test below drives the code-batch publication protocol
+// (requestCodeBatchFlushAndWait -> codeReady -> flush), whose owner-side
+// implementation is EJitOrcEngine::isCodeReady / flushPendingCode. Both are
+// declared only under EJIT_SRE_CODE_POOL, and batching cannot be stubbed out
+// here: with no flush the pool leaves every slot Pending and the worker loop
+// never terminates. So the test, and the helpers only it uses, compile only in
+// a code-pool build.
+#ifdef EJIT_SRE_CODE_POOL
+
 namespace {
 constexpr uint32_t RealCompileStressFunctions = 20;
 
@@ -182,9 +191,8 @@ static uint32_t applyStressArithmetic(uint32_t Value, uint32_t Func) {
 } // namespace
 
 TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
-  InitializeNativeTarget();
-  InitializeNativeTargetAsmPrinter();
-
+  // No InitializeNativeTarget() here: EJitOrcEngine::Create owns target
+  // registration, matching the worker-only initialization path.
   RealCompileStressCtx Compile;
   Compile.names.reserve(RealCompileStressFunctions);
   Compile.compiled.resize(RealCompileStressFunctions, nullptr);
@@ -304,6 +312,8 @@ TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
   RecordProperty("heartbeat_count", Heartbeats.load());
   RecordProperty("heartbeat_max_gap_us", MaxHeartbeatGapUs.load());
 }
+
+#endif // EJIT_SRE_CODE_POOL
 
 static std::string findCapturedPgoName(const EJitOptimizer &Opt,
                                        StringRef FunctionName) {
