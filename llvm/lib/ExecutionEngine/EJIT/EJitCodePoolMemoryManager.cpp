@@ -176,6 +176,28 @@ EJitCodePoolManager &EJitCodePoolMemoryManager::selectPool(
 void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
                                          OnAllocatedFunction OnAllocated) {
   EJitCodePoolManager &Pool = selectPool(JD);
+
+  // Fold pure read-only sections (string constants, const arrays, jump
+  // tables) into the executable segment BEFORE the layout is built: the
+  // compact 16B packing below requires every segment to be executable, so a
+  // single 37-byte .rodata would otherwise force the whole graph back to
+  // page-per-segment layout and burn a full 4KiB page. The constant bytes
+  // are never executed (the AOT path already embeds literal pools in .text),
+  // and sealing them RX together with the code only tightens W^X: in the
+  // page-based layout they sat on a slab that is enable_rw'd wholesale at
+  // allocate and from which only the exec ranges are sealed back, so the
+  // rodata page stayed writable in the fixed code segment. Writable sections
+  // keep their own pages (the peer enable_rw protocol and the no-RWX
+  // invariant rest on write/exec pages never sharing), and an alignment
+  // beyond the code alignment still falls back via the compact check below.
+  // Gated on batched seal mode — the only mode whose layout this serves.
+  if (Pool.usesBatchedPageSeal())
+    for (Section &Sec : G.sections())
+      if ((Sec.getMemProt() & orc::MemProt::Read) != orc::MemProt::None &&
+          (Sec.getMemProt() & (orc::MemProt::Write | orc::MemProt::Exec)) ==
+              orc::MemProt::None)
+        Sec.setMemProt(orc::MemProt::Read | orc::MemProt::Exec);
+
   BasicLayout BL(G);
 
   bool ExecOnly = true;
