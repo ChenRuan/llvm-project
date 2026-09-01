@@ -13,6 +13,10 @@ set(LLVM_LINK_COMPONENTS
   TargetParser
   )
 
+if(EJIT_SRE_SVE_VECTORIZATION)
+  list(APPEND LLVM_LINK_COMPONENTS Vectorize)
+endif()
+
 add_llvm_unittest(EJITTests
   EJitRuntimeTest.cpp
   EJitFieldOffsetTest.cpp
@@ -43,6 +47,13 @@ endif()
 
 if(EJIT_SRE_PGO_BRANCH_AUDIT)
   target_compile_definitions(EJITTests PRIVATE EJIT_SRE_PGO_BRANCH_AUDIT)
+endif()
+
+if(EJIT_SRE_SVE_VECTORIZATION)
+  target_compile_definitions(EJITTests PRIVATE EJIT_SRE_SVE_VECTORIZATION)
+  if("AArch64" IN_LIST LLVM_TARGETS_TO_BUILD)
+    target_compile_definitions(EJITTests PRIVATE EJIT_TEST_HAS_AARCH64)
+  endif()
 endif()
 
 # EJit.cpp calls InitializeAllAsmParsers(); a target's AsmParser lib is only

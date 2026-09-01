@@ -26,6 +26,9 @@
 #include "llvm/IR/Module.h"
 
 namespace llvm {
+
+class TargetMachine;
+
 namespace ejit {
 
 struct EJitMayConstLoadSite;
@@ -49,12 +52,18 @@ class EJitOptimizer {
 public:
   EJitOptimizer(PeriodArrayRegistry &reg);
 
+  /// Use the JIT target's TargetMachine for backend-accurate TTI. A null
+  /// machine keeps the scalar compatibility path used by host-only callers.
+  EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM);
+
   /// Run the full JIT specialization pipeline:
-  ///   1. Parameter substitution (ejit_period_arr_ind → constants)
-  ///   2. InstCombine (fold GEP chains from substituted params)
-  ///   3. Inline (L2+: expand callee bodies so may_const GEPs are traceable)
-  ///   4. StructFieldPass (may_const loads → runtime constants)
-  ///   5. Core optimization pipeline (L1/L2/L3)
+  ///   1a. Parameter substitution (ejit_period_arr_ind → constants)
+  ///   1b. InstCombine + StructFieldPass (entry specialization)
+  ///   1c. IPSCCP + InstCombine + StructFieldPass (callee specialization)
+  ///   1d. Module cleanup (RPO attrs + DAE + GlobalDCE)
+  ///   2-4. LowerExpect + O1/O2/O3 simplification + final StructField cleanup
+  ///   5. Optional vectorization (L2/L3 only)
+  ///   6. Final GlobalDCE
   ///
   /// ctx.tier selects the PGO branch (EJIT_ONLINE_PGO.md §4): Baseline (no
   /// PGO), Instrumented (Tier-1: + PGOGen/Lowering/capture), PGOUse (Tier-2:
@@ -127,6 +136,14 @@ private:
   /// constant returns back to call sites.
   void runInterproceduralPropagation(Module &M);
 
+  /// Run module cleanup after specialization. The external ejit_entry roots
+  /// remain visible; only local dead arguments/functions are removed.
+  void runModuleCleanup(Module &M);
+
+  /// Run the optional post-specialization vector pipeline. L1 is a no-op;
+  /// L2 uses SLP/partial unrolling and L3 additionally uses LoopVectorize.
+  void runVectorization(Module &M, OptimizationLevel level);
+
   /// Light fold pass run at the PGO Gen/Use point (InstCombine + SimplifyCFG)
   /// to fold branches exposed by specialization. Identical prefix for Tier-1
   /// and Tier-2 keeps the CFG (and thus the PGO hash) aligned.
@@ -142,8 +159,8 @@ private:
   /// the just-substituted period-index / may_const constants to their fixed
   /// point (scalar fold/propagate/simplify), folds loops whose bounds became
   /// constant, re-specializes the array accesses that unrolling turns into
-  /// constant-index GEPs, then does a final cleanup. `level` is accepted for
-  /// ABI compatibility and does not affect the pipeline.
+  /// constant-index GEPs, then does a final cleanup. `level` selects the
+  /// function simplification level and the optional vector stage.
   void runOptimizationPipeline(Module &M, OptimizationLevel level,
                                CompileTier tier);
 
@@ -157,6 +174,10 @@ private:
 
   /// Pick the cached function-simplification FPM for an EJIT optimization tier.
   FunctionPassManager &simplifyFPMForLevel(OptimizationLevel level);
+
+#ifdef EJIT_SRE_SVE_VECTORIZATION
+  FunctionPassManager *vectorFPMForLevel(OptimizationLevel level);
+#endif
 
   PeriodArrayRegistry &registry_;
 
@@ -179,6 +200,17 @@ private:
   FunctionPassManager simplifyO2_;
   FunctionPassManager simplifyO3_;
   FunctionPassManager cleanupFPM_;
+
+  // Phase 1g and Phase 6 module cleanup managers.
+  ModulePassManager cleanupMPM_;
+  ModulePassManager finalDCEMPM_;
+
+#ifdef EJIT_SRE_SVE_VECTORIZATION
+  // Phase 5, after the final StructFieldPass. Tier-1 never reaches it.
+  FunctionPassManager vectorO2_;
+  FunctionPassManager vectorO3_;
+  bool vectorizationEnabled_ = false;
+#endif
   // Tier-2-only profile-guided memory-operation specialization. The main
   // O1/O2/O3 simplification pipeline already contains profile-aware unrolling.
   FunctionPassManager pgoUseFPM_;

@@ -180,6 +180,10 @@ struct EJitOrcEngine::Impl {
   std::map<std::string, void *> userSymbols;
   /// If non-empty, dump JIT-optimized IR to this directory.
   std::string dumpJITDir;
+  /// TargetMachine feeding the optimizer's TargetIRAnalysis. Declared BEFORE
+  /// the optimizer so it is destroyed AFTER it (reverse declaration order).
+  /// Created from the same JITTargetMachineBuilder the JIT compiles with.
+  std::unique_ptr<TargetMachine> optimizerTM;
   /// Persistent optimizer — analysis managers are registered once and reused.
   std::unique_ptr<EJitOptimizer> optimizer;
   /// TargetMachine used for the name-filtered ASM diagnostic dump (created
@@ -722,6 +726,13 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
     return JTMBOrErr.takeError();
   }
 
+#ifdef EJIT_SRE_SVE_VECTORIZATION
+  // The opt-in SVE feature must be present on the JIT builder before creating
+  // every TargetMachine below, including the optimizer's independent TM.
+  if (JTMBOrErr->getTargetTriple().isAArch64())
+    JTMBOrErr->addFeatures({"+sve"});
+#endif
+
   // Use Small code model so data accesses use ADRP+LDR (2 insns/global, ±4GB
   // PC-relative) instead of movz/movk absolute (5 insns/global). The JIT slab
   // is ~1.5-2.2GB from .text (within ADRP's ±4GB range), confirmed by
@@ -818,8 +829,19 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   });
 
   // Create persistent optimizer — analysis managers are registered once here
-  // and reused across compilations (cleared between runs).
-  engine->P->optimizer = std::make_unique<EJitOptimizer>(periodReg);
+  // and reused across compilations (cleared between runs). Give it an
+  // independent TargetMachine from the same JTMB the JIT compiles with, so
+  // its TargetIRAnalysis is backend-accurate. It is separate from the dump
+  // TargetMachines because the optimizer owns cached analyses that must not
+  // depend on diagnostic-dump lifetime.
+  if (auto TMOrErr = JTMBOrErr->createTargetMachine())
+    engine->P->optimizerTM = std::move(*TMOrErr);
+  else
+    EJIT_DIAG("optimizer: createTargetMachine failed (%s); vectorization is "
+              "disabled",
+              toString(TMOrErr.takeError()).c_str());
+  engine->P->optimizer =
+      std::make_unique<EJitOptimizer>(periodReg, engine->P->optimizerTM.get());
 
   // Register all known global variable addresses from the PeriodArrayRegistry
   // so that external global references in any loaded bitcode module resolve

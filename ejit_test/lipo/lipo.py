@@ -57,7 +57,8 @@ COMMON_LIBS = [
     "libLLVMCore.a", "libLLVMSupport.a", "libLLVMDemangle.a",
     "libLLVMBinaryFormat.a", "libLLVMBitReader.a", "libLLVMBitstreamReader.a",
     "libLLVMAnalysis.a", "libLLVMScalarOpts.a", "libLLVMInstCombine.a",
-    "libLLVMipo.a", "libLLVMTransformUtils.a", "libLLVMCodeGen.a",
+    "libLLVMipo.a", "libLLVMTransformUtils.a", "libLLVMVectorize.a",
+    "libLLVMCodeGen.a",
     "libLLVMCodeGenTypes.a", "libLLVMTarget.a", "libLLVMTargetParser.a",
     "libLLVMSelectionDAG.a", "libLLVMAsmPrinter.a", "libLLVMMC.a",
     "libLLVMObject.a", "libLLVMProfileData.a", "libLLVMInstrumentation.a",
@@ -73,6 +74,24 @@ COMMON_LIBS = [
 def all_libs(arch):
     """Return the full list of .a basenames for the given architecture."""
     return COMMON_LIBS + TARGET_LIBS.get(arch, [])
+
+
+def existing_libs(build_dir, arch):
+    """Return only archives present in this build configuration.
+
+    SVE is an opt-in LLVM component.  In an SVE-OFF build, Vectorize may not
+    be built at all, so the manifest is intentionally a superset and the
+    linker input must be assembled from files that actually exist.
+    """
+    L = lib_dir(build_dir)
+    return [name for name in all_libs(arch)
+            if os.path.isfile(os.path.join(L, name))]
+
+
+def existing_lib_paths(build_dir, arch):
+    """Return existing archive paths without shell-style string splitting."""
+    L = lib_dir(build_dir)
+    return [os.path.join(L, name) for name in existing_libs(build_dir, arch)]
 
 
 def cxx(build_dir):
@@ -203,9 +222,8 @@ def doit_extract(args):
     sp.run([CXX, "-x", "c", "-", "-O2", "-fno-PIC", "-fno-PIE" , "-c", "-o", test_o],
            input=b"int main(){return 0;}", capture_output=True)
 
-    libs = all_libs(arch)
-    all_a = " ".join(os.path.join(L, f) for f in libs
-                     if os.path.exists(os.path.join(L, f)))
+    libs = existing_libs(build_dir, arch)
+    all_a_paths = existing_lib_paths(build_dir, arch)
     ejit_a = os.path.join(L, "libLLVMEJIT.a")
 
     # ── 1. Build symbol index ────────────────────────────────────────────
@@ -226,7 +244,7 @@ def doit_extract(args):
         "-Wl,--print-map",
         "-Wl,--allow-multiple-definition",
         f"-Wl,--whole-archive", ejit_a, f"-Wl,--no-whole-archive",
-        *all_a.split(), "-lpthread", "-Wl,-no-pie", "-ferror-limit=0", "-ldl", test_o,
+        *all_a_paths, "-lpthread", "-Wl,-no-pie", "-ferror-limit=0", "-ldl", test_o,
         "-o", os.path.join(work, "_ref")
     ], capture_output=True, text=True)
     if r.returncode != 0:
@@ -316,10 +334,9 @@ def doit_extract(args):
     sp.run(["ar", "crs", output, *o_files], capture_output=True)
 
     sz_mb = os.path.getsize(output) / (1024 * 1024)
-    existing = [f for f in libs if os.path.exists(os.path.join(L, f))]
-    orig_mb = sum(os.path.getsize(os.path.join(L, f)) for f in existing) / (1024 * 1024)
+    orig_mb = sum(os.path.getsize(os.path.join(L, f)) for f in libs) / (1024 * 1024)
     print(f"       {len(o_files)} .o files, {sz_mb:.0f} MB")
-    print(f"       (from {len(existing)} .a = {orig_mb:.0f} MB)")
+    print(f"       (from {len(libs)} .a = {orig_mb:.0f} MB)")
     print(f"       output: {output}")
 
 

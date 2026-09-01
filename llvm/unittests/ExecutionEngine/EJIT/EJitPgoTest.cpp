@@ -12,6 +12,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#include "llvm/ExecutionEngine/EJIT/EJitValueProfile.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -487,7 +488,267 @@ bool readCounterInfo(const Module &M, const std::string &name, uint64_t &hash,
   numCounters = cast<ArrayType>(Profc->getValueType())->getNumElements();
   return true;
 }
+
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+struct PgoParityLayout {
+  uint64_t funcHash = 0;
+  unsigned numCounters = 0;
+  uint16_t numValueSites[3] = {0, 0, 0};
+};
+
+static bool readPgoParityLayout(const Module &M, StringRef name,
+                                PgoParityLayout &out) {
+  const GlobalVariable *Profd =
+      M.getGlobalVariable("__profd_" + name.str(), true);
+  const GlobalVariable *Profc =
+      M.getGlobalVariable("__profc_" + name.str(), true);
+  if (!Profd || !Profc || !Profd->hasInitializer())
+    return false;
+
+  auto *Init = dyn_cast<ConstantStruct>(Profd->getInitializer());
+  if (!Init || Init->getNumOperands() < 8)
+    return false;
+  auto *Hash = dyn_cast<ConstantInt>(Init->getOperand(1));
+  auto *Sites = dyn_cast<ConstantDataSequential>(Init->getOperand(7));
+  auto *Counters = dyn_cast<ArrayType>(Profc->getValueType());
+  if (!Hash || !Counters ||
+      (!Sites && !isa<ConstantAggregateZero>(Init->getOperand(7))))
+    return false;
+
+  out.funcHash = Hash->getZExtValue();
+  out.numCounters = Counters->getNumElements();
+  if (Sites)
+    for (unsigned I = 0; I != 3; ++I)
+      out.numValueSites[I] = static_cast<uint16_t>(
+          cast<ConstantInt>(Sites->getElementAsConstant(I))->getZExtValue());
+  return true;
+}
+
+// The helper has an unused first argument, while the dead callee has no users.
+// The entry keeps a branch with observable external calls and a loop whose
+// bound is the value-profile site. This makes the common cleanup observable
+// without changing the Gen/Use PGO shape.
+static std::unique_ptr<Module> makeCleanupParityModule(LLVMContext &Ctx) {
+  auto M = std::make_unique<Module>("pgo_cleanup_parity", Ctx);
+  auto *I32 = Type::getInt32Ty(Ctx);
+  auto *Void = Type::getVoidTy(Ctx);
+  auto *VoidI32 = FunctionType::get(Void, {I32}, false);
+  M->getOrInsertFunction("positive_path", VoidI32);
+  M->getOrInsertFunction("negative_path", VoidI32);
+
+  auto *HelperTy = FunctionType::get(I32, {I32, I32}, false);
+  auto *Helper = Function::Create(HelperTy, GlobalValue::InternalLinkage,
+                                  "cleanup_helper", M.get());
+  {
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Helper));
+    B.CreateRet(B.CreateAdd(Helper->getArg(1), B.getInt32(1)));
+  }
+
+  auto *DeadTy = FunctionType::get(Void, {I32}, false);
+  auto *Dead = Function::Create(DeadTy, GlobalValue::InternalLinkage,
+                                "dead_cleanup_callee", M.get());
+  {
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Dead));
+    B.CreateRetVoid();
+  }
+
+  auto *Entry =
+      Function::Create(FunctionType::get(I32, {I32}, false),
+                       GlobalValue::ExternalLinkage, "cleanup_entry", M.get());
+  markEJitEntry(*Entry);
+  BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", Entry);
+  BasicBlock *Positive = BasicBlock::Create(Ctx, "positive", Entry);
+  BasicBlock *Negative = BasicBlock::Create(Ctx, "negative", Entry);
+  BasicBlock *Preheader = BasicBlock::Create(Ctx, "loop.preheader", Entry);
+  BasicBlock *Header = BasicBlock::Create(Ctx, "loop.header", Entry);
+  BasicBlock *Latch = BasicBlock::Create(Ctx, "loop.latch", Entry);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "loop.exit", Entry);
+
+  IRBuilder<> B(EntryBB);
+  Value *IsPositive = B.CreateICmpSGT(Entry->getArg(0), B.getInt32(0));
+  B.CreateCondBr(IsPositive, Positive, Negative);
+  B.SetInsertPoint(Positive);
+  B.CreateCall(M->getFunction("positive_path"), {Entry->getArg(0)});
+  Value *PositiveValue =
+      B.CreateCall(Helper, {Entry->getArg(0), Entry->getArg(0)});
+  B.CreateBr(Preheader);
+  B.SetInsertPoint(Negative);
+  B.CreateCall(M->getFunction("negative_path"), {Entry->getArg(0)});
+  Value *NegativeValue =
+      B.CreateCall(Helper, {Entry->getArg(0), B.getInt32(0)});
+  B.CreateBr(Preheader);
+  B.SetInsertPoint(Preheader);
+  PHINode *Initial = B.CreatePHI(I32, 2, "initial");
+  Initial->addIncoming(PositiveValue, Positive);
+  Initial->addIncoming(NegativeValue, Negative);
+  B.CreateBr(Header);
+  B.SetInsertPoint(Header);
+  PHINode *I = B.CreatePHI(I32, 2, "i");
+  PHINode *Acc = B.CreatePHI(I32, 2, "acc");
+  I->addIncoming(B.getInt32(0), Preheader);
+  Acc->addIncoming(Initial, Preheader);
+  Value *AccNext = B.CreateAdd(Acc, I, "acc.next");
+  Value *INext = B.CreateAdd(I, B.getInt32(1), "i.next");
+  Value *Continue = B.CreateICmpSLT(INext, Entry->getArg(0));
+  B.CreateCondBr(Continue, Latch, Exit);
+  B.SetInsertPoint(Latch);
+  I->addIncoming(INext, Latch);
+  Acc->addIncoming(AccNext, Latch);
+  B.CreateBr(Header);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(AccNext);
+  return M;
+}
+
+static const EJitVpFunctionInfo *findVpInfo(ArrayRef<EJitVpFunctionInfo> Infos,
+                                            StringRef Name) {
+  for (const EJitVpFunctionInfo &Info : Infos)
+    if (Info.name == Name)
+      return &Info;
+  return nullptr;
+}
+#endif
 } // namespace
+
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+// Exercise the exact cleanup prefix on both sides of a real Gen -> profile ->
+// Use transition. The profile record is read back by IndexedInstrProfReader,
+// and PGOInstrumentationUse must attach !prof for the same CFG hash. The
+// scalar side table is built from the captured Tier-1 inventory and consumed
+// by the Tier-2 guarded specialization, so the value-site count is not a
+// hand-written comparison.
+TEST(EJitPgo, CleanupPrefixKeepsGenUseProfileParity) {
+  LLVMContext Ctx;
+  auto M0 = makeCleanupParityModule(Ctx);
+  PeriodArrayRegistry Reg;
+  EJitOptimizer Opt(Reg);
+
+  auto M1 = CloneModule(*M0);
+  SpecializationContext Gen;
+  Gen.fnName = "cleanup_entry";
+  Gen.tier = CompileTier::Instrumented;
+  Opt.runPipeline(*M1, Gen);
+
+  Function *Helper = M1->getFunction("cleanup_helper");
+  ASSERT_NE(Helper, nullptr);
+  EXPECT_EQ(Helper->arg_size(), 1u)
+      << "DAE must remove cleanup_helper's unused first argument";
+  EXPECT_EQ(M1->getFunction("dead_cleanup_callee"), nullptr)
+      << "GlobalDCE must remove the unreferenced local callee";
+
+  PgoParityLayout Layout;
+  ASSERT_TRUE(readPgoParityLayout(*M1, "cleanup_entry", Layout));
+  const EJitVpFunctionInfo *EntryInfo =
+      findVpInfo(Opt.getLastVpFunctions(), "cleanup_entry");
+  ASSERT_NE(EntryInfo, nullptr);
+  ASSERT_EQ(EntryInfo->numScalarSites, 1u);
+  const uint64_t CapturedNameHash = EntryInfo->pgoHash;
+  const uint32_t CapturedScalarSites = EntryInfo->numScalarSites;
+
+  // A second independent Gen run checks that the shared cleanup prefix emits
+  // the same CFG/counter/value-site layout that the Use-side profile will
+  // consume, rather than merely accepting one self-consistent snapshot.
+  auto M1Repeat = CloneModule(*M0);
+  Opt.clearAnalyses();
+  SpecializationContext GenRepeat;
+  GenRepeat.fnName = "cleanup_entry";
+  GenRepeat.tier = CompileTier::Instrumented;
+  Opt.runPipeline(*M1Repeat, GenRepeat);
+  PgoParityLayout RepeatLayout;
+  ASSERT_TRUE(readPgoParityLayout(*M1Repeat, "cleanup_entry", RepeatLayout));
+  const EJitVpFunctionInfo *RepeatInfo =
+      findVpInfo(Opt.getLastVpFunctions(), "cleanup_entry");
+  ASSERT_NE(RepeatInfo, nullptr);
+  EXPECT_EQ(RepeatLayout.funcHash, Layout.funcHash);
+  EXPECT_EQ(RepeatLayout.numCounters, Layout.numCounters);
+  EXPECT_EQ(RepeatLayout.numValueSites[0], Layout.numValueSites[0]);
+  EXPECT_EQ(RepeatLayout.numValueSites[1], Layout.numValueSites[1]);
+  EXPECT_EQ(RepeatLayout.numValueSites[2], Layout.numValueSites[2]);
+  EXPECT_EQ(RepeatInfo->numScalarSites, CapturedScalarSites);
+
+  std::vector<uint64_t> Counts(Layout.numCounters, 100);
+  struct alignas(8) FakeProfd {
+    uint64_t nameRef = 0, funcHash = 0, counterPtr = 0, bitmapPtr = 0,
+             functionPtr = 0, values = 0;
+    uint32_t numCounters = 0;
+    uint16_t numValueSites[3] = {0, 0, 0};
+    uint32_t numBitmapBytes = 0;
+  } Profd;
+  Profd.nameRef = EntryInfo->pgoHash;
+  Profd.funcHash = Layout.funcHash;
+  Profd.numCounters = Layout.numCounters;
+  for (unsigned I = 0; I != 3; ++I)
+    Profd.numValueSites[I] = Layout.numValueSites[I];
+
+  PgoCounterRef Counter{"cleanup_entry",
+                        reinterpret_cast<uintptr_t>(Counts.data()),
+                        reinterpret_cast<uintptr_t>(&Profd)};
+  std::string Profile = synthesizeProfileBuffer({Counter});
+  ASSERT_FALSE(Profile.empty());
+  {
+    auto Reader = cantFail(
+        IndexedInstrProfReader::create(MemoryBuffer::getMemBuffer(Profile)));
+    auto Record = Reader->getInstrProfRecord("cleanup_entry", Layout.funcHash);
+    ASSERT_TRUE(static_cast<bool>(Record));
+    EXPECT_EQ(Record->Counts.size(), Layout.numCounters);
+  }
+
+  PgoValueFunction ValueFunction;
+  ValueFunction.funcHash = Layout.funcHash;
+  ValueFunction.pgoNameHash = CapturedNameHash;
+  ValueFunction.numScalarSites = CapturedScalarSites;
+  EJitVpSiteSample ScalarSample;
+  ScalarSample.siteKey =
+      ejitVpSiteKey(CapturedNameHash, kEJitVpScalar, /*siteIdx=*/0);
+  ScalarSample.total = 100;
+  ScalarSample.values[0] = 4;
+  ScalarSample.counts[0] = 100;
+  SmallVector<PgoValueSite, 2> OfficialSites;
+  SmallVector<PgoScalarSite, 2> ScalarSites;
+  ASSERT_TRUE(aggregateValueSamples({ScalarSample}, {ValueFunction}, {},
+                                    OfficialSites, ScalarSites));
+  ASSERT_EQ(ScalarSites.size(), 1u);
+  EXPECT_EQ(ScalarSites.front().total, 100u);
+
+  auto M2 = CloneModule(*M0);
+  Opt.clearAnalyses();
+  SpecializationContext Use;
+  Use.fnName = "cleanup_entry";
+  Use.tier = CompileTier::PGOUse;
+  Use.optLevel = OptimizationLevel::L1;
+  Use.profileData = Profile;
+  Use.scalarValueSites.assign(ScalarSites.begin(), ScalarSites.end());
+  Opt.runPipeline(*M2, Use);
+
+  // A mismatched CFG hash makes PGOInstrumentationUse silently skip the
+  // record; seeing !prof here is the direct Gen/Use parity assertion.
+  Function *Entry = M2->getFunction("cleanup_entry");
+  ASSERT_NE(Entry, nullptr);
+  bool HasBranchProfile = false;
+  unsigned ValueSiteMetadata = 0;
+  bool HasScalarGuard = false;
+  for (BasicBlock &BB : *Entry)
+    for (Instruction &I : BB) {
+      if (auto *BI = dyn_cast<BranchInst>(&I))
+        HasBranchProfile |= BI->isConditional() && BI->hasMetadata("prof");
+      if (auto *Cmp = dyn_cast<ICmpInst>(&I))
+        if (Cmp->getPredicate() == ICmpInst::ICMP_EQ &&
+            ((isa<ConstantInt>(Cmp->getOperand(0)) &&
+              cast<ConstantInt>(Cmp->getOperand(0))->equalsInt(4)) ||
+             (isa<ConstantInt>(Cmp->getOperand(1)) &&
+              cast<ConstantInt>(Cmp->getOperand(1))->equalsInt(4))))
+          HasScalarGuard = true;
+      ValueSiteMetadata += I.getMetadata(MD_EJIT_VP_SITE) != nullptr;
+    }
+  EXPECT_TRUE(HasBranchProfile);
+  EXPECT_TRUE(HasScalarGuard)
+      << "Tier-2 must consume the captured scalar site and build its guard";
+  // The scalar site metadata is intentionally consumed by the guarded
+  // specialization pass; it is not expected to survive the full pipeline.
+  EXPECT_EQ(ValueSiteMetadata, 0u);
+  EXPECT_EQ(M2->getFunction("dead_cleanup_callee"), nullptr);
+}
+#endif
 
 // PGO stage 3: Tier-2 PGOUse + ModuleInlinerWrapperPass inlines a hot callee
 // (bar) into its caller (foo). Verifies the CGSCC inline pass runs in the
