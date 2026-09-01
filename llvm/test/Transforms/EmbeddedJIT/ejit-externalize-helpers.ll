@@ -248,12 +248,9 @@ attributes #1 = { inlinehint }
 ; EXT side: the extracted bitcode. Big helpers are declarations (the static
 ; one renamed to its registration key); small helpers stay as internal
 ; definitions; entries keep their bodies; hint_big is gone (inlined).
-; EXT: declare i32 @ejit_static._stdin_.{{0x[0-9a-f]+}}.st_helper_big(i32)
-; EXT: define internal i32 @st_helper_small(i32 %x)
-; EXT: declare i32 @ext_helper_big(i32)
-; EXT: define internal i32 @ext_helper_small(i32 %x)
-; EXT: declare i32 @boundary_helper(i32)
-; EXT: define internal i32 @kept_15inst(i32 %x)
+; The entries come first (extractAndSerialize moves every ejit_entry definition
+; to the head of the function list so the compiled entry starts at the aligned
+; base of .text); the helpers follow in their original relative order.
 ; EXT: define i32 @entry(i32 %idx) {{.*}} {
 ; EXT: tail call i32 @ejit_static._stdin_.{{0x[0-9a-f]+}}.st_helper_big(i32 %v)
 ; EXT: tail call i32 @st_helper_small(i32 %r1)
@@ -262,6 +259,12 @@ attributes #1 = { inlinehint }
 ; EXT: tail call i32 @boundary_helper(i32 {{.*}})
 ; EXT: tail call i32 @kept_15inst(i32 {{.*}})
 ; EXT: define internal i32 @entry_big(i32 %idx) #[[ENTRY_ATTR:[0-9]+]] {{.*}} {
+; EXT: declare i32 @ejit_static._stdin_.{{0x[0-9a-f]+}}.st_helper_big(i32)
+; EXT: define internal i32 @st_helper_small(i32 %x)
+; EXT: declare i32 @ext_helper_big(i32)
+; EXT: define internal i32 @ext_helper_small(i32 %x)
+; EXT: declare i32 @boundary_helper(i32)
+; EXT: define internal i32 @kept_15inst(i32 %x)
 ; EXT: attributes #[[ENTRY_ATTR]] = { {{.*}}"ejit.wrapper_symbol"="ejit_static._stdin_.{{0x[0-9a-f]+}}.entry_big"{{.*}} }
 ; EXT-NOT: @st_helper_big
 ; EXT-NOT: @hint_big

@@ -41,16 +41,18 @@ define void @ejit_entry_ext() !ejit.metadata !3 {
   ret void
 }
 
+; Entry functions come first (extractAndSerialize moves every ejit_entry
+; definition to the head of the function list) and must keep their original
+; linkage (not internal).
+; EXTRACTED: define{{.*}} i32 @ejit_entry_calc(
+; EXTRACTED-NOT: define internal {{.*}}@ejit_entry_calc
+; EXTRACTED: define{{.*}} void @ejit_entry_ext(
+; EXTRACTED-NOT: define internal {{.*}}@ejit_entry_ext
+
 ; Check that helpers become internal in the extracted bitcode.
 ; EXTRACTED: define internal i32 @helper_add(
 ; EXTRACTED: define internal i32 @helper_mul(
-
-; Entry functions must keep their original linkage (not internal).
-; EXTRACTED: define{{.*}} i32 @ejit_entry_calc(
-; EXTRACTED-NOT: define internal {{.*}}@ejit_entry_calc
 ; EXTRACTED: declare{{.*}} void @external_lib_func()
-; EXTRACTED: define{{.*}} void @ejit_entry_ext(
-; EXTRACTED-NOT: define internal {{.*}}@ejit_entry_ext
 
 !0 = !{!"ejit_entry"}
 !1 = !{!0}
