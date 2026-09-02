@@ -1120,3 +1120,56 @@ TEST(EJitCodePoolMemMgrBatch, HighAlignedReadOnlySectionKeepsPageLayout) {
   cantFail(MM.deallocate(std::move(FA)));
   cantFail(MM.deallocate(std::move(FA2)));
 }
+
+// Immediate 4K-seal mode (batchedPageSeal = false, fourKSeal = true): the
+// promotion must still fire, because it is gated on usesPageSeal(), not on
+// batched. Here the win is intra-allocation, not cross-allocation: a pure
+// read-only section would otherwise land in its own segment and own its own
+// 4KiB page (BasicLayout groups by {MemProt, MemLifetime}, so R-- and R+X
+// stay separate segments, each page-padded). Promoted to R+X, rodata merges
+// into the code segment, lays out contiguous with it, and the single 4K page
+// is sealed RX at finalize. This is the aarch64_be far-pool / Tier-1 shape
+// (online-PGO __profc_ counters are R+W and stay out of the gate).
+TEST(EJitCodePoolMemMgr4K, ReadOnlySectionFoldsIntoExecSegmentImmediate) {
+  MockSre4K M;
+  EJitCodePoolManager Pool(
+      fourKMemMgrOpts(), [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G = makeTextAndRoDataGraph(0x1000, 0x2000, /*RodataAlign=*/16);
+  Section *Text = G->findSectionByName("__text");
+  Section *RoData = G->findSectionByName("__rodata");
+  ASSERT_NE(Text, nullptr);
+  ASSERT_NE(RoData, nullptr);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  void *TextAddr = blockAddrInSection(*G, *Text);
+  void *RoAddr = blockAddrInSection(*G, *RoData);
+  ASSERT_NE(TextAddr, nullptr);
+  ASSERT_NE(RoAddr, nullptr);
+
+  // Promoted, and the 37 bytes share the code's page (no page of its own).
+  EXPECT_EQ(RoData->getMemProt(), orc::MemProt::Read | orc::MemProt::Exec);
+  auto PageOf = [](void *P) {
+    return reinterpret_cast<uintptr_t>(P) &
+           ~static_cast<uintptr_t>(kFourKiB - 1);
+  };
+  EXPECT_EQ(PageOf(TextAddr), PageOf(RoAddr))
+      << "read-only content must not occupy a page of its own in immediate "
+         "mode either";
+  // Contiguous within the segment: rodata lands right after the 64-byte text
+  // block (16-byte aligned), so the two do not straddle a page boundary.
+  EXPECT_EQ(static_cast<uintptr_t>(reinterpret_cast<char *>(RoAddr) -
+                                   reinterpret_cast<char *>(TextAddr)),
+            static_cast<uintptr_t>(64))
+      << "text and rodata must be contiguous, not page-strided";
+
+  // Immediate mode seals the exec page at finalize (not deferred to flush).
+  EXPECT_EQ(M.SealCalls, 0u);
+  auto FA = cantFail(IFA->finalize());
+  EXPECT_EQ(M.SealCalls, 1u);
+  ASSERT_EQ(M.SealedPages.size(), 1u);
+  EXPECT_EQ(M.SealedPages[0], PageOf(TextAddr));
+  cantFail(MM.deallocate(std::move(FA)));
+}
