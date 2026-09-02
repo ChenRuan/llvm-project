@@ -430,6 +430,31 @@ void *blockAddrInSection(LinkGraph &G, Section &S) {
   return nullptr;
 }
 
+// The Tier-1 online-PGO shape: one executable (__text, R+X), one read-only
+// data (__profd_, R), and one runtime-writable counter (__profc_, R+W) in
+// the same graph. The far pool serves spec_t1_* dylibs in immediate 4K-seal
+// mode; this is the layout the promotion widens to cover.
+std::unique_ptr<LinkGraph> makeTextProfdProfcGraph(uint64_t TextVAddr,
+                                                   uint64_t ProfdVAddr,
+                                                   uint64_t ProfcVAddr) {
+  auto G = std::make_unique<LinkGraph>(
+      "g", std::make_shared<orc::SymbolStringPool>(),
+      Triple("x86_64-unknown-linux-gnu"), SubtargetFeatures(),
+      getGenericEdgeKindName);
+  auto &Text =
+      G->createSection("__text", orc::MemProt::Read | orc::MemProt::Exec);
+  G->createContentBlock(Text, ArrayRef<char>(CodeBytes, 64),
+                        orc::ExecutorAddr(TextVAddr), 16, 0);
+  auto &Profd = G->createSection("__profd_", orc::MemProt::Read);
+  G->createContentBlock(Profd, ArrayRef<char>(CodeBytes, 37),
+                        orc::ExecutorAddr(ProfdVAddr), 16, 0);
+  auto &Profc =
+      G->createSection("__profc_", orc::MemProt::Read | orc::MemProt::Write);
+  G->createContentBlock(Profc, ArrayRef<char>(CodeBytes, 64),
+                        orc::ExecutorAddr(ProfcVAddr), 16, 0);
+  return G;
+}
+
 } // namespace
 
 // allocate() must not seal; finalize() seals exactly the covered 4K page(s);
@@ -1171,5 +1196,83 @@ TEST(EJitCodePoolMemMgr4K, ReadOnlySectionFoldsIntoExecSegmentImmediate) {
   EXPECT_EQ(M.SealCalls, 1u);
   ASSERT_EQ(M.SealedPages.size(), 1u);
   EXPECT_EQ(M.SealedPages[0], PageOf(TextAddr));
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
+// The Tier-1 online-PGO shape routed through selectPool's spec_t1_ branch:
+// text (R+X) + __profd_ (R, read-only) + __profc_ (R+W, runtime counter) in
+// one graph, allocated on the FAR pool in immediate 4K-seal mode. This is the
+// real surface the widened gate (usesPageSeal) exposes, and it asserts the
+// invariants the far-pool path must keep:
+//  - __profd_ is promoted to R+X and folds into the code page (it is
+//    read-only; a peer reads it from the RX page, same as code);
+//  - __profc_ (R+W) is NOT promoted (Write excluded) and keeps its own RW
+//    page, never sharing a 4K page with the executable extent (no RWX);
+//  - the recorded writable range covers ONLY __profc_ (never the exec
+//    extent), so a peer's enable_rw touches only the counter page.
+TEST(EJitCodePoolMemMgr4K, FarPoolTier1ProfdFoldsProfcStaysWritable) {
+  MockSre4K NearM, FarM;
+  auto NearOpts = fourKMemMgrOpts(); // fourKSeal=true, batched=false, near
+  NearOpts.kind = EJitCodePoolKind::Near;
+  auto FarOpts = fourKMemMgrOpts();
+  FarOpts.kind = EJitCodePoolKind::Far;
+  EJitCodePoolManager Near(
+      NearOpts, [&NearM](size_t N) { return NearM.rawAlloc(N); },
+      [&NearM](void *V) { return NearM.seal(V); },
+      [&NearM](void *B, size_t S) { return NearM.split(B, S); });
+  EJitCodePoolManager Far(
+      FarOpts, [&FarM](size_t N) { return FarM.rawAlloc(N); },
+      [&FarM](void *V) { return FarM.seal(V); },
+      [&FarM](void *B, size_t S) { return FarM.split(B, S); });
+  EJitCodePoolMemoryManager MM(Near, Far, kFourKiB);
+
+  JITLinkDylib Tier1("spec_t1_1");
+  auto G = makeTextProfdProfcGraph(0x1000, 0x2000, 0x3000);
+  Section *Text = G->findSectionByName("__text");
+  Section *Profd = G->findSectionByName("__profd_");
+  Section *Profc = G->findSectionByName("__profc_");
+  ASSERT_NE(Text, nullptr);
+  ASSERT_NE(Profd, nullptr);
+  ASSERT_NE(Profc, nullptr);
+  auto IFA = cantFail(MM.allocate(&Tier1, *G));
+  void *TextAddr = blockAddrInSection(*G, *Text);
+  void *ProfdAddr = blockAddrInSection(*G, *Profd);
+  void *ProfcAddr = blockAddrInSection(*G, *Profc);
+  ASSERT_NE(TextAddr, nullptr);
+  ASSERT_NE(ProfdAddr, nullptr);
+  ASSERT_NE(ProfcAddr, nullptr);
+
+  auto PageOf = [](void *P) {
+    return reinterpret_cast<uintptr_t>(P) &
+           ~static_cast<uintptr_t>(kFourKiB - 1);
+  };
+
+  // Routed to the far pool (selectPool's spec_t1_ branch).
+  EXPECT_TRUE(Far.contains(TextAddr));
+  EXPECT_FALSE(Near.contains(TextAddr));
+
+  // __profd_ (read-only) promoted to R+X and folded onto the code page.
+  EXPECT_EQ(Profd->getMemProt(), orc::MemProt::Read | orc::MemProt::Exec);
+  EXPECT_EQ(PageOf(TextAddr), PageOf(ProfdAddr))
+      << "__profd_ must fold into the code page, not own one";
+
+  // __profc_ (R+W) NOT promoted and never shares a page with the exec extent.
+  EXPECT_EQ(Profc->getMemProt(),
+            orc::MemProt::Read | orc::MemProt::Write);
+  EXPECT_NE(PageOf(ProfcAddr), PageOf(TextAddr))
+      << "__profc_ must keep its own RW page (no RWX)";
+
+  auto FA = cantFail(IFA->finalize());
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(Far.findRange(TextAddr, Info));
+  EXPECT_EQ(Info.poolKind, EJitCodePoolKind::Far);
+  // Exactly one writable range, and it covers only __profc_ (never the exec
+  // extent that contains text + __profd_).
+  ASSERT_EQ(Info.writableCount, 1u);
+  EXPECT_EQ(Info.writableRanges[0].addr, PageOf(ProfcAddr));
+  EXPECT_EQ(PageOf(reinterpret_cast<void *>(Info.writableRanges[0].addr)),
+            PageOf(ProfcAddr));
+  EXPECT_NE(PageOf(reinterpret_cast<void *>(Info.writableRanges[0].addr)),
+            PageOf(TextAddr));
   cantFail(MM.deallocate(std::move(FA)));
 }
