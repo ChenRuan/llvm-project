@@ -58,6 +58,12 @@
 #ifndef EJIT_SRE_TASKPOOL_QUEUE_CAPACITY
 #define EJIT_SRE_TASKPOOL_QUEUE_CAPACITY 1024u
 #endif
+#ifndef EJIT_CODE_POOL_FIXED_NEAR_HOT_PENDING_LIMIT
+/// Bound owner-private linked near-hot results while producers are active. The
+/// product batch is approximately 150 versions; a larger bound leaves room
+/// for retries without making the vector an unbounded memory sink.
+#define EJIT_CODE_POOL_FIXED_NEAR_HOT_PENDING_LIMIT 256u
+#endif
 #ifndef EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES
 #define EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES 1u
 #endif
@@ -72,7 +78,7 @@
 // once full, a peer hitting an untracked pool cleanly falls back rather than
 // risking an unbounded table or a duplicate split entry.
 #ifndef EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS
-#define EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS 16u
+#define EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS 32u
 #endif
 #ifndef EJIT_SRE_SHARED_DUMP_NAME_BYTES
 #define EJIT_SRE_SHARED_DUMP_NAME_BYTES 128u
@@ -390,7 +396,17 @@ struct EJitSharedCodePoolStats {
     EJitAtomicU64 sealInvocations;
     EJitAtomicU64 splitInvocations;
     EJitAtomicU64 finalizedRangeCount;
+    EJitAtomicU64 baseAddress;
+    EJitAtomicU64 endAddress;
+    EJitAtomicU64 pendingBytes;
+    EJitAtomicU64 pendingRangeCount;
+    EJitAtomicU64 fallbackCount;
+    EJitAtomicU32 full;
   } near, far;
+  /// Per semantic near-hot pool detail. Entry 0..15 is cell[0..15], entry 16
+  /// is the legal no-cell public pool. This is diagnostic cold state and is
+  /// not read on the dispatch hit path.
+  Detail nearHot[kEJitNearHotPoolCount];
 };
 
 /// Plain (non-atomic) snapshot of code-pool stats, used as the callback
@@ -408,6 +424,12 @@ struct EJitCodePoolStatsOut {
     uint64_t sealInvocations = 0;
     uint64_t splitInvocations = 0;
     uint64_t finalizedRangeCount = 0;
+    uint64_t baseAddress = 0;
+    uint64_t endAddress = 0;
+    uint64_t pendingBytes = 0;
+    uint64_t pendingRangeCount = 0;
+    uint64_t fallbackCount = 0;
+    uint32_t full = 0;
   };
   uint64_t poolCount = 0;
   uint64_t sealedCount = 0;
@@ -419,6 +441,7 @@ struct EJitCodePoolStatsOut {
   uint64_t splitInvocations = 0;
   uint64_t finalizedRangeCount = 0;
   Detail near;
+  Detail nearHot[kEJitNearHotPoolCount];
   Detail far;
 };
 

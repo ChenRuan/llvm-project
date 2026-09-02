@@ -753,6 +753,45 @@ if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL)
                  "(size is __ejit_code_end - __ejit_code_start from the linker script's .text.ejit block)")
 endif()
 
+# Alternative to the old single near pool: reserve 16 fixed 2MiB cell slices
+# plus one fixed 4MiB no-cell/public slice (36MiB total). This is intentionally
+# opt-in until a product linker script reserves the larger .text.ejit region.
+option(EJIT_CODE_POOL_FIXED_NEAR_HOT
+  "Use 16 fixed 2MiB cell near-hot pools plus one fixed 4MiB public pool" OFF)
+if(EJIT_CODE_POOL_FIXED_NEAR_HOT)
+  if(NOT EJIT_SRE_CODE_POOL OR NOT EJIT_CODE_POOL_4K_SEAL OR
+     NOT EJIT_FIXED_CODE_POOL OR NOT EJIT_CODE_POOL_BATCHED_PUBLISH)
+    message(FATAL_ERROR
+      "EJIT_CODE_POOL_FIXED_NEAR_HOT requires EJIT_SRE_CODE_POOL, "
+      "EJIT_CODE_POOL_4K_SEAL, EJIT_CODE_POOL_BATCHED_PUBLISH and "
+      "EJIT_FIXED_CODE_POOL")
+  endif()
+  set(EJIT_CODE_POOL_NEAR_HOT_CELL_BYTES 2097152 CACHE STRING
+    "Bytes reserved for each fixed near-hot cell pool (must be 2MiB aligned)")
+  set(EJIT_CODE_POOL_NEAR_HOT_PUBLIC_BYTES 4194304 CACHE STRING
+    "Bytes reserved for the fixed near-hot no-cell/public pool (must be 2MiB aligned)")
+  ejit_require_numeric(EJIT_CODE_POOL_NEAR_HOT_CELL_BYTES)
+  ejit_require_numeric(EJIT_CODE_POOL_NEAR_HOT_PUBLIC_BYTES)
+  if(EJIT_CODE_POOL_NEAR_HOT_CELL_BYTES LESS 2097152 OR
+     EJIT_CODE_POOL_NEAR_HOT_PUBLIC_BYTES LESS 2097152)
+    message(FATAL_ERROR
+      "Fixed near-hot pool sizes must each be at least 2MiB")
+  endif()
+  math(EXPR _ejit_near_hot_cell_remainder
+    "${EJIT_CODE_POOL_NEAR_HOT_CELL_BYTES} % 2097152")
+  math(EXPR _ejit_near_hot_public_remainder
+    "${EJIT_CODE_POOL_NEAR_HOT_PUBLIC_BYTES} % 2097152")
+  if(NOT _ejit_near_hot_cell_remainder EQUAL 0 OR
+     NOT _ejit_near_hot_public_remainder EQUAL 0)
+    message(FATAL_ERROR
+      "Fixed near-hot pool sizes must be multiples of the 2MiB split granule")
+  endif()
+  math(EXPR _ejit_near_hot_region_bytes
+    "16 * ${EJIT_CODE_POOL_NEAR_HOT_CELL_BYTES} + ${EJIT_CODE_POOL_NEAR_HOT_PUBLIC_BYTES}")
+  message(STATUS
+    "EmbeddedJIT: fixed near-hot layout enabled (16x${EJIT_CODE_POOL_NEAR_HOT_CELL_BYTES}B cell + ${EJIT_CODE_POOL_NEAR_HOT_PUBLIC_BYTES}B public = ${_ejit_near_hot_region_bytes}B)")
+endif()
+
 #===-- EmbeddedJIT per-function inline cache (multi-version) -------------===#
 # EJIT_ICACHE_DIM_SIZE: the per-dimension bound D of the per-function
 # @__ejit_icache_fn_<name> [D]^numDims inline-cache array. MUST be a power of 2

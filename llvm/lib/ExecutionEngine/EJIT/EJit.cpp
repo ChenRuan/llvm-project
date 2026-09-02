@@ -78,6 +78,14 @@ EJit::EJit(const Config &config) : config_(config) {
 #endif
   compileDriver_ = std::make_unique<EJitCompileDriver>(
       config_, *runtimeState_, *moduleLoader_, logger);
+#if defined(EJIT_SRE_SHARED_TASKPOOL) && defined(EJIT_CODE_POOL_FIXED_NEAR_HOT)
+  EJIT_DIAG("EJit allocation view driver=%p driverSize=%zu sharedPool=%p "
+            "sharedPoolSize=%zu",
+            static_cast<void *>(compileDriver_.get()),
+            sizeof(EJitCompileDriver),
+            static_cast<void *>(compileDriver_->sharedTaskPool()),
+            sizeof(EJitSharedTaskPool));
+#endif
 
   // Consume registration data from the staging store (constructor path).
   StoredData data = EJitRegistrationStore::instance().consume();
@@ -966,6 +974,8 @@ bool EJit::getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const {
       Total.finalizedRangeCount = s.finalizedRangeCount;
       CopyShared(out->total, Total);
       CopyShared(out->near, s.near);
+      for (size_t I = 0; I < 17; ++I)
+        CopyShared(out->nearHot[I], s.nearHot[I]);
       CopyShared(out->far, s.far);
       return true;
     }
@@ -980,6 +990,8 @@ bool EJit::getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const {
   EJitTieredCodePoolStats s = engine->getTieredCodePoolStats();
   CopyManager(out->total, s.total);
   CopyManager(out->near, s.near);
+  for (size_t I = 0; I < s.nearHot.size(); ++I)
+    CopyManager(out->nearHot[I], s.nearHot[I]);
   CopyManager(out->far, s.far);
   return true;
 #else
@@ -1015,6 +1027,38 @@ void EJit::printCodePoolStats() const {
   };
   PrintOne("total", s.total);
   PrintOne("near(final)", s.near);
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  for (unsigned I = 0; I < 16; ++I)
+    PrintOne((std::string("near(cell") + std::to_string(I) + ")").c_str(),
+             s.nearHot[I]);
+  PrintOne("near(public)", s.nearHot[16]);
+  // The versioned public stats shape intentionally keeps the old aggregate
+  // fields. The shared diagnostic mirror carries the fixed-pool geometry and
+  // pending state needed to distinguish an RW/NX allocation from published
+  // RX code.
+  EJitCodePoolStatsOut detailed{};
+  if (const EJitSharedTaskPool *sp = sharedTaskPool()) {
+    if (sp->readCodePoolStats(&detailed)) {
+      auto PrintDetail = [](const char *Kind,
+                            const EJitCodePoolStatsOut::Detail &D) {
+        EJIT_DIAG_RAW("  %s range=[0x%llx,0x%llx) pendingBytes=%llu "
+                      "pendingRanges=%llu finalized=%llu full=%u fallback=%llu",
+                      Kind, (unsigned long long)D.baseAddress,
+                      (unsigned long long)D.endAddress,
+                      (unsigned long long)D.pendingBytes,
+                      (unsigned long long)D.pendingRangeCount,
+                      (unsigned long long)D.finalizedRangeCount,
+                      static_cast<unsigned>(D.full),
+                      (unsigned long long)D.fallbackCount);
+      };
+      for (unsigned I = 0; I < 16; ++I)
+        PrintDetail(
+            (std::string("near(cell") + std::to_string(I) + ")").c_str(),
+            detailed.nearHot[I]);
+      PrintDetail("near(public)", detailed.nearHot[16]);
+    }
+  }
+#endif
   PrintOne("far(tier1)", s.far);
 #else
   EJIT_DIAG_RAW("code pool: EJIT_SRE_CODE_POOL not enabled");

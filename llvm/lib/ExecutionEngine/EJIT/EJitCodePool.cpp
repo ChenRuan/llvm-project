@@ -117,7 +117,10 @@ Error EJitCodePoolManager::newActivePoolLocked() {
     // fixed-address guarantee (the specialization falls back to AOT instead).
     uintptr_t RegionEnd = Opts_.fixedBase + Opts_.fixedSize;
     uintptr_t Next = alignUpAddr(Opts_.fixedBase + FixedUsed_, Opts_.poolAlign);
-    if (Next + Opts_.poolSize > RegionEnd) {
+    if (RegionEnd < Opts_.fixedBase || Next < Opts_.fixedBase ||
+        Next + Opts_.poolSize < Next || Next + Opts_.poolSize > RegionEnd) {
+      ++AllocationFailureCount_;
+      FixedRegionFull_ = true;
       EJIT_DIAG("newActivePool FAIL: fixed region exhausted next=0x%llx +%zu > "
                 "end=0x%llx (used=%zu of %zu)",
                 static_cast<unsigned long long>(Next), Opts_.poolSize,
@@ -769,8 +772,9 @@ bool EJitCodePoolManager::findRange(const void *Ptr,
 #endif
   uintptr_t A = addr(Ptr);
 
-  // The pointer must resolve to a real, recorded executable allocation — never
-  // a guessed extent. Find the finalized range that contains it.
+  // The pointer must resolve to a real, finalized executable allocation —
+  // never a guessed extent. Pending ranges have a separate owner-private
+  // query below so the public range contract remains "ready".
   const FinalizedRange *Found = nullptr;
   for (const FinalizedRange &R : FinalizedRanges_) {
     if (A >= R.start && A < R.start + R.size) {
@@ -778,10 +782,8 @@ bool EJitCodePoolManager::findRange(const void *Ptr,
       break;
     }
   }
-  if (!Found) {
-    EJIT_DIAG_DEBUG("findRange miss: ptr=%p not in any finalized range", Ptr);
+  if (!Found)
     return false;
-  }
 
   // The allocation must also belong to a known pool (so a peer learns the
   // 2MiB split granule). An address resolved outside the pools (e.g. a
@@ -815,7 +817,7 @@ bool EJitCodePoolManager::findRange(const void *Ptr,
       }
       Out.poolBase = B;
       Out.poolSize = static_cast<uint64_t>(P.size);
-      Out.poolId = static_cast<uint32_t>(I);
+      Out.poolId = Opts_.poolId + static_cast<uint32_t>(I);
       // Runtime-writable extents of this allocation (e.g. __profc_): a peer
       // core enable_rw's exactly these before executing. Copied by value.
       Out.writableCount = Found->writableCount;
@@ -844,6 +846,53 @@ bool EJitCodePoolManager::findRange(const void *Ptr,
   return false;
 }
 
+bool EJitCodePoolManager::findPendingRange(const void *Ptr,
+                                           EJitCompiledCodeInfo &Out) const {
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(Mutex_);
+#endif
+  const uintptr_t A = addr(Ptr);
+  const FinalizedRange *Found = nullptr;
+  for (const FinalizedRange &R : PendingRanges_)
+    if (A >= R.start && A < R.start + R.size) {
+      Found = &R;
+      break;
+    }
+  if (!Found)
+    return false;
+  for (size_t I = 0; I < Pools_.size(); ++I) {
+    const CodePool &P = *Pools_[I];
+    const uintptr_t B = addr(P.base);
+    if (A < B || A >= B + P.size)
+      continue;
+    Out.fnPtr = const_cast<void *>(Ptr);
+    Out.codeStart = Found->start;
+    Out.codeSize = Found->size;
+    Out.poolBase = B;
+    Out.poolSize = static_cast<uint64_t>(P.size);
+    Out.poolId = Opts_.poolId + static_cast<uint32_t>(I);
+    Out.writableCount = Found->writableCount;
+    for (uint32_t W = 0; W < kEJitMaxWritableRanges; ++W)
+      Out.writableRanges[W] =
+          W < Found->writableCount ? Found->writables[W] : EJitWritableRange{};
+    Out.requiresPeerEnableRw = Opts_.needsEnableRw ? 1u : 0u;
+    Out.poolKind = Opts_.kind;
+    return true;
+  }
+  return false;
+}
+
+bool EJitCodePoolManager::isRangeReady(const void *Ptr) const {
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(Mutex_);
+#endif
+  const uintptr_t A = addr(Ptr);
+  for (const FinalizedRange &R : FinalizedRanges_)
+    if (A >= R.start && A < R.start + R.size)
+      return true;
+  return false;
+}
+
 EJitCodePoolManager::Stats EJitCodePoolManager::getStats() const {
 #ifndef EJIT_FREESTANDING
   std::lock_guard<std::mutex> Lock(Mutex_);
@@ -854,6 +903,16 @@ EJitCodePoolManager::Stats EJitCodePoolManager::getStats() const {
   S.splitInvocations = SplitInvocations_;
   S.rwEnableInvocations = RwEnableInvocations_;
   S.finalizedRangeCount = FinalizedRanges_.size();
+  S.pendingRangeCount = PendingRanges_.size();
+  S.fallbackCount = AllocationFailureCount_;
+  S.full = FixedRegionFull_;
+  if (!Pools_.empty()) {
+    S.baseAddress = addr(Pools_.front()->base);
+    const CodePool &Last = *Pools_.back();
+    S.endAddress = addr(Last.base) + Last.size;
+  }
+  for (const FinalizedRange &R : PendingRanges_)
+    S.pendingBytes += static_cast<size_t>(R.size);
   for (auto &P : Pools_) {
     S.reservedBytes += P->size;
     S.usedBytes += P->used;

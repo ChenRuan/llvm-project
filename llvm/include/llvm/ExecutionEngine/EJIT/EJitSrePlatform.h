@@ -28,10 +28,19 @@ enum class EJitCodePoolPlacement { NearFixed, FarDynamic };
 
 /// Construct an EJitCodePoolManager wired to the SRE platform: raw memory from
 /// SRE_MemDbgAlloc (partition EJIT_SRE_CODE_POOL_PTNO) and sealing via
-/// enable_ex. On a host without real SRE symbols, weak fallbacks make this a
-/// link-safe no-op-seal / aligned-host-alloc manager (see EJitSrePlatform.cpp).
+/// enable_ex. The final SRE link environment must provide the platform
+/// allocation, split, permission, and cache symbols; missing symbols are a
+/// link-time configuration error (see EJitSrePlatform.cpp).
 std::unique_ptr<EJitCodePoolManager> makeSreCodePoolManager(
-    EJitCodePoolPlacement Placement = EJitCodePoolPlacement::NearFixed);
+    EJitCodePoolPlacement Placement = EJitCodePoolPlacement::NearFixed,
+    uint32_t PoolId = 0, uintptr_t FixedBase = 0, size_t FixedSize = 0);
+
+/// Construct one of the fixed near-hot pools. Cell ids 0..15 map to a 2MiB
+/// slice and kEJitNearHotPublicPoolId maps to the 4MiB no-cell slice. Returns
+/// nullptr when the linker-reserved region cannot hold the complete 36MiB
+/// layout; callers must then use the AOT fallback rather than spill pools.
+std::unique_ptr<EJitCodePoolManager>
+makeSreNearHotCodePoolManager(uint32_t PoolId);
 
 /// Install execute permission for the legacy 2MiB code pool containing
 /// \p FnPtr in the calling core's translation context. This is intentionally a

@@ -184,23 +184,47 @@ private:
 
 EJitCodePoolMemoryManager::EJitCodePoolMemoryManager(EJitCodePoolManager &Pool,
                                                      size_t PageSize)
-    : NearPool_(Pool), PageSize_(PageSize) {}
+    : NearPool_(&Pool), NearPools_{&Pool}, PageSize_(PageSize) {}
 
 EJitCodePoolMemoryManager::EJitCodePoolMemoryManager(
     EJitCodePoolManager &NearPool, EJitCodePoolManager &FarPool,
     size_t PageSize)
-    : NearPool_(NearPool), FarPool_(&FarPool), PageSize_(PageSize) {}
+    : NearPool_(&NearPool), NearPools_{&NearPool}, FarPool_(&FarPool),
+      PageSize_(PageSize) {}
 
-EJitCodePoolManager &EJitCodePoolMemoryManager::selectPool(
-    const JITLinkDylib *JD) const {
+EJitCodePoolMemoryManager::EJitCodePoolMemoryManager(
+    std::vector<EJitCodePoolManager *> NearPools, EJitCodePoolManager &FarPool,
+    size_t PageSize, PoolSelector Selector)
+    : NearPool_(NearPools.empty() ? nullptr : NearPools.front()),
+      NearPools_(std::move(NearPools)), FarPool_(&FarPool),
+      Selector_(std::move(Selector)), PageSize_(PageSize) {}
+
+EJitCodePoolManager *
+EJitCodePoolMemoryManager::selectPool(const JITLinkDylib *JD) const {
+  if (Selector_) {
+    if (EJitCodePoolManager *Pool = Selector_(JD))
+      return Pool;
+    EJIT_DIAG("selectPool: missing controlled JITDylib metadata name=%s",
+              JD ? JD->getName().c_str() : "<null>");
+    return nullptr;
+  }
   if (FarPool_ && JD && StringRef(JD->getName()).starts_with("spec_t1_"))
-    return *FarPool_;
+    return FarPool_;
+  if (!NearPools_.empty())
+    return NearPools_.front();
   return NearPool_;
 }
 
 void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
                                          OnAllocatedFunction OnAllocated) {
-  EJitCodePoolManager &Pool = selectPool(JD);
+  EJitCodePoolManager *SelectedPool = selectPool(JD);
+  if (!SelectedPool) {
+    OnAllocated(make_error<StringError>(
+        "EJitCodePool: missing controlled pool metadata",
+        inconvertibleErrorCode()));
+    return;
+  }
+  EJitCodePoolManager &Pool = *SelectedPool;
 
   // Fold pure read-only sections (string constants, const arrays, jump
   // tables) into the executable segment BEFORE the layout is built.
@@ -271,7 +295,7 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   }
 
   uint64_t Total = SegsSizes->total();
-  const char *Placement = FarPool_ == &Pool ? "far" : "near";
+  [[maybe_unused]] const char *Placement = FarPool_ == &Pool ? "far" : "near";
   EJIT_DIAG_DEBUG(
       "allocate: graph=%s pool=%s total=%llu layoutAlign=%zu compact=%u",
       G.getName().c_str(), Placement, static_cast<unsigned long long>(Total),

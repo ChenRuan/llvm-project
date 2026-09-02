@@ -144,6 +144,8 @@ typedef struct ejit_code_pool_stats_t {
 typedef struct ejit_code_pool_stats_v2_t {
   ejit_code_pool_stats_t total;
   ejit_code_pool_stats_t near;
+  /// Entry 0..15 is cell[0..15]; entry 16 is the legal no-cell public pool.
+  ejit_code_pool_stats_t nearHot[17];
   ejit_code_pool_stats_t far;
 } ejit_code_pool_stats_v2_t;
 

@@ -10,6 +10,7 @@
 #define LLVM_EXECUTIONENGINE_EJIT_EJITORCENGINE_H
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
@@ -17,6 +18,7 @@
 #endif
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/Support/Error.h"
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -34,6 +36,7 @@ namespace ejit {
 struct EJitTieredCodePoolStats {
   EJitCodePoolManager::Stats total;
   EJitCodePoolManager::Stats near;
+  std::array<EJitCodePoolManager::Stats, kEJitNearHotPoolCount> nearHot;
   EJitCodePoolManager::Stats far;
 };
 #endif
@@ -98,6 +101,10 @@ struct SpecializationContext {
   struct DimInfo {
     std::string periodName;
     uint8_t cellIdx;
+    /// The lifecycle slot read from registration metadata. The invalid
+    /// sentinel is retained so fixed near-hot routing can reject malformed
+    /// metadata instead of silently placing it in the public pool.
+    uint32_t dimType = 0xFFFFFFFFu;
   };
   SmallVector<DimInfo, 4> dimensions;
   uint32_t boundArgIndex = 0;
@@ -143,7 +150,8 @@ public:
   /// by cacheKey. Each specialization gets its own JITDylib so symbols
   /// from the same TU bitcode can be defined multiple times without conflict.
   Error loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
-                          const std::string &origFnName);
+                          const std::string &origFnName,
+                          uint32_t poolId = kEJitNearHotPublicPoolId);
 
   /// Look up a compiled function symbol in the specialization JITDylib
   /// identified by cacheKey.
@@ -197,8 +205,9 @@ public:
   /// preparation). Returns false if \p FnPtr is not pool-backed code with a
   /// recorded finalized range. Available only with EJIT_SRE_CODE_POOL.
   bool findCodeRange(const void *FnPtr, EJitCompiledCodeInfo &Out) const;
+  bool findPendingCodeRange(const void *FnPtr, EJitCompiledCodeInfo &Out) const;
   bool isCodeReady(const void *FnPtr) const;
-  Error flushPendingCode();
+  Error flushPendingCode(uint32_t poolId = 0xFFFFFFFFu);
 #endif
 
 private:

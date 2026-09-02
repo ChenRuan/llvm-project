@@ -2696,9 +2696,17 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
     D.sealInvocations.storeRelaxed(0);
     D.splitInvocations.storeRelaxed(0);
     D.finalizedRangeCount.storeRelaxed(0);
+    D.baseAddress.storeRelaxed(0);
+    D.endAddress.storeRelaxed(0);
+    D.pendingBytes.storeRelaxed(0);
+    D.pendingRangeCount.storeRelaxed(0);
+    D.fallbackCount.storeRelaxed(0);
+    D.full.storeRelaxed(0);
   };
   ClearPoolDetail(st->codePoolStats.near);
   ClearPoolDetail(st->codePoolStats.far);
+  for (uint32_t I = 0; I < kEJitNearHotPoolCount; ++I)
+    ClearPoolDetail(st->codePoolStats.nearHot[I]);
   // Per-core, per-pool 4K split readiness (ABI v5). MUST be cleared on every
   // (re)initialization: a stale splitDone bit from an earlier generation would
   // otherwise make a peer skip split_2m_to_4k for a pool the new generation
@@ -2818,9 +2826,16 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       uint32_t self = EJitCoreId::current();
       uint32_t nextGen = state_->generation.loadRelaxed() + 1;
       // Owner-private batch state must never cross a generation boundary.
+#ifndef EJIT_CODE_POOL_FIXED_NEAR_HOT
       pendingBatchCompiles_.clear();
+#endif
       pendingPublishes_.clear();
       autoTier2PublishPending_ = false;
+      autoTier2PublishBlocked_ = false;
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+      nearHotFirstLinkedDiagnosed_ = false;
+      nearHotFirstFlushDiagnosed_ = false;
+#endif
       initSharedStorage(state_, static_cast<uint32_t>(configuredMode_),
                         pgoEnabled_.loadRelaxed(),
                         tier2Threshold_.loadRelaxed(),
@@ -2872,6 +2887,9 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       // Start the ONE worker (if a starter was injected). A failure here is a
       // clean init failure: record it, publish Failed, and DO NOT pretend JIT
       // is up.
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+      diagnoseCodeBatchCallbacks("pre-worker", workerCtx_);
+#endif
       bool workerOk = true;
       if (workerStart_) {
         uint64_t taskId = 0;
@@ -2974,12 +2992,34 @@ void EJitSharedTaskPool::ownerShutdown() {
   // A failed enable_ex may leave linked, non-executable objects queued after
   // the worker's final flush attempt. Drop their owner-private metadata before
   // destroying the engine; shared Pending slots were already drained above.
-  for (PendingPublish &P : pendingPublishes_)
+  if (!pendingPublishes_.empty())
+    EJIT_DIAG("near-hot flush reason=shutdown dropped=%zu",
+              pendingPublishes_.size());
+  for (PendingPublish &P : pendingPublishes_) {
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+    // A shutdown drops linked-but-unpublished near code.  The pending cache
+    // slot carries no function pointer in this mode, but clear it defensively
+    // and release the in-flight claims/profile admission before the generation
+    // changes below.
+    cacheDropPending(P.req, nullptr);
+    dedupClear(P.req.funcIndex, P.req.generation);
+    const uint32_t Tier = decodeReqTier(P.req.funcIndex);
+    if (P.req.generation == state_->generation.loadAcquire() &&
+        (Tier == kEJitTierInstrumented || Tier == kEJitTierPgoUse))
+      finishPgoFunction(stripReqTier(P.req.funcIndex), /*completed=*/false,
+                        "owner-shutdown");
+    if (publishFn_)
+      publishFn_(publishCtx_, P.req, false);
+#endif
     if (releaseFn_)
       releaseFn_(releaseCtx_, P.fn);
+  }
+#ifndef EJIT_CODE_POOL_FIXED_NEAR_HOT
   pendingBatchCompiles_.clear();
+#endif
   pendingPublishes_.clear();
   autoTier2PublishPending_ = false;
+  autoTier2PublishBlocked_ = false;
   // Release what the election built, between the join and Uninitialized: no
   // compile can be in flight, and no peer can be elected yet. Without this the
   // former owner keeps its engine while a new owner builds another, so the
@@ -3459,11 +3499,20 @@ void EJitSharedTaskPool::publishCodePoolStats() {
     Dst.sealInvocations.storeRelaxed(Src.sealInvocations);
     Dst.splitInvocations.storeRelaxed(Src.splitInvocations);
     Dst.finalizedRangeCount.storeRelaxed(Src.finalizedRangeCount);
+    Dst.baseAddress.storeRelaxed(Src.baseAddress);
+    Dst.endAddress.storeRelaxed(Src.endAddress);
+    Dst.pendingBytes.storeRelaxed(Src.pendingBytes);
+    Dst.pendingRangeCount.storeRelaxed(Src.pendingRangeCount);
+    Dst.fallbackCount.storeRelaxed(Src.fallbackCount);
+    Dst.full.storeRelaxed(Src.full);
   };
   PublishDetail(state_->codePoolStats.near, s.near);
+  for (uint32_t I = 0; I < kEJitNearHotPoolCount; ++I)
+    PublishDetail(state_->codePoolStats.nearHot[I], s.nearHot[I]);
   PublishDetail(state_->codePoolStats.far, s.far);
 }
 
+#ifndef EJIT_CODE_POOL_FIXED_NEAR_HOT
 void EJitSharedTaskPool::compilePendingBatchRequests() {
   if (pendingBatchCompiles_.empty())
     return;
@@ -3522,8 +3571,253 @@ void EJitSharedTaskPool::compilePendingBatchRequests() {
     workerThrottle();
   }
 }
+#endif
 
-bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests) {
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+bool EJitSharedTaskPool::codeBatchFlushPoolCallbacksIntact() const {
+  return codeBatchFlushPoolFn_ == codeBatchFlushPoolExpectedFn_ &&
+         codeBatchFlushPoolCtx_ == codeBatchFlushPoolExpectedCtx_ &&
+         codeBatchFlushPoolCanary_ ==
+             makeCodeBatchFlushCanary(codeBatchFlushPoolFn_,
+                                      codeBatchFlushPoolCtx_) &&
+         codeBatchFlushPoolLayoutTag_ ==
+             makeCodeBatchFlushLayoutTag(this);
+}
+#endif
+
+void EJitSharedTaskPool::diagnoseCodeBatchCallbacks(const char *Reason,
+                                                    const void *OwnerCtx) const {
+#if defined(EJIT_CODE_POOL_FIXED_NEAR_HOT) && defined(EJIT_DIAG_ENABLE)
+  const bool CallbacksIntact = codeBatchFlushPoolCallbacksIntact();
+  const bool CallbackValid =
+      CallbacksIntact && codeBatchFlushPoolFn_ && codeBatchFlushPoolCtx_;
+  const uint64_t LayoutTag = makeCodeBatchFlushLayoutTag(this);
+  const bool LayoutMatches = codeBatchFlushPoolLayoutTag_ == LayoutTag;
+  const char *Validation = "matched-target-unverified";
+  if (!codeBatchFlushPoolFn_)
+    Validation = "callback-target-null";
+  else if (!codeBatchFlushPoolCtx_)
+    Validation = "callback-context-null";
+  else if (!LayoutMatches)
+    Validation = "layout-mismatch";
+  else if (!CallbacksIntact)
+    Validation = "callback-mismatch";
+  const unsigned FeatureMask = codeBatchFlushPoolFeatureMask();
+  const uintptr_t Base = reinterpret_cast<uintptr_t>(this);
+  const size_t PoolFlushFnOffset =
+      reinterpret_cast<uintptr_t>(&codeBatchFlushPoolFn_) - Base;
+  const size_t PoolFlushCtxOffset =
+      reinterpret_cast<uintptr_t>(&codeBatchFlushPoolCtx_) - Base;
+  const size_t SplitFnOffset =
+      reinterpret_cast<uintptr_t>(&splitPoolFn_) - Base;
+  const size_t SplitCtxOffset =
+      reinterpret_cast<uintptr_t>(&splitPoolCtx_) - Base;
+  const size_t ExpectedFnOffset =
+      reinterpret_cast<uintptr_t>(&codeBatchFlushPoolExpectedFn_) - Base;
+  const size_t ExpectedCtxOffset =
+      reinterpret_cast<uintptr_t>(&codeBatchFlushPoolExpectedCtx_) - Base;
+  const size_t CanaryOffset =
+      reinterpret_cast<uintptr_t>(&codeBatchFlushPoolCanary_) - Base;
+  constexpr unsigned Has4KSeal =
+#ifdef EJIT_CODE_POOL_4K_SEAL
+      1u;
+#else
+      0u;
+#endif
+  constexpr unsigned HasBatchPublish =
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
+      1u;
+#else
+      0u;
+#endif
+  constexpr unsigned HasFixedPool =
+#ifdef EJIT_FIXED_CODE_POOL
+      1u;
+#else
+      0u;
+#endif
+  // SRE diagnostic transports commonly cap one formatted record at 512 bytes.
+  // Keep each record deliberately short: an oversized callback diagnostic is
+  // least useful precisely when this path is diagnosing a target-side fault.
+  EJIT_DIAG("near-hot cb stage=%s self=%p owner=%p fn=%p ctx=%p",
+      Reason ? Reason : "unspecified",
+      static_cast<const void *>(this), OwnerCtx,
+      reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(
+          codeBatchFlushPoolFn_)),
+      codeBatchFlushPoolCtx_);
+  EJIT_DIAG("near-hot cb guard stage=%s expectedFn=%p expectedCtx=%p "
+            "intact=%u valid=%u layout=%u status=%s",
+      Reason ? Reason : "unspecified",
+      reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(
+          codeBatchFlushPoolExpectedFn_)),
+      codeBatchFlushPoolExpectedCtx_,
+      CallbacksIntact ? 1u : 0u, CallbackValid ? 1u : 0u,
+      LayoutMatches ? 1u : 0u, Validation);
+  EJIT_DIAG("near-hot cb abi size=%zu fnOff=%zu ctxOff=%zu expFnOff=%zu "
+            "expCtxOff=%zu canaryOff=%zu",
+      sizeof(EJitSharedTaskPool), PoolFlushFnOffset, PoolFlushCtxOffset,
+      ExpectedFnOffset, ExpectedCtxOffset, CanaryOffset);
+  EJIT_DIAG("near-hot cb tags canary=0x%llx saved=0x%llx now=0x%llx "
+            "features=0x%x splitOff=%zu/%zu flags=%u/%u/%u",
+      static_cast<unsigned long long>(codeBatchFlushPoolCanary_),
+      static_cast<unsigned long long>(codeBatchFlushPoolLayoutTag_),
+      static_cast<unsigned long long>(LayoutTag),
+      FeatureMask, SplitFnOffset, SplitCtxOffset, Has4KSeal,
+      HasBatchPublish, HasFixedPool);
+#else
+  (void)Reason;
+  (void)OwnerCtx;
+#endif
+}
+
+bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests,
+                                               const char *Reason) {
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  (void)compileBatchRequests;
+  // The fixed near-hot layout is a per-pool commit protocol. Falling back to
+  // the legacy all-pools callback here would make a failed pool seal unrelated
+  // pools and would invalidate the partial-commit guarantee.
+  // The owner callback currently dereferences its context to reach the private
+  // ORC engine. Fail closed if either half of the pair is missing: a malformed
+  // registration must leave the request pending/AOT, never make a null-context
+  // indirect call from the worker.
+  if (!nearHotFirstFlushDiagnosed_) {
+    nearHotFirstFlushDiagnosed_ = true;
+    // The callback context is intentionally not trusted as a driver address.
+    // The explicit owner-side diagnostics above are the authoritative driver
+    // identity; this line is about the pre-call callback state only.
+    diagnoseCodeBatchCallbacks("first-pre-flush", nullptr);
+  }
+  const auto FlushFn = codeBatchFlushPoolFn_;
+  void *const FlushCtx = codeBatchFlushPoolCtx_;
+  const bool CallbacksIntact = codeBatchFlushPoolCallbacksIntact();
+  const bool LayoutMatches =
+      codeBatchFlushPoolLayoutTag_ == makeCodeBatchFlushLayoutTag(this);
+  const char *Validation = "matched-target-unverified";
+  if (!FlushFn)
+    Validation = "callback-target-null";
+  else if (!FlushCtx)
+    Validation = "callback-context-null";
+  else if (!LayoutMatches)
+    Validation = "layout-mismatch";
+  else if (!CallbacksIntact)
+    Validation = "callback-mismatch";
+  if (!CallbacksIntact || !FlushFn || !FlushCtx) {
+    if (!pendingPublishes_.empty())
+      EJIT_DIAG("near-hot pool flush skipped reason=pre-flush "
+                "sharedPoolThis=%p flushCtx=%p expectedOwnerCtx=%p "
+                "fn=%p ctx=%p expectedFn=%p expectedCtx=%p canary=0x%llx "
+                "layoutTag=0x%llx intact=%u validation=%s pending=%zu",
+                static_cast<const void *>(this), FlushCtx,
+                codeBatchFlushPoolExpectedCtx_,
+                reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(
+                    FlushFn)),
+                FlushCtx,
+                reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(
+                    codeBatchFlushPoolExpectedFn_)),
+                codeBatchFlushPoolExpectedCtx_,
+                static_cast<unsigned long long>(codeBatchFlushPoolCanary_),
+                static_cast<unsigned long long>(
+                    codeBatchFlushPoolLayoutTag_),
+                CallbacksIntact ? 1u : 0u, Validation,
+                pendingPublishes_.size());
+    // Do not let an unavailable callback turn an idle worker into an implicit
+    // retry loop. An explicit flush request clears this gate before retrying.
+    autoTier2PublishBlocked_ = !pendingPublishes_.empty();
+    return pendingPublishes_.empty();
+  }
+
+  [[maybe_unused]] size_t Published = 0;
+  size_t Dropped = 0;
+  std::vector<PendingPublish> Retry;
+  // There are exactly 17 semantic near-hot pools. Do not use std::find on a
+  // vector<uint32_t> here: libc++ may lower that specialization to wmemchr,
+  // which is not a safe executable dependency in the freestanding SRE image.
+  uint32_t FlushedPoolBitmap = 0;
+  size_t FlushedPoolCount = 0;
+  [[maybe_unused]] uint32_t FailedPoolBitmap = 0;
+  for (const PendingPublish &P : pendingPublishes_) {
+    bool Flushed = false;
+    if (P.poolId >= kEJitNearHotPoolCount) {
+      EJIT_DIAG("near-hot flush skip invalid pool=%u", P.poolId);
+    } else {
+      const uint32_t PoolBit = uint32_t{1} << P.poolId;
+      if ((FlushedPoolBitmap & PoolBit) != 0)
+        continue;
+      FlushedPoolBitmap |= PoolBit;
+      ++FlushedPoolCount;
+      EJIT_DIAG("near-hot flush enter pool=%u fn=%p ctx=%p pending=%zu",
+                P.poolId,
+                reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(FlushFn)),
+                FlushCtx, pendingPublishes_.size());
+      Flushed = FlushFn(FlushCtx, P.poolId);
+      if (!Flushed)
+        FailedPoolBitmap |= PoolBit;
+      EJIT_DIAG("near-hot flush return pool=%u ok=%u", P.poolId,
+                static_cast<unsigned>(Flushed));
+    }
+    for (const PendingPublish &Member : pendingPublishes_) {
+      if (Member.poolId != P.poolId)
+        continue;
+      const uint32_t Tier = decodeReqTier(Member.req.funcIndex);
+      const uint32_t FuncIndex = stripReqTier(Member.req.funcIndex);
+      EJitPublishStatus PS = EJitPublishStatus::Failed;
+      EJitCompiledCodeInfo Info{};
+      const bool Ready =
+          Flushed && codeReadyFn_ && codeReadyFn_(codeBatchCtx_, Member.fn);
+      const bool HasRange = Ready && codeRangeFn_ &&
+                            codeRangeFn_(codeRangeCtx_, Member.fn, &Info);
+      if (HasRange)
+        PS =
+            cachePublish(Member.req, Member.fn, &Info, Tier == kEJitTierPgoUse);
+      if (PS == EJitPublishStatus::Published) {
+        ++Published;
+        EJIT_STAT_INC(state_->counters.asyncCompiles);
+        if (publishFn_)
+          publishFn_(publishCtx_, Member.req, true);
+        if (Tier == kEJitTierPgoUse) {
+          EJIT_STAT_INC(state_->counters.tier2Compiles);
+          finishPgoFunction(FuncIndex, /*completed=*/true);
+        }
+        dedupClear(Member.req.funcIndex, Member.req.generation);
+        continue;
+      }
+      if (Tier == kEJitTierPgoUse && Flushed &&
+          PS == EJitPublishStatus::Failed) {
+        Retry.push_back(Member);
+        EJIT_STAT_INC(state_->counters.publishFailed);
+        continue;
+      }
+      ++Dropped;
+      // A fixed near-hot compile is never inserted with its fnPtr before the
+      // pool commit, so the pending cache slot (if any) still carries null.
+      // Passing Member.fn would leave that slot Pending forever.
+      cacheDropPending(Member.req, nullptr);
+      if (publishFn_)
+        publishFn_(publishCtx_, Member.req, false);
+      if (Member.req.generation == state_->generation.loadAcquire() &&
+          Tier == kEJitTierPgoUse)
+        finishPgoFunction(FuncIndex, /*completed=*/false);
+      if (releaseFn_)
+        releaseFn_(releaseCtx_, Member.fn);
+      EJIT_STAT_INC(state_->counters.publishFailed);
+      dedupClear(Member.req.funcIndex, Member.req.generation);
+    }
+  }
+  pendingPublishes_.swap(Retry);
+  autoTier2PublishPending_ = !pendingPublishes_.empty();
+  // Seal or cache publication failures are explicitly retryable, but must not
+  // turn an idle worker into a retry loop. flushCodeBatch() and the shared
+  // explicit request clear this gate before retrying.
+  autoTier2PublishBlocked_ = !pendingPublishes_.empty();
+  publishCodePoolStats();
+  EJIT_DIAG("near-hot flush reason=%s pools=%zu published=%zu dropped=%zu "
+            "retry=%zu failedPoolBitmap=0x%08x",
+            Reason ? Reason : "unspecified", FlushedPoolCount, Published,
+            Dropped, pendingPublishes_.size(), FailedPoolBitmap);
+  return Dropped == 0 && pendingPublishes_.empty();
+#else
+  (void)Reason;
   if (compileBatchRequests)
     compilePendingBatchRequests();
   if (!codeBatchFlushFn_)
@@ -3597,6 +3891,7 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests) {
                     "dropped=%zu retry=%zu",
                     Total, Published, Dropped, pendingPublishes_.size());
   return Dropped == 0 && pendingPublishes_.empty();
+#endif
 }
 
 bool EJitSharedTaskPool::serviceCodeBatchRequest() {
@@ -3609,9 +3904,10 @@ bool EJitSharedTaskPool::serviceCodeBatchRequest() {
           Expected, static_cast<uint32_t>(EJitCodeBatchRequestState::Running)))
     return false;
   // Include every request that was already queued when this explicit publish
-  // began, but do not chase producers indefinitely. pollOne() drains compact
-  // requests into owner-private storage, where the subsequent flush sorts them
-  // by dimensions before ORC/JITLink allocation.
+  // began, but do not chase producers indefinitely. In fixed near-hot mode
+  // pollOne() links each request directly into its semantic pool; the flush
+  // only commits already-linked pool ranges. The legacy path retains its
+  // owner-private dimension-sorted batch.
   uint32_t Queued =
       state_->enqueuePos.loadAcquire() - state_->dequeuePos.loadAcquire();
   Queued = std::min(Queued, kEJitSharedQueueSlots);
@@ -3621,7 +3917,9 @@ bool EJitSharedTaskPool::serviceCodeBatchRequest() {
     workerThrottle();
   }
   autoTier2PublishPending_ = false;
-  const bool Ok = flushPendingPublishes();
+  autoTier2PublishBlocked_ = false;
+  const bool Ok = flushPendingPublishes(/*compileBatchRequests=*/true,
+                                        /*reason=*/"explicit");
   state_->codeBatchRequestState.storeRelease(
       static_cast<uint32_t>(Ok ? EJitCodeBatchRequestState::Succeeded
                                : EJitCodeBatchRequestState::Failed));
@@ -3635,18 +3933,30 @@ bool EJitSharedTaskPool::serviceAutoTier2Publish() {
 #ifndef EJIT_CODE_POOL_BATCHED_PUBLISH
   return false;
 #else
-  if (!autoTier2PublishPending_ || !state_)
+  if (!autoTier2PublishPending_ || autoTier2PublishBlocked_ || !state_)
     return false;
   // pollOne() has just observed the queue empty. Re-check both positions so a
   // Tier-1 request that raced that observation is compiled from the far pool
   // before the near-pool Tier-2 batch is sealed and published.
-  if (state_->enqueuePos.loadAcquire() != state_->dequeuePos.loadAcquire())
+  if (state_->enqueuePos.loadAcquire() != state_->dequeuePos.loadAcquire()) {
+    autoTier2IdleTicks_ = 0;
     return false;
+  }
+
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  // One empty observation can race a producer that is about to enqueue the
+  // next specialization. Require two worker idle observations before sealing
+  // any pool; explicit publish remains an immediate override.
+  if (++autoTier2IdleTicks_ < 2u)
+    return false;
+#endif
 
   autoTier2PublishPending_ = false;
+  autoTier2IdleTicks_ = 0;
   EJIT_DIAG("PGO Tier-2 queue drained: auto-publishing %zu linked version(s)",
             pendingPublishes_.size());
-  if (!flushPendingPublishes(/*compileBatchRequests=*/false))
+  if (!flushPendingPublishes(/*compileBatchRequests=*/false,
+                             /*reason=*/"idle"))
     EJIT_DIAG("PGO Tier-2 auto-publish failed: pending=%zu; explicit publish "
               "may retry",
               pendingPublishes_.size());
@@ -3735,8 +4045,16 @@ bool EJitSharedTaskPool::readCodePoolStats(EJitCodePoolStatsOut *out) const {
     Dst.sealInvocations = Src.sealInvocations.loadRelaxed();
     Dst.splitInvocations = Src.splitInvocations.loadRelaxed();
     Dst.finalizedRangeCount = Src.finalizedRangeCount.loadRelaxed();
+    Dst.baseAddress = Src.baseAddress.loadRelaxed();
+    Dst.endAddress = Src.endAddress.loadRelaxed();
+    Dst.pendingBytes = Src.pendingBytes.loadRelaxed();
+    Dst.pendingRangeCount = Src.pendingRangeCount.loadRelaxed();
+    Dst.fallbackCount = Src.fallbackCount.loadRelaxed();
+    Dst.full = Src.full.loadRelaxed();
   };
   ReadDetail(state_->codePoolStats.near, out->near);
+  for (uint32_t I = 0; I < kEJitNearHotPoolCount; ++I)
+    ReadDetail(state_->codePoolStats.nearHot[I], out->nearHot[I]);
   ReadDetail(state_->codePoolStats.far, out->far);
   return true;
 }
@@ -3833,6 +4151,65 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
         req.funcIndex);
     return;
   }
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  if (tier == kEJitTierPgoUse && !nearHotFirstLinkedDiagnosed_) {
+    nearHotFirstLinkedDiagnosed_ = true;
+    diagnoseCodeBatchCallbacks("first-t2-linked", compileCtx_);
+  }
+#endif
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  // Near code must remain owner-private until its pool is sealed.  Without a
+  // per-pool flush callback there is no safe way to make it executable or
+  // publish it, so fail closed instead of leaving a permanent pending item.
+  auto dropUnpublishedNearResult = [&](const char *Reason) {
+    cacheDropPending(req, nullptr);
+    if (publishFn_)
+      publishFn_(publishCtx_, req, false);
+    dedupClear(req.funcIndex, req.generation);
+    finishPgoOnFailure();
+    if (releaseFn_)
+      releaseFn_(releaseCtx_, fn);
+    EJIT_STAT_INC(state_->counters.publishFailed);
+    EJIT_DIAG("near-hot result dropped func=%u reason=%s", realFuncIndex,
+              Reason);
+  };
+  if (tier != kEJitTierInstrumented &&
+      (!codeReadyFn_ || !codeRangeFn_ || !codeBatchFlushPoolFn_)) {
+    dropUnpublishedNearResult("missing-near-publish-callback");
+    return;
+  }
+  if (!codeReadyFn_(codeBatchCtx_, fn)) {
+    if (tier == kEJitTierInstrumented) {
+      dropUnpublishedNearResult("tier1-not-ready");
+      return;
+    }
+    if (info.codeSize == 0 || info.poolId >= kEJitNearHotPoolCount) {
+      dropUnpublishedNearResult("missing-pool-range");
+      return;
+    }
+    if (pendingPublishes_.size() >=
+        static_cast<size_t>(EJIT_CODE_POOL_FIXED_NEAR_HOT_PENDING_LIMIT)) {
+      EJIT_DIAG(
+          "near-hot pending capacity reached limit=%u; flushing",
+          static_cast<unsigned>(EJIT_CODE_POOL_FIXED_NEAR_HOT_PENDING_LIMIT));
+      autoTier2PublishPending_ = true;
+      (void)flushPendingPublishes(/*compileBatchRequests=*/false,
+                                  /*reason=*/"capacity");
+      if (pendingPublishes_.size() >=
+          static_cast<size_t>(EJIT_CODE_POOL_FIXED_NEAR_HOT_PENDING_LIMIT)) {
+        dropUnpublishedNearResult("pending-capacity");
+        return;
+      }
+    }
+    const uint32_t PoolId = info.poolId;
+    pendingPublishes_.push_back({req, fn, PoolId});
+    autoTier2PublishPending_ = true;
+    publishCodePoolStats();
+    EJIT_DIAG_DEBUG("near-hot linked pending func=%u pool=%u pending=%zu",
+                    realFuncIndex, PoolId, pendingPublishes_.size());
+    return;
+  }
+#else
   if (codeReadyFn_ && !codeReadyFn_(codeBatchCtx_, fn)) {
     if (tier == kEJitTierPgoUse) {
       // Tier-2 has completed compilation/JITLink into the near RW/NX pool, but
@@ -3881,6 +4258,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
         req.funcIndex, pendingPublishes_.size());
     return;
   }
+#endif
   if (info.codeSize == 0 && codeRangeFn_)
     (void)codeRangeFn_(codeRangeCtx_, fn, &info);
   EJitPublishStatus PS = cachePublish(req, fn, &info, pgoClearExclusive);
@@ -3935,14 +4313,19 @@ bool EJitSharedTaskPool::pollOne() {
   if (!state_)
     return false;
 
-  // All tiers arrive on the same shared MPSC queue. Baseline requests defer
-  // compilation so explicit publication can sort their JITLink allocations.
-  // Tier-1 compiles immediately into the far pool and starts sampling. Tier-2
-  // also compiles immediately, but runCompile retains its near-pool result
-  // owner-private until queue-drain publication replaces the live Tier-1 slot.
+  // All tiers arrive on the same shared MPSC queue. In fixed near-hot mode
+  // baseline and Tier-2 compile/link immediately into their selected near
+  // pool, while publication waits for the queue-drain commit. The legacy path
+  // may retain baseline requests for dimension-sorted batch allocation. Tier-1
+  // always compiles into the far pool and starts sampling immediately.
   EJitCompileRequest Req{};
   if (!queuePop(Req))
     return false;
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  autoTier2IdleTicks_ = 0;
+  runCompile(Req);
+  return true;
+#else
   if (codeReadyFn_ && codeBatchFlushFn_ &&
       decodeReqTier(Req.funcIndex) == kEJitTierBaseline) {
     if (pendingBatchCompiles_.size() >= kEJitSharedQueueSlots) {
@@ -3965,6 +4348,7 @@ bool EJitSharedTaskPool::pollOne() {
   }
   runCompile(Req);
   return true;
+#endif
 }
 
 bool EJitSharedTaskPool::serviceMayConstRankingRequest() {

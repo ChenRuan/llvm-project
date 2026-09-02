@@ -28,6 +28,7 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -165,7 +166,12 @@ struct EJitOrcEngine::Impl {
   /// Tier-1 code uses the previous dynamic SRE allocation path. Both outlive
   /// LLJIT and its routing memory manager.
   std::unique_ptr<EJitCodePoolManager> nearCodePool;
+  std::array<std::unique_ptr<EJitCodePoolManager>, kEJitNearHotPoolCount>
+      nearHotCodePools;
   std::unique_ptr<EJitCodePoolManager> farCodePool;
+  /// Controlled allocation metadata. The key is the exact name of a
+  /// JITDylib created by loadBitcodeModule; the MemoryManager never parses it.
+  std::map<std::string, EJitCodePoolManager *> specPoolByDylib;
 #endif
   std::unique_ptr<orc::LLJIT> J;
   PeriodArrayRegistry *periodReg = nullptr;
@@ -760,11 +766,46 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // engine (so it outlives the LLJIT); the object linking layer owns a memory
   // manager that references it. Pages are kept RW here and sealed to RX later,
   // at lookup time, by the pool manager's enable_ex sealing.
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  for (uint32_t I = 0; I < kEJitNearHotPoolCount; ++I) {
+    engine->P->nearHotCodePools[I] = makeSreNearHotCodePoolManager(I);
+    if (!engine->P->nearHotCodePools[I]) {
+      return make_error<StringError>(
+          "EJitOrcEngine: fixed near-hot pool layout unavailable",
+          inconvertibleErrorCode());
+    }
+  }
+#else
   engine->P->nearCodePool =
       makeSreCodePoolManager(EJitCodePoolPlacement::NearFixed);
+#endif
   engine->P->farCodePool =
-      makeSreCodePoolManager(EJitCodePoolPlacement::FarDynamic);
+      makeSreCodePoolManager(EJitCodePoolPlacement::FarDynamic, kEJitFarPoolId);
   {
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+    std::vector<EJitCodePoolManager *> NearPools;
+    NearPools.reserve(kEJitNearHotPoolCount);
+    for (auto &Pool : engine->P->nearHotCodePools)
+      NearPools.push_back(Pool.get());
+    auto *FarPool = engine->P->farCodePool.get();
+    auto Selector =
+        [State = engine->P.get()](
+            const jitlink::JITLinkDylib *JD) -> EJitCodePoolManager * {
+      if (!JD)
+        return nullptr;
+      auto It = State->specPoolByDylib.find(JD->getName());
+      return It == State->specPoolByDylib.end() ? nullptr : It->second;
+    };
+    Builder.setObjectLinkingLayerCreator(
+        [NearPools = std::move(NearPools), FarPool,
+         Selector](orc::ExecutionSession &ES)
+            -> Expected<std::unique_ptr<orc::ObjectLayer>> {
+          constexpr size_t JitPageSize = 4096;
+          return std::make_unique<orc::ObjectLinkingLayer>(
+              ES, std::make_unique<EJitCodePoolMemoryManager>(
+                      NearPools, *FarPool, JitPageSize, Selector));
+        });
+#else
     EJitCodePoolManager *NearPool = engine->P->nearCodePool.get();
     EJitCodePoolManager *FarPool = engine->P->farCodePool.get();
     Builder.setObjectLinkingLayerCreator(
@@ -778,6 +819,7 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
               ES, std::make_unique<EJitCodePoolMemoryManager>(
                       *NearPool, *FarPool, JitPageSize));
         });
+#endif
   }
 #endif
 
@@ -998,7 +1040,8 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
 }
 
 Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
-                                       const std::string &origFnName) {
+                                       const std::string &origFnName,
+                                       uint32_t poolId) {
   EJIT_DIAG_VERBOSE("loadBitcode key=0x%016lx func=%s size=%zu", cacheKey,
                     origFnName.c_str(), bitcodeData.size());
   auto Ctx = std::make_unique<LLVMContext>();
@@ -1093,6 +1136,9 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
   // would be needed for reclaimable memory managers (§5 JD lifecycle).
   auto it = P->specDylibs.find(cacheKey);
   if (it != P->specDylibs.end()) {
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+    P->specPoolByDylib.erase(it->second->getName());
+#endif
     if (auto Err = P->J->getExecutionSession().removeJITDylib(*it->second))
       EJIT_DIAG("loadBitcode key=0x%016lx: remove stale JD FAILED: %s",
                 cacheKey, toString(std::move(Err)).c_str());
@@ -1104,12 +1150,30 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
           ? "t1"
           : P->activeCtx && P->activeCtx->tier == CompileTier::PGOUse ? "t2"
                                                                       : "base";
-  auto JDOrErr = P->J->createJITDylib("spec_" + std::string(TierTag) + "_" +
-                                      std::to_string(cacheKey));
+  std::string JDName =
+      "spec_" + std::string(TierTag) + "_" + std::to_string(cacheKey);
+  auto JDOrErr = P->J->createJITDylib(JDName);
   if (!JDOrErr) {
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: create JITDylib error", cacheKey);
     return JDOrErr.takeError();
   }
+
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  EJitCodePoolManager *SelectedPool = nullptr;
+  if (P->activeCtx && P->activeCtx->tier == CompileTier::Instrumented) {
+    if (P->farCodePool && poolId == kEJitFarPoolId)
+      SelectedPool = P->farCodePool.get();
+  } else if (poolId < kEJitNearHotPoolCount) {
+    SelectedPool = P->nearHotCodePools[poolId].get();
+  }
+  if (!SelectedPool) {
+    (void)P->J->getExecutionSession().removeJITDylib(*JDOrErr);
+    return make_error<StringError>(
+        "EJitOrcEngine: invalid or unavailable allocation pool",
+        inconvertibleErrorCode());
+  }
+  P->specPoolByDylib.emplace(JDName, SelectedPool);
+#endif
 
   // Resolve undefined function symbols from user-registered table.
   // Required for bare-metal where dynamic lookup (dlsym) is unavailable.
@@ -1197,6 +1261,12 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
           *JDOrErr,
           orc::ThreadSafeModule(std::move(*ModuleOrErr), std::move(Ctx)))) {
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: add IR module error", cacheKey);
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+    P->specPoolByDylib.erase(JDName);
+#endif
+    if (auto RemoveErr = P->J->getExecutionSession().removeJITDylib(*JDOrErr))
+      EJIT_DIAG("loadBitcode key=0x%016lx: remove failed JD FAILED: %s",
+                cacheKey, toString(std::move(RemoveErr)).c_str());
     return Err;
   }
 
@@ -1306,8 +1376,34 @@ EJitCodePoolManager::Stats EJitOrcEngine::getCodePoolStats() const {
 
 EJitTieredCodePoolStats EJitOrcEngine::getTieredCodePoolStats() const {
   EJitTieredCodePoolStats Out;
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  for (size_t I = 0; I < P->nearHotCodePools.size(); ++I) {
+    Out.nearHot[I] = P->nearHotCodePools[I]->getStats();
+    Out.near.poolCount += Out.nearHot[I].poolCount;
+    Out.near.sealedCount += Out.nearHot[I].sealedCount;
+    Out.near.activeCount += Out.nearHot[I].activeCount;
+    Out.near.usedBytes += Out.nearHot[I].usedBytes;
+    Out.near.reservedBytes += Out.nearHot[I].reservedBytes;
+    Out.near.wastedBytes += Out.nearHot[I].wastedBytes;
+    Out.near.sealInvocations += Out.nearHot[I].sealInvocations;
+    Out.near.splitInvocations += Out.nearHot[I].splitInvocations;
+    Out.near.rwEnableInvocations += Out.nearHot[I].rwEnableInvocations;
+    Out.near.finalizedRangeCount += Out.nearHot[I].finalizedRangeCount;
+    Out.near.pendingBytes += Out.nearHot[I].pendingBytes;
+    Out.near.pendingRangeCount += Out.nearHot[I].pendingRangeCount;
+    Out.near.fallbackCount += Out.nearHot[I].fallbackCount;
+    Out.near.full = Out.near.full || Out.nearHot[I].full;
+    if (Out.nearHot[I].baseAddress != 0 &&
+        (Out.near.baseAddress == 0 ||
+         Out.nearHot[I].baseAddress < Out.near.baseAddress))
+      Out.near.baseAddress = Out.nearHot[I].baseAddress;
+    if (Out.nearHot[I].endAddress > Out.near.endAddress)
+      Out.near.endAddress = Out.nearHot[I].endAddress;
+  }
+#else
   if (P->nearCodePool)
     Out.near = P->nearCodePool->getStats();
+#endif
   if (P->farCodePool)
     Out.far = P->farCodePool->getStats();
 #define EJIT_SUM_STAT(Field) Out.total.Field = Out.near.Field + Out.far.Field
@@ -1321,29 +1417,80 @@ EJitTieredCodePoolStats EJitOrcEngine::getTieredCodePoolStats() const {
   EJIT_SUM_STAT(splitInvocations);
   EJIT_SUM_STAT(rwEnableInvocations);
   EJIT_SUM_STAT(finalizedRangeCount);
+  Out.total.pendingBytes = Out.near.pendingBytes + Out.far.pendingBytes;
+  Out.total.pendingRangeCount =
+      Out.near.pendingRangeCount + Out.far.pendingRangeCount;
+  Out.total.fallbackCount = Out.near.fallbackCount + Out.far.fallbackCount;
+  Out.total.full = Out.near.full || Out.far.full;
+  Out.total.baseAddress =
+      Out.near.baseAddress != 0 ? Out.near.baseAddress : Out.far.baseAddress;
+  Out.total.endAddress = Out.far.endAddress > Out.near.endAddress
+                             ? Out.far.endAddress
+                             : Out.near.endAddress;
 #undef EJIT_SUM_STAT
   return Out;
 }
 
 bool EJitOrcEngine::findCodeRange(const void *FnPtr,
                                   EJitCompiledCodeInfo &Out) const {
-  if (!P->nearCodePool && !P->farCodePool) {
+  if (!P->nearCodePool && P->nearHotCodePools[0] == nullptr &&
+      !P->farCodePool) {
     EJIT_DIAG("findCodeRange FAIL: no code pool (fnPtr=%p)", FnPtr);
     return false;
   }
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  for (const auto &Pool : P->nearHotCodePools)
+    if (Pool && Pool->findRange(FnPtr, Out))
+      return true;
+#else
   if (P->nearCodePool && P->nearCodePool->findRange(FnPtr, Out))
     return true;
+#endif
   return P->farCodePool && P->farCodePool->findRange(FnPtr, Out);
 }
 
-bool EJitOrcEngine::isCodeReady(const void *FnPtr) const {
-  EJitCompiledCodeInfo Info{};
-  return findCodeRange(FnPtr, Info);
+bool EJitOrcEngine::findPendingCodeRange(const void *FnPtr,
+                                         EJitCompiledCodeInfo &Out) const {
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  for (const auto &Pool : P->nearHotCodePools)
+    if (Pool && Pool->findPendingRange(FnPtr, Out))
+      return true;
+#else
+  if (P->nearCodePool && P->nearCodePool->findPendingRange(FnPtr, Out))
+    return true;
+#endif
+  return P->farCodePool && P->farCodePool->findPendingRange(FnPtr, Out);
 }
 
-Error EJitOrcEngine::flushPendingCode() {
-  if (!P->nearCodePool)
-    return Error::success();
-  return P->nearCodePool->flushPendingRanges();
+bool EJitOrcEngine::isCodeReady(const void *FnPtr) const {
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  for (const auto &Pool : P->nearHotCodePools)
+    if (Pool && Pool->isRangeReady(FnPtr))
+      return true;
+#else
+  if (P->nearCodePool && P->nearCodePool->isRangeReady(FnPtr))
+    return true;
+#endif
+  return P->farCodePool && P->farCodePool->isRangeReady(FnPtr);
+}
+
+Error EJitOrcEngine::flushPendingCode(uint32_t poolId) {
+  Error Result = Error::success();
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  if (poolId != 0xFFFFFFFFu) {
+    if (poolId >= kEJitNearHotPoolCount || !P->nearHotCodePools[poolId])
+      return make_error<StringError>("EJitOrcEngine: invalid near-hot pool id",
+                                     inconvertibleErrorCode());
+    return P->nearHotCodePools[poolId]->flushPendingRanges();
+  }
+  for (auto &Pool : P->nearHotCodePools)
+    if (Pool)
+      Result = joinErrors(std::move(Result), Pool->flushPendingRanges());
+#else
+  (void)poolId;
+  if (P->nearCodePool)
+    Result = P->nearCodePool->flushPendingRanges();
+#endif
+  return Result;
 }
 #endif

@@ -215,6 +215,41 @@ if(EJIT_TEST_FIXED_WORKER_CORE)
     EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE=0)
 endif()
 
+# The production fixed near-hot path is compiled into LLVMEJIT with a private
+# macro, while this suite compiles EJitSharedTaskPool.cpp directly. Keep a
+# small, configuration-matched executable for the fixed-path state-machine
+# regression without changing the legacy shared-taskpool suite above.
+if(EJIT_CODE_POOL_FIXED_NEAR_HOT)
+  set(EJIT_FIXED_NEAR_HOT_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
+  set(LLVM_LINK_COMPONENTS Support)
+  add_llvm_unittest(EJITFixedNearHotTaskPoolTests
+    EJitFixedNearHotTaskPoolTest.cpp
+    ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitCodePool.cpp
+    ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
+    ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
+    ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
+
+    PARTIAL_SOURCES_INTENDED
+    )
+  set(LLVM_LINK_COMPONENTS "${EJIT_FIXED_NEAR_HOT_LINK_COMPONENTS_SAVED}")
+  target_compile_definitions(EJITFixedNearHotTaskPoolTests PRIVATE
+    EJIT_SRE_TASKPOOL
+    EJIT_SRE_SHARED_TASKPOOL
+    EJIT_SRE_TASKPOOL_TESTING
+    EJIT_STATS_ENABLE
+    EJIT_CODE_POOL_BATCHED_PUBLISH
+    EJIT_CODE_POOL_FIXED_NEAR_HOT
+    EJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS}
+    EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}
+    EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}
+    EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}
+    EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS}
+    EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}
+    EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=3
+    EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=100
+    )
+endif()
+
 # Convenience target: build + run only the cross-core shared taskpool tests.
 add_custom_target(check-ejit-shared-taskpool
   COMMAND $<TARGET_FILE:EJITSharedTaskPoolTests>

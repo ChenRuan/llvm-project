@@ -117,6 +117,11 @@ public:
   struct Options {
     /// Diagnostic placement class propagated with finalized code ranges.
     EJitCodePoolKind kind = EJitCodePoolKind::Unknown;
+    /// Stable semantic pool id propagated with finalized code ranges. For a
+    /// single-manager pool this is normally 0..16 for near-hot pools or
+    /// kEJitFarPoolId for the temporary Tier-1 pool. The manager adds its
+    /// local pool index to this base id when a manager owns multiple pools.
+    uint32_t poolId = 0;
     /// Usable bytes per pool (EJIT_SRE_CODE_POOL_SIZE). Default 2MiB. In 4K
     /// seal mode this is rounded up to a multiple of poolAlign.
     size_t poolSize = static_cast<size_t>(2) * 1024 * 1024;
@@ -171,6 +176,15 @@ public:
                                     ///< (per 4K page, code-segment mode only)
     size_t finalizedRangeCount = 0; ///< distinct executable ranges recorded
                                     ///< (duplicates are not double-counted)
+    /// Envelope of the manager's pool addresses. For a fixed near-hot manager
+    /// this is exactly one semantic pool; for a dynamic manager it is only a
+    /// diagnostic envelope and may contain gaps.
+    uint64_t baseAddress = 0;
+    uint64_t endAddress = 0;
+    size_t pendingBytes = 0; ///< linked but not yet RX bytes
+    size_t pendingRangeCount = 0;
+    size_t fallbackCount = 0; ///< allocation failures that forced fallback
+    bool full = false;        ///< fixed region exhausted
   };
 
   EJitCodePoolManager(Options Opts, RawAllocFn Alloc, SealFn Seal,
@@ -244,6 +258,8 @@ public:
 
   bool usesBatchedPageSeal() const { return Opts_.batchedPageSeal; }
   size_t codeAlignment() const { return Opts_.minCodeAlign; }
+  uint32_t poolId() const { return Opts_.poolId; }
+  EJitCodePoolKind poolKind() const { return Opts_.kind; }
 
   /// Stage a fully linked executable range without making it callable yet.
   /// All staged ranges are sealed and promoted atomically as one publication
@@ -301,6 +317,15 @@ public:
   /// take a clean fallback and never publish a shared pointer with no range.
   bool findRange(const void *Ptr, EJitCompiledCodeInfo &Out) const;
 
+  /// Resolve a linked but not yet sealed allocation. This is owner-private
+  /// metadata only; callers must not expose the returned pointer until
+  /// isRangeReady() is true.
+  bool findPendingRange(const void *Ptr, EJitCompiledCodeInfo &Out) const;
+
+  /// True only after a pending range has been promoted by
+  /// flushPendingRanges(). This remains false while the linked code is RW/NX.
+  bool isRangeReady(const void *Ptr) const;
+
   /// True if `Ptr` falls inside the usable range of any owned pool.
   bool contains(const void *Ptr) const;
 
@@ -325,6 +350,8 @@ private:
   size_t SealInvocations_ = 0;
   size_t SplitInvocations_ = 0;
   size_t RwEnableInvocations_ = 0;
+  size_t AllocationFailureCount_ = 0;
+  bool FixedRegionFull_ = false;
   /// Bump cursor (bytes consumed) over the fixed region [fixedBase, fixedBase +
   /// fixedSize) when Options::fixedSize > 0; unused in dynamic-allocation mode.
   size_t FixedUsed_ = 0;

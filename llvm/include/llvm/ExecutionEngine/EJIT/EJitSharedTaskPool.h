@@ -358,6 +358,9 @@ public:
   /// address resolvable through CodeRangeCallback.
   using CodeReadyCallback = bool (*)(void *ctx, const void *fnPtr);
   using CodeBatchFlushCallback = bool (*)(void *ctx);
+  /// Flush one semantic near-hot pool. A failed pool remains pending/retryable
+  /// without preventing other pools from committing their own code.
+  using CodeBatchFlushPoolCallback = bool (*)(void *ctx, uint32_t poolId);
   /// Per-core platform primitive: split a 2MiB-aligned [poolBase, poolBase +
   /// poolSize) window into 4KiB mappings in the CALLING core's translation
   /// context (split_2m_to_4k). Returns true on success. Used only in 4K
@@ -621,6 +624,35 @@ public:
     codeBatchFlushFn_ = flush;
     codeBatchCtx_ = ctx;
   }
+  void setCodeBatchPoolFlushCallback(CodeBatchFlushPoolCallback flush,
+                                     void *ctx) {
+    codeBatchFlushPoolFn_ = flush;
+    codeBatchFlushPoolCtx_ = ctx;
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+    codeBatchFlushPoolExpectedFn_ = flush;
+    codeBatchFlushPoolExpectedCtx_ = ctx;
+    codeBatchFlushPoolCanary_ = makeCodeBatchFlushCanary(flush, ctx);
+    codeBatchFlushPoolLayoutTag_ =
+        makeCodeBatchFlushLayoutTag(this);
+#endif
+  }
+  /// Owner-only diagnostic for fixed near-hot pool callback wiring.
+  void diagnoseCodeBatchCallbacks(const char *reason,
+                                  const void *ownerCtx) const;
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  /// Test-only corruption hook: leaves the registered expected values intact.
+  void corruptCodeBatchPoolCallbackForTest(CodeBatchFlushPoolCallback flush,
+                                           void *ctx) {
+    codeBatchFlushPoolFn_ = flush;
+    codeBatchFlushPoolCtx_ = ctx;
+  }
+  /// Test-only corruption hook for the cross-TU layout guard.
+  void corruptCodeBatchPoolLayoutTagForTest(uint64_t tag) {
+    codeBatchFlushPoolLayoutTag_ = tag;
+  }
+#endif
+#endif
   /// Read the shared code-pool stats mirror (last owner-published snapshot).
   /// Returns false if the shared state is not bound. Every core sees the same
   /// values. Use this for ejit_get/print_code_pool_stats in shared builds.
@@ -1087,10 +1119,17 @@ public:
   uint32_t pendingCount() const;
   /// Owner-side explicit flush for deterministic tests. Production callers use
   /// requestCodeBatchFlushAndWait() so enable_ex runs on the owner worker.
-  bool flushCodeBatch() { return flushPendingPublishes(); }
+  bool flushCodeBatch() {
+    autoTier2PublishBlocked_ = false;
+    return flushPendingPublishes();
+  }
   size_t pendingPublishCount() const { return pendingPublishes_.size(); }
   size_t pendingBatchCompileCount() const {
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+    return 0;
+#else
     return pendingBatchCompiles_.size();
+#endif
   }
 
   /// Ask the owner worker to seal every completed code range and publish its
@@ -1319,10 +1358,67 @@ private:
   /// §4.9).
   void runCompile(const EJitCompileRequest &req,
                   bool hasBatchRequestMarker = false);
+#ifndef EJIT_CODE_POOL_FIXED_NEAR_HOT
   void compilePendingBatchRequests();
-  bool flushPendingPublishes(bool compileBatchRequests = true);
+#endif
+  bool flushPendingPublishes(bool compileBatchRequests = true,
+                             const char *reason = "explicit");
   bool serviceCodeBatchRequest();
   bool serviceAutoTier2Publish();
+
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  static uint32_t codeBatchFlushPoolFeatureMask() {
+    uint32_t Mask = 1u; // EJIT_CODE_POOL_FIXED_NEAR_HOT
+#ifdef EJIT_CODE_POOL_4K_SEAL
+    Mask |= 1u << 1;
+#endif
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
+    Mask |= 1u << 2;
+#endif
+#ifdef EJIT_FIXED_CODE_POOL
+    Mask |= 1u << 3;
+#endif
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+    Mask |= 1u << 4;
+#endif
+#ifdef EJIT_SRE_SHARED_CODE_POINTERS
+    Mask |= 1u << 5;
+#endif
+    return Mask;
+  }
+  static uint64_t makeCodeBatchFlushLayoutTag(
+      const EJitSharedTaskPool *Self) {
+    const uintptr_t Base = reinterpret_cast<uintptr_t>(Self);
+    uint64_t Tag = 0xcbf29ce484222325ULL;
+    auto Mix = [&Tag](uint64_t Value) {
+      Tag ^= Value + 0x9e3779b97f4a7c15ULL + (Tag << 6) + (Tag >> 2);
+    };
+    Mix(sizeof(EJitSharedTaskPool));
+    Mix(reinterpret_cast<uintptr_t>(&Self->codeBatchFlushPoolFn_) - Base);
+    Mix(reinterpret_cast<uintptr_t>(&Self->codeBatchFlushPoolCtx_) - Base);
+    Mix(reinterpret_cast<uintptr_t>(&Self->codeBatchFlushPoolExpectedFn_) -
+        Base);
+    Mix(reinterpret_cast<uintptr_t>(&Self->codeBatchFlushPoolExpectedCtx_) -
+        Base);
+    Mix(reinterpret_cast<uintptr_t>(&Self->codeBatchFlushPoolCanary_) - Base);
+    Mix(reinterpret_cast<uintptr_t>(&Self->codeBatchFlushPoolLayoutTag_) -
+        Base);
+    Mix(reinterpret_cast<uintptr_t>(&Self->splitPoolFn_) - Base);
+    Mix(reinterpret_cast<uintptr_t>(&Self->splitPoolCtx_) - Base);
+    Mix(codeBatchFlushPoolFeatureMask());
+    return Tag;
+  }
+  static uint64_t makeCodeBatchFlushCanary(CodeBatchFlushPoolCallback fn,
+                                           void *ctx) {
+    const uint64_t F =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fn));
+    const uint64_t C =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ctx));
+    const uint64_t RotC = (C << 17) | (C >> 47);
+    return F ^ RotC ^ UINT64_C(0x6e656172686f7431);
+  }
+  bool codeBatchFlushPoolCallbacksIntact() const;
+#endif
 
   /// Release staged-PGO ownership if \p funcIndex still owns it. Tier-2
   /// completion and terminal worker failures call this; transient queue-full
@@ -1354,6 +1450,13 @@ private:
   CodeReadyCallback codeReadyFn_ = nullptr;
   CodeBatchFlushCallback codeBatchFlushFn_ = nullptr;
   void *codeBatchCtx_ = nullptr;
+  CodeBatchFlushPoolCallback codeBatchFlushPoolFn_ = nullptr;
+  void *codeBatchFlushPoolCtx_ = nullptr;
+  [[maybe_unused]] CodeBatchFlushPoolCallback codeBatchFlushPoolExpectedFn_ =
+      nullptr;
+  [[maybe_unused]] void *codeBatchFlushPoolExpectedCtx_ = nullptr;
+  [[maybe_unused]] uint64_t codeBatchFlushPoolCanary_ = 0;
+  [[maybe_unused]] uint64_t codeBatchFlushPoolLayoutTag_ = 0;
   SplitPoolCallback splitPoolFn_ = nullptr;
   void *splitPoolCtx_ = nullptr;
   SealPageCallback sealPageFn_ = nullptr;
@@ -1378,6 +1481,8 @@ private:
   EJitCompileMode configuredMode_ = EJitCompileMode::Async;
   bool codeSharingEnabled_ = false;
   bool isOwner_ = false;
+  [[maybe_unused]] bool nearHotFirstLinkedDiagnosed_ = false;
+  [[maybe_unused]] bool nearHotFirstFlushDiagnosed_ = false;
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   IcacheFillMidpointHook icacheFillMidpointHook_ = nullptr;
   void *icacheFillMidpointCtx_ = nullptr;
@@ -1385,6 +1490,7 @@ private:
   struct PendingPublish {
     EJitCompileRequest req{};
     void *fn = nullptr;
+    uint32_t poolId = 0xFFFFFFFFu;
   };
   struct PendingBatchCompile {
     EJitCompileRequest req{};
@@ -1395,6 +1501,10 @@ private:
   /// Armed when Tier-2 links into the near RW/NX pool. Consumed only after the
   /// owner worker observes the shared compile queue empty.
   bool autoTier2PublishPending_ = false;
+  uint32_t autoTier2IdleTicks_ = 0;
+  /// A failed per-pool seal/publish must wait for an explicit retry. Keeping
+  /// this separate from pending state avoids retrying every idle worker tick.
+  bool autoTier2PublishBlocked_ = false;
   // Inline-cache safety gate: true while the cache is safe to use (no releaser
   // wired - the production default). v2 does no HP-scan retire, so a wired
   // releaser (code may be freed) + the cache = UAF; the gate then auto-disables

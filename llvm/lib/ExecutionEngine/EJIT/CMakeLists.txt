@@ -252,6 +252,13 @@ if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_FIXED_CODE_POOL)
 endif()
 
+if(EJIT_CODE_POOL_FIXED_NEAR_HOT)
+  target_compile_definitions(LLVMEJIT PRIVATE
+    EJIT_CODE_POOL_FIXED_NEAR_HOT
+    EJIT_CODE_POOL_NEAR_HOT_CELL_BYTES=${EJIT_CODE_POOL_NEAR_HOT_CELL_BYTES}
+    EJIT_CODE_POOL_NEAR_HOT_PUBLIC_BYTES=${EJIT_CODE_POOL_NEAR_HOT_PUBLIC_BYTES})
+endif()
+
 # EJIT_ICACHE_DIM_SIZE: per-dim bound D of the multi-version inline cache.
 # Used by icacheFill/icacheTry linearization in EJitSharedTaskPool. Must match
 # the AOT -mllvm -print-ejit-icache-dim-size value (both from the top-level CMake

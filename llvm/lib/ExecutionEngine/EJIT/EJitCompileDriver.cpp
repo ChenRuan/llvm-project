@@ -30,6 +30,33 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+namespace {
+bool selectNearHotPool(const SpecializationContext &Ctx, uint32_t &PoolId) {
+  bool HasCell = false;
+  uint8_t Cell = 0;
+  for (const auto &Dim : Ctx.dimensions) {
+    if (Dim.periodName.empty() || Dim.dimType == 0xFFFFFFFFu)
+      return false;
+    if (Dim.periodName != "cell")
+      continue;
+    if (HasCell)
+      return false;
+    HasCell = true;
+    Cell = Dim.cellIdx;
+  }
+  if (!HasCell) {
+    PoolId = kEJitNearHotPublicPoolId;
+    return true;
+  }
+  if (Cell >= kEJitNearHotCellPoolCount)
+    return false;
+  PoolId = Cell;
+  return true;
+}
+} // namespace
+#endif
+
 #ifdef EJIT_SRE_TASKPOOL
 namespace {
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
@@ -87,7 +114,8 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
   auto *drv = static_cast<EJitCompileDriver *>(ctx);
   EJitOrcEngine *eng = drv->getJitEngine();
   if (eng && outInfo)
-    return eng->findCodeRange(fnPtr, *outInfo);
+    return eng->findCodeRange(fnPtr, *outInfo) ||
+           eng->findPendingCodeRange(fnPtr, *outInfo);
   return false;
 #else
   (void)ctx;
@@ -126,6 +154,26 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
 #endif
 }
 
+[[maybe_unused]] bool sharedCodeBatchFlushPoolThunk(void *ctx,
+                                                    uint32_t poolId) {
+#if defined(EJIT_SRE_CODE_POOL) && defined(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  auto *drv = static_cast<EJitCompileDriver *>(ctx);
+  EJitOrcEngine *eng = drv->getJitEngine();
+  if (!eng)
+    return false;
+  if (auto Err = eng->flushPendingCode(poolId)) {
+    EJIT_DIAG("near-hot pool flush failed pool=%u: %s", poolId,
+              toString(std::move(Err)).c_str());
+    return false;
+  }
+  return true;
+#else
+  (void)ctx;
+  (void)poolId;
+  return true;
+#endif
+}
+
 /// Owner-private provider: snapshot the owner-core code-pool manager stats for
 /// the shared taskpool to mirror cross-core (see CodePoolStatsCallback). The
 /// pools are owner-private, so without this a non-owner core's
@@ -158,8 +206,16 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
       Dst.sealInvocations = Src.sealInvocations;
       Dst.splitInvocations = Src.splitInvocations;
       Dst.finalizedRangeCount = Src.finalizedRangeCount;
+      Dst.baseAddress = Src.baseAddress;
+      Dst.endAddress = Src.endAddress;
+      Dst.pendingBytes = Src.pendingBytes;
+      Dst.pendingRangeCount = Src.pendingRangeCount;
+      Dst.fallbackCount = Src.fallbackCount;
+      Dst.full = Src.full ? 1u : 0u;
     };
     CopyDetail(out->near, tiered.near);
+    for (size_t I = 0; I < tiered.nearHot.size(); ++I)
+      CopyDetail(out->nearHot[I], tiered.nearHot[I]);
     CopyDetail(out->far, tiered.far);
     return true;
   }
@@ -295,6 +351,11 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
 #ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
   sharedPool_.setCodeBatchCallbacks(&sharedCodeReadyThunk,
                                     &sharedCodeBatchFlushThunk, this);
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  sharedPool_.setCodeBatchPoolFlushCallback(&sharedCodeBatchFlushPoolThunk,
+                                            this);
+  sharedPool_.diagnoseCodeBatchCallbacks("registered", this);
+#endif
 #endif
 #endif
 #ifdef EJIT_SRE_SHARED_CODE_POINTERS
@@ -376,6 +437,7 @@ bool EJitCompileDriver::startSharedTaskPool() {
   switch (r) {
   case EJitSharedTaskPool::InitResult::BecameOwner:
     EJIT_DIAG("shared taskpool init: became owner");
+    sharedPool_.diagnoseCodeBatchCallbacks("owner-ready", this);
     return true;
   case EJitSharedTaskPool::InitResult::AttachedReady:
     EJIT_DIAG("shared taskpool init: attached ready");
@@ -532,7 +594,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   ctx.cacheKey = cacheKey;
   ctx.optLevel = config_.optLevel;
   for (unsigned i = 0; i < dimCount; ++i)
-    ctx.dimensions.push_back({periodNames[i], dims[i]});
+    ctx.dimensions.push_back({periodNames[i], dims[i], meta.dimTypes[i]});
   if (request && request->boundSize) {
     if (request->boundSize > EJIT_BOUND_PTR_MAX_BYTES) {
       EJIT_DIAG("compile FAIL key=0x%016lx func=%s: bound snapshot too large",
@@ -672,6 +734,17 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     }
   }
 
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  uint32_t PoolId = kEJitNearHotPublicPoolId;
+  if (ctx.tier == CompileTier::Instrumented)
+    PoolId = kEJitFarPoolId;
+  else if (!selectNearHotPool(ctx, PoolId)) {
+    EJIT_DIAG("compile SKIP key=0x%016lx func=%s: invalid cell metadata",
+              cacheKey, funcName.c_str());
+    return nullptr;
+  }
+#endif
+
   if (!jitEngine_) {
     EJIT_DIAG("compile FAIL key=0x%016lx func=%s: no sync engine", cacheKey,
               funcName.c_str());
@@ -685,7 +758,13 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
 
   jitEngine_->setActiveContext(&ctx);
 
-  if (auto Err = jitEngine_->loadBitcodeModule(bitcode, cacheKey, funcName)) {
+  if (auto Err = jitEngine_->loadBitcodeModule(bitcode, cacheKey, funcName,
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+                                               PoolId
+#else
+                                               kEJitNearHotPublicPoolId
+#endif
+                                               )) {
     jitEngine_->setActiveContext(nullptr);
     EJIT_DIAG("compile FAIL key=0x%016lx func=%s: load bitcode module failed",
               cacheKey, funcName.c_str());

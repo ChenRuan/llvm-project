@@ -38,6 +38,15 @@ enum class EJitCodePoolKind : uint32_t {
   Far = 2,
 };
 
+/// Stable near-hot pool ids. IDs 0..15 are semantic cell pools and 16 is the
+/// legal no-cell public pool. They are deliberately independent of a manager's
+/// local pool index so the id can cross the ORC, taskpool and shared-cache
+/// boundaries without relying on an address or a JITDylib name.
+constexpr uint32_t kEJitNearHotCellPoolCount = 16u;
+constexpr uint32_t kEJitNearHotPublicPoolId = kEJitNearHotCellPoolCount;
+constexpr uint32_t kEJitNearHotPoolCount = kEJitNearHotPublicPoolId + 1u;
+constexpr uint32_t kEJitFarPoolId = kEJitNearHotPoolCount;
+
 /// Maximum number of runtime-writable ranges carried with one finalized
 /// compilation. A finalized allocation normally has a single writable data
 /// segment (the Tier-1 __profc_ counters); the small fixed bound leaves head
