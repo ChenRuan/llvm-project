@@ -316,6 +316,8 @@ struct MockSre4K {
   size_t SealCalls = 0;
   int FailSealOnCall = -1; // 1-based seal index to fail; -1 = never
   unsigned SealFailRc = 7;
+  uintptr_t FailSealRegion = 0;
+  size_t FailSealRegionSize = 0;
   std::vector<uintptr_t> RwEnabledPages;
   size_t RwEnableCalls = 0;
   unsigned RwEnableRc = 0; // 0 = success; non-zero simulates enable_rw failure
@@ -342,6 +344,12 @@ struct MockSre4K {
     ++SealCalls;
     SealedPages.push_back(reinterpret_cast<uintptr_t>(P));
     if (FailSealOnCall > 0 && static_cast<int>(SealCalls) == FailSealOnCall)
+      return SealFailRc;
+    const uintptr_t Page = reinterpret_cast<uintptr_t>(P);
+    if (FailSealRegion != 0 &&
+        (Page < FailSealRegion || Page - FailSealRegion >= FailSealRegionSize))
+      return 0;
+    if (FailSealRegion != 0)
       return SealFailRc;
     return 0;
   }
@@ -1381,4 +1389,152 @@ TEST(EJitCodePoolMemMgrBatch, FnSizeSurvivesPendingFlush) {
   EXPECT_EQ(Info.fnSize, static_cast<uint64_t>(FnSize));
 
   cantFail(MM.deallocate(std::move(FA)));
+}
+
+// The fixed near-hot layout uses the JITDylib identity selected before
+// JITLink allocation. Verify that cell/public allocations remain isolated and
+// that a failed pool commit does not prevent another pool from committing.
+TEST(EJitCodePoolMemMgrBatch, FixedNearPoolsSelectAndCommitIndependently) {
+  constexpr uint32_t CellPool0 = 0;
+  constexpr uint32_t CellPool1 = 1;
+  constexpr uint32_t PublicPool = 16;
+  constexpr size_t CellBytes = kTwoMiB;
+  constexpr size_t PublicBytes = 4 * kTwoMiB;
+
+  MockSre4K M;
+  std::vector<std::unique_ptr<void, void (*)(void *)>> Regions;
+  std::vector<std::unique_ptr<EJitCodePoolManager>> Pools;
+  std::vector<EJitCodePoolManager *> NearPools;
+  for (uint32_t I = 0; I <= PublicPool; ++I) {
+    const size_t Bytes = I == PublicPool ? PublicBytes : CellBytes;
+    void *Region = testAlignedAlloc(kTwoMiB, Bytes);
+    ASSERT_NE(Region, nullptr);
+    Regions.emplace_back(Region, testAlignedFree);
+
+    auto O = fourKMemMgrOpts();
+    O.kind = EJitCodePoolKind::Near;
+    O.poolId = I;
+    O.poolSize = Bytes;
+    O.fixedBase = reinterpret_cast<uintptr_t>(Region);
+    O.fixedSize = Bytes;
+    O.needsEnableRw = true;
+    O.batchedPageSeal = true;
+    Pools.push_back(std::make_unique<EJitCodePoolManager>(
+        O, [&M](size_t N) { return M.rawAlloc(N); },
+        [&M](void *V) { return M.seal(V); },
+        [&M](void *B, size_t S) { return M.split(B, S); },
+        [&M](void *V) { return M.enableRw(V); }));
+    NearPools.push_back(Pools.back().get());
+  }
+
+  auto Far = std::make_unique<EJitCodePoolManager>(
+      poolOpts(CellBytes), [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); });
+  EJitCodePoolMemoryManager MM(
+      NearPools, *Far, kFourKiB,
+      [&](const JITLinkDylib *JD) -> EJitCodePoolManager * {
+        if (!JD)
+          return nullptr;
+        if (JD->getName() == "spec_cell0")
+          return NearPools[CellPool0];
+        if (JD->getName() == "spec_cell1")
+          return NearPools[CellPool1];
+        if (JD->getName() == "spec_public")
+          return NearPools[PublicPool];
+        return nullptr;
+      });
+
+  JITLinkDylib Cell0("spec_cell0");
+  JITLinkDylib Cell1("spec_cell1");
+  JITLinkDylib Public("spec_public");
+  JITLinkDylib Unknown("spec_cell00");
+
+  auto G0 = makeCodeGraph(64, 0x1000);
+  auto IFA0 = cantFail(MM.allocate(&Cell0, *G0));
+  void *Addr0 = firstBlockAddr(*G0);
+  auto FA0 = cantFail(IFA0->finalize());
+  auto G0b = makeCodeGraph(64, 0x1100);
+  auto IFA0b = cantFail(MM.allocate(&Cell0, *G0b));
+  void *Addr0b = firstBlockAddr(*G0b);
+  auto FA0b = cantFail(IFA0b->finalize());
+
+  auto G1 = makeCodeGraph(64, 0x2000);
+  auto IFA1 = cantFail(MM.allocate(&Cell1, *G1));
+  void *Addr1 = firstBlockAddr(*G1);
+  auto FA1 = cantFail(IFA1->finalize());
+  auto GP = makeCodeGraph(64, 0x3000);
+  auto IFAP = cantFail(MM.allocate(&Public, *GP));
+  void *AddrP = firstBlockAddr(*GP);
+  auto FAP = cantFail(IFAP->finalize());
+
+  EXPECT_TRUE(Pools[CellPool0]->contains(Addr0));
+  EXPECT_TRUE(Pools[CellPool0]->contains(Addr0b));
+  EXPECT_TRUE(Pools[CellPool1]->contains(Addr1));
+  EXPECT_TRUE(Pools[PublicPool]->contains(AddrP));
+  EXPECT_GT(reinterpret_cast<uintptr_t>(Addr0b),
+            reinterpret_cast<uintptr_t>(Addr0));
+  EJitCompiledCodeInfo Info{};
+  EXPECT_FALSE(Pools[CellPool0]->findRange(Addr0, Info));
+  ASSERT_TRUE(Pools[CellPool0]->findPendingRange(Addr0, Info));
+  EXPECT_EQ(Info.poolId, CellPool0);
+  EXPECT_EQ(Info.poolKind, EJitCodePoolKind::Near);
+  EXPECT_FALSE(Pools[CellPool1]->findRange(Addr1, Info));
+  EXPECT_FALSE(Pools[PublicPool]->findRange(AddrP, Info));
+
+  // Exercise the real JITLink memory-manager path with an interleaved batch,
+  // rather than relying only on the four sentinel allocations above. The
+  // fixed selector remains semantic (cell0/cell1/public), and every result is
+  // still pending until its owning pool is flushed.
+  std::vector<void *> Interleaved;
+  for (size_t I = 0; I < 20; ++I) {
+    const uint32_t PoolId = I % 3 == 0   ? CellPool0
+                            : I % 3 == 1 ? CellPool1
+                                         : PublicPool;
+    const std::string Name = PoolId == CellPool0   ? "spec_cell0"
+                             : PoolId == CellPool1 ? "spec_cell1"
+                                                   : "spec_public";
+    JITLinkDylib JD(Name);
+    auto G = makeCodeGraph(64, 0x5000 + I * 0x100);
+    auto IFA = cantFail(MM.allocate(&JD, *G));
+    void *Addr = firstBlockAddr(*G);
+    Interleaved.push_back(Addr);
+    auto FA = cantFail(IFA->finalize());
+    cantFail(MM.deallocate(std::move(FA)));
+    ASSERT_TRUE(Pools[PoolId]->contains(Addr));
+    EXPECT_FALSE(Pools[PoolId]->findRange(Addr, Info));
+    ASSERT_TRUE(Pools[PoolId]->findPendingRange(Addr, Info));
+    EXPECT_EQ(Info.poolId, PoolId);
+  }
+  EXPECT_EQ(Interleaved.size(), 20u);
+
+  // A malformed/unknown JITDylib identity must fail allocation rather than
+  // silently falling back to the first near pool.
+  auto BadGraph = makeCodeGraph(64, 0x4000);
+  auto BadAlloc = MM.allocate(&Unknown, *BadGraph);
+  ASSERT_FALSE(static_cast<bool>(BadAlloc));
+  consumeError(BadAlloc.takeError());
+
+  // Commit cell0 and public independently. Inject a seal failure only for
+  // cell1; its pending range remains retryable and cannot block cell0/public.
+  M.FailSealRegion = reinterpret_cast<uintptr_t>(Regions[CellPool1].get());
+  M.FailSealRegionSize = CellBytes;
+  cantFail(Pools[CellPool0]->flushPendingRanges());
+  cantFail(Pools[PublicPool]->flushPendingRanges());
+  EXPECT_TRUE(Pools[CellPool0]->findRange(Addr0, Info));
+  EXPECT_TRUE(Pools[PublicPool]->findRange(AddrP, Info));
+  EXPECT_FALSE(Pools[CellPool1]->findRange(Addr1, Info));
+  EXPECT_GT(Pools[CellPool1]->pendingRangeCount(), 0u);
+  auto Failed = Pools[CellPool1]->flushPendingRanges();
+  ASSERT_TRUE(static_cast<bool>(Failed));
+  consumeError(std::move(Failed));
+
+  M.FailSealRegion = 0;
+  cantFail(Pools[CellPool1]->flushPendingRanges());
+  EXPECT_TRUE(Pools[CellPool1]->findRange(Addr1, Info));
+  EXPECT_EQ(Pools[CellPool1]->pendingRangeCount(), 0u);
+
+  cantFail(MM.deallocate(std::move(FA0)));
+  cantFail(MM.deallocate(std::move(FA0b)));
+  cantFail(MM.deallocate(std::move(FA1)));
+  cantFail(MM.deallocate(std::move(FAP)));
 }

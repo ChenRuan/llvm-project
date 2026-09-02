@@ -3089,7 +3089,9 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // v18 adds per-slot fnSize (entry function's real size) for print_compiled
   // waste diagnostics (fn_size/overhead); purely diagnostic, never used by a
   // peer for sealing or enable_rw.
-  EXPECT_EQ(kEJitSharedAbiVersion, 18u);
+  // v19 adds fixed near-hot pool
+  // diagnostics and stable semantic pool ids.
+  EXPECT_EQ(kEJitSharedAbiVersion, 19u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(

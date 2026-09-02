@@ -48,6 +48,29 @@ Integration tests for the EmbeddedJIT JIT compilation system.
 
 ### Board-only Multicore Demo
 
+`ejit_fixed_near_hot_sre_multicore_test.c` is a self-contained online-PGO smoke
+test for the fixed near-hot layout. It has no business-header or MFS dependency:
+
+1. Core 6 runs `test_ejit_period` once and becomes the fixed worker.
+2. Core 16 runs `test_ejit_period` once, using `ejit_init_pgo` and triggering
+   four `ejit_entry` functions over cell[0..15] (64 Tier-2 identities) plus
+   one no-cell/public identity. Identities run in batches no larger than the
+   configured `EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES` (or two when that macro
+   is not supplied); each waits for its Tier-1 compile and then performs 64
+   real Tier-1 samples before waiting for Tier-2 completion. Define
+   `FIXED_NEAR_HOT_FUNCTION_COUNT=8` at compile time for the 129-identity
+   stress variant.
+3. Core 6 runs `test_ejit_fixed_near_hot_print` to validate all 17 pool
+   envelopes and print the published compiled list.
+
+The test expects the far T1 pool and every near-hot pool to be non-empty and
+finalized, with at least four finalized ranges in each cell pool, one in the
+public pool, no pending entries, and zero compile/publish failures. The runtime
+summary must additionally show no fallback and a zero failed-pool bitmap; its
+real address-sorted `print_compiled` rows provide function/version/tier/pool/
+address/exec-size, while the test prints per-pool version/exec-byte/span,
+tail-padding, and density counters. It does not call `ejit_shutdown()`.
+
 `ejit_bound_ptr_sre_multicore_test.c` provides the SRE `test_ejit_period`
 entry for validating dimension-bound pointer snapshots across cores:
 

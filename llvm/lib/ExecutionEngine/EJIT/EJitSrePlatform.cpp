@@ -25,10 +25,12 @@
 #ifdef EJIT_SRE_CODE_POOL
 
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h" // seal/split granule contract
 
 #include <cstdint>
+#include <limits>
 
 #ifndef EJIT_SRE_CODE_POOL_SIZE
 #define EJIT_SRE_CODE_POOL_SIZE                                                \
@@ -52,6 +54,19 @@ constexpr unsigned char kSrePtNo =
 constexpr unsigned kSreMid = static_cast<unsigned>(EJIT_SRE_CODE_POOL_MID);
 constexpr size_t k2MiB = static_cast<size_t>(2) * 1024 * 1024;
 constexpr size_t k4KiB = static_cast<size_t>(4) * 1024;
+#ifndef EJIT_CODE_POOL_NEAR_HOT_CELL_BYTES
+#define EJIT_CODE_POOL_NEAR_HOT_CELL_BYTES (2 * 1024 * 1024)
+#endif
+#ifndef EJIT_CODE_POOL_NEAR_HOT_PUBLIC_BYTES
+#define EJIT_CODE_POOL_NEAR_HOT_PUBLIC_BYTES (4 * 1024 * 1024)
+#endif
+constexpr size_t kNearHotCellBytes =
+    static_cast<size_t>(EJIT_CODE_POOL_NEAR_HOT_CELL_BYTES);
+constexpr size_t kNearHotPublicBytes =
+    static_cast<size_t>(EJIT_CODE_POOL_NEAR_HOT_PUBLIC_BYTES);
+constexpr size_t kNearHotRegionBytes =
+    kNearHotCellBytes * llvm::ejit::kEJitNearHotCellPoolCount +
+    kNearHotPublicBytes;
 } // namespace
 
 // Hard-lock the platform split/seal granularities against the shared-pool
@@ -63,6 +78,14 @@ static_assert(k2MiB == llvm::ejit::kEJitSharedSplitGranule,
 static_assert(k4KiB == llvm::ejit::kEJitSharedSealPage,
               "SRE pool seal page (4 KiB) must equal "
               "kEJitSharedSealPage (EJitSharedTaskPoolState.h).");
+static_assert(kNearHotCellBytes >= k2MiB && kNearHotCellBytes % k2MiB == 0,
+              "each near-hot cell pool must be a positive 2MiB multiple");
+static_assert(kNearHotPublicBytes >= k2MiB && kNearHotPublicBytes % k2MiB == 0,
+              "the near-hot public pool must be a positive 2MiB multiple");
+static_assert(kNearHotCellBytes <=
+                  (std::numeric_limits<size_t>::max() - kNearHotPublicBytes) /
+                      llvm::ejit::kEJitNearHotCellPoolCount,
+              "near-hot pool layout size overflows size_t");
 
 //===----------------------------------------------------------------------===//
 // Platform primitives (declaration only — defined by the platform/business)
@@ -183,11 +206,14 @@ unsigned sealAndSyncCache(uintptr_t Va, size_t Size) {
 } // namespace
 
 std::unique_ptr<llvm::ejit::EJitCodePoolManager>
-llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
+llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement,
+                                   uint32_t PoolId, uintptr_t FixedBase,
+                                   size_t FixedSize) {
   EJitCodePoolManager::Options Opts;
   Opts.kind = Placement == EJitCodePoolPlacement::NearFixed
                   ? EJitCodePoolKind::Near
                   : EJitCodePoolKind::Far;
+  Opts.poolId = PoolId;
   Opts.poolSize = static_cast<size_t>(kSrePoolSize);
   Opts.poolAlign = k2MiB; // large-page / split granularity
   Opts.minCodeAlign = 64;
@@ -219,7 +245,7 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
   // fall back to SRE_MemDbgAlloc (a too-small fixed region would exhaust on
   // every compile). A fixed region gives a stable JIT address range and, when
   // placed within +-128MiB of .text, lets codegen use direct bl/adrp.
-  if (Placement == EJitCodePoolPlacement::NearFixed) {
+  if (Placement == EJitCodePoolPlacement::NearFixed && FixedSize == 0) {
     uintptr_t FBase = reinterpret_cast<uintptr_t>(__ejit_code_start);
     uintptr_t FEnd = reinterpret_cast<uintptr_t>(__ejit_code_end);
     uintptr_t AlignedBase = (FBase + (static_cast<uintptr_t>(k2MiB) - 1)) &
@@ -252,6 +278,19 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
     }
   }
 #endif
+
+  if (Placement == EJitCodePoolPlacement::NearFixed && FixedSize != 0) {
+    if ((FixedBase & (k2MiB - 1)) != 0 || FixedSize < Opts.poolSize) {
+      EJIT_DIAG(
+          "makeSreCodePoolManager: invalid explicit fixed slice base=0x%llx "
+          "size=%zu",
+          static_cast<unsigned long long>(FixedBase), FixedSize);
+      return nullptr;
+    }
+    Opts.fixedBase = FixedBase;
+    Opts.fixedSize = FixedSize;
+    Opts.poolSize = FixedSize;
+  }
 
 #ifdef EJIT_FIXED_CODE_POOL
   // Code-segment placement: the fixed region is RX by default, so each slab
@@ -320,6 +359,47 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
 
   return std::make_unique<EJitCodePoolManager>(Opts, RawAlloc, Seal, Split,
                                                EnableRw);
+}
+
+std::unique_ptr<llvm::ejit::EJitCodePoolManager>
+llvm::ejit::makeSreNearHotCodePoolManager(uint32_t PoolId) {
+  if (PoolId >= kEJitNearHotPoolCount) {
+    EJIT_DIAG("make near-hot pool: invalid poolId=%u", PoolId);
+    return nullptr;
+  }
+#if defined(EJIT_FIXED_CODE_POOL)
+  uintptr_t FBase = reinterpret_cast<uintptr_t>(__ejit_code_start);
+  uintptr_t FEnd = reinterpret_cast<uintptr_t>(__ejit_code_end);
+  uintptr_t AlignedBase =
+      (FBase + (k2MiB - 1)) & ~(static_cast<uintptr_t>(k2MiB) - 1);
+  const size_t SliceBytes = PoolId == kEJitNearHotPublicPoolId
+                                ? kNearHotPublicBytes
+                                : kNearHotCellBytes;
+  const uintptr_t SliceOffset =
+      static_cast<uintptr_t>(PoolId) * kNearHotCellBytes;
+  const uintptr_t MaxAddress = std::numeric_limits<uintptr_t>::max();
+  const bool SliceOverflows = SliceOffset > kNearHotRegionBytes ||
+                              SliceBytes > kNearHotRegionBytes - SliceOffset;
+  const bool AddressOverflows = SliceOffset > MaxAddress - AlignedBase;
+  const bool RegionTooSmall =
+      FEnd < AlignedBase ||
+      (!AddressOverflows && (SliceOffset > FEnd - AlignedBase ||
+                             SliceBytes > FEnd - AlignedBase - SliceOffset));
+  if (AlignedBase < FBase || SliceOverflows || AddressOverflows ||
+      RegionTooSmall) {
+    EJIT_DIAG("make near-hot pool: fixed region too small poolId=%u "
+              "base=0x%llx end=0x%llx need=%zu",
+              PoolId, static_cast<unsigned long long>(FBase),
+              static_cast<unsigned long long>(FEnd), kNearHotRegionBytes);
+    return nullptr;
+  }
+  return makeSreCodePoolManager(EJitCodePoolPlacement::NearFixed, PoolId,
+                                AlignedBase + SliceOffset, SliceBytes);
+#else
+  EJIT_DIAG("make near-hot pool: EJIT_FIXED_CODE_POOL is disabled poolId=%u",
+            PoolId);
+  return nullptr;
+#endif
 }
 
 bool llvm::ejit::prepareSreCodeForCurrentCore(const void *FnPtr) {

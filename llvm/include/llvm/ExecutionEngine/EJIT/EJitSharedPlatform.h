@@ -111,7 +111,9 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// (codeSize - fnSize) without owner-private lookups. Purely diagnostic; a peer
 /// core never uses it for sealing or enable_rw. 0 means no symbol metadata was
 /// recorded (print_compiled reports fn_size=0, overhead=codeSize).
-constexpr uint32_t kEJitSharedAbiVersion = 18u;
+/// v19: the owner-published pool mirror carries the 16 cell + public near-hot
+/// pool details and pool ids are stable across separate managers.
+constexpr uint32_t kEJitSharedAbiVersion = 19u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

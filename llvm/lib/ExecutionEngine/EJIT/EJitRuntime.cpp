@@ -28,7 +28,6 @@
 #include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
 #endif
 #ifndef EJIT_FREESTANDING
-#include <algorithm>
 #include <chrono>
 #endif
 // ejit_print_version() falls back to std::printf when not routing through the
@@ -36,6 +35,7 @@
 #ifndef EJIT_SRE_DIAG
 #include <cstdio>
 #endif
+#include <algorithm>
 #include <cstddef>
 #include <type_traits>
 #include <vector>
@@ -1758,26 +1758,15 @@ void ejit_taskpool_print_compiled() {
     uint32_t byTier[3];
     uint32_t byPool[3];
     uint32_t finalPostPublishSeen;
-    /// Per-slot code-extent samples for the sizes summary line. Collected in
-    /// the count pass, sorted by codeStart within each pool, then tallied:
-    /// fn_total = ΣfnSize, alloc_total = ΣcodeSize, pad_total = Σ(codeSize -
-    /// fnSize), and 16B_VIOLATIONS counts same-pool adjacent allocations whose
-    /// gap < 16 (the compact-layout precondition; compact graphs should be 0,
-    /// a non-zero value flags that task-1 16B alignment has not taken effect).
-    /// The gap uses codeStart (the allocation start), NOT fnPtr (the entry
-    /// symbol address, which may sit at a non-zero offset inside the
-    /// allocation) so the inter-allocation stride is measured correctly.
     struct Sample {
       uintptr_t codeStart;
       uint64_t codeSize;
       uint64_t fnSize;
       uint32_t poolKind;
+      uint32_t poolId;
     };
     std::vector<Sample> samples;
   } count = {{0}, {0}, {0}, 0, {}};
-  // Pre-reserve the upper bound (every slot Ready) so the count-pass callback
-  // never allocates while holding a per-bucket read lock (forEachCompiled
-  // calls cb between bucketTryRead/bucketReadRelease with no try/catch).
   count.samples.reserve(kEJitSharedCacheBuckets * kEJitSharedCacheSlots);
   EJitSharedTaskPool::ForEachCompiledStats st = sp->forEachCompiled(
       [](const EJitSharedCacheSlot &slot, void *cbCtx) {
@@ -1795,13 +1784,9 @@ void ejit_taskpool_print_compiled() {
         if (tier != kEJitTierInstrumented &&
             slot.postPublishSeen.loadRelaxed() != 0)
           ++C->finalPostPublishSeen;
-        // Collect a sizes sample for the summary line. A shared_alloc slot
-        // (codeStart 0 / codeSize 0) carries no real allocation and is skipped
-        // so its zero extent cannot dilute the tallies.
-        uintptr_t cs0 = slot.codeStart;
-        uint64_t cs = slot.codeSize;
-        if (cs0 != 0 && cs != 0)
-          C->samples.push_back({cs0, cs, slot.fnSize, slot.poolKind});
+        if (slot.codeStart != 0 && slot.codeSize != 0)
+          C->samples.push_back({slot.codeStart, slot.codeSize, slot.fnSize,
+                                slot.poolKind, slot.poolId});
       },
       &count);
   // Summary line first (fixed line count, so no throttle): total, cache
@@ -1832,14 +1817,6 @@ void ejit_taskpool_print_compiled() {
                 count.byPool[static_cast<uint32_t>(EJitCodePoolKind::Near)],
                 count.byPool[static_cast<uint32_t>(EJitCodePoolKind::Far)],
                 count.byPool[static_cast<uint32_t>(EJitCodePoolKind::Unknown)]);
-  // Sizes summary: total function bytes vs total allocation bytes, plus a
-  // compact-precondition check. Sorted by fnPtr within each pool, adjacent
-  // same-pool allocations whose gap < 16 count as a 16B_VIOLATION (the
-  // compact layout's stride requirement; a compact graph should be 0, a
-  // non-zero value flags that task-1 16B alignment has not taken effect).
-  // 0 fnSize (no symbol metadata) contributes its full codeSize to padding so
-  // the totals still reconcile. Fixed line count, no throttle (matches the
-  // entries/tiers/pools summary style above).
   uint64_t fnTotal = 0, allocTotal = 0, padTotal = 0;
   uint32_t violations = 0;
   if (!count.samples.empty()) {
@@ -1847,24 +1824,21 @@ void ejit_taskpool_print_compiled() {
               [](const CountCtx::Sample &A, const CountCtx::Sample &B) {
                 if (A.poolKind != B.poolKind)
                   return A.poolKind < B.poolKind;
+                if (A.poolId != B.poolId)
+                  return A.poolId < B.poolId;
                 return A.codeStart < B.codeStart;
               });
     for (size_t I = 0; I < count.samples.size(); ++I) {
       const auto &S = count.samples[I];
       fnTotal += S.fnSize;
       allocTotal += S.codeSize;
-      padTotal += (S.fnSize <= S.codeSize) ? (S.codeSize - S.fnSize) : 0;
-      // Gap to the next same-pool sample: an executable pointer never resolves
-      // to a stale range (v1 append-only), so a later address in the same pool
-      // is a distinct later allocation; their gap is the inter-allocation
-      // stride the compact layout caps at 16. Measure on codeStart (the
-      // allocation start), not fnPtr (entry offset may be non-zero).
+      padTotal += S.fnSize <= S.codeSize ? S.codeSize - S.fnSize : 0;
       if (I + 1 < count.samples.size()) {
         const auto &N = count.samples[I + 1];
-        if (N.poolKind == S.poolKind && N.codeStart > S.codeStart) {
-          uint64_t Gap = N.codeStart - S.codeStart;
-          uint64_t Used = S.codeSize;
-          if (Gap > Used && (Gap - Used) < 16)
+        if (N.poolKind == S.poolKind && N.poolId == S.poolId &&
+            N.codeStart > S.codeStart) {
+          const uint64_t Gap = N.codeStart - S.codeStart;
+          if (Gap > S.codeSize && Gap - S.codeSize < 16)
             ++violations;
         }
       }
@@ -1890,98 +1864,169 @@ void ejit_taskpool_print_compiled() {
   constexpr bool ReuseTrackingEnabled = false;
   EJIT_DIAG_RAW("compiled reuse: disabled (build with EJIT_STATS_ENABLE)");
 #endif
-  // Entry lines: one RAW (prefix-free) line per Ready slot, throttled after
-  // each printed line.
-  struct PrintCtx {
-    EJitModuleLoader &loader;
-    bool reuseTrackingEnabled;
-  } printCtx{loader, ReuseTrackingEnabled};
+  // Collect before printing so diagnostics are ordered by the real resolved
+  // function address instead of cache-bucket order. This is cold-path storage
+  // only; the cache hit and dispatch paths do not allocate or sort.
+  struct CompiledRow {
+    uint32_t funcIndex = 0;
+    uint32_t numDims = 0;
+    uint32_t generation = 0;
+    uint32_t poolId = 0;
+    uint32_t poolKind = 0;
+    uint8_t tier = 0;
+    bool postPublishSeen = false;
+    uintptr_t address = 0;
+    uintptr_t codeStart = 0;
+    uint64_t codeSize = 0;
+    uint64_t fnSize = 0;
+    EJitDimPair dims[kEJitSharedMaxDims] = {};
+    uint32_t versions[kEJitSharedMaxDims] = {};
+  };
+  SmallVector<CompiledRow, 128> rows;
+  struct CollectCtx {
+    SmallVector<CompiledRow, 128> *rows;
+  } collectCtx{&rows};
   EJitSharedTaskPool::ForEachCompiledStats st2 = sp->forEachCompiled(
       [](const EJitSharedCacheSlot &slot, void *cbCtx) {
-        PrintCtx &ctx = *static_cast<PrintCtx *>(cbCtx);
-        EJitModuleLoader &ld = ctx.loader;
-        const std::string &name =
-            ld.getFuncNameByFuncIdx(slot.funcIndex);
-        // Per the publish protocol: fnPtr is read with acquire only after
-        // state==Ready was observed with acquire (forEachCompiled did).
-        void *fn = reinterpret_cast<void *>(slot.fnPtr.loadAcquire());
-        // Only the numDims leading pairs are meaningful; clamp a corrupt
-        // slot's numDims to the ABI maximum so the builders cannot overflow.
-        const uint32_t n = slot.numDims < kEJitSharedMaxDims
-                               ? slot.numDims
-                               : kEJitSharedMaxDims;
-        // dims=[d:i,...] for the n meaningful pairs, e.g. "1:5" / "1:5,2:7".
-        // Sized for the uint32 worst case: kEJitSharedMaxDims x
-        // ("4294967295:4294967295" = 21) + separators + NUL.
-        char dims[kEJitSharedMaxDims * 21 + (kEJitSharedMaxDims - 1) + 1];
-        char *p = dims;
-        char *end = dims + sizeof(dims);
-        for (uint32_t i = 0; i < n && p < end; ++i)
-          p += snprintf(p, (size_t)(end - p), "%s%u:%u", i ? "," : "",
-                        slot.dims[i].dimType, slot.dims[i].instanceId);
-        if (p >= end)
-          p = end - 1;
-        *p = '\0';
-        const char *PostPublishSeen =
-            !ctx.reuseTrackingEnabled
-                ? "disabled"
-                : (slot.postPublishSeen.loadRelaxed() != 0 ? "yes" : "no");
-        const uint8_t SlotTier = slot.tier.loadRelaxed();
-        const char *Tier = SlotTier == kEJitTierPgoUse ? "tier2"
-                           : SlotTier == kEJitTierInstrumented
-                               ? "tier1-collecting"
-                               : "baseline";
-        const char *PoolKind =
-            slot.poolKind == static_cast<uint32_t>(EJitCodePoolKind::Near)
-                ? "near"
-                : slot.poolKind == static_cast<uint32_t>(EJitCodePoolKind::Far)
-                      ? "far"
-                      : "unknown";
-        if (gEJitDiagLevel >= EJIT_LOG_LVL_VERBOSE) {
-          // Same shape for the per-instance version snapshot (uint32 x
-          // kEJitSharedMaxDims + separators + NUL).
-          char ver[kEJitSharedMaxDims * 10 + (kEJitSharedMaxDims - 1) + 1];
-          p = ver;
-          end = ver + sizeof(ver);
-          for (uint32_t i = 0; i < n && p < end; ++i)
-            p += snprintf(p, (size_t)(end - p), "%s%u", i ? "," : "",
-                          slot.versions[i]);
-          if (p >= end)
-            p = end - 1;
-          *p = '\0';
-          EJIT_DIAG_RAW("funcIdx=%u name=%s tier=%s numDims=%u dims=[%s] fn=%p "
-                        "post_publish_seen=%s ver=[%s] code_size=%llu "
-                        "fn_size=%llu overhead=%llu "
-                        "pool=%s pool_id=%u "
-                        "gen=%u",
-                        slot.funcIndex,
-                        name.empty() ? "<unknown>" : name.c_str(), Tier,
-                        slot.numDims, dims, fn, PostPublishSeen, ver,
-                        static_cast<unsigned long long>(slot.codeSize),
-                        static_cast<unsigned long long>(slot.fnSize),
-                        static_cast<unsigned long long>(
-                            slot.fnSize <= slot.codeSize
-                                ? slot.codeSize - slot.fnSize
-                                : 0),
-                        PoolKind, slot.poolId, slot.generation);
-        } else {
-          EJIT_DIAG_RAW("funcIdx=%u name=%s tier=%s numDims=%u dims=[%s] fn=%p "
-                        "code_size=%llu fn_size=%llu overhead=%llu "
-                        "pool=%s post_publish_seen=%s",
-                        slot.funcIndex,
-                        name.empty() ? "<unknown>" : name.c_str(), Tier,
-                        slot.numDims, dims, fn,
-                        static_cast<unsigned long long>(slot.codeSize),
-                        static_cast<unsigned long long>(slot.fnSize),
-                        static_cast<unsigned long long>(
-                            slot.fnSize <= slot.codeSize
-                                ? slot.codeSize - slot.fnSize
-                                : 0),
-                        PoolKind, PostPublishSeen);
+        auto &rows = *static_cast<CollectCtx *>(cbCtx)->rows;
+        CompiledRow row;
+        row.funcIndex = slot.funcIndex;
+        row.numDims = slot.numDims < kEJitSharedMaxDims ? slot.numDims
+                                                        : kEJitSharedMaxDims;
+        row.generation = slot.generation;
+        row.poolId = slot.poolId;
+        row.poolKind = slot.poolKind;
+        row.tier = slot.tier.loadRelaxed();
+        row.postPublishSeen = slot.postPublishSeen.loadRelaxed() != 0;
+        row.address = slot.fnPtr.loadAcquire();
+        row.codeStart = slot.codeStart;
+        row.codeSize = slot.codeSize;
+        row.fnSize = slot.fnSize;
+        for (uint32_t i = 0; i < row.numDims; ++i) {
+          row.dims[i] = slot.dims[i];
+          row.versions[i] = slot.versions[i];
         }
-        ejitDiagPrintThrottle();
+        rows.push_back(row);
       },
-      &printCtx);
+      &collectCtx);
+  std::sort(rows.begin(), rows.end(),
+            [](const CompiledRow &a, const CompiledRow &b) {
+              if (a.address != b.address)
+                return a.address < b.address;
+              if (a.codeStart != b.codeStart)
+                return a.codeStart < b.codeStart;
+              return a.funcIndex < b.funcIndex;
+            });
+
+  struct LayoutSummary {
+    uint32_t poolKind = 0;
+    uint32_t poolId = 0;
+    uint32_t versions = 0;
+    uintptr_t firstAddress = 0;
+    uintptr_t lastAddress = 0;
+    uint64_t rangeStart = 0;
+    uint64_t rangeEnd = 0;
+    uint64_t execBytes = 0;
+  };
+  SmallVector<LayoutSummary, kEJitNearHotPoolCount + 1> layouts;
+  auto poolLayout = [&layouts](const CompiledRow &row) -> LayoutSummary & {
+    for (LayoutSummary &layout : layouts)
+      if (layout.poolKind == row.poolKind && layout.poolId == row.poolId)
+        return layout;
+    layouts.push_back(LayoutSummary{row.poolKind, row.poolId});
+    return layouts.back();
+  };
+
+  // Entry lines: one RAW (prefix-free) line per Ready slot, throttled after
+  // each printed line. Every row includes the fields needed to correlate the
+  // executable allocation with the fixed pool summary below.
+  for (const CompiledRow &row : rows) {
+    const std::string &name = loader.getFuncNameByFuncIdx(row.funcIndex);
+    const uint32_t n = row.numDims;
+    char dims[kEJitSharedMaxDims * 21 + (kEJitSharedMaxDims - 1) + 1];
+    char vers[kEJitSharedMaxDims * 10 + (kEJitSharedMaxDims - 1) + 1];
+    char *p = dims;
+    char *end = dims + sizeof(dims);
+    for (uint32_t i = 0; i < n && p < end; ++i)
+      p += snprintf(p, static_cast<size_t>(end - p), "%s%u:%u", i ? "," : "",
+                    row.dims[i].dimType, row.dims[i].instanceId);
+    if (p >= end)
+      p = end - 1;
+    *p = '\0';
+    p = vers;
+    end = vers + sizeof(vers);
+    for (uint32_t i = 0; i < n && p < end; ++i)
+      p += snprintf(p, static_cast<size_t>(end - p), "%s%u", i ? "," : "",
+                    row.versions[i]);
+    if (p >= end)
+      p = end - 1;
+    *p = '\0';
+    const char *tier = row.tier == kEJitTierPgoUse         ? "tier2"
+                       : row.tier == kEJitTierInstrumented ? "tier1-collecting"
+                                                           : "baseline";
+    const char *poolKind =
+        row.poolKind == static_cast<uint32_t>(EJitCodePoolKind::Near) ? "near"
+        : row.poolKind == static_cast<uint32_t>(EJitCodePoolKind::Far)
+            ? "far"
+            : "unknown";
+    LayoutSummary &layout = poolLayout(row);
+    ++layout.versions;
+    layout.firstAddress = layout.versions == 1
+                              ? row.address
+                              : std::min(layout.firstAddress, row.address);
+    layout.lastAddress = std::max(layout.lastAddress, row.address);
+    const uint64_t start = row.codeStart != 0
+                               ? static_cast<uint64_t>(row.codeStart)
+                               : static_cast<uint64_t>(row.address);
+    const uint64_t finish = start + row.codeSize;
+    layout.rangeStart =
+        layout.versions == 1 ? start : std::min(layout.rangeStart, start);
+    layout.rangeEnd = std::max(layout.rangeEnd, finish);
+    layout.execBytes += row.codeSize;
+    EJIT_DIAG_RAW(
+        "compiled row: funcIdx=%u name=%s version=[%s] tier=%s pool=%s "
+        "pool_id=%u address=%p exec_size=%llu fn_size=%llu overhead=%llu "
+        "code_range=[0x%llx,0x%llx) dims=[%s] generation=%u "
+        "post_publish_seen=%s",
+        row.funcIndex, name.empty() ? "<unknown>" : name.c_str(), vers, tier,
+        poolKind, row.poolId, reinterpret_cast<void *>(row.address),
+        static_cast<unsigned long long>(row.codeSize),
+        static_cast<unsigned long long>(row.fnSize),
+        static_cast<unsigned long long>(
+            row.fnSize <= row.codeSize ? row.codeSize - row.fnSize : 0),
+        static_cast<unsigned long long>(start),
+        static_cast<unsigned long long>(finish), dims, row.generation,
+        !ReuseTrackingEnabled ? "disabled"
+        : row.postPublishSeen ? "yes"
+                              : "no");
+    ejitDiagPrintThrottle();
+  }
+  EJIT_DIAG_RAW("compiled layout: address_order=ascending rows=%u",
+                rows.size());
+  for (const LayoutSummary &layout : layouts) {
+    const uint64_t span = layout.rangeEnd >= layout.rangeStart
+                              ? layout.rangeEnd - layout.rangeStart
+                              : 0;
+    const uint64_t padding =
+        span > layout.execBytes ? span - layout.execBytes : 0;
+    const uint64_t density = span ? (layout.execBytes * 1000u) / span : 0;
+    const char *poolKind =
+        layout.poolKind == static_cast<uint32_t>(EJitCodePoolKind::Near)
+            ? "near"
+        : layout.poolKind == static_cast<uint32_t>(EJitCodePoolKind::Far)
+            ? "far"
+            : "unknown";
+    EJIT_DIAG_RAW("compiled layout pool=%s pool_id=%u versions=%u first=0x%llx "
+                  "last=0x%llx exec_bytes=%llu span=%llu padding_or_gap=%llu "
+                  "density=%llu/1000",
+                  poolKind, layout.poolId, layout.versions,
+                  static_cast<unsigned long long>(layout.firstAddress),
+                  static_cast<unsigned long long>(layout.lastAddress),
+                  static_cast<unsigned long long>(layout.execBytes),
+                  static_cast<unsigned long long>(span),
+                  static_cast<unsigned long long>(padding),
+                  static_cast<unsigned long long>(density));
+  }
   // The summary counted the first walk; if the entry walk itself skipped
   // contended buckets, its lines are incomplete relative to it — report the
   // shortfall (fixed line count, so no throttle) instead of dropping it.

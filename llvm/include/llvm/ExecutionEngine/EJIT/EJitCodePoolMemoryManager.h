@@ -26,6 +26,8 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitCodePool.h"
 #include "llvm/ExecutionEngine/JITLink/JITLinkMemoryManager.h"
+#include <functional>
+#include <vector>
 
 namespace llvm {
 namespace ejit {
@@ -35,9 +37,18 @@ namespace ejit {
 /// the pool manager). The referenced pool manager must outlive this object.
 class EJitCodePoolMemoryManager : public jitlink::JITLinkMemoryManager {
 public:
+  /// The selector is supplied by EJitOrcEngine and is keyed by an internally
+  /// created JITDylib. It returns nullptr for missing/corrupt metadata, which
+  /// makes allocation fail instead of silently placing code in another pool.
+  using PoolSelector =
+      std::function<EJitCodePoolManager *(const jitlink::JITLinkDylib *)>;
+
   EJitCodePoolMemoryManager(EJitCodePoolManager &Pool, size_t PageSize);
   EJitCodePoolMemoryManager(EJitCodePoolManager &NearPool,
                             EJitCodePoolManager &FarPool, size_t PageSize);
+  EJitCodePoolMemoryManager(std::vector<EJitCodePoolManager *> NearPools,
+                            EJitCodePoolManager &FarPool, size_t PageSize,
+                            PoolSelector Selector);
 
   void allocate(const jitlink::JITLinkDylib *JD, jitlink::LinkGraph &G,
                 OnAllocatedFunction OnAllocated) override;
@@ -49,16 +60,18 @@ public:
   using JITLinkMemoryManager::allocate;
   using JITLinkMemoryManager::deallocate;
 
-  EJitCodePoolManager &getPool() { return NearPool_; }
+  EJitCodePoolManager &getPool() { return *NearPool_; }
 
 private:
   class InFlightAllocImpl;
   struct FinalizedInfo;
 
-  EJitCodePoolManager &selectPool(const jitlink::JITLinkDylib *JD) const;
+  EJitCodePoolManager *selectPool(const jitlink::JITLinkDylib *JD) const;
 
-  EJitCodePoolManager &NearPool_;
+  EJitCodePoolManager *NearPool_ = nullptr;
+  std::vector<EJitCodePoolManager *> NearPools_;
   EJitCodePoolManager *FarPool_ = nullptr;
+  PoolSelector Selector_;
   size_t PageSize_;
 };
 
