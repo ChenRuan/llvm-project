@@ -2297,6 +2297,7 @@ EJitSharedTaskPool::cacheStageBatchRequest(const EJitCompileRequest &req) {
   }
   Target->codeStart = 0;
   Target->codeSize = 0;
+  Target->fnSize = 0;
   Target->poolBase = 0;
   Target->poolSize = 0;
   Target->poolId = 0;
@@ -2366,6 +2367,7 @@ EJitSharedTaskPool::cacheStagePending(const EJitCompileRequest &req,
   }
   Target->codeStart = 0;
   Target->codeSize = 0;
+  Target->fnSize = 0;
   Target->poolBase = 0;
   Target->poolSize = 0;
   Target->poolId = 0;
@@ -2403,6 +2405,7 @@ void EJitSharedTaskPool::cacheDropPending(const EJitCompileRequest &req,
     Slot.executableCoreMask.storeRelease(0);
     Slot.codeStart = 0;
     Slot.codeSize = 0;
+    Slot.fnSize = 0;
     Slot.poolBase = 0;
     Slot.poolSize = 0;
     Slot.poolId = 0;
@@ -2496,6 +2499,7 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   if (info && info->codeSize != 0) {
     target->codeStart = info->codeStart;
     target->codeSize = info->codeSize;
+    target->fnSize = info->fnSize;
     target->poolBase = info->poolBase;
     target->poolSize = info->poolSize;
     target->poolId = info->poolId;
@@ -2520,6 +2524,7 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   } else {
     target->codeStart = 0;
     target->codeSize = 0;
+    target->fnSize = 0;
     target->poolBase = 0;
     target->poolSize = 0;
     target->poolId = 0;
@@ -2742,6 +2747,7 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
       // earlier generation can never be read back after a re-init.
       Slot.codeStart = 0;
       Slot.codeSize = 0;
+      Slot.fnSize = 0;
       Slot.poolBase = 0;
       Slot.poolSize = 0;
       Slot.poolId = 0;

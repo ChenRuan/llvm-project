@@ -204,6 +204,17 @@ struct EJitSharedCacheSlot {
   /// consistently. 0 codeSize => no range metadata (peer cleanly falls back).
   uintptr_t codeStart;    ///< start of the RX-sealed executable allocation
   uint64_t codeSize;      ///< size in bytes of that allocation (0 = none)
+  /// Real size in bytes of the entry function symbol (the published fnPtr),
+  /// recovered by findRange() from the finalized graph's defined symbols and
+  /// carried here so every core's print_compiled can report fn_size/overhead
+  /// (v18). Smaller than codeSize (which covers the whole allocation incl.
+  /// padding/rodata/other symbol bodies). 0 => no symbol metadata was
+  /// recorded: print_compiled then reports fn_size=0 and overhead=codeSize.
+  /// Plain scalar, written under the bucket write lock BEFORE state=Ready is
+  /// released (same write-seq as codeSize), so an acquiring reader sees it
+  /// consistently. Cleared at every slot-zeroing path (publish-empty,
+  /// stage-pending, drop-pending, re-init generation flip).
+  uint64_t fnSize;
   uintptr_t poolBase;     ///< 2MiB pool base (split_2m_to_4k granule)
   uint64_t poolSize;      ///< usable pool size
   uint32_t poolId;   ///< stable pool index within its near/far manager

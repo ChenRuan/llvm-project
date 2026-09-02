@@ -96,7 +96,30 @@ public:
           // malformed writable set rather than truncating it; that must fail
           // finalize (no callable pointer) so a peer is never handed code whose
           // counter pages it cannot fully prepare. Restore W^X and report.
+          // Pre-collect this graph's defined symbols (address,size) once: the
+          // entry symbol's real size (fnSize) is recovered by findRange() from
+          // these, matched against the published fnPtr. Collected before G is
+          // marked finalized (below). isolateSpecializationEntry guarantees the
+          // TU's ejit_entry has the sole defined body, so the executable
+          // segment normally holds exactly one defined symbol (the entry).
           for (const ExecSegRange &R : ExecRanges) {
+            EJitFnSymEntry Syms[kEJitMaxSymsPerRange];
+            uint32_t SymCount = 0;
+            if (G) {
+              const uintptr_t SegStart = R.Addr;
+              const uintptr_t SegEnd = R.Addr + R.Size;
+              for (auto *Sym : G->defined_symbols()) {
+                uintptr_t SAddr = Sym->getAddress().getValue();
+                if (SAddr < SegStart || SAddr >= SegEnd)
+                  continue;
+                if (SymCount < kEJitMaxSymsPerRange) {
+                  Syms[SymCount] = {SAddr,
+                                   static_cast<uint64_t>(Sym->getSize())};
+                  ++SymCount;
+                }
+                // over-bound: truncate (fnSize is diagnostic, not safety)
+              }
+            }
             const bool Recorded =
                 Pool->usesBatchedPageSeal()
                     ? Pool->recordPendingRange(
@@ -104,13 +127,15 @@ public:
                           static_cast<size_t>(R.Size),
                           WritableRanges.empty() ? nullptr
                                                  : WritableRanges.data(),
-                          static_cast<uint32_t>(WritableRanges.size()))
+                          static_cast<uint32_t>(WritableRanges.size()),
+                          SymCount ? Syms : nullptr, SymCount)
                     : Pool->recordFinalizedRange(
                           reinterpret_cast<void *>(R.Addr),
                           static_cast<size_t>(R.Size),
                           WritableRanges.empty() ? nullptr
                                                  : WritableRanges.data(),
-                          static_cast<uint32_t>(WritableRanges.size()));
+                          static_cast<uint32_t>(WritableRanges.size()),
+                          SymCount ? Syms : nullptr, SymCount);
             if (!Recorded) {
               EJIT_DIAG(
                   "finalize FAIL: recordFinalizedRange rejected addr=0x%llx"
