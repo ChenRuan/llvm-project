@@ -354,6 +354,7 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
 #ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
   sharedPool_.setCodeBatchPoolFlushCallback(&sharedCodeBatchFlushPoolThunk,
                                             this);
+  sharedPool_.diagnoseCodeBatchCallbacks("registered", this);
 #endif
 #endif
 #endif
@@ -436,6 +437,7 @@ bool EJitCompileDriver::startSharedTaskPool() {
   switch (r) {
   case EJitSharedTaskPool::InitResult::BecameOwner:
     EJIT_DIAG("shared taskpool init: became owner");
+    sharedPool_.diagnoseCodeBatchCallbacks("owner-ready", this);
     return true;
   case EJitSharedTaskPool::InitResult::AttachedReady:
     EJIT_DIAG("shared taskpool init: attached ready");

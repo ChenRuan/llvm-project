@@ -78,6 +78,14 @@ EJit::EJit(const Config &config) : config_(config) {
 #endif
   compileDriver_ = std::make_unique<EJitCompileDriver>(
       config_, *runtimeState_, *moduleLoader_, logger);
+#if defined(EJIT_SRE_SHARED_TASKPOOL) && defined(EJIT_CODE_POOL_FIXED_NEAR_HOT)
+  EJIT_DIAG("EJit allocation view driver=%p driverSize=%zu sharedPool=%p "
+            "sharedPoolSize=%zu",
+            static_cast<void *>(compileDriver_.get()),
+            sizeof(EJitCompileDriver),
+            static_cast<void *>(compileDriver_->sharedTaskPool()),
+            sizeof(EJitSharedTaskPool));
+#endif
 
   // Consume registration data from the staging store (constructor path).
   StoredData data = EJitRegistrationStore::instance().consume();

@@ -782,10 +782,8 @@ bool EJitCodePoolManager::findRange(const void *Ptr,
       break;
     }
   }
-  if (!Found) {
-    EJIT_DIAG_DEBUG("findRange miss: ptr=%p not in any finalized range", Ptr);
+  if (!Found)
     return false;
-  }
 
   // The allocation must also belong to a known pool (so a peer learns the
   // 2MiB split granule). An address resolved outside the pools (e.g. a

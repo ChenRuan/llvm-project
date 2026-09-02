@@ -2001,7 +2001,7 @@ void ejit_taskpool_print_compiled() {
                               : "no");
     ejitDiagPrintThrottle();
   }
-  EJIT_DIAG_RAW("compiled layout: address_order=ascending rows=%u",
+  EJIT_DIAG_RAW("compiled layout: address_order=ascending rows=%zu",
                 rows.size());
   for (const LayoutSummary &layout : layouts) {
     const uint64_t span = layout.rangeEnd >= layout.rangeStart

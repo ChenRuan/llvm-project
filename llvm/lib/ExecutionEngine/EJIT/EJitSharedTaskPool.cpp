@@ -2832,6 +2832,10 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       pendingPublishes_.clear();
       autoTier2PublishPending_ = false;
       autoTier2PublishBlocked_ = false;
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+      nearHotFirstLinkedDiagnosed_ = false;
+      nearHotFirstFlushDiagnosed_ = false;
+#endif
       initSharedStorage(state_, static_cast<uint32_t>(configuredMode_),
                         pgoEnabled_.loadRelaxed(),
                         tier2Threshold_.loadRelaxed(),
@@ -2883,6 +2887,9 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       // Start the ONE worker (if a starter was injected). A failure here is a
       // clean init failure: record it, publish Failed, and DO NOT pretend JIT
       // is up.
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+      diagnoseCodeBatchCallbacks("pre-worker", workerCtx_);
+#endif
       bool workerOk = true;
       if (workerStart_) {
         uint64_t taskId = 0;
@@ -3566,6 +3573,103 @@ void EJitSharedTaskPool::compilePendingBatchRequests() {
 }
 #endif
 
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+bool EJitSharedTaskPool::codeBatchFlushPoolCallbacksIntact() const {
+  return codeBatchFlushPoolFn_ == codeBatchFlushPoolExpectedFn_ &&
+         codeBatchFlushPoolCtx_ == codeBatchFlushPoolExpectedCtx_ &&
+         codeBatchFlushPoolCanary_ ==
+             makeCodeBatchFlushCanary(codeBatchFlushPoolFn_,
+                                      codeBatchFlushPoolCtx_) &&
+         codeBatchFlushPoolLayoutTag_ ==
+             makeCodeBatchFlushLayoutTag(this);
+}
+#endif
+
+void EJitSharedTaskPool::diagnoseCodeBatchCallbacks(const char *Reason,
+                                                    const void *OwnerCtx) const {
+#if defined(EJIT_CODE_POOL_FIXED_NEAR_HOT) && defined(EJIT_DIAG_ENABLE)
+  const bool CallbacksIntact = codeBatchFlushPoolCallbacksIntact();
+  const bool CallbackValid =
+      CallbacksIntact && codeBatchFlushPoolFn_ && codeBatchFlushPoolCtx_;
+  const uint64_t LayoutTag = makeCodeBatchFlushLayoutTag(this);
+  const bool LayoutMatches = codeBatchFlushPoolLayoutTag_ == LayoutTag;
+  const char *Validation = "matched-target-unverified";
+  if (!codeBatchFlushPoolFn_)
+    Validation = "callback-target-null";
+  else if (!codeBatchFlushPoolCtx_)
+    Validation = "callback-context-null";
+  else if (!LayoutMatches)
+    Validation = "layout-mismatch";
+  else if (!CallbacksIntact)
+    Validation = "callback-mismatch";
+  const unsigned FeatureMask = codeBatchFlushPoolFeatureMask();
+  const uintptr_t Base = reinterpret_cast<uintptr_t>(this);
+  const size_t PoolFlushFnOffset =
+      reinterpret_cast<uintptr_t>(&codeBatchFlushPoolFn_) - Base;
+  const size_t PoolFlushCtxOffset =
+      reinterpret_cast<uintptr_t>(&codeBatchFlushPoolCtx_) - Base;
+  const size_t SplitFnOffset =
+      reinterpret_cast<uintptr_t>(&splitPoolFn_) - Base;
+  const size_t SplitCtxOffset =
+      reinterpret_cast<uintptr_t>(&splitPoolCtx_) - Base;
+  const size_t ExpectedFnOffset =
+      reinterpret_cast<uintptr_t>(&codeBatchFlushPoolExpectedFn_) - Base;
+  const size_t ExpectedCtxOffset =
+      reinterpret_cast<uintptr_t>(&codeBatchFlushPoolExpectedCtx_) - Base;
+  const size_t CanaryOffset =
+      reinterpret_cast<uintptr_t>(&codeBatchFlushPoolCanary_) - Base;
+  constexpr unsigned Has4KSeal =
+#ifdef EJIT_CODE_POOL_4K_SEAL
+      1u;
+#else
+      0u;
+#endif
+  constexpr unsigned HasBatchPublish =
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
+      1u;
+#else
+      0u;
+#endif
+  constexpr unsigned HasFixedPool =
+#ifdef EJIT_FIXED_CODE_POOL
+      1u;
+#else
+      0u;
+#endif
+  // SRE diagnostic transports commonly cap one formatted record at 512 bytes.
+  // Keep each record deliberately short: an oversized callback diagnostic is
+  // least useful precisely when this path is diagnosing a target-side fault.
+  EJIT_DIAG("near-hot cb stage=%s self=%p owner=%p fn=%p ctx=%p",
+      Reason ? Reason : "unspecified",
+      static_cast<const void *>(this), OwnerCtx,
+      reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(
+          codeBatchFlushPoolFn_)),
+      codeBatchFlushPoolCtx_);
+  EJIT_DIAG("near-hot cb guard stage=%s expectedFn=%p expectedCtx=%p "
+            "intact=%u valid=%u layout=%u status=%s",
+      Reason ? Reason : "unspecified",
+      reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(
+          codeBatchFlushPoolExpectedFn_)),
+      codeBatchFlushPoolExpectedCtx_,
+      CallbacksIntact ? 1u : 0u, CallbackValid ? 1u : 0u,
+      LayoutMatches ? 1u : 0u, Validation);
+  EJIT_DIAG("near-hot cb abi size=%zu fnOff=%zu ctxOff=%zu expFnOff=%zu "
+            "expCtxOff=%zu canaryOff=%zu",
+      sizeof(EJitSharedTaskPool), PoolFlushFnOffset, PoolFlushCtxOffset,
+      ExpectedFnOffset, ExpectedCtxOffset, CanaryOffset);
+  EJIT_DIAG("near-hot cb tags canary=0x%llx saved=0x%llx now=0x%llx "
+            "features=0x%x splitOff=%zu/%zu flags=%u/%u/%u",
+      static_cast<unsigned long long>(codeBatchFlushPoolCanary_),
+      static_cast<unsigned long long>(codeBatchFlushPoolLayoutTag_),
+      static_cast<unsigned long long>(LayoutTag),
+      FeatureMask, SplitFnOffset, SplitCtxOffset, Has4KSeal,
+      HasBatchPublish, HasFixedPool);
+#else
+  (void)Reason;
+  (void)OwnerCtx;
+#endif
+}
+
 bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests,
                                                const char *Reason) {
 #ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
@@ -3573,25 +3677,85 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests,
   // The fixed near-hot layout is a per-pool commit protocol. Falling back to
   // the legacy all-pools callback here would make a failed pool seal unrelated
   // pools and would invalidate the partial-commit guarantee.
-  if (!codeBatchFlushPoolFn_)
+  // The owner callback currently dereferences its context to reach the private
+  // ORC engine. Fail closed if either half of the pair is missing: a malformed
+  // registration must leave the request pending/AOT, never make a null-context
+  // indirect call from the worker.
+  if (!nearHotFirstFlushDiagnosed_) {
+    nearHotFirstFlushDiagnosed_ = true;
+    // The callback context is intentionally not trusted as a driver address.
+    // The explicit owner-side diagnostics above are the authoritative driver
+    // identity; this line is about the pre-call callback state only.
+    diagnoseCodeBatchCallbacks("first-pre-flush", nullptr);
+  }
+  const auto FlushFn = codeBatchFlushPoolFn_;
+  void *const FlushCtx = codeBatchFlushPoolCtx_;
+  const bool CallbacksIntact = codeBatchFlushPoolCallbacksIntact();
+  const bool LayoutMatches =
+      codeBatchFlushPoolLayoutTag_ == makeCodeBatchFlushLayoutTag(this);
+  const char *Validation = "matched-target-unverified";
+  if (!FlushFn)
+    Validation = "callback-target-null";
+  else if (!FlushCtx)
+    Validation = "callback-context-null";
+  else if (!LayoutMatches)
+    Validation = "layout-mismatch";
+  else if (!CallbacksIntact)
+    Validation = "callback-mismatch";
+  if (!CallbacksIntact || !FlushFn || !FlushCtx) {
+    if (!pendingPublishes_.empty())
+      EJIT_DIAG("near-hot pool flush skipped reason=pre-flush "
+                "sharedPoolThis=%p flushCtx=%p expectedOwnerCtx=%p "
+                "fn=%p ctx=%p expectedFn=%p expectedCtx=%p canary=0x%llx "
+                "layoutTag=0x%llx intact=%u validation=%s pending=%zu",
+                static_cast<const void *>(this), FlushCtx,
+                codeBatchFlushPoolExpectedCtx_,
+                reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(
+                    FlushFn)),
+                FlushCtx,
+                reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(
+                    codeBatchFlushPoolExpectedFn_)),
+                codeBatchFlushPoolExpectedCtx_,
+                static_cast<unsigned long long>(codeBatchFlushPoolCanary_),
+                static_cast<unsigned long long>(
+                    codeBatchFlushPoolLayoutTag_),
+                CallbacksIntact ? 1u : 0u, Validation,
+                pendingPublishes_.size());
+    // Do not let an unavailable callback turn an idle worker into an implicit
+    // retry loop. An explicit flush request clears this gate before retrying.
+    autoTier2PublishBlocked_ = !pendingPublishes_.empty();
     return pendingPublishes_.empty();
+  }
 
   [[maybe_unused]] size_t Published = 0;
   size_t Dropped = 0;
   std::vector<PendingPublish> Retry;
-  std::vector<uint32_t> FlushedPools;
+  // There are exactly 17 semantic near-hot pools. Do not use std::find on a
+  // vector<uint32_t> here: libc++ may lower that specialization to wmemchr,
+  // which is not a safe executable dependency in the freestanding SRE image.
+  uint32_t FlushedPoolBitmap = 0;
+  size_t FlushedPoolCount = 0;
   [[maybe_unused]] uint32_t FailedPoolBitmap = 0;
   for (const PendingPublish &P : pendingPublishes_) {
-    if (std::find(FlushedPools.begin(), FlushedPools.end(), P.poolId) !=
-        FlushedPools.end())
-      continue;
-    FlushedPools.push_back(P.poolId);
-    const bool Flushed =
-        codeBatchFlushPoolFn_(codeBatchFlushPoolCtx_, P.poolId);
-    if (!Flushed && P.poolId < 32)
-      FailedPoolBitmap |= uint32_t{1} << P.poolId;
-    EJIT_DIAG_DEBUG("near-hot pool flush pool=%u ok=%u", P.poolId,
-                    static_cast<unsigned>(Flushed));
+    bool Flushed = false;
+    if (P.poolId >= kEJitNearHotPoolCount) {
+      EJIT_DIAG("near-hot flush skip invalid pool=%u", P.poolId);
+    } else {
+      const uint32_t PoolBit = uint32_t{1} << P.poolId;
+      if ((FlushedPoolBitmap & PoolBit) != 0)
+        continue;
+      FlushedPoolBitmap |= PoolBit;
+      ++FlushedPoolCount;
+      EJIT_DIAG("near-hot flush enter pool=%u fn=%p ctx=%p pending=%zu",
+                P.poolId,
+                reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(FlushFn)),
+                FlushCtx, pendingPublishes_.size());
+      Flushed = FlushFn(FlushCtx, P.poolId);
+      if (!Flushed)
+        FailedPoolBitmap |= PoolBit;
+      EJIT_DIAG("near-hot flush return pool=%u ok=%u", P.poolId,
+                static_cast<unsigned>(Flushed));
+    }
     for (const PendingPublish &Member : pendingPublishes_) {
       if (Member.poolId != P.poolId)
         continue;
@@ -3649,7 +3813,7 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests,
   publishCodePoolStats();
   EJIT_DIAG("near-hot flush reason=%s pools=%zu published=%zu dropped=%zu "
             "retry=%zu failedPoolBitmap=0x%08x",
-            Reason ? Reason : "unspecified", FlushedPools.size(), Published,
+            Reason ? Reason : "unspecified", FlushedPoolCount, Published,
             Dropped, pendingPublishes_.size(), FailedPoolBitmap);
   return Dropped == 0 && pendingPublishes_.empty();
 #else
@@ -3987,6 +4151,12 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
         req.funcIndex);
     return;
   }
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+  if (tier == kEJitTierPgoUse && !nearHotFirstLinkedDiagnosed_) {
+    nearHotFirstLinkedDiagnosed_ = true;
+    diagnoseCodeBatchCallbacks("first-t2-linked", compileCtx_);
+  }
+#endif
 #ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
   // Near code must remain owner-private until its pool is sealed.  Without a
   // per-pool flush callback there is no safe way to make it executable or

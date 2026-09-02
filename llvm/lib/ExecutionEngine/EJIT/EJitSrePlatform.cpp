@@ -315,11 +315,17 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement,
   // pool base. sealAndSyncCache syncs caches for the written range then makes
   // the page executable (enable_ex does not sync caches).
 #ifdef EJIT_CODE_POOL_4K_SEAL
-    return sealAndSyncCache(reinterpret_cast<uintptr_t>(Va), k4KiB);
+    const unsigned Rc =
+        sealAndSyncCache(reinterpret_cast<uintptr_t>(Va), k4KiB);
 #else
-    return sealAndSyncCache(reinterpret_cast<uintptr_t>(Va),
-                            static_cast<size_t>(kSrePoolSize));
+    const unsigned Rc = sealAndSyncCache(
+        reinterpret_cast<uintptr_t>(Va), static_cast<size_t>(kSrePoolSize));
 #endif
+    EJIT_DIAG_DEBUG("SRE adapter enable_ex va=0x%llx rc=%u",
+                    static_cast<unsigned long long>(
+                        reinterpret_cast<uintptr_t>(Va)),
+                    Rc);
+    return Rc;
 #else
     // Code-pool routing without permission flips (bring-up / measurement).
     (void)Va;
@@ -348,9 +354,14 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement,
     // WRITE, not execute (enable_ex / sealAndSyncCache syncs caches later, at
     // RW -> RX). Per-core: only the compiling core calls this; peer cores only
     // enable_ex to execute.
-    return ejit_sre_enable_rw(
+    const unsigned Rc = ejit_sre_enable_rw(
         /*level=*/1u,
         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Va)));
+    EJIT_DIAG_DEBUG("SRE adapter enable_rw va=0x%llx rc=%u",
+                    static_cast<unsigned long long>(
+                        reinterpret_cast<uintptr_t>(Va)),
+                    Rc);
+    return Rc;
 #else
     (void)Va;
     return 0;

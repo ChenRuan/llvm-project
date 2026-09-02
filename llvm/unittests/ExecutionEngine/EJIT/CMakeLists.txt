@@ -224,6 +224,7 @@ if(EJIT_CODE_POOL_FIXED_NEAR_HOT)
   set(LLVM_LINK_COMPONENTS Support)
   add_llvm_unittest(EJITFixedNearHotTaskPoolTests
     EJitFixedNearHotTaskPoolTest.cpp
+    ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitCodePool.cpp
     ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
     ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
     ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
