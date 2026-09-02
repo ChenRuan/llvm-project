@@ -1,10 +1,11 @@
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -S %s | FileCheck %s --check-prefix=WRAP
 ; RUN: opt -passes=ejit-register-bitcode -S %s | FileCheck %s --check-prefix=REG
 
-; A direct helper that participates in bound-pointer propagation must still be
-; a separately registered EJIT entry. The ordinary helper below is reachable
-; from the closure, but it must not acquire an independent wrapper/cache
-; identity merely because an entry calls it.
+; A direct helper that participates in bound-pointer propagation must own both
+; a separately registered EJIT entry identity and its bound-pointer contract.
+; The ordinary helper below is reachable from the closure, but it must not
+; acquire an independent wrapper/cache identity merely because an entry calls
+; it.
 
 ; WRAP-DAG: @__ejit_funcidx_root = internal global i32 -1
 ; WRAP-DAG: @__ejit_funcidx_helper = internal global i32 -1
@@ -15,7 +16,7 @@
 ; WRAP: call i32 @ejit_taskpool_compile_or_get_bound
 ; WRAP-LABEL: define i32 @helper(i8 %cell, ptr %cfg)
 ; WRAP: jit_entry:
-; WRAP: call i32 @ejit_taskpool_compile_or_get_1d
+; WRAP: call i32 @ejit_taskpool_compile_or_get_bound
 ; WRAP-LABEL: define internal i32 @plain_helper(ptr %cfg)
 ; WRAP-NEXT: entry:
 ; WRAP-NOT: jit_entry
@@ -51,4 +52,5 @@ entry:
                   !{!"ejit_period_arr_ind", !"cell", i32 0},
                   !{!"ejit_bound_ptr", !"cell", i32 1, i64 4}}
 !21 = distinct !{!{!"ejit_entry"},
-                  !{!"ejit_period_arr_ind", !"cell", i32 0}}
+                  !{!"ejit_period_arr_ind", !"cell", i32 0},
+                  !{!"ejit_bound_ptr", !"cell", i32 1, i64 4}}

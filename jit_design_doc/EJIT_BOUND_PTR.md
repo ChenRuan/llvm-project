@@ -68,19 +68,21 @@ No nested pointer is followed.
 
 ## Helper propagation
 
-The annotation belongs on the root entry's pointer parameter. A direct helper
-may receive the same pointer without repeating `EJIT_BOUND_PTR`, but it must
-also be an `EJIT_ENTRY` and declare the matching `EJIT_DIM(period)` parameter.
-That gives the helper an independent wrapper/cache identity for the same cell.
+The root and every direct helper own their pointer contracts independently.
+A helper that receives propagated bound facts must repeat
+`EJIT_BOUND_PTR(period)` on that pointer formal, be an `EJIT_ENTRY`, and declare
+the matching `EJIT_DIM(period)` parameter. Its bound size and `ejit_may_const`
+field metadata must describe the same object range. Together these annotations
+give the helper an independent wrapper/cache identity for the same cell.
 
 Every direct call edge is checked. The helper's period argument must come from
 the caller's same period formal, or from the same specialization constant after
 dimension replacement; pointer and integer casts are accepted where the
 existing IR pipeline proves them equivalent. Each pointer formal must also
-receive the same bound pointer source and offset. An unannotated helper,
-indirect or address-taken call, missing or ambiguous dimension, different
-constant, or inconsistent callsite is a conservative boundary: the bound
-pointer is not propagated across that edge.
+receive the same bound pointer source and offset. A helper pointer formal
+without matching `EJIT_BOUND_PTR`, an indirect or address-taken call, missing
+or ambiguous dimension, different constant, or inconsistent callsite is a
+conservative boundary: the bound pointer is not propagated across that edge.
 
 ## Build and compatibility
 

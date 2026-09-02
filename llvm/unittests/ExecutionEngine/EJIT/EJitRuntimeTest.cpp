@@ -1866,14 +1866,14 @@ TEST(EJitStructFieldPass, BoundPointerPropagatesThroughDirectHelpers) {
     }
     define i32 @bound_helper1(i32 %cell, ptr %cfg) noinline !ejit.metadata !4 {
     entry:
-      %mode.ptr = getelementptr %Cfg, ptr %cfg, i32 0, i32 1
       %cell8 = trunc i32 %cell to i8
-      %result = call i32 @bound_helper2(i8 %cell8, ptr %mode.ptr)
+      %result = call i32 @bound_helper2(i8 %cell8, ptr %cfg)
       ret i32 %result
     }
-    define i32 @bound_helper2(i8 %cell, ptr %mode.ptr) noinline
+    define i32 @bound_helper2(i8 %cell, ptr %cfg) noinline
         !ejit.metadata !7 {
     entry:
+      %mode.ptr = getelementptr %Cfg, ptr %cfg, i32 0, i32 1
       %mode = load i32, ptr %mode.ptr, !ejit.may_const !10
       %tail = call i32 @bound_helper3(ptr %mode.ptr)
       %result = add i32 %mode, %tail
@@ -1888,13 +1888,14 @@ TEST(EJitStructFieldPass, BoundPointerPropagatesThroughDirectHelpers) {
     !1 = !{!"ejit_entry"}
     !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, !5}
-    !4 = distinct !{!8, !9}
+    !4 = distinct !{!8, !9, !12}
     !5 = !{i64 4, i64 4}
-    !7 = distinct !{!10, !11}
+    !7 = distinct !{!10, !11, !12}
     !8 = !{!"ejit_entry"}
     !9 = !{!"ejit_period_arr_ind", !"cell", i32 0}
     !10 = !{!"ejit"}
     !11 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !12 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, !5}
   )",
                                Err, Ctx);
   ASSERT_TRUE(M) << Err.getMessage().str();
@@ -1954,11 +1955,12 @@ TEST(EJitStructFieldPass, AmbiguousHelperPointerIsNotSpecialized) {
     !1 = !{!"ejit_entry"}
     !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
-    !4 = distinct !{!6, !7}
+    !4 = distinct !{!6, !7, !9}
     !5 = !{i64 0, i64 4}
     !6 = !{!"ejit_entry"}
     !7 = !{!"ejit_period_arr_ind", !"cell", i32 0}
     !8 = !{!"ejit"}
+    !9 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
   )",
                                Err, Ctx);
   ASSERT_TRUE(M) << Err.getMessage().str();
@@ -1979,7 +1981,7 @@ TEST(EJitStructFieldPass, AmbiguousHelperPointerIsNotSpecialized) {
             1);
 }
 
-TEST(EJitStructFieldPass, UnannotatedHelperIsNotSpecialized) {
+TEST(EJitStructFieldPass, EntryDimensionWithoutBoundPointerIsNotSpecialized) {
   LLVMContext Ctx;
   SMDiagnostic Err;
   auto M = parseAssemblyString(R"(
@@ -1989,7 +1991,8 @@ TEST(EJitStructFieldPass, UnannotatedHelperIsNotSpecialized) {
       %result = call i32 @unannotated_helper(i8 %cell, ptr %cfg)
       ret i32 %result
     }
-    define internal i32 @unannotated_helper(i8 %cell, ptr %cfg) noinline {
+    define i32 @unannotated_helper(i8 %cell, ptr %cfg) noinline
+        !ejit.metadata !6 {
     entry:
       %value = load i32, ptr %cfg, !ejit.may_const !4
       ret i32 %value
@@ -2000,6 +2003,7 @@ TEST(EJitStructFieldPass, UnannotatedHelperIsNotSpecialized) {
     !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
     !4 = !{!"ejit"}
     !5 = !{i64 0, i64 4}
+    !6 = distinct !{!1, !2}
   )",
                                Err, Ctx);
   ASSERT_TRUE(M) << Err.getMessage().str();
@@ -2041,11 +2045,12 @@ TEST(EJitStructFieldPass, MismatchedHelperDimensionIsNotSpecialized) {
     !1 = !{!"ejit_entry"}
     !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
-    !4 = distinct !{!6, !8}
+    !4 = distinct !{!6, !8, !9}
     !5 = !{i64 0, i64 4}
     !6 = !{!"ejit_entry"}
     !7 = !{!"ejit"}
     !8 = !{!"ejit_period_arr_ind", !"other", i32 0}
+    !9 = !{!"ejit_bound_ptr", !"other", i32 1, i64 4, !5}
   )",
                                Err, Ctx);
   ASSERT_TRUE(M) << Err.getMessage().str();
@@ -2089,11 +2094,12 @@ TEST(EJitStructFieldPass, HelperOtherCellIsNotSpecialized) {
     !1 = !{!"ejit_entry"}
     !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !5}
-    !4 = distinct !{!6, !8}
+    !4 = distinct !{!6, !8, !9}
     !5 = !{i64 0, i64 4}
     !6 = !{!"ejit_entry"}
     !7 = !{!"ejit"}
     !8 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !9 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
   )",
                                Err, Ctx);
   ASSERT_TRUE(M) << Err.getMessage().str();
@@ -2136,11 +2142,12 @@ TEST(EJitStructFieldPass, HelperDifferentSpecializedConstantIsNotSpecialized) {
     !1 = !{!"ejit_entry"}
     !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
-    !4 = distinct !{!6, !8}
+    !4 = distinct !{!6, !8, !9}
     !5 = !{i64 0, i64 4}
     !6 = !{!"ejit_entry"}
     !7 = !{!"ejit"}
     !8 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !9 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
   )",
                                Err, Ctx);
   ASSERT_TRUE(M) << Err.getMessage().str();
@@ -2192,11 +2199,12 @@ TEST(EJitStructFieldPass, InconsistentHelperDimensionSourcesAreNotSpecialized) {
     !1 = !{!"ejit_entry"}
     !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !5}
-    !4 = distinct !{!6, !8}
+    !4 = distinct !{!6, !8, !9}
     !5 = !{i64 0, i64 4}
     !6 = !{!"ejit_entry"}
     !7 = !{!"ejit"}
     !8 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !9 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
   )",
                                Err, Ctx);
   ASSERT_TRUE(M) << Err.getMessage().str();
@@ -2237,12 +2245,13 @@ TEST(EJitStructFieldPass, BoundPointerHelperSupportsMultipleCellVersions) {
     !1 = !{!"ejit_entry"}
     !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !5}
-    !4 = distinct !{!6, !8, !9}
+    !4 = distinct !{!6, !8, !9, !10}
     !5 = !{i64 0, i64 4}
     !6 = !{!"ejit_entry"}
     !7 = !{!"ejit"}
     !8 = !{!"ejit_period_arr_ind", !"cell", i32 0}
     !9 = !{!"ejit_period_arr_ind", !"trp", i32 1}
+    !10 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !5}
   )";
 
   for (uint32_t Cell = 0; Cell < 2; ++Cell) {
@@ -2275,6 +2284,66 @@ TEST(EJitStructFieldPass, BoundPointerHelperSupportsMultipleCellVersions) {
     ASSERT_NE(Value, nullptr);
     EXPECT_EQ(Value->getZExtValue(), BoundObject);
   }
+}
+
+TEST(EJitStructFieldPass, BoundPointerHelperPropagatesCellAndTrpPointers) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    %CellCfg = type { i32 }
+    %TrpCfg = type { i32 }
+    define i32 @bound_root(i8 %cell, i8 %trp, ptr %cellCfg, ptr %trpCfg)
+        !ejit.metadata !0 {
+    entry:
+      %result = call i32 @bound_helper(i8 %cell, i8 %trp,
+                                      ptr %cellCfg, ptr %trpCfg)
+      ret i32 %result
+    }
+    define i32 @bound_helper(i8 %cell, i8 %trp, ptr %cellCfg, ptr %trpCfg)
+        noinline !ejit.metadata !1 {
+    entry:
+      %cellValue = load i32, ptr %cellCfg, !ejit.may_const !8
+      %trpValue = load i32, ptr %trpCfg, !ejit.may_const !8
+      %sum = add i32 %cellValue, %trpValue
+      ret i32 %sum
+    }
+    !0 = distinct !{!2, !3, !4, !5, !6}
+    !1 = distinct !{!2, !3, !4, !5, !6}
+    !2 = !{!"ejit_entry"}
+    !3 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !4 = !{!"ejit_period_arr_ind", !"trp", i32 1}
+    !5 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !7}
+    !6 = !{!"ejit_bound_ptr", !"trp", i32 3, i64 4, !7}
+    !7 = !{i64 0, i64 4}
+    !8 = !{!"ejit"}
+  )",
+                               Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+
+  uint32_t CellConfig = 13;
+  uint32_t TrpConfig = 29;
+  SmallVector<EJitBoundPointerView, 2> Views{
+      {reinterpret_cast<const uint8_t *>(&CellConfig), sizeof(CellConfig), 2,
+       1},
+      {reinterpret_cast<const uint8_t *>(&TrpConfig), sizeof(TrpConfig), 3,
+       2}};
+  PeriodArrayRegistry Registry;
+  EJitStructFieldPass Pass(Registry, Views, "bound_root");
+  Pass.initFromModule(*M);
+  FunctionAnalysisManager FAM;
+  Function *Helper = M->getFunction("bound_helper");
+  ASSERT_NE(Helper, nullptr);
+  Pass.run(*Helper, FAM);
+
+  EXPECT_EQ(std::count_if(inst_begin(Helper), inst_end(Helper),
+                          [](Instruction &I) { return isa<LoadInst>(I); }),
+            0);
+  auto *Sum = dyn_cast<BinaryOperator>(
+      Helper->getEntryBlock().getTerminator()->getOperand(0));
+  ASSERT_NE(Sum, nullptr);
+  EXPECT_EQ(cast<ConstantInt>(Sum->getOperand(0))->getZExtValue(), CellConfig);
+  EXPECT_EQ(cast<ConstantInt>(Sum->getOperand(1))->getZExtValue(), TrpConfig);
 }
 
 //===----------------------------------------------------------------------===//

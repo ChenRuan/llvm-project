@@ -2,7 +2,6 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
@@ -523,7 +522,17 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     }
     for (uint32_t I = 0; I < request->boundCount; ++I) {
       const EJitBoundPtrDescriptor &B = request->boundPointers[I];
-      if (!llvm::is_contained(meta.boundPointerArgIndices, B.argIndex)) {
+      // Keep this lookup as an explicit loop. libc++ may lower generic
+      // uint32_t range searches to wmemchr, which is unavailable on the
+      // freestanding SRE target.
+      bool HasMatchingBoundFormal = false;
+      for (uint32_t ArgIndex : meta.boundPointerArgIndices) {
+        if (ArgIndex == B.argIndex) {
+          HasMatchingBoundFormal = true;
+          break;
+        }
+      }
+      if (!HasMatchingBoundFormal) {
         EJIT_DIAG("compile FAIL key=0x%016lx func=%s: bound argIndex=%u "
                   "has no matching EJIT_BOUND_PTR pointer formal",
                   cacheKey, funcName.c_str(), B.argIndex);

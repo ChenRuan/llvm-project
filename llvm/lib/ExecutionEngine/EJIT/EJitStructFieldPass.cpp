@@ -146,6 +146,51 @@ static MDNode *getBoundArgumentMetadata(const Function &F,
   return nullptr;
 }
 
+static bool hasMatchingBoundArgumentContract(
+    const Function &F, unsigned ArgIndex, StringRef PeriodName,
+    uint64_t BaseOffset, uint64_t RootSize,
+    ArrayRef<std::pair<uint64_t, uint64_t>> RootFields) {
+  MDNode *MD = getBoundArgumentMetadata(F, ArgIndex);
+  if (!MD)
+    return false;
+
+  auto *Period = dyn_cast<MDString>(MD->getOperand(1));
+  auto *Size = mdconst::dyn_extract<ConstantInt>(MD->getOperand(3));
+  if (!Period || Period->getString() != PeriodName || !Size)
+    return false;
+  const uint64_t BoundSize = Size->getZExtValue();
+  if (!BoundSize || BaseOffset > RootSize || BoundSize > RootSize - BaseOffset)
+    return false;
+
+  SmallVector<std::pair<uint64_t, uint64_t>, 4> DeclaredFields;
+  for (unsigned I = 4; I < MD->getNumOperands(); ++I) {
+    auto *Field = dyn_cast<MDNode>(MD->getOperand(I));
+    if (!Field || Field->getNumOperands() != 2)
+      return false;
+    auto *Offset = mdconst::dyn_extract<ConstantInt>(Field->getOperand(0));
+    auto *FieldSize = mdconst::dyn_extract<ConstantInt>(Field->getOperand(1));
+    if (!Offset || !FieldSize || !FieldSize->getZExtValue() ||
+        Offset->getZExtValue() > BoundSize ||
+        FieldSize->getZExtValue() > BoundSize - Offset->getZExtValue())
+      return false;
+    DeclaredFields.emplace_back(Offset->getZExtValue(),
+                                FieldSize->getZExtValue());
+  }
+
+  SmallVector<std::pair<uint64_t, uint64_t>, 4> ExpectedFields;
+  for (const auto &[Offset, FieldSize] : RootFields) {
+    if (Offset < BaseOffset)
+      continue;
+    const uint64_t Relative = Offset - BaseOffset;
+    if (Relative > BoundSize || FieldSize > BoundSize - Relative)
+      continue;
+    ExpectedFields.emplace_back(Relative, FieldSize);
+  }
+  llvm::sort(DeclaredFields);
+  llvm::sort(ExpectedFields);
+  return DeclaredFields == ExpectedFields;
+}
+
 static std::optional<uint64_t> accumulateArgumentOffset(const DataLayout &DL,
                                                         const Value *PtrOp,
                                                         const Argument *Root);
@@ -416,7 +461,10 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
               continue;
             auto Offset = getBoundPointerOffset(CB->getArgOperand(ArgIndex),
                                                 State.boundArguments, DL);
-            if (!Offset || *Offset >= View.size)
+            if (!Offset || *Offset >= View.size ||
+                !hasMatchingBoundArgumentContract(
+                    *Callee, ArgIndex, BoundPeriodName, *Offset, View.size,
+                    State.mayConstFields))
               continue;
             Changed |= State.boundArguments.try_emplace(Formal, *Offset).second;
           }
@@ -440,7 +488,10 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
           }
           auto CalleeDimension =
               getMatchingBoundEntryDimensionArg(*Callee, BoundPeriodName);
-          if (!CalleeDimension) {
+          if (!CalleeDimension ||
+              !hasMatchingBoundArgumentContract(
+                  *Callee, Formal->getArgNo(), BoundPeriodName, ExpectedOffset,
+                  View.size, State.mayConstFields)) {
             Invalid.push_back(Formal);
             continue;
           }

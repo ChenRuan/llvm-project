@@ -4,7 +4,8 @@
 //   1. Core 6:  run test_ejit_period.  It initializes the fixed worker,
 //      enables capture, and waits for the producer.
 //   2. Core 16: run test_ejit_period.  It attaches to core 6, activates two
-//      cell versions, and compiles the entry through two shared structures.
+//      cell versions, then serially drives helper/root through AOT, 64 real
+//      Tier-1 dispatches, Tier-2 publication, and two Ready calls.
 //   3. Core 6:  run test_ejit_bound_ptr_multistruct_print to inspect the
 //      compiled list, entry view, and complete module view.
 //
@@ -14,9 +15,100 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
-#include <stddef.h>
-#include <stdint.h>
+// Kept self-contained for direct board integration: no project or libc
+// headers are required by this file.
+typedef unsigned char uint8_t;
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+typedef __SIZE_TYPE__ size_t;
+typedef __UINTPTR_TYPE__ uintptr_t;
+typedef _Bool bool;
+
+#define true 1
+#define false 0
+#define UINTPTR_MAX (~(uintptr_t)0)
+
+#define EJIT_PERIOD_CONST __attribute__((ejit_period_const))
+#define EJIT_IN_PERIOD_ARRAY(x) __attribute__((ejit_in_period_array(#x)))
+#define EJIT_DIM(x) __attribute__((ejit_dim(#x)))
+#define EJIT_BOUND_PTR(x) __attribute__((ejit_bound_ptr(#x)))
+#define ejit_entry __attribute__((ejit_entry))
+#define EJIT_ENTRY ejit_entry
+
+#define ejit_may_const EJIT_PERIOD_CONST
+#define ejit_period_arr(x) EJIT_IN_PERIOD_ARRAY(x)
+
+typedef enum {
+  EJIT_OK = 0,
+  EJIT_ERR_INVALID_PARAM = -1,
+} ejit_status_t;
+
+typedef enum {
+  EJIT_COMPILE_SYNC = 0,
+  EJIT_COMPILE_ASYNC = 1,
+} ejit_compile_mode_t;
+
+typedef enum {
+  EJIT_OPT_L1 = 1,
+  EJIT_OPT_L2 = 2,
+  EJIT_OPT_L3 = 3,
+} ejit_opt_level_t;
+
+typedef struct {
+  ejit_compile_mode_t compileMode;
+  ejit_opt_level_t optLevel;
+  size_t maxCodeMemory;
+  size_t maxDataMemory;
+  size_t maxCacheEntries;
+  size_t maxCacheSize;
+  bool enableLogger;
+  bool forceStaticRegistry;
+  const char *dumpJITDir;
+} ejit_config_t;
+
+typedef struct {
+  uint32_t dimType;
+  uint32_t instanceId;
+} ejit_dim_pair_t;
+
+typedef struct {
+  const void *rawPtr;
+  uint32_t size;
+  uint32_t argIndex;
+} ejit_bound_ptr_t;
+
+typedef struct {
+  uint64_t cacheHits;
+  uint64_t asyncCompiles;
+  uint64_t asyncEnqueues;
+  uint64_t alreadyPending;
+  uint64_t queueFull;
+  uint64_t compileFailed;
+  uint64_t publishFailed;
+  uint64_t instanceDisabled;
+  uint64_t instanceDisabledPreActivate;
+  uint32_t readyEntries;
+  uint32_t pendingEntries;
+  uint32_t queueApproxSize;
+  uint32_t reserved;
+} ejit_taskpool_stats_t;
+
+extern ejit_status_t ejit_init_pgo(const ejit_config_t *config);
+extern ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx);
+extern bool ejit_is_active(const char *periodName, uint32_t cellIdx);
+extern void ejit_clear_cache(void);
+extern unsigned ejit_taskpool_pending_count(void);
+extern ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
+extern void ejit_taskpool_print_stats(void);
+extern void ejit_taskpool_print_compiled(void);
+extern uint32_t ejit_taskpool_get_worker_core(void);
+extern ejit_status_t ejit_taskpool_compile_or_get_bound_v(
+    uint32_t funcIndex, const ejit_dim_pair_t *dims, uint32_t numDims,
+    const ejit_bound_ptr_t *bounds, uint32_t boundCount, void **outFn,
+    uint32_t *outBucket);
+extern void ejit_dump_func(const char *name);
+extern void ejit_print_dumped(const char *name);
+extern void ejit_print_dumped_module(const char *name);
 
 extern void SRE_printf(const char *format, ...);
 extern uint32_t SRE_TaskDelay(uint32_t tick);
@@ -35,6 +127,7 @@ extern uint8_t g_ucLocalCoreID;
 #define EJIT_BOUND_MULTI_WAIT_ROUNDS 6000u
 #define EJIT_BOUND_MULTI_WAIT_TICKS 10u
 #define EJIT_BOUND_MULTI_PAYLOAD_WORDS 512u
+#define EJIT_BOUND_MULTI_T1_SAMPLES 64u
 
 // These are deliberately larger than 1 KiB. They model shared application
 // state while keeping the request transport fixed at one descriptor each.
@@ -52,12 +145,13 @@ typedef struct {
   uint32_t payload[EJIT_BOUND_MULTI_PAYLOAD_WORDS];
 } EJitBoundMultiTrpConfig;
 
-typedef char EJitBoundMultiCellMustBeLarge[
-    (sizeof(EJitBoundMultiCellConfig) > 1024u) ? 1 : -1];
-typedef char EJitBoundMultiTrpMustBeLarge[
-    (sizeof(EJitBoundMultiTrpConfig) > 1024u) ? 1 : -1];
-typedef char EJitBoundMultiDescriptorMustBeFixed[
-    (sizeof(ejit_bound_ptr_t) <= 32u) ? 1 : -1];
+typedef char EJitBoundMultiCellMustBeLarge
+    [(sizeof(EJitBoundMultiCellConfig) > 1024u) ? 1 : -1];
+typedef char EJitBoundMultiTrpMustBeLarge
+    [(sizeof(EJitBoundMultiTrpConfig) > 1024u) ? 1 : -1];
+typedef char
+    EJitBoundMultiDescriptorMustBeFixed[(sizeof(ejit_bound_ptr_t) <= 32u) ? 1
+                                                                          : -1];
 
 enum BoundMultiStage {
   BOUND_MULTI_RESET = 0,
@@ -74,21 +168,21 @@ EJIT_SHARED_SECTION_ATTR EJitBoundMultiCellConfig
     g_bound_multi_cell_configs[8] = {
         [EJIT_BOUND_MULTI_CELL_A] = {7u, 5u, 100u, {0xC011A001u}},
         [EJIT_BOUND_MULTI_CELL_B] = {7u, 9u, 200u, {0xC011B002u}},
-    };
+};
 EJIT_SHARED_SECTION_ATTR EJitBoundMultiTrpConfig
     g_bound_multi_trp_configs[8] = {
         [EJIT_BOUND_MULTI_TRP] = {3u, 11u, 0x7A2u, {0x7A2F0002u}},
-    };
+};
 EJIT_SHARED_SECTION_ATTR volatile uint32_t g_bound_multi_stage;
 EJIT_SHARED_SECTION_ATTR volatile uint64_t g_bound_multi_sink;
 
-// The helper is independently addressable, so propagation is valid only
-// because it has EJIT_ENTRY and both matching dimensions.  It intentionally
-// repeats neither EJIT_BOUND_PTR annotation.
-EJIT_ENTRY uint32_t bound_multi_helper(
+// The helper owns an independent specialization identity and repeats the
+// matching dimension and bound-pointer contracts for both objects.
+ejit_entry uint32_t bound_multi_helper(
     EJIT_DIM(cell) uint8_t cellIndex, EJIT_DIM(trp) uint8_t trpIndex,
-    const EJitBoundMultiCellConfig *cellConfig,
-    const EJitBoundMultiTrpConfig *trpConfig, uint32_t input) {
+    EJIT_BOUND_PTR(cell) const EJitBoundMultiCellConfig *cellConfig,
+    EJIT_BOUND_PTR(trp) const EJitBoundMultiTrpConfig *trpConfig,
+    uint32_t input) {
   uint32_t value = input;
   if (cellConfig->algorithm == 7u)
     value *= cellConfig->scale;
@@ -96,7 +190,7 @@ EJIT_ENTRY uint32_t bound_multi_helper(
          trpConfig->offset + trpConfig->runtimeTag + cellIndex + trpIndex;
 }
 
-EJIT_ENTRY uint32_t bound_multi_root(
+ejit_entry uint32_t bound_multi_root(
     EJIT_DIM(cell) uint8_t cellIndex, EJIT_DIM(trp) uint8_t trpIndex,
     EJIT_BOUND_PTR(cell) const EJitBoundMultiCellConfig *cellConfig,
     EJIT_BOUND_PTR(trp) const EJitBoundMultiTrpConfig *trpConfig,
@@ -118,34 +212,161 @@ static uint32_t expected_value(uint32_t cell) {
 }
 
 static uint32_t call_bound_root(uint32_t cell) {
-  return bound_multi_root(
-      (uint8_t)cell, (uint8_t)EJIT_BOUND_MULTI_TRP,
-      &g_bound_multi_cell_configs[cell],
-      &g_bound_multi_trp_configs[EJIT_BOUND_MULTI_TRP], 10u);
+  return bound_multi_root((uint8_t)cell, (uint8_t)EJIT_BOUND_MULTI_TRP,
+                          &g_bound_multi_cell_configs[cell],
+                          &g_bound_multi_trp_configs[EJIT_BOUND_MULTI_TRP],
+                          10u);
 }
 
-static int wait_for_compiles(uint64_t baseline, uint32_t expected,
-                             const char *label) {
+enum BoundMultiTarget {
+  BOUND_MULTI_HELPER = 0,
+  BOUND_MULTI_ROOT = 1,
+};
+
+static const char *target_name(uint32_t target) {
+  return target == BOUND_MULTI_HELPER ? "helper" : "root";
+}
+
+static uint32_t call_bound_target(uint32_t target, uint32_t cell) {
+  if (target == BOUND_MULTI_HELPER)
+    return bound_multi_helper((uint8_t)cell, (uint8_t)EJIT_BOUND_MULTI_TRP,
+                              &g_bound_multi_cell_configs[cell],
+                              &g_bound_multi_trp_configs[EJIT_BOUND_MULTI_TRP],
+                              10u);
+  return call_bound_root(cell);
+}
+
+static void print_profile_state(const char *phase, uint32_t target,
+                                uint32_t cell, uint32_t calls,
+                                uint64_t baseline,
+                                const ejit_taskpool_stats_t *stats) {
+  const uint64_t compiled =
+      stats->asyncCompiles >= baseline ? stats->asyncCompiles - baseline : 0u;
+  SRE_printf("[BOUND-MULTI] pgo=1 phase=%s target=%s cell=%u calls=%u "
+             "compiled=%llu/2 active(cell/trp)=%u/%u pending=%u/%u "
+             "queue=%u failed=%llu/%llu\n",
+             phase, target_name(target), cell, calls,
+             (unsigned long long)compiled,
+             (unsigned)ejit_is_active("cell", cell),
+             (unsigned)ejit_is_active("trp", EJIT_BOUND_MULTI_TRP),
+             ejit_taskpool_pending_count(), stats->pendingEntries,
+             stats->queueApproxSize, (unsigned long long)stats->compileFailed,
+             (unsigned long long)stats->publishFailed);
+}
+
+static int wait_for_t1(uint64_t baseline, uint32_t target, uint32_t cell) {
+  uint32_t emptyRounds = 0;
   for (uint32_t round = 0; round < EJIT_BOUND_MULTI_WAIT_ROUNDS; ++round) {
     ejit_taskpool_stats_t stats = {0};
-    (void)ejit_taskpool_get_stats(&stats);
+    if (ejit_taskpool_get_stats(&stats) != EJIT_OK)
+      return 0;
     if (stats.compileFailed || stats.publishFailed) {
-      SRE_printf("[BOUND-MULTI] FAIL %s compile=%llu publish=%llu\n", label,
-                 (unsigned long long)stats.compileFailed,
-                 (unsigned long long)stats.publishFailed);
+      print_profile_state("T1-failed", target, cell, 1u, baseline, &stats);
       return 0;
     }
-    if (stats.asyncCompiles >= baseline + expected &&
-        stats.pendingEntries == 0 && stats.queueApproxSize == 0 &&
+    if (stats.asyncCompiles >= baseline + 1u &&
         ejit_taskpool_pending_count() == 0)
       return 1;
+    if (stats.pendingEntries == 0 && stats.queueApproxSize == 0 &&
+        ejit_taskpool_pending_count() == 0 &&
+        stats.asyncCompiles < baseline + 1u) {
+      if (++emptyRounds >= 5u) {
+        print_profile_state("T1-missing", target, cell, 1u, baseline, &stats);
+        return 0;
+      }
+    } else {
+      emptyRounds = 0;
+    }
     if ((round % 500u) == 0)
-      SRE_printf("[BOUND-MULTI] waiting %s compiles=%llu/%llu pending=%u\n",
-                 label, (unsigned long long)(stats.asyncCompiles - baseline),
-                 (unsigned long long)expected, stats.pendingEntries);
+      print_profile_state("T1-wait", target, cell, 1u, baseline, &stats);
     (void)SRE_TaskDelay(EJIT_BOUND_MULTI_WAIT_TICKS);
   }
-  SRE_printf("[BOUND-MULTI] FAIL timeout waiting %s\n", label);
+  ejit_taskpool_stats_t stats = {0};
+  (void)ejit_taskpool_get_stats(&stats);
+  print_profile_state("T1-timeout", target, cell, 1u, baseline, &stats);
+  return 0;
+}
+
+static int drive_profile(uint32_t target, uint32_t cell, uint64_t *sink) {
+  ejit_taskpool_stats_t before = {0};
+  if (ejit_taskpool_get_stats(&before) != EJIT_OK)
+    return 0;
+  const uint64_t baseline = before.asyncCompiles;
+  const uint32_t expected = expected_value(cell);
+
+  uint32_t got = call_bound_target(target, cell);
+  if (got != expected || !wait_for_t1(baseline, target, cell)) {
+    SRE_printf("[BOUND-MULTI] FAIL target=%s cell=%u initial=%u expected=%u\n",
+               target_name(target), cell, got, expected);
+    return 0;
+  }
+  *sink ^= got;
+
+  for (uint32_t sample = 0; sample < EJIT_BOUND_MULTI_T1_SAMPLES; ++sample) {
+    got = call_bound_target(target, cell);
+    if (got != expected) {
+      SRE_printf("[BOUND-MULTI] FAIL target=%s cell=%u sample=%u/%u "
+                 "got=%u expected=%u\n",
+                 target_name(target), cell, sample + 1u,
+                 EJIT_BOUND_MULTI_T1_SAMPLES, got, expected);
+      return 0;
+    }
+    *sink ^= got;
+    if (sample == 0u || ((sample + 1u) % 16u) == 0u) {
+      ejit_taskpool_stats_t stats = {0};
+      (void)ejit_taskpool_get_stats(&stats);
+      print_profile_state("T1-sampling", target, cell, sample + 1u, baseline,
+                          &stats);
+    }
+    if (((sample + 1u) % 8u) == 0u)
+      (void)SRE_TaskDelay(1u);
+  }
+
+  for (uint32_t round = 0; round < EJIT_BOUND_MULTI_WAIT_ROUNDS; ++round) {
+    // Calls after the quota keep the wrapper progressing through AOT fallback,
+    // deferred Tier-2 enqueue, compile, publish, and finally Ready dispatch.
+    got = call_bound_target(target, cell);
+    if (got != expected)
+      return 0;
+    *sink ^= got;
+
+    ejit_taskpool_stats_t stats = {0};
+    if (ejit_taskpool_get_stats(&stats) != EJIT_OK)
+      return 0;
+    if (stats.compileFailed || stats.publishFailed) {
+      print_profile_state("T2-failed", target, cell,
+                          EJIT_BOUND_MULTI_T1_SAMPLES + round + 1u, baseline,
+                          &stats);
+      return 0;
+    }
+    if (stats.asyncCompiles >= baseline + 2u && stats.pendingEntries == 0 &&
+        stats.queueApproxSize == 0 && ejit_taskpool_pending_count() == 0) {
+      // Do not equate publication with execution: call the Ready version twice.
+      const uint32_t verify1 = call_bound_target(target, cell);
+      const uint32_t verify2 = call_bound_target(target, cell);
+      if (verify1 != expected || verify2 != expected)
+        return 0;
+      *sink ^= verify1;
+      *sink ^= verify2;
+      print_profile_state("T2-ready", target, cell,
+                          EJIT_BOUND_MULTI_T1_SAMPLES + round + 3u, baseline,
+                          &stats);
+      return 1;
+    }
+    if (round == 0u || ((round + 1u) % 500u) == 0u)
+      print_profile_state("T2-wait", target, cell,
+                          EJIT_BOUND_MULTI_T1_SAMPLES + round + 1u, baseline,
+                          &stats);
+    if (((round + 1u) % 8u) == 0u)
+      (void)SRE_TaskDelay(1u);
+  }
+
+  ejit_taskpool_stats_t stats = {0};
+  (void)ejit_taskpool_get_stats(&stats);
+  print_profile_state("T2-timeout", target, cell,
+                      EJIT_BOUND_MULTI_T1_SAMPLES +
+                          EJIT_BOUND_MULTI_WAIT_ROUNDS,
+                      baseline, &stats);
   return 0;
 }
 
@@ -193,9 +414,9 @@ static int check_invalid_descriptors(void) {
 
   ejit_bound_ptr_t nullObject = {
       (const void *)0, (uint32_t)sizeof(EJitBoundMultiCellConfig), 0u};
-  rc = ejit_taskpool_compile_or_get_bound_v(
-      0u, (const ejit_dim_pair_t *)0, 0u, &nullObject, 1u, (void **)0,
-      (uint32_t *)0);
+  rc = ejit_taskpool_compile_or_get_bound_v(0u, (const ejit_dim_pair_t *)0, 0u,
+                                            &nullObject, 1u, (void **)0,
+                                            (uint32_t *)0);
   if (rc != EJIT_ERR_INVALID_PARAM) {
     SRE_printf("[BOUND-MULTI] FAIL null/lifetime check rc=%d\n", (int)rc);
     return 0;
@@ -203,19 +424,18 @@ static int check_invalid_descriptors(void) {
 
   ejit_bound_ptr_t zeroSize = {
       &g_bound_multi_cell_configs[EJIT_BOUND_MULTI_CELL_A], 0u, 0u};
-  rc = ejit_taskpool_compile_or_get_bound_v(
-      0u, (const ejit_dim_pair_t *)0, 0u, &zeroSize, 1u, (void **)0,
-      (uint32_t *)0);
+  rc = ejit_taskpool_compile_or_get_bound_v(0u, (const ejit_dim_pair_t *)0, 0u,
+                                            &zeroSize, 1u, (void **)0,
+                                            (uint32_t *)0);
   if (rc != EJIT_ERR_INVALID_PARAM) {
     SRE_printf("[BOUND-MULTI] FAIL zero-size check rc=%d\n", (int)rc);
     return 0;
   }
 
-  ejit_bound_ptr_t overflow = {
-      (const void *)(uintptr_t)UINTPTR_MAX, 8u, 0u};
-  rc = ejit_taskpool_compile_or_get_bound_v(
-      0u, (const ejit_dim_pair_t *)0, 0u, &overflow, 1u, (void **)0,
-      (uint32_t *)0);
+  ejit_bound_ptr_t overflow = {(const void *)(uintptr_t)UINTPTR_MAX, 8u, 0u};
+  rc = ejit_taskpool_compile_or_get_bound_v(0u, (const ejit_dim_pair_t *)0, 0u,
+                                            &overflow, 1u, (void **)0,
+                                            (uint32_t *)0);
   if (rc != EJIT_ERR_INVALID_PARAM) {
     SRE_printf("[BOUND-MULTI] FAIL overflow check rc=%d\n", (int)rc);
     return 0;
@@ -227,9 +447,9 @@ static int check_invalid_descriptors(void) {
       {&g_bound_multi_trp_configs[EJIT_BOUND_MULTI_TRP],
        (uint32_t)sizeof(EJitBoundMultiTrpConfig), 0u},
   };
-  rc = ejit_taskpool_compile_or_get_bound_v(
-      0u, (const ejit_dim_pair_t *)0, 0u, duplicate, 2u, (void **)0,
-      (uint32_t *)0);
+  rc = ejit_taskpool_compile_or_get_bound_v(0u, (const ejit_dim_pair_t *)0, 0u,
+                                            duplicate, 2u, (void **)0,
+                                            (uint32_t *)0);
   if (rc != EJIT_ERR_INVALID_PARAM) {
     SRE_printf("[BOUND-MULTI] FAIL duplicate argIndex check rc=%d\n", (int)rc);
     return 0;
@@ -266,56 +486,45 @@ static int run_producer(void) {
 
   ejit_taskpool_stats_t before = {0};
   (void)ejit_taskpool_get_stats(&before);
-
-  // Submit cell A and wait before cell B: current shared dedup is keyed by
-  // function identity, so serial submission makes both cell versions visible.
-  const uint32_t aotA = call_bound_root(EJIT_BOUND_MULTI_CELL_A);
-  if (aotA != expected_value(EJIT_BOUND_MULTI_CELL_A) ||
-      ejit_publish_pending_code() != EJIT_OK ||
-      !wait_for_compiles(before.asyncCompiles, 2u, "cell-A")) {
-    SRE_printf("[BOUND-MULTI][core=%u] FAIL cell-A AOT/compile\n",
-               EJIT_BOUND_MULTI_PRODUCER_CORE);
-    ejit_taskpool_print_stats();
-    return -7;
+  uint64_t sink = 0;
+  const uint32_t cells[2] = {EJIT_BOUND_MULTI_CELL_A, EJIT_BOUND_MULTI_CELL_B};
+  for (uint32_t i = 0; i < 2u; ++i) {
+    const uint32_t cell = cells[i];
+    // Finish the helper identity first, then root. This prevents two functions
+    // or two cells of one function from occupying PGO admission slots while
+    // waiting on each other.
+    if (!drive_profile(BOUND_MULTI_HELPER, cell, &sink) ||
+        !drive_profile(BOUND_MULTI_ROOT, cell, &sink)) {
+      SRE_printf("[BOUND-MULTI][core=%u] FAIL profile target cell=%u\n",
+                 EJIT_BOUND_MULTI_PRODUCER_CORE, cell);
+      ejit_taskpool_print_stats();
+      return -7;
+    }
   }
 
-  const uint32_t aotB = call_bound_root(EJIT_BOUND_MULTI_CELL_B);
-  if (aotB != expected_value(EJIT_BOUND_MULTI_CELL_B) ||
-      ejit_publish_pending_code() != EJIT_OK ||
-      !wait_for_compiles(before.asyncCompiles, 4u, "cell-B")) {
-    SRE_printf("[BOUND-MULTI][core=%u] FAIL cell-B AOT/compile\n",
-               EJIT_BOUND_MULTI_PRODUCER_CORE);
-    ejit_taskpool_print_stats();
-    return -8;
-  }
-
-  ejit_taskpool_stats_t compiled = {0};
-  (void)ejit_taskpool_get_stats(&compiled);
-  const uint32_t jitA = call_bound_root(EJIT_BOUND_MULTI_CELL_A);
-  const uint32_t jitB = call_bound_root(EJIT_BOUND_MULTI_CELL_B);
   ejit_taskpool_stats_t after = {0};
   (void)ejit_taskpool_get_stats(&after);
-  if (jitA != expected_value(EJIT_BOUND_MULTI_CELL_A) ||
-      jitB != expected_value(EJIT_BOUND_MULTI_CELL_B) ||
-      after.cacheHits < compiled.cacheHits + 2u) {
-    SRE_printf("[BOUND-MULTI][core=%u] FAIL JIT cellA=%u cellB=%u "
-               "hits=%llu/%llu\n",
-               EJIT_BOUND_MULTI_PRODUCER_CORE, jitA, jitB,
-               (unsigned long long)(after.cacheHits - compiled.cacheHits),
-               (unsigned long long)2u);
+  if (after.asyncCompiles < before.asyncCompiles + 8u || after.compileFailed ||
+      after.publishFailed || ejit_taskpool_pending_count() != 0) {
+    SRE_printf("[BOUND-MULTI][core=%u] FAIL final compiles=%llu/8 "
+               "failed=%llu/%llu pending=%u\n",
+               EJIT_BOUND_MULTI_PRODUCER_CORE,
+               (unsigned long long)(after.asyncCompiles - before.asyncCompiles),
+               (unsigned long long)after.compileFailed,
+               (unsigned long long)after.publishFailed,
+               ejit_taskpool_pending_count());
     return -9;
   }
 
-  __atomic_store_n(&g_bound_multi_sink,
-                   ((uint64_t)jitA << 32) | (uint64_t)jitB, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_bound_multi_sink, sink, __ATOMIC_RELEASE);
   __atomic_store_n(&g_bound_multi_stage, BOUND_MULTI_COMPILED,
                    __ATOMIC_RELEASE);
-  SRE_printf("[BOUND-MULTI][core=%u] PASS cellA AOT/JIT=%u/%u cellB "
-             "AOT/JIT=%u/%u compiles=%llu hits=%llu; return to core %u "
-             "for dumps\n",
-             EJIT_BOUND_MULTI_PRODUCER_CORE, aotA, jitA, aotB, jitB,
+  SRE_printf("[BOUND-MULTI][core=%u] PASS helper/root T2 Ready for cell=%u/%u "
+             "compiles=%llu hits=%llu; return to core %u for dumps\n",
+             EJIT_BOUND_MULTI_PRODUCER_CORE, EJIT_BOUND_MULTI_CELL_A,
+             EJIT_BOUND_MULTI_CELL_B,
              (unsigned long long)(after.asyncCompiles - before.asyncCompiles),
-             (unsigned long long)(after.cacheHits - compiled.cacheHits),
+             (unsigned long long)(after.cacheHits - before.cacheHits),
              EJIT_BOUND_MULTI_WORKER_CORE);
   return 0;
 }
@@ -380,8 +589,7 @@ int test_ejit_bound_ptr_multistruct_print(uint8_t a, uint8_t b, uint8_t c,
              core,
              (unsigned long long)__atomic_load_n(&g_bound_multi_sink,
                                                  __ATOMIC_ACQUIRE));
-  __atomic_store_n(&g_bound_multi_stage, BOUND_MULTI_PRINTED,
-                   __ATOMIC_RELEASE);
+  __atomic_store_n(&g_bound_multi_stage, BOUND_MULTI_PRINTED, __ATOMIC_RELEASE);
   return 0;
 }
 
@@ -400,7 +608,7 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   cfg.enableLogger = true;
   cfg.forceStaticRegistry = true;
 
-  ejit_status_t rc = ejit_init(&cfg);
+  ejit_status_t rc = ejit_init_pgo(&cfg);
   uint32_t worker = ejit_taskpool_get_worker_core();
   SRE_printf("[BOUND-MULTI][core=%u] init rc=%d worker=%u stage=%u\n", core,
              (int)rc, worker,
