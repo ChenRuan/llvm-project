@@ -176,6 +176,50 @@ EJitCodePoolManager &EJitCodePoolMemoryManager::selectPool(
 void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
                                          OnAllocatedFunction OnAllocated) {
   EJitCodePoolManager &Pool = selectPool(JD);
+
+  // Fold pure read-only sections (string constants, const arrays, jump
+  // tables) into the executable segment BEFORE the layout is built.
+  //
+  // Why fold: BasicLayout groups blocks by {MemProt, MemLifetime}. A pure
+  // read-only section (R--) and the code section (R+X) land in DIFFERENT
+  // segments, and whether the layout is the 16-byte compact one (batched
+  // mode) or the 4K-page one (immediate mode), the two segments each occupy
+  // their OWN 4KiB page(s) — a 37-byte .rodata costs a whole page and, in
+  // batched mode, also breaks the ExecOnly compact stride. Promoting the
+  // R-- section to R+X BEFORE BasicLayout merges it into the code segment,
+  // so text and rodata lay out contiguous within one segment and share a
+  // page. This wins in BOTH 4K seal sub-modes: batched (16-byte compact
+  // stride across allocations) and immediate (contiguous within the single
+  // allocation's page), and in both near and far pools.
+  //
+  // Why safe:
+  //  - The constant bytes are never executed (the AOT path already embeds
+  //    literal pools in .text), and even if executed they are on an RX page.
+  //  - Sealing them RX with the code tightens W^X: previously the rodata
+  //    page sat on a slab-wide enable_rw'd (RW) page and, being neither exec
+  //    nor write, was never sealed back — staying RW in the fixed code
+  //    segment. Folded, it seals RX with the code.
+  //  - Writable sections (e.g. Tier-1 __profc_ counters, R+W) are excluded
+  //    by the Write check, so the peer enable_rw protocol and the no-RWX
+  //    invariant (write/exec pages never share) are untouched. __profd_
+  //    (read-only) folding into the exec segment is fine: a peer reads it
+  //    from the RX page, same as it reads code.
+  //  - An over-aligned (e.g. alignas(32)) read-only block still triggers the
+  //    page-granular fallback: the merged segment's Alignment = max(block
+  //    alignments) exceeds codeAlignment(), so FitsCompactAlign=false (in
+  //    batched mode) / LayoutAlign stays PageSize_ (in immediate mode).
+  //
+  // Gated on usesPageSeal() (4K-seal, both sub-modes): the legacy 2MiB
+  // whole-pool seal flips an entire pool RX off a single pointer, which
+  // cannot carve out per-page W^X, so folding read-only data there would
+  // lose the W^X tightening and is not done.
+  if (Pool.usesPageSeal())
+    for (Section &Sec : G.sections())
+      if ((Sec.getMemProt() & orc::MemProt::Read) != orc::MemProt::None &&
+          (Sec.getMemProt() & (orc::MemProt::Write | orc::MemProt::Exec)) ==
+              orc::MemProt::None)
+        Sec.setMemProt(orc::MemProt::Read | orc::MemProt::Exec);
+
   BasicLayout BL(G);
 
   bool ExecOnly = true;

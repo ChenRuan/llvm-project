@@ -397,6 +397,64 @@ void *blockAddrByExec(LinkGraph &G, bool WantExec) {
   return nullptr;
 }
 
+// A graph with one executable (__text, R+X) section and one pure read-only
+// (__rodata, R) section — the shape a function holding a string constant or a
+// const table links into. RodataAlign is the read-only block's alignment.
+std::unique_ptr<LinkGraph> makeTextAndRoDataGraph(uint64_t TextVAddr,
+                                                  uint64_t RoDataVAddr,
+                                                  unsigned RodataAlign) {
+  auto G = std::make_unique<LinkGraph>(
+      "g", std::make_shared<orc::SymbolStringPool>(),
+      Triple("x86_64-unknown-linux-gnu"), SubtargetFeatures(),
+      getGenericEdgeKindName);
+  auto &Text =
+      G->createSection("__text", orc::MemProt::Read | orc::MemProt::Exec);
+  G->createContentBlock(Text, ArrayRef<char>(CodeBytes, 64),
+                        orc::ExecutorAddr(TextVAddr), 16, 0);
+  auto &RoData = G->createSection("__rodata", orc::MemProt::Read);
+  // 37 bytes — the exact size of the .rodata.str1.1 section observed on the
+  // board forcing a whole-graph page fallback.
+  G->createContentBlock(RoData, ArrayRef<char>(CodeBytes, 37),
+                        orc::ExecutorAddr(RoDataVAddr), RodataAlign, 0);
+  return G;
+}
+
+// Returns the assigned address of the first block in the given section
+// (after allocate() has applied the layout). Section identity, not prot: the
+// read-only section is promoted to R+X during allocate, so a prot-based scan
+// can no longer tell it apart from the code.
+void *blockAddrInSection(LinkGraph &G, Section &S) {
+  for (Block *B : G.blocks())
+    if (&B->getSection() == &S)
+      return B->getAddress().toPtr<void *>();
+  return nullptr;
+}
+
+// The Tier-1 online-PGO shape: one executable (__text, R+X), one read-only
+// data (__profd_, R), and one runtime-writable counter (__profc_, R+W) in
+// the same graph. The far pool serves spec_t1_* dylibs in immediate 4K-seal
+// mode; this is the layout the promotion widens to cover.
+std::unique_ptr<LinkGraph> makeTextProfdProfcGraph(uint64_t TextVAddr,
+                                                   uint64_t ProfdVAddr,
+                                                   uint64_t ProfcVAddr) {
+  auto G = std::make_unique<LinkGraph>(
+      "g", std::make_shared<orc::SymbolStringPool>(),
+      Triple("x86_64-unknown-linux-gnu"), SubtargetFeatures(),
+      getGenericEdgeKindName);
+  auto &Text =
+      G->createSection("__text", orc::MemProt::Read | orc::MemProt::Exec);
+  G->createContentBlock(Text, ArrayRef<char>(CodeBytes, 64),
+                        orc::ExecutorAddr(TextVAddr), 16, 0);
+  auto &Profd = G->createSection("__profd_", orc::MemProt::Read);
+  G->createContentBlock(Profd, ArrayRef<char>(CodeBytes, 37),
+                        orc::ExecutorAddr(ProfdVAddr), 16, 0);
+  auto &Profc =
+      G->createSection("__profc_", orc::MemProt::Read | orc::MemProt::Write);
+  G->createContentBlock(Profc, ArrayRef<char>(CodeBytes, 64),
+                        orc::ExecutorAddr(ProfcVAddr), 16, 0);
+  return G;
+}
+
 } // namespace
 
 // allocate() must not seal; finalize() seals exactly the covered 4K page(s);
@@ -974,4 +1032,247 @@ TEST(EJitCodePoolMemMgrBatch, PureCodeAllocationsSharePageUntilFlush) {
 
   cantFail(MM.deallocate(std::move(FA0)));
   cantFail(MM.deallocate(std::move(FA1)));
+}
+
+// A pure read-only section (string constant, const table, jump table) must
+// NOT cost a page-exclusive segment in batched-seal mode: allocate folds it
+// into the executable segment, so the graph keeps the compact 16B layout —
+// the 37 bytes of .rodata share the code's page instead of owning a 4KiB one
+// — and at flush they seal RX together with the code (tightening W^X over
+// the page-based layout, which left them on a slab-wide RW page).
+TEST(EJitCodePoolMemMgrBatch, ReadOnlySectionFoldsIntoExecSegment) {
+  MockSre4K M;
+  auto O = fourKMemMgrOpts();
+  O.minCodeAlign = 16;
+  O.batchedPageSeal = true;
+  EJitCodePoolManager Pool(
+      O, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G = makeTextAndRoDataGraph(0x1000, 0x2000, /*RodataAlign=*/16);
+  Section *Text = G->findSectionByName("__text");
+  Section *RoData = G->findSectionByName("__rodata");
+  ASSERT_NE(Text, nullptr);
+  ASSERT_NE(RoData, nullptr);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  // Resolve by section identity, not block-iteration order: G.blocks() backs a
+  // DenseSet so its order is non-deterministic, and after promotion both
+  // sections are R+X so a prot-based scan cannot tell them apart either.
+  void *TextAddr = blockAddrInSection(*G, *Text);
+  void *RoAddr = blockAddrInSection(*G, *RoData);
+  ASSERT_NE(TextAddr, nullptr);
+  ASSERT_NE(RoAddr, nullptr);
+
+  // Folded into the executable segment: the section is promoted to R+X and
+  // the 37 bytes share the code's page.
+  EXPECT_EQ(RoData->getMemProt(),
+            orc::MemProt::Read | orc::MemProt::Exec);
+  auto PageOf = [](void *P) {
+    return reinterpret_cast<uintptr_t>(P) &
+           ~static_cast<uintptr_t>(kFourKiB - 1);
+  };
+  EXPECT_EQ(PageOf(TextAddr), PageOf(RoAddr))
+      << "read-only content must not occupy a page of its own";
+
+  // The compact stride survives the folded section: the next graph packs
+  // onto the same page (total 64+37 bytes, 16B-padded).
+  auto G2 = makeCodeGraph(64, 0x3000);
+  auto IFA2 = cantFail(MM.allocate(nullptr, *G2));
+  void *Addr2 = firstBlockAddr(*G2);
+  EXPECT_EQ(PageOf(Addr2), PageOf(TextAddr));
+
+  // Both allocations record pending ranges and seal as ONE page at flush.
+  EXPECT_EQ(M.SealCalls, 0u);
+  auto FA = cantFail(IFA->finalize());
+  auto FA2 = cantFail(IFA2->finalize());
+  EXPECT_EQ(Pool.pendingRangeCount(), 2u);
+  cantFail(Pool.flushPendingRanges());
+  EXPECT_EQ(M.SealCalls, 1u);
+
+  EJitCompiledCodeInfo Info{};
+  EXPECT_TRUE(Pool.findRange(TextAddr, Info));
+
+  cantFail(MM.deallocate(std::move(FA)));
+  cantFail(MM.deallocate(std::move(FA2)));
+}
+
+// A read-only block aligned BEYOND the code alignment (e.g. alignas(32))
+// keeps the page-granular fallback: the promotion still folds it into the
+// executable segment, but the merged segment's alignment then exceeds the
+// compact threshold, so the layout is page-per-segment again — the safety
+// valve that keeps over-aligned content out of 16B packing.
+TEST(EJitCodePoolMemMgrBatch, HighAlignedReadOnlySectionKeepsPageLayout) {
+  MockSre4K M;
+  auto O = fourKMemMgrOpts();
+  O.minCodeAlign = 16;
+  O.batchedPageSeal = true;
+  EJitCodePoolManager Pool(
+      O, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G = makeTextAndRoDataGraph(0x1000, 0x2000, /*RodataAlign=*/32);
+  Section *Text = G->findSectionByName("__text");
+  Section *RoData = G->findSectionByName("__rodata");
+  ASSERT_NE(Text, nullptr);
+  ASSERT_NE(RoData, nullptr);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  void *TextAddr = blockAddrInSection(*G, *Text);
+  void *RoAddr = blockAddrInSection(*G, *RoData);
+  ASSERT_NE(TextAddr, nullptr);
+  ASSERT_NE(RoAddr, nullptr);
+
+  // Folded (promoted, same page as the code)…
+  EXPECT_EQ(RoData->getMemProt(), orc::MemProt::Read | orc::MemProt::Exec);
+  auto PageOf = [](void *P) {
+    return reinterpret_cast<uintptr_t>(P) &
+           ~static_cast<uintptr_t>(kFourKiB - 1);
+  };
+  EXPECT_EQ(PageOf(TextAddr), PageOf(RoAddr));
+
+  // …but the layout fell back to page granularity: a following allocation
+  // cannot share this page (a compact stride would land it ~112 bytes in).
+  auto G2 = makeCodeGraph(64, 0x3000);
+  auto IFA2 = cantFail(MM.allocate(nullptr, *G2));
+  void *Addr2 = firstBlockAddr(*G2);
+  EXPECT_NE(PageOf(Addr2), PageOf(TextAddr));
+
+  auto FA = cantFail(IFA->finalize());
+  auto FA2 = cantFail(IFA2->finalize());
+  cantFail(MM.deallocate(std::move(FA)));
+  cantFail(MM.deallocate(std::move(FA2)));
+}
+
+// Immediate 4K-seal mode (batchedPageSeal = false, fourKSeal = true): the
+// promotion must still fire, because it is gated on usesPageSeal(), not on
+// batched. Here the win is intra-allocation, not cross-allocation: a pure
+// read-only section would otherwise land in its own segment and own its own
+// 4KiB page (BasicLayout groups by {MemProt, MemLifetime}, so R-- and R+X
+// stay separate segments, each page-padded). Promoted to R+X, rodata merges
+// into the code segment, lays out contiguous with it, and the single 4K page
+// is sealed RX at finalize. This is the aarch64_be far-pool / Tier-1 shape
+// (online-PGO __profc_ counters are R+W and stay out of the gate).
+TEST(EJitCodePoolMemMgr4K, ReadOnlySectionFoldsIntoExecSegmentImmediate) {
+  MockSre4K M;
+  EJitCodePoolManager Pool(
+      fourKMemMgrOpts(), [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G = makeTextAndRoDataGraph(0x1000, 0x2000, /*RodataAlign=*/16);
+  Section *Text = G->findSectionByName("__text");
+  Section *RoData = G->findSectionByName("__rodata");
+  ASSERT_NE(Text, nullptr);
+  ASSERT_NE(RoData, nullptr);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  void *TextAddr = blockAddrInSection(*G, *Text);
+  void *RoAddr = blockAddrInSection(*G, *RoData);
+  ASSERT_NE(TextAddr, nullptr);
+  ASSERT_NE(RoAddr, nullptr);
+
+  // Promoted, and the 37 bytes share the code's page (no page of its own).
+  EXPECT_EQ(RoData->getMemProt(), orc::MemProt::Read | orc::MemProt::Exec);
+  auto PageOf = [](void *P) {
+    return reinterpret_cast<uintptr_t>(P) &
+           ~static_cast<uintptr_t>(kFourKiB - 1);
+  };
+  EXPECT_EQ(PageOf(TextAddr), PageOf(RoAddr))
+      << "read-only content must not occupy a page of its own in immediate "
+         "mode either";
+  // Contiguous within the segment: rodata lands right after the 64-byte text
+  // block (16-byte aligned), so the two do not straddle a page boundary.
+  EXPECT_EQ(static_cast<uintptr_t>(reinterpret_cast<char *>(RoAddr) -
+                                   reinterpret_cast<char *>(TextAddr)),
+            static_cast<uintptr_t>(64))
+      << "text and rodata must be contiguous, not page-strided";
+
+  // Immediate mode seals the exec page at finalize (not deferred to flush).
+  EXPECT_EQ(M.SealCalls, 0u);
+  auto FA = cantFail(IFA->finalize());
+  EXPECT_EQ(M.SealCalls, 1u);
+  ASSERT_EQ(M.SealedPages.size(), 1u);
+  EXPECT_EQ(M.SealedPages[0], PageOf(TextAddr));
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
+// The Tier-1 online-PGO shape routed through selectPool's spec_t1_ branch:
+// text (R+X) + __profd_ (R, read-only) + __profc_ (R+W, runtime counter) in
+// one graph, allocated on the FAR pool in immediate 4K-seal mode. This is the
+// real surface the widened gate (usesPageSeal) exposes, and it asserts the
+// invariants the far-pool path must keep:
+//  - __profd_ is promoted to R+X and folds into the code page (it is
+//    read-only; a peer reads it from the RX page, same as code);
+//  - __profc_ (R+W) is NOT promoted (Write excluded) and keeps its own RW
+//    page, never sharing a 4K page with the executable extent (no RWX);
+//  - the recorded writable range covers ONLY __profc_ (never the exec
+//    extent), so a peer's enable_rw touches only the counter page.
+TEST(EJitCodePoolMemMgr4K, FarPoolTier1ProfdFoldsProfcStaysWritable) {
+  MockSre4K NearM, FarM;
+  auto NearOpts = fourKMemMgrOpts(); // fourKSeal=true, batched=false, near
+  NearOpts.kind = EJitCodePoolKind::Near;
+  auto FarOpts = fourKMemMgrOpts();
+  FarOpts.kind = EJitCodePoolKind::Far;
+  EJitCodePoolManager Near(
+      NearOpts, [&NearM](size_t N) { return NearM.rawAlloc(N); },
+      [&NearM](void *V) { return NearM.seal(V); },
+      [&NearM](void *B, size_t S) { return NearM.split(B, S); });
+  EJitCodePoolManager Far(
+      FarOpts, [&FarM](size_t N) { return FarM.rawAlloc(N); },
+      [&FarM](void *V) { return FarM.seal(V); },
+      [&FarM](void *B, size_t S) { return FarM.split(B, S); });
+  EJitCodePoolMemoryManager MM(Near, Far, kFourKiB);
+
+  JITLinkDylib Tier1("spec_t1_1");
+  auto G = makeTextProfdProfcGraph(0x1000, 0x2000, 0x3000);
+  Section *Text = G->findSectionByName("__text");
+  Section *Profd = G->findSectionByName("__profd_");
+  Section *Profc = G->findSectionByName("__profc_");
+  ASSERT_NE(Text, nullptr);
+  ASSERT_NE(Profd, nullptr);
+  ASSERT_NE(Profc, nullptr);
+  auto IFA = cantFail(MM.allocate(&Tier1, *G));
+  void *TextAddr = blockAddrInSection(*G, *Text);
+  void *ProfdAddr = blockAddrInSection(*G, *Profd);
+  void *ProfcAddr = blockAddrInSection(*G, *Profc);
+  ASSERT_NE(TextAddr, nullptr);
+  ASSERT_NE(ProfdAddr, nullptr);
+  ASSERT_NE(ProfcAddr, nullptr);
+
+  auto PageOf = [](void *P) {
+    return reinterpret_cast<uintptr_t>(P) &
+           ~static_cast<uintptr_t>(kFourKiB - 1);
+  };
+
+  // Routed to the far pool (selectPool's spec_t1_ branch).
+  EXPECT_TRUE(Far.contains(TextAddr));
+  EXPECT_FALSE(Near.contains(TextAddr));
+
+  // __profd_ (read-only) promoted to R+X and folded onto the code page.
+  EXPECT_EQ(Profd->getMemProt(), orc::MemProt::Read | orc::MemProt::Exec);
+  EXPECT_EQ(PageOf(TextAddr), PageOf(ProfdAddr))
+      << "__profd_ must fold into the code page, not own one";
+
+  // __profc_ (R+W) NOT promoted and never shares a page with the exec extent.
+  EXPECT_EQ(Profc->getMemProt(),
+            orc::MemProt::Read | orc::MemProt::Write);
+  EXPECT_NE(PageOf(ProfcAddr), PageOf(TextAddr))
+      << "__profc_ must keep its own RW page (no RWX)";
+
+  auto FA = cantFail(IFA->finalize());
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(Far.findRange(TextAddr, Info));
+  EXPECT_EQ(Info.poolKind, EJitCodePoolKind::Far);
+  // Exactly one writable range, and it covers only __profc_ (never the exec
+  // extent that contains text + __profd_).
+  ASSERT_EQ(Info.writableCount, 1u);
+  EXPECT_EQ(Info.writableRanges[0].addr, PageOf(ProfcAddr));
+  EXPECT_EQ(PageOf(reinterpret_cast<void *>(Info.writableRanges[0].addr)),
+            PageOf(ProfcAddr));
+  EXPECT_NE(PageOf(reinterpret_cast<void *>(Info.writableRanges[0].addr)),
+            PageOf(TextAddr));
+  cantFail(MM.deallocate(std::move(FA)));
 }
