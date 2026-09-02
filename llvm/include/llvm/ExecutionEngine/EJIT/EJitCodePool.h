@@ -250,7 +250,9 @@ public:
   /// batch by flushPendingRanges().
   bool recordPendingRange(const void *Base, size_t Size,
                           const EJitWritableRange *Writables = nullptr,
-                          uint32_t WritableCount = 0);
+                          uint32_t WritableCount = 0,
+                          const EJitFnSymEntry *Syms = nullptr,
+                          uint32_t SymCount = 0);
   void notePendingAllocation();
   Error flushPendingRanges();
   size_t pendingRangeCount() const;
@@ -277,9 +279,19 @@ public:
   /// A null/zero writable set (WritableCount == 0) records the executable range
   /// with no writable data and returns true. A benign no-op (Base null / Size
   /// 0) also returns true.
+  ///
+  /// \p Syms / \p SymCount give the defined symbols (address,size) of this
+  /// executable range, captured from the JITLink graph at finalize. Purely
+  /// diagnostic: findRange() matches the published fnPtr against them to
+  /// recover fnSize for print_compiled waste reporting. An over-bound set is
+  /// truncated (not rejected) since fnSize is diagnostic, not a safety
+  /// invariant. Null/zero records the range with no symbol metadata (findRange
+  /// then reports fnSize=0).
   bool recordFinalizedRange(const void *Base, size_t Size,
                             const EJitWritableRange *Writables = nullptr,
-                            uint32_t WritableCount = 0);
+                            uint32_t WritableCount = 0,
+                            const EJitFnSymEntry *Syms = nullptr,
+                            uint32_t SymCount = 0);
 
   /// Resolve a function pointer to the finalized executable allocation and pool
   /// that contain it, filling \p Out (codeStart/codeSize from the recorded
@@ -330,6 +342,14 @@ private:
     /// rejected at record time).
     uint32_t writableCount = 0;
     EJitWritableRange writables[kEJitMaxWritableRanges] = {};
+    /// Defined symbols (address,size) inside [start, start+size), captured at
+    /// finalize from the JITLink graph. Diagnostic only (never a peer-prepare
+    /// invariant): findRange() matches the published fnPtr address against
+    /// these to recover the entry's real size (fnSize). Over-bound sets are
+    /// truncated, not rejected, since fnSize is a diagnostic quantity. Owner-
+    /// private: only the matched fnSize crosses into the shared cache slot.
+    uint32_t symCount = 0;
+    EJitFnSymEntry syms[kEJitMaxSymsPerRange] = {};
   };
   std::vector<FinalizedRange> FinalizedRanges_;
   std::vector<FinalizedRange> PendingRanges_;

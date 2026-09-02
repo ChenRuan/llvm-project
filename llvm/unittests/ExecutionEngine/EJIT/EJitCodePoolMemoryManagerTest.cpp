@@ -114,6 +114,24 @@ void *firstBlockAddr(LinkGraph &G) {
   return B->getAddress().toPtr<void *>();
 }
 
+// A code graph with one DEFINED symbol of the given size at the block's start
+// (offset 0). fnSize capture at finalize iterates G->defined_symbols(), so a
+// graph with no defined symbol yields fnSize=0 (the "no symbol metadata"
+// fallback); this helper builds the symbol-bearing variant used to assert the
+// entry's real size is recovered.
+std::unique_ptr<LinkGraph> makeCodeGraphWithDefinedSymbol(size_t Size,
+                                                          uint64_t VAddr) {
+  auto G = makeCodeGraph(Size, VAddr);
+  // blocks() yields Block* (BlockSet iterators); dereference to a Block& for
+  // addDefinedSymbol, which attaches a named defined symbol of |Size| at the
+  // block's start (offset 0).
+  Block &B = **G->blocks().begin();
+  G->addDefinedSymbol(B, orc::ExecutorAddrDiff(0), "entry",
+                      orc::ExecutorAddrDiff(Size), Linkage::Strong,
+                      Scope::Default, true, false);
+  return G;
+}
+
 } // namespace
 
 // JIT code memory is allocated out of the pool (not mmap), and the resolved
@@ -644,6 +662,60 @@ TEST(EJitCodePoolMemMgr4K, FinalizedRangeCarriesWritableDataExtent) {
   uintptr_t WPE =
       pageUp(Info.writableRanges[0].addr + Info.writableRanges[0].size);
   EXPECT_TRUE(WPE <= CodePS || CodePE <= WPS); // no shared 4K page
+
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
+// The finalized executable range carries the entry function's real size
+// (fnSize), recovered from the JITLink graph's defined symbols by matching
+// the published fnPtr address. fnSize < codeSize (the allocation covers the
+// whole executable extent incl. padding).
+TEST(EJitCodePoolMemMgr4K, FinalizedRangeCarriesEntryFnSize) {
+  MockSre4K M;
+  EJitCodePoolManager Pool(
+      fourKMemMgrOpts(), [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  constexpr size_t FnSize = 64;
+  auto G = makeCodeGraphWithDefinedSymbol(FnSize, 0x1000);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  void *EntryAddr = firstBlockAddr(*G);
+  auto FA = cantFail(IFA->finalize());
+
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(Pool.findRange(EntryAddr, Info));
+  EXPECT_EQ(Info.fnPtr, EntryAddr);
+  EXPECT_EQ(Info.fnSize, static_cast<uint64_t>(FnSize));
+  // codeSize covers the whole executable allocation (page-rounded): it is at
+  // least the function size, so overhead = codeSize - fnSize >= 0.
+  EXPECT_GE(Info.codeSize, Info.fnSize);
+
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
+// A graph with no defined symbol records no symbol metadata: fnSize is 0
+// (print_compiled then reports fn_size=0, overhead=codeSize). This guards the
+// "no symbol metadata" fallback path so a symbolless graph never mis-reports
+// a stale fnSize.
+TEST(EJitCodePoolMemMgr4K, FinalizedRangeFnSizeZeroWithoutDefinedSymbol) {
+  MockSre4K M;
+  EJitCodePoolManager Pool(
+      fourKMemMgrOpts(), [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G = makeCodeGraph(64, 0x1000); // no defined symbol
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  void *CodeAddr = firstBlockAddr(*G);
+  auto FA = cantFail(IFA->finalize());
+
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(Pool.findRange(CodeAddr, Info));
+  EXPECT_EQ(Info.fnSize, 0u);
+  EXPECT_GT(Info.codeSize, 0u);
 
   cantFail(MM.deallocate(std::move(FA)));
 }
@@ -1274,5 +1346,39 @@ TEST(EJitCodePoolMemMgr4K, FarPoolTier1ProfdFoldsProfcStaysWritable) {
             PageOf(ProfcAddr));
   EXPECT_NE(PageOf(reinterpret_cast<void *>(Info.writableRanges[0].addr)),
             PageOf(TextAddr));
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
+// In batched-seal mode, fnSize capture flows through the pending path
+// (recordPendingRange → flushPendingRanges → findRange), not the immediate
+// recordFinalizedRange path. A pending range is NOT resolvable by findRange
+// until flush; fnSize must survive the pending→finalized copy so it is still
+// recoverable after flush.
+TEST(EJitCodePoolMemMgrBatch, FnSizeSurvivesPendingFlush) {
+  MockSre4K M;
+  auto O = fourKMemMgrOpts();
+  O.minCodeAlign = 16;
+  O.batchedPageSeal = true;
+  EJitCodePoolManager Pool(
+      O, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  constexpr size_t FnSize = 64;
+  auto G = makeCodeGraphWithDefinedSymbol(FnSize, 0x1000);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  void *EntryAddr = firstBlockAddr(*G);
+  auto FA = cantFail(IFA->finalize());
+
+  // Pending: not resolvable yet, so fnSize is not yet recoverable.
+  EJitCompiledCodeInfo Info{};
+  EXPECT_FALSE(Pool.findRange(EntryAddr, Info));
+
+  cantFail(Pool.flushPendingRanges());
+  ASSERT_TRUE(Pool.findRange(EntryAddr, Info));
+  EXPECT_EQ(Info.fnPtr, EntryAddr);
+  EXPECT_EQ(Info.fnSize, static_cast<uint64_t>(FnSize));
+
   cantFail(MM.deallocate(std::move(FA)));
 }

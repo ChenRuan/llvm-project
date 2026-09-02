@@ -28,6 +28,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
 #endif
 #ifndef EJIT_FREESTANDING
+#include <algorithm>
 #include <chrono>
 #endif
 // ejit_print_version() falls back to std::printf when not routing through the
@@ -37,6 +38,7 @@
 #endif
 #include <cstddef>
 #include <type_traits>
+#include <vector>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -1756,22 +1758,50 @@ void ejit_taskpool_print_compiled() {
     uint32_t byTier[3];
     uint32_t byPool[3];
     uint32_t finalPostPublishSeen;
-  } count = {{0}, {0}, {0}, 0};
+    /// Per-slot code-extent samples for the sizes summary line. Collected in
+    /// the count pass, sorted by codeStart within each pool, then tallied:
+    /// fn_total = ΣfnSize, alloc_total = ΣcodeSize, pad_total = Σ(codeSize -
+    /// fnSize), and 16B_VIOLATIONS counts same-pool adjacent allocations whose
+    /// gap < 16 (the compact-layout precondition; compact graphs should be 0,
+    /// a non-zero value flags that task-1 16B alignment has not taken effect).
+    /// The gap uses codeStart (the allocation start), NOT fnPtr (the entry
+    /// symbol address, which may sit at a non-zero offset inside the
+    /// allocation) so the inter-allocation stride is measured correctly.
+    struct Sample {
+      uintptr_t codeStart;
+      uint64_t codeSize;
+      uint64_t fnSize;
+      uint32_t poolKind;
+    };
+    std::vector<Sample> samples;
+  } count = {{0}, {0}, {0}, 0, {}};
+  // Pre-reserve the upper bound (every slot Ready) so the count-pass callback
+  // never allocates while holding a per-bucket read lock (forEachCompiled
+  // calls cb between bucketTryRead/bucketReadRelease with no try/catch).
+  count.samples.reserve(kEJitSharedCacheBuckets * kEJitSharedCacheSlots);
   EJitSharedTaskPool::ForEachCompiledStats st = sp->forEachCompiled(
       [](const EJitSharedCacheSlot &slot, void *cbCtx) {
+        CountCtx *C = static_cast<CountCtx *>(cbCtx);
         // Valid numDims is 0..kEJitSharedMaxDims; clamp a corrupt slot's
         // value so the tally cannot index past byDims.
         uint32_t n = slot.numDims < kEJitSharedMaxDims ? slot.numDims
                                                        : kEJitSharedMaxDims;
-        ++static_cast<CountCtx *>(cbCtx)->byDims[n];
+        ++C->byDims[n];
         uint8_t tier = slot.tier.loadRelaxed();
         if (tier <= kEJitTierPgoUse)
-          ++static_cast<CountCtx *>(cbCtx)->byTier[tier];
+          ++C->byTier[tier];
         if (slot.poolKind <= static_cast<uint32_t>(EJitCodePoolKind::Far))
-          ++static_cast<CountCtx *>(cbCtx)->byPool[slot.poolKind];
+          ++C->byPool[slot.poolKind];
         if (tier != kEJitTierInstrumented &&
             slot.postPublishSeen.loadRelaxed() != 0)
-          ++static_cast<CountCtx *>(cbCtx)->finalPostPublishSeen;
+          ++C->finalPostPublishSeen;
+        // Collect a sizes sample for the summary line. A shared_alloc slot
+        // (codeStart 0 / codeSize 0) carries no real allocation and is skipped
+        // so its zero extent cannot dilute the tallies.
+        uintptr_t cs0 = slot.codeStart;
+        uint64_t cs = slot.codeSize;
+        if (cs0 != 0 && cs != 0)
+          C->samples.push_back({cs0, cs, slot.fnSize, slot.poolKind});
       },
       &count);
   // Summary line first (fixed line count, so no throttle): total, cache
@@ -1802,6 +1832,49 @@ void ejit_taskpool_print_compiled() {
                 count.byPool[static_cast<uint32_t>(EJitCodePoolKind::Near)],
                 count.byPool[static_cast<uint32_t>(EJitCodePoolKind::Far)],
                 count.byPool[static_cast<uint32_t>(EJitCodePoolKind::Unknown)]);
+  // Sizes summary: total function bytes vs total allocation bytes, plus a
+  // compact-precondition check. Sorted by fnPtr within each pool, adjacent
+  // same-pool allocations whose gap < 16 count as a 16B_VIOLATION (the
+  // compact layout's stride requirement; a compact graph should be 0, a
+  // non-zero value flags that task-1 16B alignment has not taken effect).
+  // 0 fnSize (no symbol metadata) contributes its full codeSize to padding so
+  // the totals still reconcile. Fixed line count, no throttle (matches the
+  // entries/tiers/pools summary style above).
+  uint64_t fnTotal = 0, allocTotal = 0, padTotal = 0;
+  uint32_t violations = 0;
+  if (!count.samples.empty()) {
+    std::sort(count.samples.begin(), count.samples.end(),
+              [](const CountCtx::Sample &A, const CountCtx::Sample &B) {
+                if (A.poolKind != B.poolKind)
+                  return A.poolKind < B.poolKind;
+                return A.codeStart < B.codeStart;
+              });
+    for (size_t I = 0; I < count.samples.size(); ++I) {
+      const auto &S = count.samples[I];
+      fnTotal += S.fnSize;
+      allocTotal += S.codeSize;
+      padTotal += (S.fnSize <= S.codeSize) ? (S.codeSize - S.fnSize) : 0;
+      // Gap to the next same-pool sample: an executable pointer never resolves
+      // to a stale range (v1 append-only), so a later address in the same pool
+      // is a distinct later allocation; their gap is the inter-allocation
+      // stride the compact layout caps at 16. Measure on codeStart (the
+      // allocation start), not fnPtr (entry offset may be non-zero).
+      if (I + 1 < count.samples.size()) {
+        const auto &N = count.samples[I + 1];
+        if (N.poolKind == S.poolKind && N.codeStart > S.codeStart) {
+          uint64_t Gap = N.codeStart - S.codeStart;
+          uint64_t Used = S.codeSize;
+          if (Gap > Used && (Gap - Used) < 16)
+            ++violations;
+        }
+      }
+    }
+  }
+  EJIT_DIAG_RAW("compiled sizes: fn_total=%llu alloc_total=%llu pad_total=%llu "
+                "16B_VIOLATIONS=%u",
+                static_cast<unsigned long long>(fnTotal),
+                static_cast<unsigned long long>(allocTotal),
+                static_cast<unsigned long long>(padTotal), violations);
 #ifdef EJIT_STATS_ENABLE
   constexpr bool ReuseTrackingEnabled = true;
   const uint32_t FinalVersions = count.byTier[kEJitTierBaseline] +
@@ -1877,20 +1950,34 @@ void ejit_taskpool_print_compiled() {
             p = end - 1;
           *p = '\0';
           EJIT_DIAG_RAW("funcIdx=%u name=%s tier=%s numDims=%u dims=[%s] fn=%p "
-                        "post_publish_seen=%s ver=[%s] size=%llu "
+                        "post_publish_seen=%s ver=[%s] code_size=%llu "
+                        "fn_size=%llu overhead=%llu "
                         "pool=%s pool_id=%u "
                         "gen=%u",
                         slot.funcIndex,
                         name.empty() ? "<unknown>" : name.c_str(), Tier,
                         slot.numDims, dims, fn, PostPublishSeen, ver,
                         static_cast<unsigned long long>(slot.codeSize),
+                        static_cast<unsigned long long>(slot.fnSize),
+                        static_cast<unsigned long long>(
+                            slot.fnSize <= slot.codeSize
+                                ? slot.codeSize - slot.fnSize
+                                : 0),
                         PoolKind, slot.poolId, slot.generation);
         } else {
           EJIT_DIAG_RAW("funcIdx=%u name=%s tier=%s numDims=%u dims=[%s] fn=%p "
+                        "code_size=%llu fn_size=%llu overhead=%llu "
                         "pool=%s post_publish_seen=%s",
                         slot.funcIndex,
                         name.empty() ? "<unknown>" : name.c_str(), Tier,
-                        slot.numDims, dims, fn, PoolKind, PostPublishSeen);
+                        slot.numDims, dims, fn,
+                        static_cast<unsigned long long>(slot.codeSize),
+                        static_cast<unsigned long long>(slot.fnSize),
+                        static_cast<unsigned long long>(
+                            slot.fnSize <= slot.codeSize
+                                ? slot.codeSize - slot.fnSize
+                                : 0),
+                        PoolKind, PostPublishSeen);
         }
         ejitDiagPrintThrottle();
       },

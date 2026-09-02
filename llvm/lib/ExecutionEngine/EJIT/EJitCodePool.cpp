@@ -526,7 +526,9 @@ Error EJitCodePoolManager::restoreRxRange(const void *Start, size_t Size) {
 
 bool EJitCodePoolManager::recordPendingRange(const void *Base, size_t Size,
                                              const EJitWritableRange *Writables,
-                                             uint32_t WritableCount) {
+                                             uint32_t WritableCount,
+                                             const EJitFnSymEntry *Syms,
+                                             uint32_t SymCount) {
   if (!Opts_.batchedPageSeal || !Base || Size == 0)
     return true;
   if (WritableCount > kEJitMaxWritableRanges ||
@@ -556,6 +558,15 @@ bool EJitCodePoolManager::recordPendingRange(const void *Base, size_t Size,
   Rec.writableCount = WritableCount;
   for (uint32_t I = 0; I < WritableCount; ++I)
     Rec.writables[I] = Writables[I];
+  // Diagnostic-only symbol metadata (truncated, not rejected) — see
+  // recordFinalizedRange for the rationale.
+  if (Syms && SymCount > 0) {
+    uint32_t N = SymCount > kEJitMaxSymsPerRange ? kEJitMaxSymsPerRange
+                                                 : SymCount;
+    Rec.symCount = N;
+    for (uint32_t I = 0; I < N; ++I)
+      Rec.syms[I] = Syms[I];
+  }
   PendingRanges_.push_back(Rec);
   return true;
 }
@@ -656,7 +667,7 @@ bool EJitCodePoolManager::contains(const void *Ptr) const {
 
 bool EJitCodePoolManager::recordFinalizedRange(
     const void *Base, size_t Size, const EJitWritableRange *Writables,
-    uint32_t WritableCount) {
+    uint32_t WritableCount, const EJitFnSymEntry *Syms, uint32_t SymCount) {
   if (!Base || Size == 0) {
     EJIT_DIAG_DEBUG("recordFinalizedRange skip: base=%p size=%zu", Base, Size);
     return true; // benign no-op (no executable extent to record).
@@ -732,6 +743,18 @@ bool EJitCodePoolManager::recordFinalizedRange(
   Rec.writableCount = WritableCount;
   for (uint32_t I = 0; I < WritableCount; ++I)
     Rec.writables[I] = Writables[I];
+  // Defined symbols (address,size) are diagnostic-only: an over-bound set is
+  // truncated, not rejected (fnSize is a waste-diagnostic quantity, never a
+  // peer-prepare/safety invariant like the writable set above). A non-zero
+  // count with a null array is treated as zero (no symbol metadata) rather than
+  // a hard reject — findRange then reports fnSize=0 (clean fallback).
+  if (Syms && SymCount > 0) {
+    uint32_t N = SymCount > kEJitMaxSymsPerRange ? kEJitMaxSymsPerRange
+                                                 : SymCount;
+    Rec.symCount = N;
+    for (uint32_t I = 0; I < N; ++I)
+      Rec.syms[I] = Syms[I];
+  }
   FinalizedRanges_.push_back(Rec);
   EJIT_DIAG_DEBUG(
       "recordFinalizedRange OK: base=%p size=%zu writable=%u total=%zu", Base,
@@ -770,6 +793,26 @@ bool EJitCodePoolManager::findRange(const void *Ptr,
       Out.fnPtr = const_cast<void *>(Ptr);
       Out.codeStart = Found->start;
       Out.codeSize = Found->size;
+      // Recover the entry function's real size for print_compiled waste
+      // diagnostics. The published fnPtr is the entry symbol's address; match
+      // it against the recorded defined symbols. Prefer an exact address match
+      // (the entry itself); otherwise fall back to the symbol whose body
+      // contains A (SAddr <= A < SAddr + size). 0 if no symbol metadata was
+      // recorded (then overhead defaults to the whole codeSize).
+      Out.fnSize = 0;
+      for (uint32_t S = 0; S < Found->symCount; ++S) {
+        uintptr_t SAddr = Found->syms[S].addr;
+        if (SAddr == A) {
+          Out.fnSize = Found->syms[S].size;
+          break; // exact entry match
+        }
+        // Containing-symbol fallback (e.g. fnPtr points into the middle of a
+        // symbol body rather than at its start). A real "contains" test needs
+        // both bounds; without it a non-containing preceding symbol could win.
+        if (SAddr <= A &&
+            A - SAddr < Found->syms[S].size) // SAddr <= A < SAddr + size
+          Out.fnSize = Found->syms[S].size;
+      }
       Out.poolBase = B;
       Out.poolSize = static_cast<uint64_t>(P.size);
       Out.poolId = static_cast<uint32_t>(I);

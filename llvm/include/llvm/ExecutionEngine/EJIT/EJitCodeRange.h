@@ -61,6 +61,31 @@ struct EJitWritableRange {
   uint64_t size = 0;
 };
 
+/// Maximum number of defined symbols (address,size) carried with one finalized
+/// executable range, used to recover the entry function's real size for waste
+/// diagnostics (print_compiled fn_size/overhead). A finalized allocation's
+/// executable segment usually holds a single defined symbol (the entry, since
+/// isolateSpecializationEntry turns the TU's other ejit_entry definitions into
+/// declarations); the small fixed bound leaves head room for the rare graph
+/// with several linked-in symbol bodies. Unlike writableRanges this is purely
+/// diagnostic (never a safety/peer-prepare invariant), so an over-bound set is
+/// truncated rather than rejected. Owner-private bookkeeping only — never
+/// serialized into the shared cache slot; only fnSize (the matched entry's
+/// size) crosses the ABI boundary.
+constexpr uint32_t kEJitMaxSymsPerRange = 8u;
+
+/// One defined symbol of a finalized executable range (owner-private,
+/// diagnostic only): the entry function's real size is recovered by matching
+/// the published fnPtr address against these recorded (addr,size) pairs at
+/// findRange() time. Every field is a fixed-width scalar accessed by value
+/// (endian-safe on aarch64_be).
+struct EJitFnSymEntry {
+  /// Address of a defined symbol inside the executable segment.
+  uintptr_t addr = 0;
+  /// Size in bytes of that symbol. 0 => unused entry.
+  uint64_t size = 0;
+};
+
 /// Real executable extent of one finalized compilation. Every field is a
 /// fixed-width scalar accessed by value (endian-safe on aarch64_be).
 struct EJitCompiledCodeInfo {
@@ -71,6 +96,13 @@ struct EJitCompiledCodeInfo {
   uintptr_t codeStart = 0;
   /// Size in bytes of that executable allocation. 0 => no range metadata.
   uint64_t codeSize = 0;
+  /// Real size in bytes of the entry function symbol (the published fnPtr),
+  /// recovered from the finalized graph's defined symbols. Smaller than
+  /// codeSize (which covers the whole allocation incl. padding/rodata/other
+  /// linked symbol bodies). 0 => no symbol metadata: print_compiled then
+  /// reports fn_size=0 and overhead=codeSize (cannot split). Carried into the
+  /// shared cache slot (ABI v18) so every core's print_compiled sees it.
+  uint64_t fnSize = 0;
   /// Base of the 2MiB-aligned code pool that contains the allocation (the
   /// split_2m_to_4k granularity on the target).
   uintptr_t poolBase = 0;

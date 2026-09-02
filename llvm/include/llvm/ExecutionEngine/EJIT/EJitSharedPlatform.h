@@ -105,7 +105,13 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// diagnostic mirror publishes aggregate plus placement-specific statistics.
 /// v17: cache slots can remain Pending while compact code waits for an explicit
 /// owner-worker batch publish request.
-constexpr uint32_t kEJitSharedAbiVersion = 17u;
+/// v18: each cache slot carries fnSize (the entry function's real size in
+/// bytes, recovered from the finalized graph's defined symbols) so every core's
+/// print_compiled can report per-function fn_size and waste overhead
+/// (codeSize - fnSize) without owner-private lookups. Purely diagnostic; a peer
+/// core never uses it for sealing or enable_rw. 0 means no symbol metadata was
+/// recorded (print_compiled reports fn_size=0, overhead=codeSize).
+constexpr uint32_t kEJitSharedAbiVersion = 18u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

@@ -179,6 +179,7 @@ struct RangeCtx {
   uint64_t poolSize = 0x200000ull; // 2 MiB
   uintptr_t codeStart = 0x40000000ull;
   uint64_t codeSize = 64;
+  uint64_t fnSize = 0; // entry function's real size (v18); 0 => no metadata.
   uint32_t poolId = 0;
   EJitCodePoolKind poolKind = EJitCodePoolKind::Near;
   bool provide = true;
@@ -199,6 +200,7 @@ bool mockCodeRange(void *ctx, const void *fnPtr, EJitCompiledCodeInfo *out) {
   out->fnPtr = const_cast<void *>(fnPtr);
   out->codeStart = r->codeStart;
   out->codeSize = r->codeSize;
+  out->fnSize = r->fnSize;
   out->poolBase = r->poolBase;
   out->poolSize = r->poolSize;
   out->poolId = r->poolId;
@@ -1645,6 +1647,47 @@ TEST_F(SharedTaskPoolTest, ForEachCompiledReportsVisitedAndSkipped) {
 }
 
 //===----------------------------------------------------------------------===//
+// The shared cache slot carries fnSize (the entry function's real size, ABI
+// v18) so every core's print_compiled can report fn_size/overhead without an
+// owner-private lookup. The code-range provider fills info.fnSize at publish
+// time; it must land in the slot under the bucket write lock (before
+// state=Ready) and be readable back through forEachCompiled.
+//===----------------------------------------------------------------------===//
+TEST_F(SharedTaskPoolTest, PublishedSlotCarriesFnSize) {
+  EJitSharedTaskPool owner;
+  FourKLog fourK;
+  RangeCtx range;
+  range.codeSize = 128;
+  range.fnSize = 56; // entry real size < allocation extent
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 42);
+
+  EJitSharedCacheSlot *slot = findReadySlot(42);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->codeSize, 128u);
+  EXPECT_EQ(slot->fnSize, 56u);
+
+  // A walk callback reads fnSize back without an owner-private lookup.
+  struct Ctx {
+    uint64_t fnSize;
+    uint64_t codeSize;
+    uint32_t seen;
+  } ctx{0, 0, 0};
+  auto cb = [](const EJitSharedCacheSlot &s, void *c) {
+    auto *cc = static_cast<Ctx *>(c);
+    if (s.funcIndex == 42) {
+      cc->fnSize = s.fnSize;
+      cc->codeSize = s.codeSize;
+      ++cc->seen;
+    }
+  };
+  owner.forEachCompiled(cb, &ctx);
+  EXPECT_EQ(ctx.seen, 1u);
+  EXPECT_EQ(ctx.fnSize, 56u);
+  EXPECT_EQ(ctx.codeSize, 128u);
+}
+
+//===----------------------------------------------------------------------===//
 // 11/ Cross-core fnPtr sharing gate.
 //===----------------------------------------------------------------------===//
 TEST_F(SharedTaskPoolTest, CrossCoreFnPtrSharingGate) {
@@ -3043,7 +3086,10 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // requests; v14 adds the owned bound-pointer snapshot, and v15 adds
   // per-version post-publish reuse tracking; v16 adds near/far placement.
   // v17 adds explicit batch publish state.
-  EXPECT_EQ(kEJitSharedAbiVersion, 17u);
+  // v18 adds per-slot fnSize (entry function's real size) for print_compiled
+  // waste diagnostics (fn_size/overhead); purely diagnostic, never used by a
+  // peer for sealing or enable_rw.
+  EXPECT_EQ(kEJitSharedAbiVersion, 18u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
