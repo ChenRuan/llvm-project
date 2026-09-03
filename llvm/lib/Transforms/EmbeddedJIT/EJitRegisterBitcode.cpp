@@ -799,6 +799,43 @@ static std::string extractAndSerialize(Module &M,
     F.setLinkage(GlobalValue::InternalLinkage);
   }
 
+  // Move the entry definitions to the head of the function list, keeping their
+  // relative order. This is about the ALIGNMENT of the specialized entry, not
+  // about ordering for its own sake:
+  //
+  //   * The JIT TargetMachine leaves function-sections off, so codegen emits
+  //     every function into one .text in module order, and AArch64 emits no
+  //     inter-function padding — a function that is not first starts at an
+  //     arbitrary 4-byte offset.
+  //   * EJitCodePoolManager::allocateCode floors each allocation's alignment at
+  //     Options::minCodeAlign (64B, raised to the seal page size under
+  //     immediate 4K sealing), so only the FIRST function of .text inherits it.
+  //
+  // A specialization compiles exactly one entry and the JIT deletes the other
+  // entries' bodies (isolateSpecializationEntry), so whichever entry is being
+  // compiled ends up first in .text and starts on a cache-line (or page)
+  // boundary rather than straddling one. Purely a layout change: function order
+  // within a module carries no semantics.
+  {
+    SmallVector<Function *, 4> EntryDefs;
+    for (Function &F : Extracted->functions())
+      if (!F.isDeclaration() &&
+          hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY))
+        EntryDefs.push_back(&F);
+
+    auto &FnList = Extracted->getFunctionList();
+    auto InsertPt = FnList.begin();
+    for (Function *F : EntryDefs) {
+      // splice() asserts when the insertion point is the node being moved, and
+      // an entry already in place needs no move — just step past it. EntryDefs
+      // is in list order, so InsertPt is never at end() here.
+      if (&*InsertPt == F) {
+        ++InsertPt;
+        continue;
+      }
+      FnList.splice(InsertPt, FnList, F->getIterator());
+    }
+  }
 
   logEJitGlobalMeta("extract-after-extern", *Extracted);
 
