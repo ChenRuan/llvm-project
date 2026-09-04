@@ -274,13 +274,17 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   bool ExecOnly = true;
   bool HasSegments = false;
   bool FitsCompactAlign = true;
+  size_t SegmentCount = 0;
+  size_t MaxSegmentAlign = 0;
   for (auto &KV : BL.segments()) {
     HasSegments = true;
-    if ((KV.first.getMemProt() & orc::MemProt::Exec) == orc::MemProt::None) {
+    ++SegmentCount;
+    const size_t SegmentAlign = KV.second.Alignment.value();
+    if (SegmentAlign > MaxSegmentAlign)
+      MaxSegmentAlign = SegmentAlign;
+    if ((KV.first.getMemProt() & orc::MemProt::Exec) == orc::MemProt::None)
       ExecOnly = false;
-      break;
-    }
-    if (KV.second.Alignment > Pool.codeAlignment())
+    if (SegmentAlign > Pool.codeAlignment())
       FitsCompactAlign = false;
   }
   const bool Compact =
@@ -297,9 +301,14 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   uint64_t Total = SegsSizes->total();
   [[maybe_unused]] const char *Placement = FarPool_ == &Pool ? "far" : "near";
   EJIT_DIAG_DEBUG(
-      "allocate: graph=%s pool=%s total=%llu layoutAlign=%zu compact=%u",
+      "allocate: graph=%s pool=%s total=%llu layoutAlign=%zu compact=%u "
+      "batched=%u segments=%zu execOnly=%u fitsAlign=%u maxAlign=%zu "
+      "configuredAlign=%zu",
       G.getName().c_str(), Placement, static_cast<unsigned long long>(Total),
-      LayoutAlign, static_cast<unsigned>(Compact));
+      LayoutAlign, static_cast<unsigned>(Compact),
+      static_cast<unsigned>(Pool.usesBatchedPageSeal()), SegmentCount,
+      static_cast<unsigned>(ExecOnly), static_cast<unsigned>(FitsCompactAlign),
+      MaxSegmentAlign, Pool.codeAlignment());
 
   void *Slab = nullptr;
   if (Total > 0) {
