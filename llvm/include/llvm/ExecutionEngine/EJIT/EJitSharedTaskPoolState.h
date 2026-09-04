@@ -67,6 +67,20 @@
 #ifndef EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES
 #define EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES 1u
 #endif
+#ifndef EJIT_SRE_PGO_COLD_PROFILE_TIMEOUT_TICKS
+#define EJIT_SRE_PGO_COLD_PROFILE_TIMEOUT_TICKS UINT64_C(300000000000)
+#endif
+#ifndef EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES
+#define EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES UINT64_C(30000000000)
+#endif
+#ifndef EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY
+#define EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY 128u
+#endif
+static_assert(EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY >= 1u &&
+                  EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY <= 128u,
+              "cold suppression capacity must be in [1, 128]");
+static_assert(EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES > 0,
+              "PGO publish quiet window must be non-zero");
 // Fixed slots per cache bucket. The shared cache is a fixed-capacity POD table
 // (no std::unordered_map can live in shared memory), so each bucket holds a
 // fixed array of slots. A bucket that fills evicts its oldest-generation slot.
@@ -175,6 +189,50 @@ enum class EJitCodeBatchRequestState : uint32_t {
   Failed = 4,
 };
 
+enum class EJitPgoAdmissionState : uint32_t {
+  Free = 0,
+  Active = 1,
+  Aborting = 2,
+};
+
+enum class EJitPgoProfilePhase : uint32_t {
+  Tier1Queued = 0,
+  Tier1Sampling = 1,
+  Tier2Queued = 2,
+  Tier2Compiling = 3,
+};
+
+/// Exact shared ownership record for one pre-link online-PGO lifecycle.
+/// Producer cores only create the record under pgoAdmissionLock. Progress and
+/// expiry are maintained by the single owner worker.
+struct EJitPgoAdmissionSlot {
+  EJitAtomicU32 state; ///< EJitPgoAdmissionState; published last on admission.
+  uint32_t funcIndex;
+  uint32_t numDims;
+  uint32_t generation;
+  EJitDimPair dims[kEJitSharedMaxDims];
+  uint32_t versions[kEJitSharedMaxDims];
+  EJitAtomicU64 token;
+  EJitAtomicU64 lastObservedHits;
+  EJitAtomicU64 lastProgressTick;
+  EJitAtomicU32 phase; ///< EJitPgoProfilePhase
+  EJitAtomicU32 progressQuarter;
+};
+
+/// Bounded, admission-lock protected AOT-only identities. Keeping these out of
+/// the result cache means cold profiles cannot evict executable code or consume
+/// cache ways. Old records are replaced round-robin; generation/version checks
+/// make stale records harmless.
+struct EJitPgoColdSuppression {
+  uint32_t valid;
+  uint32_t funcIndex;
+  uint32_t numDims;
+  uint32_t generation;
+  EJitDimPair dims[kEJitSharedMaxDims];
+  uint32_t versions[kEJitSharedMaxDims];
+  uint64_t token;
+};
+
 //===----------------------------------------------------------------------===//
 // EJitSharedWritableRange: one runtime-writable extent of a published code
 // allocation (e.g. the Tier-1 __profc_ counters). Plain fixed-width scalars so
@@ -253,6 +311,9 @@ struct EJitSharedCacheSlot {
   /// compile driver via ORC lookup and kept driver-private — they do not
   /// need to live in the shared slot.
   EJitAtomicU64 hitCount;
+  /// Exact online-PGO lifecycle token. Non-zero only for Tier-1/Tier-2 code;
+  /// used by owner cold-GC and late completion checks, never by the wrapper.
+  EJitAtomicU64 pgoToken;
   /// PGO (§7.1): current compile tier of the published code.  0 = Baseline /
   /// not yet published, 1 = Instrumented (Tier-1), 2 = PGOUse (Tier-2).
   /// Used to suppress the Tier-2 auto-trigger on slots that are already
@@ -365,6 +426,7 @@ struct EJitSharedCounters {
   EJitAtomicU64 tier1Compiles;
   EJitAtomicU64 tier2Compiles;
   EJitAtomicU64 profileMergeFails;
+  EJitAtomicU64 coldExpired;
 };
 
 //===----------------------------------------------------------------------===//
@@ -544,13 +606,25 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU32 icacheReleasersWired;
   EJitAtomicU32 pgoEnabled;     ///< 1 => shared online-PGO trigger is enabled
   EJitAtomicU32 tier2Threshold; ///< shared hit threshold; 0 disables trigger
-  /// Staged PGO admission. Entries are funcIndex + 1; zero means free.
+  /// Staged PGO admission. Exact token/identity matching prevents stale
+  /// completion from releasing a newer specialization of the same function.
   EJitAtomicU32 pgoAdmissionLock;
   EJitAtomicU32 pgoMaxActiveFunctions;
   EJitAtomicU32 pgoActiveFunctionCount;
-  EJitAtomicU32 pgoActiveFunctions[kEJitSharedMaxConcurrentProfiles];
-  /// Last logged progress quarter for each admission slot: 0..4.
-  EJitAtomicU32 pgoProgressQuarters[kEJitSharedMaxConcurrentProfiles];
+  EJitAtomicU32 pgoActivityEpoch;
+  EJitAtomicU32 pgoPublishBarrier;
+  EJitAtomicU32 pgoProducerInFlight;
+  EJitPgoAdmissionSlot pgoAdmissions[kEJitSharedMaxConcurrentProfiles];
+  /// Per-function value-profile gate. A linked-but-unpublished Tier-2 no
+  /// longer consumes admission, but retains this exact token until publish so
+  /// another cell cannot overlap the same function's VP storage.
+  EJitAtomicU64 pgoVpFunctionGates[kEJitSharedMaxFuncIndex];
+  /// Bounded independently of MAX_FUNC_INDEX. Full tables use deterministic
+  /// round-robin replacement; replacing a record only permits a future PGO
+  /// retry and cannot affect functional AOT correctness.
+  EJitPgoColdSuppression
+      pgoColdSuppressions[EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY];
+  uint32_t pgoColdSuppressionNext;
   EJitAtomicU64 pgoCompletedFunctions;
   EJitAtomicU64 pgoDeferredMisses;
   EJitAtomicU32 anyInstanceActivated; ///< 1 once any instance first
@@ -564,12 +638,11 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
                                       ///< with stats off the acquire-load gate
                                       ///< on the disabled path is compiled out.
 
-  //--- flat dedup slots (own cache line). Each slot stores the OWNER GENERATION
-  //    that claimed it (0 = free), not a 1-bit flag: a dedupMark CASes 0->gen
-  //    and a dedupClear CASes gen->0, so a stale worker from an earlier
-  //    generation can never clear a slot a newer generation re-claimed for the
-  //    same funcIndex (spec §11 generation-aware dedup).
-  alignas(kEJitSharedCacheLine) EJitAtomicU32 inFlight[kEJitSharedMaxFuncIndex];
+  //--- flat dedup slots (own cache line). Each slot stores a unique request
+  //    token, so stale completion cannot clear a newer request even within the
+  //    same owner generation.
+  EJitAtomicU64 nextRequestToken;
+  alignas(kEJitSharedCacheLine) EJitAtomicU64 inFlight[kEJitSharedMaxFuncIndex];
 
   //--- MPSC queue: head and tail on SEPARATE cache lines (false-sharing), ring
   //    storage on its own.
@@ -658,6 +731,8 @@ static_assert(
 static_assert(
     offsetof(EJitSharedTaskPoolState, magic) == 0,
     "magic must be the first word so a foreign/zero blob is rejected");
+static_assert(sizeof(EJitSharedTaskPoolState) <= 512u * 1024u,
+              "shared taskpool blob exceeds its 512 KiB placement budget");
 
 } // namespace ejit
 } // namespace llvm
