@@ -24,6 +24,8 @@ using orc::ExecutorAddr;
 using WrapperFunctionCall = orc::shared::WrapperFunctionCall;
 
 namespace {
+constexpr size_t kMaxBatchedCompactAlign = 64;
+
 /// One contiguous executable segment of a finalized allocation (the only kind
 /// of memory that needs execute permission). An allocation may contain several
 /// (non-contiguous) executable segments and any number of non-executable
@@ -231,13 +233,13 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   //
   // Why fold: BasicLayout groups blocks by {MemProt, MemLifetime}. A pure
   // read-only section (R--) and the code section (R+X) land in DIFFERENT
-  // segments, and whether the layout is the 16-byte compact one (batched
+  // segments, and whether the layout is the compact one (batched
   // mode) or the 4K-page one (immediate mode), the two segments each occupy
   // their OWN 4KiB page(s) — a 37-byte .rodata costs a whole page and, in
   // batched mode, also breaks the ExecOnly compact stride. Promoting the
   // R-- section to R+X BEFORE BasicLayout merges it into the code segment,
   // so text and rodata lay out contiguous within one segment and share a
-  // page. This wins in BOTH 4K seal sub-modes: batched (16-byte compact
+  // page. This wins in BOTH 4K seal sub-modes: batched (16-64 byte compact
   // stride across allocations) and immediate (contiguous within the single
   // allocation's page), and in both near and far pools.
   //
@@ -253,10 +255,11 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   //    invariant (write/exec pages never share) are untouched. __profd_
   //    (read-only) folding into the exec segment is fine: a peer reads it
   //    from the RX page, same as it reads code.
-  //  - An over-aligned (e.g. alignas(32)) read-only block still triggers the
-  //    page-granular fallback: the merged segment's Alignment = max(block
-  //    alignments) exceeds codeAlignment(), so FitsCompactAlign=false (in
-  //    batched mode) / LayoutAlign stays PageSize_ (in immediate mode).
+  //  - An over-aligned (greater than 64 bytes) read-only block still triggers
+  //    the page-granular fallback: the merged segment's Alignment = max(block
+  //    alignments) exceeds kMaxBatchedCompactAlign, so
+  //    FitsCompactAlign=false (in batched mode) / LayoutAlign stays PageSize_
+  //    (in immediate mode).
   //
   // Gated on usesPageSeal() (4K-seal, both sub-modes): the legacy 2MiB
   // whole-pool seal flips an entire pool RX off a single pointer, which
@@ -276,6 +279,9 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   bool FitsCompactAlign = true;
   size_t SegmentCount = 0;
   size_t MaxSegmentAlign = 0;
+  const size_t CompactAlignLimit =
+      Pool.codeAlignment() > kMaxBatchedCompactAlign ? Pool.codeAlignment()
+                                                     : kMaxBatchedCompactAlign;
   for (auto &KV : BL.segments()) {
     HasSegments = true;
     ++SegmentCount;
@@ -284,12 +290,15 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
       MaxSegmentAlign = SegmentAlign;
     if ((KV.first.getMemProt() & orc::MemProt::Exec) == orc::MemProt::None)
       ExecOnly = false;
-    if (SegmentAlign > Pool.codeAlignment())
+    if (SegmentAlign > CompactAlignLimit)
       FitsCompactAlign = false;
   }
   const bool Compact =
       Pool.usesBatchedPageSeal() && HasSegments && ExecOnly && FitsCompactAlign;
-  const size_t LayoutAlign = Compact ? Pool.codeAlignment() : PageSize_;
+  const size_t CompactAlign = MaxSegmentAlign > Pool.codeAlignment()
+                                  ? MaxSegmentAlign
+                                  : Pool.codeAlignment();
+  const size_t LayoutAlign = Compact ? CompactAlign : PageSize_;
   auto SegsSizes = BL.getContiguousPageBasedLayoutSizes(LayoutAlign);
   if (!SegsSizes) {
     EJIT_DIAG("allocate FAIL: layout sizes error graph=%s",
@@ -303,12 +312,12 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   EJIT_DIAG_DEBUG(
       "allocate: graph=%s pool=%s total=%llu layoutAlign=%zu compact=%u "
       "batched=%u segments=%zu execOnly=%u fitsAlign=%u maxAlign=%zu "
-      "configuredAlign=%zu",
+      "configuredAlign=%zu compactAlignLimit=%zu",
       G.getName().c_str(), Placement, static_cast<unsigned long long>(Total),
       LayoutAlign, static_cast<unsigned>(Compact),
       static_cast<unsigned>(Pool.usesBatchedPageSeal()), SegmentCount,
       static_cast<unsigned>(ExecOnly), static_cast<unsigned>(FitsCompactAlign),
-      MaxSegmentAlign, Pool.codeAlignment());
+      MaxSegmentAlign, Pool.codeAlignment(), CompactAlignLimit);
 
   void *Slab = nullptr;
   if (Total > 0) {
