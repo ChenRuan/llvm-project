@@ -39,10 +39,15 @@ EJitDimPair dim(uint32_t Type, uint32_t Instance) {
   return EJitDimPair{Type, Instance};
 }
 
+uint64_t mockNowCycles(void *Ctx) {
+  return *static_cast<uint64_t *>(Ctx);
+}
+
 struct FixedNearEntry {
   void *fn = nullptr;
   uint32_t poolId = kEJitNearHotPublicPoolId;
   bool ready = false;
+  uint32_t tier = kEJitTierBaseline;
 };
 
 struct FixedNearPublishCtx {
@@ -110,7 +115,9 @@ bool mockFixedNearCompile(void *Ctx, const EJitCompileRequest &Req,
   auto *C = static_cast<FixedNearPublishCtx *>(Ctx);
   void *Fn = reinterpret_cast<void *>(
       0x600000ull + static_cast<uintptr_t>(C->entries.size()) * 0x100u);
-  C->entries.push_back({Fn, fixedNearPoolForRequest(Req), false});
+  const uint32_t Tier = decodeReqTier(Req.funcIndex);
+  C->entries.push_back(
+      {Fn, fixedNearPoolForRequest(Req), Tier == kEJitTierInstrumented, Tier});
   *OutFn = Fn;
   return true;
 }
@@ -313,6 +320,213 @@ TEST_F(FixedNearTaskPoolTest, WaitsForQuiescenceAndPublishesByPool) {
     Owner.releaseRead(HP.bucketIndex);
 }
 
+TEST_F(FixedNearTaskPoolTest, Accumulates150PgoVersionsUntilQuietWindow) {
+  FixedNearPublishCtx Ctx;
+  EJitSharedTaskPool Owner;
+  uint64_t Now = 1;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(State.get());
+  Owner.setCompiler(&mockFixedNearCompile, &Ctx);
+  Owner.setCodeRangeProvider(&mockFixedNearRange, &Ctx);
+  Owner.setCodeBatchCallbacks(&mockFixedNearReady, &mockFixedNearLegacyFlush,
+                              &Ctx);
+  Owner.setCodeBatchPoolFlushCallback(&mockFixedNearFlushPool, &Ctx);
+  Owner.setNowTicksSource(&mockNowCycles, &Now);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setPgoEnabled(true, 1, 4);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  constexpr uint32_t FirstFunc = 400;
+  constexpr uint32_t VersionCount = 150;
+  for (uint32_t Func = FirstFunc; Func != FirstFunc + VersionCount; ++Func) {
+    ASSERT_EQ(Owner.compileOrGet(Func, nullptr, 0, codeFor(Func)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Owner.pollOne());
+    auto Tier1 = Owner.tryCacheHit0D(Func);
+    ASSERT_EQ(Tier1.status, EJitCompileOrGetStatus::CacheHit);
+    if (Tier1.hasReadToken)
+      Owner.releaseRead(Tier1.bucketIndex);
+    ASSERT_TRUE(Owner.pollOne());
+  }
+
+  EXPECT_EQ(Owner.pendingPublishCount(), VersionCount);
+  EXPECT_EQ(Ctx.flushCalls, 0u);
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Idle);
+  EXPECT_EQ(Ctx.flushCalls, 0u);
+  Now += EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES;
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
+  EXPECT_EQ(Ctx.flushCalls, 1u);
+  EXPECT_EQ(Owner.pendingPublishCount(), 0u);
+}
+
+TEST_F(FixedNearTaskPoolTest, PgoActivityRestartsQuietWindow) {
+  FixedNearPublishCtx Ctx;
+  EJitSharedTaskPool Owner;
+  uint64_t Now = 1;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(State.get());
+  Owner.setCompiler(&mockFixedNearCompile, &Ctx);
+  Owner.setCodeRangeProvider(&mockFixedNearRange, &Ctx);
+  Owner.setCodeBatchCallbacks(&mockFixedNearReady, &mockFixedNearLegacyFlush,
+                              &Ctx);
+  Owner.setCodeBatchPoolFlushCallback(&mockFixedNearFlushPool, &Ctx);
+  Owner.setNowTicksSource(&mockNowCycles, &Now);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setPgoEnabled(true, 1, 1);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  auto CompileTier2 = [&](uint32_t Func) {
+    EXPECT_EQ(Owner.compileOrGet(Func, nullptr, 0, codeFor(Func)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    EXPECT_TRUE(Owner.pollOne());
+    auto Tier1 = Owner.tryCacheHit0D(Func);
+    EXPECT_EQ(Tier1.status, EJitCompileOrGetStatus::CacheHit);
+    if (Tier1.hasReadToken)
+      Owner.releaseRead(Tier1.bucketIndex);
+    EXPECT_TRUE(Owner.pollOne());
+  };
+
+  CompileTier2(600);
+  ASSERT_EQ(Owner.pendingPublishCount(), 1u);
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Idle);
+  Now += EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES - 1;
+  CompileTier2(601);
+  EXPECT_EQ(Ctx.flushCalls, 0u);
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Idle);
+  ++Now;
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Idle);
+  EXPECT_EQ(Ctx.flushCalls, 0u);
+  Now += EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES - 1;
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
+  EXPECT_EQ(Ctx.flushCalls, 1u);
+  EXPECT_EQ(Owner.pendingPublishCount(), 0u);
+}
+
+TEST_F(FixedNearTaskPoolTest, CapacityAndExplicitPublishRemainImmediate) {
+  FixedNearPublishCtx Ctx;
+  EJitSharedTaskPool Owner;
+  uint64_t Now = 1;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(State.get());
+  Owner.setCompiler(&mockFixedNearCompile, &Ctx);
+  Owner.setCodeRangeProvider(&mockFixedNearRange, &Ctx);
+  Owner.setCodeBatchCallbacks(&mockFixedNearReady, &mockFixedNearLegacyFlush,
+                              &Ctx);
+  Owner.setCodeBatchPoolFlushCallback(&mockFixedNearFlushPool, &Ctx);
+  Owner.setNowTicksSource(&mockNowCycles, &Now);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setPgoEnabled(true, 1, 4);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  constexpr uint32_t FirstFunc = 800;
+  constexpr uint32_t VersionCount =
+      EJIT_CODE_POOL_FIXED_NEAR_HOT_PENDING_LIMIT + 1;
+  for (uint32_t Func = FirstFunc; Func != FirstFunc + VersionCount; ++Func) {
+    ASSERT_EQ(Owner.compileOrGet(Func, nullptr, 0, codeFor(Func)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Owner.pollOne());
+    auto Tier1 = Owner.tryCacheHit0D(Func);
+    ASSERT_EQ(Tier1.status, EJitCompileOrGetStatus::CacheHit);
+    if (Tier1.hasReadToken)
+      Owner.releaseRead(Tier1.bucketIndex);
+    ASSERT_TRUE(Owner.pollOne());
+  }
+
+  EXPECT_EQ(Ctx.flushCalls, 1u);
+  ASSERT_EQ(Owner.pendingPublishCount(), 1u);
+  EXPECT_TRUE(Owner.flushCodeBatch());
+  EXPECT_EQ(Ctx.flushCalls, 2u);
+  EXPECT_EQ(Owner.pendingPublishCount(), 0u);
+}
+
+TEST_F(FixedNearTaskPoolTest, ColdProfileTimeoutStartsFinalQuietWindow) {
+  FixedNearPublishCtx Ctx;
+  EJitSharedTaskPool Owner;
+  uint64_t Now = 1;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(State.get());
+  Owner.setCompiler(&mockFixedNearCompile, &Ctx);
+  Owner.setCodeRangeProvider(&mockFixedNearRange, &Ctx);
+  Owner.setCodeBatchCallbacks(&mockFixedNearReady, &mockFixedNearLegacyFlush,
+                              &Ctx);
+  Owner.setCodeBatchPoolFlushCallback(&mockFixedNearFlushPool, &Ctx);
+  Owner.setNowTicksSource(&mockNowCycles, &Now);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setPgoEnabled(true, 1, 2);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  for (uint32_t Func : {1100u, 1101u}) {
+    ASSERT_EQ(Owner.compileOrGet(Func, nullptr, 0, codeFor(Func)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Owner.pollOne());
+  }
+  auto Tier1 = Owner.tryCacheHit0D(1100);
+  ASSERT_EQ(Tier1.status, EJitCompileOrGetStatus::CacheHit);
+  if (Tier1.hasReadToken)
+    Owner.releaseRead(Tier1.bucketIndex);
+  ASSERT_TRUE(Owner.pollOne());
+  ASSERT_EQ(Owner.pendingPublishCount(), 1u);
+  EXPECT_EQ(Ctx.flushCalls, 0u);
+
+  Now += EJIT_SRE_PGO_COLD_PROFILE_TIMEOUT_TICKS + 1;
+  for (unsigned Step = 0;
+       Step != 8 && State->pgoActiveFunctionCount.loadAcquire() != 0; ++Step)
+    (void)Owner.workerPollOnce();
+  ASSERT_EQ(State->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Idle);
+  EXPECT_EQ(Ctx.flushCalls, 0u);
+  Now += EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES;
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
+  EXPECT_EQ(Ctx.flushCalls, 1u);
+  EXPECT_EQ(Owner.pendingPublishCount(), 0u);
+}
+
+struct PublishBarrierRaceCtx {
+  EJitSharedTaskPool *pool = nullptr;
+  EJitCompileOrGetStatus status = EJitCompileOrGetStatus::InvalidParam;
+};
+
+struct AbortRecorder {
+  uint32_t calls = 0;
+  uint64_t token = 0;
+};
+
+void recordAbort(void *Opaque, const EJitCompileRequest &Req) {
+  auto &Record = *static_cast<AbortRecorder *>(Opaque);
+  ++Record.calls;
+  Record.token = Req.requestToken;
+}
+
+void produceAtPublishBarrier(void *Opaque) {
+  auto &Race = *static_cast<PublishBarrierRaceCtx *>(Opaque);
+  Race.status = Race.pool->compileOrGet(299, nullptr, 0, codeFor(299)).status;
+}
+
+TEST_F(FixedNearTaskPoolTest, PublishBarrierClosesProducerQueueGap) {
+  FixedNearPublishCtx Ctx;
+  EJitSharedTaskPool Owner;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(State.get());
+  Owner.setCompiler(&mockFixedNearCompile, &Ctx);
+  Owner.setCodeRangeProvider(&mockFixedNearRange, &Ctx);
+  Owner.setCodeBatchCallbacks(&mockFixedNearReady, &mockFixedNearLegacyFlush,
+                              &Ctx);
+  Owner.setCodeBatchPoolFlushCallback(&mockFixedNearFlushPool, &Ctx);
+  Owner.setMode(EJitCompileMode::Async);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(Owner.compileOrGet(298, nullptr, 0, codeFor(298)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+
+  PublishBarrierRaceCtx Race{&Owner};
+  Owner.setAutoPublishBarrierTestHook(&produceAtPublishBarrier, &Race);
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Idle);
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
+  Owner.setAutoPublishBarrierTestHook(nullptr, nullptr);
+  EXPECT_EQ(Race.status, EJitCompileOrGetStatus::QueueFullFallback);
+  EXPECT_EQ(Ctx.flushCalls, 1u);
+}
+
 TEST_F(FixedNearTaskPoolTest,
        TwoTier2RequestsAutoFlushThroughRealCodePoolStateMachine) {
   RealFixedNearPublishCtx Ctx;
@@ -369,6 +583,41 @@ TEST_F(FixedNearTaskPoolTest,
   }
 }
 
+TEST_F(FixedNearTaskPoolTest, ShutdownAbortsLinkedTier2DriverLifecycle) {
+  FixedNearPublishCtx Ctx;
+  AbortRecorder Abort;
+  EJitSharedTaskPool Owner;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(State.get());
+  Owner.setCompiler(&mockFixedNearCompile, &Ctx);
+  Owner.setCodeRangeProvider(&mockFixedNearRange, &Ctx);
+  Owner.setCodeBatchCallbacks(&mockFixedNearReady, &mockFixedNearLegacyFlush,
+                              &Ctx);
+  Owner.setCodeBatchPoolFlushCallback(&mockFixedNearFlushPool, &Ctx);
+  Owner.setAbortPgoProfileCallback(&recordAbort, &Abort);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setPgoEnabled(true, 1);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  ASSERT_EQ(Owner.compileOrGet(220, nullptr, 0, codeFor(220)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  auto Hit = Owner.tryCacheHit0D(220);
+  ASSERT_EQ(Hit.status, EJitCompileOrGetStatus::CacheHit);
+  if (Hit.hasReadToken)
+    Owner.releaseRead(Hit.bucketIndex);
+  ASSERT_TRUE(Owner.pollOne());
+  ASSERT_EQ(Owner.pendingPublishCount(), 1u);
+  const uint64_t Token = State->inFlight[220].loadAcquire();
+  ASSERT_NE(Token, 0u);
+
+  Owner.ownerShutdown();
+  EXPECT_EQ(Abort.calls, 1u);
+  EXPECT_EQ(Abort.token, Token);
+  EXPECT_EQ(State->inFlight[220].loadAcquire(), 0u);
+  EXPECT_EQ(Owner.pendingPublishCount(), 0u);
+}
+
 TEST_F(FixedNearTaskPoolTest, FailureDoesNotBlockOtherPools) {
   FixedNearPublishCtx Ctx;
   Ctx.failCell1 = true;
@@ -405,6 +654,76 @@ TEST_F(FixedNearTaskPoolTest, FailureDoesNotBlockOtherPools) {
   EXPECT_EQ(findReadySlot(302), nullptr);
   EXPECT_NE(findReadySlot(303), nullptr);
   EXPECT_EQ(Owner.pendingPublishCount(), 0u);
+}
+
+TEST_F(FixedNearTaskPoolTest,
+       Tier2PermanentPoolFailureIsBoundedAndDoesNotBlockNewHealthyPool) {
+  FixedNearPublishCtx Ctx;
+  Ctx.failCell1 = true;
+  EJitSharedTaskPool Owner;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(State.get());
+  Owner.setCompiler(&mockFixedNearCompile, &Ctx);
+  Owner.setCodeRangeProvider(&mockFixedNearRange, &Ctx);
+  Owner.setCodeBatchCallbacks(&mockFixedNearReady, &mockFixedNearLegacyFlush,
+                              &Ctx);
+  Owner.setCodeBatchPoolFlushCallback(&mockFixedNearFlushPool, &Ctx);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setPgoEnabled(true, 1, 2);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  for (uint32_t Cell = 0; Cell != 3; ++Cell)
+    Owner.setInstanceEnabled(0, Cell, true);
+
+  const EJitDimPair Cell0[1] = {dim(0, 0)};
+  const EJitDimPair Cell1[1] = {dim(0, 1)};
+  const EJitDimPair Cell2[1] = {dim(0, 2)};
+  ASSERT_EQ(Owner.compileOrGet(321, Cell0, 1, codeFor(321)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_EQ(Owner.compileOrGet(322, Cell1, 1, codeFor(322)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_EQ(Owner.pollBudget(2), 2u);
+  for (auto Pair : {std::make_pair(321u, Cell0),
+                    std::make_pair(322u, Cell1)}) {
+    auto Hit = Owner.compileOrGet(Pair.first, Pair.second, 1,
+                                  codeFor(Pair.first));
+    ASSERT_EQ(Hit.status, EJitCompileOrGetStatus::CacheHit);
+    if (Hit.hasReadToken)
+      Owner.releaseRead(Hit.bucketIndex);
+  }
+  ASSERT_EQ(Owner.pollBudget(2), 2u);
+  ASSERT_EQ(Owner.pendingPublishCount(), 2u);
+  EXPECT_NE(Owner.compileOrGet(322, Cell1, 1, codeFor(322)).status,
+            EJitCompileOrGetStatus::CacheHit)
+      << "linked Tier-2 must remain AOT-only before pool commit";
+
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Idle);
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
+  EXPECT_NE(findReadySlot(321), nullptr);
+  ASSERT_NE(findReadySlot(322), nullptr);
+  EXPECT_EQ(findReadySlot(322)->tier.loadRelaxed(),
+            static_cast<uint8_t>(kEJitTierInstrumented));
+  ASSERT_EQ(Owner.pendingPublishCount(), 1u);
+
+  ASSERT_EQ(Owner.compileOrGet(323, Cell2, 1, codeFor(323)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  auto Hit = Owner.compileOrGet(323, Cell2, 1, codeFor(323));
+  ASSERT_EQ(Hit.status, EJitCompileOrGetStatus::CacheHit);
+  if (Hit.hasReadToken)
+    Owner.releaseRead(Hit.bucketIndex);
+  ASSERT_TRUE(Owner.pollOne());
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Idle);
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
+  EXPECT_NE(findReadySlot(323), nullptr)
+      << "a delayed failed pool must not hold a newly linked healthy pool";
+
+  for (unsigned I = 0; I != 80 && Owner.pendingPublishCount() != 0; ++I)
+    (void)Owner.workerPollOnce();
+  EXPECT_EQ(Owner.pendingPublishCount(), 0u);
+  EXPECT_EQ(findReadySlot(322), nullptr);
+  EXPECT_EQ(Owner.compileOrGet(322, Cell1, 1, codeFor(322)).status,
+            EJitCompileOrGetStatus::PgoAdmissionDeferred)
+      << "permanent failure reaches terminal AOT suppression";
 }
 
 TEST_F(FixedNearTaskPoolTest, MissingPoolFlushFallsBackCleanly) {
@@ -524,6 +843,49 @@ TEST_F(FixedNearTaskPoolTest, CorruptPoolFlushLayoutFallsBackWithoutCall) {
   EXPECT_EQ(Owner.pendingPublishCount(), 1u);
   EXPECT_EQ(Ctx.flushCalls, 0u);
   EXPECT_EQ(findReadySlot(308), nullptr);
+}
+
+TEST_F(FixedNearTaskPoolTest,
+       ThirdInvalidCallbackFailureReturnsFalseAndAbortsTier2) {
+  FixedNearPublishCtx Ctx;
+  AbortRecorder Abort;
+  EJitSharedTaskPool Owner;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(State.get());
+  Owner.setCompiler(&mockFixedNearCompile, &Ctx);
+  Owner.setCodeRangeProvider(&mockFixedNearRange, &Ctx);
+  Owner.setCodeBatchCallbacks(&mockFixedNearReady, &mockFixedNearLegacyFlush,
+                              &Ctx);
+  Owner.setCodeBatchPoolFlushCallback(&mockFixedNearFlushPool, &Ctx);
+  Owner.setAbortPgoProfileCallback(&recordAbort, &Abort);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setPgoEnabled(true, 1);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  ASSERT_EQ(Owner.compileOrGet(309, nullptr, 0, codeFor(309)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  auto Hit = Owner.tryCacheHit0D(309);
+  ASSERT_EQ(Hit.status, EJitCompileOrGetStatus::CacheHit);
+  if (Hit.hasReadToken)
+    Owner.releaseRead(Hit.bucketIndex);
+  ASSERT_TRUE(Owner.pollOne());
+  ASSERT_EQ(Owner.pendingPublishCount(), 1u);
+  const uint64_t Token = State->inFlight[309].loadAcquire();
+  ASSERT_NE(Token, 0u);
+
+  Owner.corruptCodeBatchPoolLayoutTagForTest(0xFFFFFFFFFFFFFFFFULL);
+  EXPECT_FALSE(Owner.flushCodeBatch());
+  EXPECT_EQ(Owner.pendingPublishCount(), 1u);
+  EXPECT_FALSE(Owner.flushCodeBatch());
+  EXPECT_EQ(Owner.pendingPublishCount(), 1u);
+  EXPECT_FALSE(Owner.flushCodeBatch());
+  EXPECT_EQ(Owner.pendingPublishCount(), 0u);
+  EXPECT_EQ(Abort.calls, 1u);
+  EXPECT_EQ(Abort.token, Token);
+  EXPECT_EQ(State->inFlight[309].loadAcquire(), 0u);
+  EXPECT_EQ(Owner.compileOrGet(309, nullptr, 0, codeFor(309)).status,
+            EJitCompileOrGetStatus::PgoAdmissionDeferred);
 }
 
 } // namespace
