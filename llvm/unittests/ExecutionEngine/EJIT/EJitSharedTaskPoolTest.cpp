@@ -555,6 +555,10 @@ TEST_F(SharedTaskPoolTest, AbiLayoutAndHeader) {
   EXPECT_EQ(sizeof(state_->pgoColdSuppressions),
             sizeof(EJitPgoColdSuppression) *
                 EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY);
+  EXPECT_EQ(sizeof(state_->pgoLinkedPending),
+            sizeof(EJitPgoLinkedPending) * kEJitSharedLinkedPendingSlots);
+  EXPECT_GE(kEJitSharedLinkedPendingSlots,
+            EJIT_CODE_POOL_FIXED_NEAR_HOT_PENDING_LIMIT);
 }
 
 // A process-global instance of the shared blob must require no C++ dynamic
@@ -1254,7 +1258,7 @@ TEST_F(SharedTaskPoolTest, BatchPgoTier2AutoPublishesWhenQueueDrains) {
   ASSERT_EQ(Batch.compileOrder.size(), 2u);
   EXPECT_EQ(decodeReqTier(Batch.compileOrder[1].funcIndex), kEJitTierPgoUse);
   EXPECT_EQ(Owner.pendingPublishCount(), 1u);
-  EXPECT_EQ(Owner.pendingCount(), 1u);
+  EXPECT_EQ(Owner.pendingCount(), 0u);
 
   auto StillTier1 = Owner.tryCacheHit0D(46);
   EXPECT_EQ(StillTier1.status, EJitCompileOrGetStatus::AlreadyPending);
@@ -3211,7 +3215,7 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // v19 adds fixed near-hot pool
   // diagnostics and stable semantic pool ids.
   // v20 replaces the inline bound-pointer payload with borrowed descriptors.
-  EXPECT_EQ(kEJitSharedAbiVersion, 21u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 22u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(

@@ -57,11 +57,11 @@ requires all of the following to remain stable across the debounce window:
 - an unchanged activity epoch.
 
 The debounce is `EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES`, measured by the owner
-worker's monotonic cycle counter. It defaults to `30000000000`, one tenth of
-the default cold-profile timeout, and should be tuned from the deployed counter
-frequency and the longest expected gap between profiling waves. PGO activity
-restarts the complete window. Capacity and explicit publication remain
-immediate overrides.
+worker's monotonic cycle counter. It defaults to `3000000000`, one hundredth of
+the default cold-profile timeout and 90% below the former 30000000000-cycle
+default. It should be tuned from the deployed counter frequency and the longest
+expected gap between profiling waves. PGO activity restarts the complete
+window. Capacity and explicit publication remain immediate overrides.
 
 A publish barrier makes concurrent misses fall back to AOT while the final
 snapshot is checked and pools are sealed. Pools commit independently. A failed

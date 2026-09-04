@@ -816,6 +816,14 @@ public:
     coldPgoSnapshotTestHook_ = fn;
     coldPgoSnapshotTestHookCtx_ = ctx;
   }
+  void setPgoCacheMissTestHook(TestHookFn fn, void *ctx) {
+    pgoCacheMissTestHook_ = fn;
+    pgoCacheMissTestHookCtx_ = ctx;
+  }
+  void setPgoLinkedPendingMissTestHook(TestHookFn fn, void *ctx) {
+    pgoLinkedPendingMissTestHook_ = fn;
+    pgoLinkedPendingMissTestHookCtx_ = ctx;
+  }
   void abortPgoProfileForTest(const EJitCompileRequest &req,
                               bool suppress = false) {
     abortPgoProfile(req, "test", suppress, /*countCold=*/false);
@@ -1481,19 +1489,37 @@ private:
   bool codeBatchFlushPoolCallbacksIntact() const;
 #endif
 
-  /// Release staged-PGO ownership if \p funcIndex still owns it. Tier-2
-  /// completion and terminal worker failures call this; transient queue-full
+  /// Release staged-PGO ownership if \p funcIndex still owns it. Tier-2 link
+  /// releases sampling resources before delayed publication; terminal worker
+  /// failures release them through finishPgoFunction. Transient queue-full
   /// leaves ownership intact so the next hit can retry.
   bool updatePgoPhase(const EJitCompileRequest &req, EJitPgoProfilePhase phase);
   bool releasePgoAdmission(const EJitCompileRequest &req);
+  enum class PgoMissClaimResult : uint8_t {
+    Claimed,
+    AlreadyPending,
+    InvalidFuncIndex,
+    RetryCache,
+  };
+  PgoMissClaimResult claimPgoMiss(uint32_t funcIndex,
+                                  const EJitDimPair *dims, uint32_t numDims,
+                                  uint32_t observedDispatchEpoch,
+                                  uint64_t &token);
+  bool registerLinkedPending(const EJitCompileRequest &req);
+  bool linkedPendingOwns(const EJitCompileRequest &req) const;
+  bool clearLinkedPending(const EJitCompileRequest &req);
+  bool releasePgoResources(const EJitCompileRequest &req);
+  void settlePgoFunction(const EJitCompileRequest &req, bool completed,
+                         const char *reason = nullptr);
   void finishPgoFunction(const EJitCompileRequest &req, bool completed,
                          const char *reason = nullptr);
-  bool abortPgoStateTransition(const EJitCompileRequest &req, bool suppress);
+  bool abortPgoStateTransition(const EJitCompileRequest &req, bool suppress,
+                               bool resourcesReleased = false);
   bool pgoAdmissionActive(const EJitCompileRequest &req) const;
   bool coldSuppresses(const EJitCompileRequest &req) const;
   void abortPgoProfile(const EJitCompileRequest &req, const char *reason,
                        bool suppress, bool countCold, uint64_t hits = 0,
-                       uint64_t age = 0);
+                       uint64_t age = 0, bool resourcesReleased = false);
   void retireColdProfile(const EJitCompileRequest &req, uint64_t hits,
                          uint64_t age);
 
@@ -1553,6 +1579,10 @@ private:
   void *autoPublishBarrierTestHookCtx_ = nullptr;
   TestHookFn coldPgoSnapshotTestHook_ = nullptr;
   void *coldPgoSnapshotTestHookCtx_ = nullptr;
+  TestHookFn pgoCacheMissTestHook_ = nullptr;
+  void *pgoCacheMissTestHookCtx_ = nullptr;
+  TestHookFn pgoLinkedPendingMissTestHook_ = nullptr;
+  void *pgoLinkedPendingMissTestHookCtx_ = nullptr;
 #endif
   OwnerElectedFn ownerElected_ = nullptr;
   void *ownerElectedCtx_ = nullptr;
