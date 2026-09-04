@@ -97,7 +97,8 @@ EJitCodePoolManager::Options poolOpts(size_t PoolSize) {
 // 64 bytes of filler "code" referenced by the content block (must outlive G).
 const char CodeBytes[64] = {0};
 
-std::unique_ptr<LinkGraph> makeCodeGraph(size_t Size, uint64_t VAddr) {
+std::unique_ptr<LinkGraph> makeCodeGraph(size_t Size, uint64_t VAddr,
+                                         unsigned Align = 16) {
   auto G = std::make_unique<LinkGraph>(
       "g", std::make_shared<orc::SymbolStringPool>(),
       Triple("x86_64-unknown-linux-gnu"), SubtargetFeatures(),
@@ -105,7 +106,7 @@ std::unique_ptr<LinkGraph> makeCodeGraph(size_t Size, uint64_t VAddr) {
   auto &Sec =
       G->createSection("__text", orc::MemProt::Read | orc::MemProt::Exec);
   G->createContentBlock(Sec, ArrayRef<char>(CodeBytes, Size),
-                        orc::ExecutorAddr(VAddr), 16, 0);
+                        orc::ExecutorAddr(VAddr), Align, 0);
   return G;
 }
 
@@ -1090,6 +1091,43 @@ TEST(EJitCodePoolMemMgrBatch, PureCodeAllocationsSharePageUntilFlush) {
   EXPECT_TRUE(Pool.findRange(Addr0, Info));
   EXPECT_TRUE(Pool.findRange(Addr1, Info));
 
+  cantFail(MM.deallocate(std::move(FA0)));
+  cantFail(MM.deallocate(std::move(FA1)));
+}
+
+TEST(EJitCodePoolMemMgrBatch, SixtyFourAlignedPureCodeStaysCompact) {
+  MockSre4K M;
+  auto O = fourKMemMgrOpts();
+  O.minCodeAlign = 16;
+  O.batchedPageSeal = true;
+  EJitCodePoolManager Pool(
+      O, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G0 = makeCodeGraph(64, 0x1000, /*Align=*/64);
+  auto IFA0 = cantFail(MM.allocate(nullptr, *G0));
+  void *Addr0 = firstBlockAddr(*G0);
+  auto G1 = makeCodeGraph(64, 0x2000, /*Align=*/64);
+  auto IFA1 = cantFail(MM.allocate(nullptr, *G1));
+  void *Addr1 = firstBlockAddr(*G1);
+
+  auto PageOf = [](void *P) {
+    return reinterpret_cast<uintptr_t>(P) &
+           ~static_cast<uintptr_t>(kFourKiB - 1);
+  };
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(Addr0) % 64, 0u);
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(Addr1) % 64, 0u);
+  EXPECT_EQ(PageOf(Addr0), PageOf(Addr1));
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(Addr1) -
+                reinterpret_cast<uintptr_t>(Addr0),
+            64u);
+
+  auto FA0 = cantFail(IFA0->finalize());
+  auto FA1 = cantFail(IFA1->finalize());
+  cantFail(Pool.flushPendingRanges());
+  EXPECT_EQ(M.SealCalls, 1u);
   cantFail(MM.deallocate(std::move(FA0)));
   cantFail(MM.deallocate(std::move(FA1)));
 }
