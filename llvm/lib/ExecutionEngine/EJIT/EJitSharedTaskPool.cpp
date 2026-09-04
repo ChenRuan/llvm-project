@@ -1726,17 +1726,173 @@ bool EJitSharedTaskPool::releasePgoAdmission(
   return Released;
 }
 
-void EJitSharedTaskPool::finishPgoFunction(const EJitCompileRequest &Req,
-                                           bool completed,
-                                           const char *reason) {
+EJitSharedTaskPool::PgoMissClaimResult EJitSharedTaskPool::claimPgoMiss(
+    uint32_t FuncIndex, const EJitDimPair *Dims, uint32_t NumDims,
+    uint32_t ObservedDispatchEpoch, uint64_t &Token) {
+  if (!state_ || NumDims > kEJitSharedMaxDims)
+    return PgoMissClaimResult::InvalidFuncIndex;
+
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  bool RanRegistryMissHook = false;
+#endif
+  for (;;) {
+    uint32_t Expected = 0;
+    while (!state_->pgoLinkedPendingLock.compareExchange(Expected, 1))
+      Expected = 0;
+
+    // cachePublish takes the bucket lock before this lock. Never re-enter the
+    // cache while holding pgoLinkedPendingLock: an epoch change asks the caller
+    // to drop this lock and repeat its cache lookup instead.
+    if (state_->dispatchEpoch.loadAcquire() != ObservedDispatchEpoch) {
+      state_->pgoLinkedPendingLock.storeRelease(0);
+      return PgoMissClaimResult::RetryCache;
+    }
+
+    const uint32_t Generation = state_->generation.loadAcquire();
+    bool Found = false;
+    for (uint32_t I = 0; I < kEJitSharedLinkedPendingSlots && !Found; ++I) {
+      const EJitPgoLinkedPending &Entry = state_->pgoLinkedPending[I];
+      if (Entry.token == 0 || Entry.funcIndex != FuncIndex ||
+          Entry.numDims != NumDims || Entry.generation != Generation)
+        continue;
+      Found = true;
+      for (uint32_t D = 0; D < NumDims; ++D)
+        Found &= Entry.dims[D].dimType == Dims[D].dimType &&
+                 Entry.dims[D].instanceId == Dims[D].instanceId &&
+                 Entry.versions[D] ==
+                     instanceVersion(Dims[D].dimType, Dims[D].instanceId);
+    }
+    if (Found) {
+      state_->pgoLinkedPendingLock.storeRelease(0);
+      return PgoMissClaimResult::AlreadyPending;
+    }
+
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+    if (!RanRegistryMissHook && pgoLinkedPendingMissTestHook_) {
+      RanRegistryMissHook = true;
+      state_->pgoLinkedPendingLock.storeRelease(0);
+      pgoLinkedPendingMissTestHook_(pgoLinkedPendingMissTestHookCtx_);
+      continue;
+    }
+#endif
+
+    // Registration and release of a linked Tier-2 also use this lock. Thus a
+    // producer cannot observe "not registered" and then claim dedup after the
+    // owner has released the old token: both transitions are one critical
+    // section from the producer's perspective.
+    const EJitDedupResult Dedup = dedupMark(FuncIndex, Token);
+    state_->pgoLinkedPendingLock.storeRelease(0);
+    switch (Dedup) {
+    case EJitDedupResult::Claimed:
+      return PgoMissClaimResult::Claimed;
+    case EJitDedupResult::AlreadyPending:
+      return PgoMissClaimResult::AlreadyPending;
+    case EJitDedupResult::InvalidFuncIndex:
+      return PgoMissClaimResult::InvalidFuncIndex;
+    }
+  }
+}
+
+bool EJitSharedTaskPool::registerLinkedPending(
+    const EJitCompileRequest &Req) {
+  if (!state_ || !Req.requestToken || Req.numDims > kEJitSharedMaxDims)
+    return false;
+  uint32_t Expected = 0;
+  while (!state_->pgoLinkedPendingLock.compareExchange(Expected, 1))
+    Expected = 0;
+  EJitPgoLinkedPending *Free = nullptr;
+  for (uint32_t I = 0; I < kEJitSharedLinkedPendingSlots; ++I) {
+    EJitPgoLinkedPending &Entry = state_->pgoLinkedPending[I];
+    if (Entry.token == 0) {
+      Free = &Entry;
+      break;
+    }
+  }
+  if (Free) {
+    Free->funcIndex = stripReqTier(Req.funcIndex);
+    Free->numDims = Req.numDims;
+    Free->generation = Req.generation;
+    Free->reserved = 0;
+    for (uint32_t D = 0; D < kEJitSharedMaxDims; ++D) {
+      Free->dims[D] = D < Req.numDims ? Req.dims[D] : EJitDimPair{0, 0};
+      Free->versions[D] = D < Req.numDims ? Req.versions[D] : 0;
+    }
+    Free->token = Req.requestToken;
+  }
+  state_->pgoLinkedPendingLock.storeRelease(0);
+  return Free != nullptr;
+}
+
+bool EJitSharedTaskPool::linkedPendingOwns(
+    const EJitCompileRequest &Req) const {
+  if (!state_ || !Req.requestToken || Req.numDims > kEJitSharedMaxDims)
+    return false;
+  uint32_t Expected = 0;
+  while (!state_->pgoLinkedPendingLock.compareExchange(Expected, 1))
+    Expected = 0;
+  const uint32_t FuncIndex = stripReqTier(Req.funcIndex);
+  bool Found = false;
+  for (uint32_t I = 0; I < kEJitSharedLinkedPendingSlots && !Found; ++I) {
+    const EJitPgoLinkedPending &Entry = state_->pgoLinkedPending[I];
+    if (Entry.token != Req.requestToken || Entry.funcIndex != FuncIndex ||
+        Entry.numDims != Req.numDims || Entry.generation != Req.generation)
+      continue;
+    Found = true;
+    for (uint32_t D = 0; D < Req.numDims; ++D)
+      Found &= Entry.dims[D].dimType == Req.dims[D].dimType &&
+               Entry.dims[D].instanceId == Req.dims[D].instanceId &&
+               Entry.versions[D] == Req.versions[D];
+  }
+  state_->pgoLinkedPendingLock.storeRelease(0);
+  return Found;
+}
+
+bool EJitSharedTaskPool::clearLinkedPending(
+    const EJitCompileRequest &Req) {
+  if (!state_ || !Req.requestToken || Req.numDims > kEJitSharedMaxDims)
+    return false;
+  uint32_t Expected = 0;
+  while (!state_->pgoLinkedPendingLock.compareExchange(Expected, 1))
+    Expected = 0;
+  const uint32_t FuncIndex = stripReqTier(Req.funcIndex);
+  bool Cleared = false;
+  for (uint32_t I = 0; I < kEJitSharedLinkedPendingSlots; ++I) {
+    EJitPgoLinkedPending &Entry = state_->pgoLinkedPending[I];
+    if (Entry.token != Req.requestToken || Entry.funcIndex != FuncIndex ||
+        Entry.numDims != Req.numDims || Entry.generation != Req.generation)
+      continue;
+    bool SameIdentity = true;
+    for (uint32_t D = 0; D < Req.numDims; ++D)
+      SameIdentity &= Entry.dims[D].dimType == Req.dims[D].dimType &&
+                      Entry.dims[D].instanceId == Req.dims[D].instanceId &&
+                      Entry.versions[D] == Req.versions[D];
+    if (!SameIdentity)
+      continue;
+    Entry.token = 0;
+    Cleared = true;
+    break;
+  }
+  state_->pgoLinkedPendingLock.storeRelease(0);
+  return Cleared;
+}
+
+bool EJitSharedTaskPool::releasePgoResources(
+    const EJitCompileRequest &Req) {
   const uint32_t FuncIndex = stripReqTier(Req.funcIndex);
   const bool Released = releasePgoAdmission(Req);
   uint64_t Token = Req.requestToken;
   const bool GateReleased =
       FuncIndex < kEJitSharedMaxFuncIndex && Token &&
       state_->pgoVpFunctionGates[FuncIndex].compareExchange(Token, uint64_t{0});
-  if (!Released && !GateReleased)
-    return;
+  return Released || GateReleased;
+}
+
+void EJitSharedTaskPool::settlePgoFunction(const EJitCompileRequest &Req,
+                                           bool completed,
+                                           const char *reason) {
+  // After Tier-2 link, the unique owner-private PendingPublish is the
+  // settlement token; admission, VP gate, and coarse dedup are already free.
+  const uint32_t FuncIndex = stripReqTier(Req.funcIndex);
   if (completed) {
     uint64_t done = state_->pgoCompletedFunctions.fetchAdd(1) + 1;
     EJIT_DIAG("PGO profile complete func=%u: completed=%llu deferred=%llu",
@@ -1747,6 +1903,14 @@ void EJitSharedTaskPool::finishPgoFunction(const EJitCompileRequest &Req,
     EJIT_DIAG("PGO profile aborted func=%u reason=%s; next function may start",
               FuncIndex, reason ? reason : "unspecified");
   }
+}
+
+void EJitSharedTaskPool::finishPgoFunction(const EJitCompileRequest &Req,
+                                           bool completed,
+                                           const char *reason) {
+  if (!releasePgoResources(Req))
+    return;
+  settlePgoFunction(Req, completed, reason);
 }
 
 uint64_t EJitSharedTaskPool::nowTicks() const {
@@ -1790,7 +1954,7 @@ bool EJitSharedTaskPool::coldSuppresses(const EJitCompileRequest &Req) const {
 }
 
 bool EJitSharedTaskPool::abortPgoStateTransition(
-    const EJitCompileRequest &Req, bool Suppress) {
+    const EJitCompileRequest &Req, bool Suppress, bool ResourcesReleased) {
   uint32_t Expected = 0;
   while (!state_->pgoAdmissionLock.compareExchange(Expected, 1))
     Expected = 0;
@@ -1818,7 +1982,8 @@ bool EJitSharedTaskPool::abortPgoStateTransition(
   if (pgoAbortTransitionTestHook_)
     pgoAbortTransitionTestHook_(pgoAbortTransitionTestHookCtx_);
 #endif
-  if (Suppress && (Released || OwnsGate)) {
+  const bool Owned = Released || OwnsGate || ResourcesReleased;
+  if (Suppress && Owned) {
     uint32_t Slot = EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY;
     for (uint32_t I = 0; I < EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY; ++I) {
       EJitPgoColdSuppression &Candidate = state_->pgoColdSuppressions[I];
@@ -1856,13 +2021,14 @@ bool EJitSharedTaskPool::abortPgoStateTransition(
   if (Released || OwnsGate)
     state_->pgoActivityEpoch.fetchAdd(1);
   state_->pgoAdmissionLock.storeRelease(0);
-  return Released || OwnsGate;
+  return Owned;
 }
 
 void EJitSharedTaskPool::abortPgoProfile(const EJitCompileRequest &Req,
                                          const char *Reason, bool Suppress,
                                          bool CountCold, uint64_t Hits,
-                                         uint64_t Age) {
+                                         uint64_t Age,
+                                         bool ResourcesReleased) {
   const uint32_t FuncIndex = stripReqTier(Req.funcIndex);
   const uint64_t Key = hashIdentity(FuncIndex, Req.dims, Req.numDims);
   EJitSharedCacheBucket &B =
@@ -1912,7 +2078,8 @@ void EJitSharedTaskPool::abortPgoProfile(const EJitCompileRequest &Req,
   }
   bucketWriteRelease(B);
   icacheDrainAll("pgo-cold-expired");
-  const bool Transitioned = abortPgoStateTransition(Req, Suppress);
+  const bool Transitioned =
+      abortPgoStateTransition(Req, Suppress, ResourcesReleased);
   if (Transitioned && abortPgoProfileFn_)
     abortPgoProfileFn_(abortPgoProfileCtx_, Req);
   dedupClear(Req.funcIndex, Req.requestToken);
@@ -3058,6 +3225,9 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   }
   for (uint32_t i = 0; i < kEJitSharedMaxFuncIndex; ++i)
     st->pgoVpFunctionGates[i].storeRelaxed(0);
+  st->pgoLinkedPendingLock.storeRelaxed(0);
+  for (uint32_t i = 0; i < kEJitSharedLinkedPendingSlots; ++i)
+    st->pgoLinkedPending[i].token = 0;
   for (uint32_t i = 0; i < EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY; ++i)
     st->pgoColdSuppressions[i].valid = 0;
   st->pgoColdSuppressionNext = 0;
@@ -3480,8 +3650,12 @@ void EJitSharedTaskPool::ownerShutdown() {
     // changes below.
     const uint32_t Tier = decodeReqTier(P.req.funcIndex);
     if (Tier == kEJitTierPgoUse) {
+      const bool Registered = linkedPendingOwns(P.req);
       abortPgoProfile(P.req, "owner-shutdown-linked", /*Suppress=*/false,
-                      /*CountCold=*/false);
+                      /*CountCold=*/false, /*Hits=*/0, /*Age=*/0,
+                      /*ResourcesReleased=*/Registered);
+      if (Registered)
+        (void)clearLinkedPending(P.req);
     } else {
       cacheDropPending(P.req, nullptr);
       dedupClear(P.req.funcIndex, P.req.requestToken);
@@ -3560,9 +3734,9 @@ EJitSharedTaskPool::classifyHit(const SharedLookup &Hit, bool enqueueTier2) {
     return R;
   }
   if (Hit.pgoSamplingComplete) {
-    // Tier-1 has enough data. Do not enter compileOrGet() again: Tier-2 already
-    // owns the per-function dedup claim, and the wrapper should execute its AOT
-    // fallback until the final code is published.
+    // Tier-1 has enough data. This identity's sampling-complete cache slot
+    // prevents duplicate work even after Tier-2 link releases the coarse
+    // per-function dedup claim for another identity. Execute AOT until publish.
     R.status = EJitCompileOrGetStatus::AlreadyPending;
     R.fastPathTerminal = true;
     return R;
@@ -3759,6 +3933,8 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     R.fnPtr = fallback;
     return R;
   }
+  uint32_t CacheLookupEpoch =
+      state_ ? state_->dispatchEpoch.loadAcquire() : 0;
   R = tryCacheHit(funcIndex, dims, numDims, boundPointers, boundCount);
   if (R.fastPathTerminal) {
     // Non-hit terminals surface the caller's fallback pointer (a hit already
@@ -3928,7 +4104,57 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     R.status = EJitCompileOrGetStatus::PgoAdmissionDeferred;
     return R;
   }
-  switch (dedupMark(funcIndex, Req.requestToken)) {
+  EJitDedupResult Dedup = EJitDedupResult::AlreadyPending;
+  if (pgoForRequest) {
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+    if (pgoCacheMissTestHook_)
+      pgoCacheMissTestHook_(pgoCacheMissTestHookCtx_);
+#endif
+    constexpr uint32_t MaxCacheRetries = 3;
+    for (uint32_t Attempt = 0; Attempt < MaxCacheRetries; ++Attempt) {
+      const PgoMissClaimResult Claim =
+          claimPgoMiss(funcIndex, dims, numDims, CacheLookupEpoch,
+                       Req.requestToken);
+      if (Claim == PgoMissClaimResult::Claimed) {
+        Dedup = EJitDedupResult::Claimed;
+        break;
+      }
+      if (Claim == PgoMissClaimResult::AlreadyPending) {
+        Dedup = EJitDedupResult::AlreadyPending;
+        break;
+      }
+      if (Claim == PgoMissClaimResult::InvalidFuncIndex) {
+        Dedup = EJitDedupResult::InvalidFuncIndex;
+        break;
+      }
+
+      // A publish happened after the miss. Drop the linked-registry lock before
+      // looking in the bucket again, preserving cachePublish's bucket->linked
+      // lock order. Persistent publication traffic degrades to AOT after this
+      // small bound instead of enqueueing from an unverified miss.
+      if (Attempt + 1 == MaxCacheRetries) {
+        state_->pgoDeferredMisses.fetchAdd(1);
+        R.status = EJitCompileOrGetStatus::PgoAdmissionDeferred;
+        return R;
+      }
+      CacheLookupEpoch = state_->dispatchEpoch.loadAcquire();
+      CompileOrGetResult Retry =
+          tryCacheHit(funcIndex, dims, numDims, boundPointers, boundCount);
+      if (Retry.fastPathTerminal) {
+        if (Retry.status != EJitCompileOrGetStatus::CacheHit)
+          Retry.fnPtr = fallback;
+        return Retry;
+      }
+      if (cacheHasPending(funcIndex, dims, numDims)) {
+        EJIT_STAT_INC(state_->counters.alreadyPending);
+        R.status = EJitCompileOrGetStatus::AlreadyPending;
+        return R;
+      }
+    }
+  } else {
+    Dedup = dedupMark(funcIndex, Req.requestToken);
+  }
+  switch (Dedup) {
   case EJitDedupResult::AlreadyPending:
     EJIT_STAT_INC(state_->counters.alreadyPending);
     EJIT_DIAG_VERBOSE("shared taskpool coalesced func=%u: already pending",
@@ -4243,10 +4469,14 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests,
       }
       const uint32_t Tier = decodeReqTier(P.req.funcIndex);
       cacheDropPending(P.req, nullptr);
-      if (Tier == kEJitTierPgoUse)
+      if (Tier == kEJitTierPgoUse) {
+        const bool Registered = linkedPendingOwns(P.req);
         abortPgoProfile(P.req, "near-hot-flush-callback-invalid",
-                        /*Suppress=*/true, /*CountCold=*/false);
-      else {
+                        /*Suppress=*/true, /*CountCold=*/false, /*Hits=*/0,
+                        /*Age=*/0, /*ResourcesReleased=*/Registered);
+        if (Registered)
+          (void)clearLinkedPending(P.req);
+      } else {
         dedupClear(P.req.funcIndex, P.req.requestToken);
         if (publishFn_)
           publishFn_(publishCtx_, P.req, false);
@@ -4333,7 +4563,10 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests,
           publishFn_(publishCtx_, Member.req, true);
         if (Tier == kEJitTierPgoUse) {
           EJIT_STAT_INC(state_->counters.tier2Compiles);
-          finishPgoFunction(Member.req, /*completed=*/true);
+          if (clearLinkedPending(Member.req))
+            settlePgoFunction(Member.req, /*completed=*/true);
+          else
+            finishPgoFunction(Member.req, /*completed=*/true);
         }
         dedupClear(Member.req.funcIndex, Member.req.requestToken);
         continue;
@@ -4357,10 +4590,15 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests,
       cacheDropPending(Member.req, nullptr);
       if (publishFn_ && Tier != kEJitTierPgoUse)
         publishFn_(publishCtx_, Member.req, false);
-      if (Tier == kEJitTierPgoUse)
+      if (Tier == kEJitTierPgoUse) {
+        const bool Registered = linkedPendingOwns(Member.req);
         abortPgoProfile(Member.req, "linked-publish-terminal-failure",
                         /*Suppress=*/PS != EJitPublishStatus::VersionMismatch,
-                        /*CountCold=*/false);
+                        /*CountCold=*/false, /*Hits=*/0, /*Age=*/0,
+                        /*ResourcesReleased=*/Registered);
+        if (Registered)
+          (void)clearLinkedPending(Member.req);
+      }
       if (releaseFn_)
         releaseFn_(releaseCtx_, Member.fn);
       EJIT_STAT_INC(state_->counters.publishFailed);
@@ -4419,13 +4657,16 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests,
                   FuncIndex, state_->tier2Threshold.loadAcquire());
       } else if (Tier == kEJitTierPgoUse) {
         EJIT_STAT_INC(state_->counters.tier2Compiles);
-        finishPgoFunction(P.req, /*completed=*/true);
+        if (clearLinkedPending(P.req))
+          settlePgoFunction(P.req, /*completed=*/true);
+        else
+          finishPgoFunction(P.req, /*completed=*/true);
       }
     } else if (Tier == kEJitTierPgoUse && PS == EJitPublishStatus::Failed) {
       // The linked Tier-2 code is already executable, but publishing the
-      // replacement pointer failed transiently. Keep both the owner-private
-      // result and the PGO admission; the live shared slot still points at
-      // Tier-1 and a later explicit publish can retry without recompiling.
+      // replacement pointer failed transiently. Keep the owner-private result;
+      // the live shared slot still points at Tier-1 and a later explicit
+      // publish can retry without recompiling or resampling.
       Retry.push_back(P);
       EJIT_STAT_INC(state_->counters.publishFailed);
       EJIT_DIAG("PGO Tier-2 publish deferred func=%u; Tier-1 remains active",
@@ -4437,8 +4678,15 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests,
       if (publishFn_)
         publishFn_(publishCtx_, P.req, false);
       if (P.req.generation == state_->generation.loadAcquire() &&
-          (Tier == kEJitTierInstrumented || Tier == kEJitTierPgoUse))
+          Tier == kEJitTierInstrumented)
         finishPgoFunction(P.req, /*completed=*/false);
+      else if (P.req.generation == state_->generation.loadAcquire() &&
+               Tier == kEJitTierPgoUse) {
+        if (clearLinkedPending(P.req))
+          settlePgoFunction(P.req, /*completed=*/false);
+        else
+          finishPgoFunction(P.req, /*completed=*/false);
+      }
       if (releaseFn_)
         releaseFn_(releaseCtx_, P.fn);
       if (PS == EJitPublishStatus::VersionMismatch)
@@ -4854,9 +5102,17 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
       }
     }
     const uint32_t PoolId = info.poolId;
+    const bool Registered =
+        tier == kEJitTierPgoUse && registerLinkedPending(req);
     pendingPublishes_.push_back({req, fn, PoolId});
-    if (tier == kEJitTierPgoUse)
-      (void)releasePgoAdmission(req);
+    if (Registered) {
+      (void)releasePgoResources(req);
+      dedupClear(req.funcIndex, req.requestToken);
+    } else if (tier == kEJitTierPgoUse) {
+      EJIT_DIAG("linked-pending registry full func=%u capacity=%u; retaining "
+                "PGO gate until publish",
+                realFuncIndex, kEJitSharedLinkedPendingSlots);
+    }
     autoTier2PublishPending_ = true;
     publishCodePoolStats();
     EJIT_DIAG_DEBUG("near-hot linked pending func=%u pool=%u pending=%zu",
@@ -4869,9 +5125,18 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
       // Tier-2 has completed compilation/JITLink into the near RW/NX pool, but
       // must not replace the live Tier-1 slot until the worker observes the
       // compile queue empty and seals the batch. Keep only owner-private state
-      // and retain the in-flight claim.
+      // while releasing the completed snapshot's admission and per-function
+      // VP gate so another identity of this function may begin sampling.
+      const bool Registered = registerLinkedPending(PublishReq);
       pendingPublishes_.push_back({PublishReq, fn});
-      (void)releasePgoAdmission(req);
+      if (Registered) {
+        (void)releasePgoResources(req);
+        dedupClear(req.funcIndex, req.requestToken);
+      } else {
+        EJIT_DIAG("linked-pending registry full func=%u capacity=%u; "
+                  "retaining PGO gate until publish",
+                  realFuncIndex, kEJitSharedLinkedPendingSlots);
+      }
       autoTier2PublishPending_ = true;
       EJIT_DIAG_DEBUG("PGO Tier-2 linked pending queue-drain publish func=%u "
                       "fn=%p pending=%zu",

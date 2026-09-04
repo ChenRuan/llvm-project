@@ -71,7 +71,7 @@
 #define EJIT_SRE_PGO_COLD_PROFILE_TIMEOUT_TICKS UINT64_C(300000000000)
 #endif
 #ifndef EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES
-#define EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES UINT64_C(30000000000)
+#define EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES UINT64_C(3000000000)
 #endif
 #ifndef EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY
 #define EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY 128u
@@ -124,6 +124,11 @@ constexpr uint32_t kEJitSharedCacheBuckets = EJIT_SRE_TASKPOOL_BUCKETS;
 constexpr uint32_t kEJitNoBucket = 0xFFFFFFFFu;
 constexpr uint32_t kEJitSharedCacheSlots = EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS;
 constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
+constexpr uint32_t kEJitSharedLinkedPendingSlots =
+    EJIT_CODE_POOL_FIXED_NEAR_HOT_PENDING_LIMIT;
+static_assert(kEJitSharedLinkedPendingSlots >=
+                  EJIT_CODE_POOL_FIXED_NEAR_HOT_PENDING_LIMIT,
+              "linked-pending registry must cover the near-hot pending bound");
 constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
 constexpr uint32_t kEJitSharedMaxConcurrentProfiles = 16u;
 static_assert(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES >= 1u &&
@@ -231,6 +236,19 @@ struct EJitPgoColdSuppression {
   EJitDimPair dims[kEJitSharedMaxDims];
   uint32_t versions[kEJitSharedMaxDims];
   uint64_t token;
+};
+
+/// Exact identities whose Tier-2 code is linked but not yet executable or
+/// published. The token is zero for a free entry. All fields are protected by
+/// pgoLinkedPendingLock; producers consult this table only after a cache miss.
+struct EJitPgoLinkedPending {
+  uint64_t token;
+  uint32_t funcIndex;
+  uint32_t numDims;
+  uint32_t generation;
+  uint32_t reserved;
+  EJitDimPair dims[kEJitSharedMaxDims];
+  uint32_t versions[kEJitSharedMaxDims];
 };
 
 //===----------------------------------------------------------------------===//
@@ -615,10 +633,13 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU32 pgoPublishBarrier;
   EJitAtomicU32 pgoProducerInFlight;
   EJitPgoAdmissionSlot pgoAdmissions[kEJitSharedMaxConcurrentProfiles];
-  /// Per-function value-profile gate. A linked-but-unpublished Tier-2 no
-  /// longer consumes admission, but retains this exact token until publish so
-  /// another cell cannot overlap the same function's VP storage.
+  /// Per-function value-profile gate. It serializes sampling and snapshot
+  /// capture for identities that share one function's VP storage. Tier-2 link
+  /// transfers duplicate suppression to pgoLinkedPending before clearing it.
   EJitAtomicU64 pgoVpFunctionGates[kEJitSharedMaxFuncIndex];
+  EJitAtomicU32 pgoLinkedPendingLock;
+  EJitPgoLinkedPending
+      pgoLinkedPending[kEJitSharedLinkedPendingSlots];
   /// Bounded independently of MAX_FUNC_INDEX. Full tables use deterministic
   /// round-robin replacement; replacing a record only permits a future PGO
   /// retry and cannot affect functional AOT correctness.
@@ -703,6 +724,11 @@ static_assert(
         std::is_trivially_destructible<EJitSharedCacheSlot>::value &&
         std::is_trivially_default_constructible<EJitSharedCacheSlot>::value,
     "EJitSharedCacheSlot must be POD-style");
+static_assert(
+    std::is_standard_layout<EJitPgoLinkedPending>::value &&
+        std::is_trivially_destructible<EJitPgoLinkedPending>::value &&
+        std::is_trivially_default_constructible<EJitPgoLinkedPending>::value,
+    "EJitPgoLinkedPending must be POD-style");
 static_assert(
     std::is_standard_layout<EJitSharedWritableRange>::value &&
         std::is_trivially_destructible<EJitSharedWritableRange>::value &&

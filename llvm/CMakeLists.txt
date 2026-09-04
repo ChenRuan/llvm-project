@@ -931,7 +931,7 @@ set(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES "1" CACHE STRING
   "EmbeddedJIT concurrent functions collecting online PGO profiles (1-16)")
 set(EJIT_SRE_PGO_COLD_PROFILE_TIMEOUT_TICKS "300000000000" CACHE STRING
   "Online-PGO no-progress timeout in monotonic cycle-counter ticks (0 disables)")
-set(EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES "30000000000" CACHE STRING
+set(EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES "3000000000" CACHE STRING
   "Online-PGO Tier-2 publish quiet window in owner monotonic cycle-counter cycles")
 set(EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY "128" CACHE STRING
   "Maximum exact cold-profile suppression records in shared memory")
