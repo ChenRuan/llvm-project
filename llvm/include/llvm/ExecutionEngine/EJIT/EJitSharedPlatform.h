@@ -111,12 +111,13 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// (codeSize - fnSize) without owner-private lookups. Purely diagnostic; a peer
 /// core never uses it for sealing or enable_rw. 0 means no symbol metadata was
 /// recorded (print_compiled reports fn_size=0, overhead=codeSize).
-/// v19: the owner-published pool mirror carries the 16 cell + public near-hot
-/// pool details and pool ids are stable across separate managers.
 /// v20: the old inline payload is replaced by a fixed table of borrowed
 /// raw bound-pointer descriptors; no pointee bytes or ownership cross the
 /// shared queue.
-constexpr uint32_t kEJitSharedAbiVersion = 20u;
+/// v21: removes the v19 fixed semantic near-hot pool mirror and per-pool
+/// publication layout while retaining the v20 borrowed-pointer request ABI.
+/// This experimental layout must not be mixed with any other ABI-v21 branch.
+constexpr uint32_t kEJitSharedAbiVersion = 21u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;
