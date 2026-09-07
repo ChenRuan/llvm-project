@@ -42,6 +42,7 @@
 #include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/ProfileData/InstrProfWriter.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Transforms/Instrumentation/PGOInstrumentation.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "gtest/gtest.h"
@@ -299,6 +300,8 @@ TEST(EJitVpPipeline, OrcLookupResolvesInternalTargets) {
   }
   ASSERT_FALSE(bitcode.empty());
 
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
   EJitRuntimeState state;
   Config cfg;
   auto engineOrErr = EJitOrcEngine::Create(cfg, state.getRegistry(), state);

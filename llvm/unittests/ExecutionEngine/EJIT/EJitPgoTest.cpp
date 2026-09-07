@@ -25,6 +25,7 @@
 #include "llvm/ProfileData/InstrProfWriter.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "gtest/gtest.h"
 #include <atomic>
@@ -191,8 +192,9 @@ static uint32_t applyStressArithmetic(uint32_t Value, uint32_t Func) {
 } // namespace
 
 TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
-  // No InitializeNativeTarget() here: EJitOrcEngine::Create owns target
-  // registration, matching the worker-only initialization path.
+  // Direct engine construction bypasses EJit, so initialize the target here.
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
   RealCompileStressCtx Compile;
   Compile.names.reserve(RealCompileStressFunctions);
   Compile.compiled.resize(RealCompileStressFunctions, nullptr);
@@ -884,8 +886,10 @@ TEST(EJitPgo, OrcLookupAndRealAddrProfileMerge) {
   }
   ASSERT_FALSE(bitcode.empty());
 
-  // Engine + Tier-1 (Instrumented) compile. Create owns target registration,
-  // matching the worker-only initialization path used by shared online PGO.
+  // Engine + Tier-1 (Instrumented) compile. Initialize the native target
+  // (EJit.cpp does this in ejit_init; a direct engine construct must too).
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
   EJitRuntimeState state;
   Config cfg;
   auto engineOrErr = EJitOrcEngine::Create(cfg, state.getRegistry(), state);
@@ -968,6 +972,8 @@ TEST(EJitPgo, Tier1ToTier2FullCycle) {
   }
   ASSERT_FALSE(bitcode.empty());
 
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
   EJitRuntimeState state;
   Config cfg;
   auto engineOrErr = EJitOrcEngine::Create(cfg, state.getRegistry(), state);

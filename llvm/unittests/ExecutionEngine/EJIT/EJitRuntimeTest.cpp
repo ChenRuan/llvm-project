@@ -40,6 +40,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
 #ifndef EJIT_FREESTANDING
@@ -48,32 +49,6 @@
 
 using namespace llvm;
 using namespace llvm::ejit;
-
-TEST(EJitRegistry, ForcedStaticWalkDropsConstructorOrderAssignments) {
-  auto &Functions = EJitFuncRegistry::instance();
-  auto &Lifecycles = EJitLifecycleRegistry::instance();
-  Functions.reset();
-  Lifecycles.reset();
-
-  // Model a worker core that ran application constructors before ejit_init().
-  // Hosted unit tests have empty weak static-registry ranges, so a forced walk
-  // must leave both registries empty.  Before the fix these assignments leaked
-  // through and made the worker fingerprint differ from producer cores.
-  EXPECT_EQ(Functions.resolveAssign("ctor_second"), 0u);
-  EXPECT_EQ(Functions.resolveAssign("ctor_first"), 1u);
-  EXPECT_EQ(Lifecycles.resolveAssign("trp"), 0u);
-  EXPECT_EQ(Lifecycles.resolveAssign("cell"), 1u);
-
-  Config Cfg;
-  Cfg.compileMode = CompileMode::Off;
-  Cfg.forceStaticRegistry = true;
-  { EJit Runtime(Cfg); }
-
-  EXPECT_EQ(Functions.count(), 0u);
-  EXPECT_EQ(Lifecycles.count(), 0u);
-  Functions.reset();
-  Lifecycles.reset();
-}
 
 TEST(EJitDump, FunctionAndModuleViewsHaveDifferentScopes) {
   LLVMContext Ctx;
@@ -129,10 +104,10 @@ TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
     OS.flush();
   }
 
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
   EJitRuntimeState State;
   Config Cfg;
-  // Direct engine creation owns target registration just like the shared
-  // worker-owner path; callers and producer-only EJit instances do not.
   auto EngineOrErr = EJitOrcEngine::Create(Cfg, State.getRegistry(), State);
   ASSERT_TRUE(static_cast<bool>(EngineOrErr));
   auto Engine = std::move(*EngineOrErr);
@@ -208,6 +183,8 @@ TEST(EJitOrcEngine, NestedEntryResolvesThroughRegisteredWrapper) {
     OS.flush();
   }
 
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
   EJitRuntimeState State;
   Config Cfg;
   auto EngineOrErr = EJitOrcEngine::Create(Cfg, State.getRegistry(), State);

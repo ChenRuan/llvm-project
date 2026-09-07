@@ -90,8 +90,7 @@ SECTIONS
    * The section only needs page (4KiB) alignment: the runtime owns the 2MiB
    * alignment (enable_ex / split_2m_to_4k require 2MiB-aligned bases). The bytes
    * [__ejit_code_start, aligned start) are wasted slack (at most ~2MiB), so size
-   * the region with that headroom (38M provides 36M usable for 16 cell pools
-   * and a 4MiB public pool). If the aligned
+   * the region with that headroom (16M -> ~14M usable, ~7 pools). If the aligned
    * region is smaller than one pool (2MiB) the runtime falls back to
    * SRE_MemDbgAlloc with a diagnostic. Use (NOLOAD) only when the final platform
    * loader reserves/maps NOBITS ranges. Do not rely on NOLOAD in a relocatable
@@ -122,8 +121,7 @@ SECTIONS
   .text.ejit : ALIGN(4096)
   {
     __ejit_code_start = .;
-    /* 36MiB of pools plus up to 2MiB of alignment slack. */
-    . = __ejit_code_start + 38M;
+    . = __ejit_code_start + 16M;
     __ejit_code_end = .;
   } > CODE       /* code segment, near .text (±128MiB bl/adrp reach to AOT) */
 
@@ -167,8 +165,7 @@ SECTIONS
  *     .text.ejit : ALIGN(4096)
  *     {
  *       __ejit_code_start = .;
- *       /* 36MiB of pools plus up to 2MiB of alignment slack. */
- *       . = __ejit_code_start + 38M;
+ *       . = __ejit_code_start + 16M;
  *       __ejit_code_end = .;
  *     }
  *   } INSERT AFTER .text;

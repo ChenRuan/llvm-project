@@ -3,7 +3,6 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Bitcode/BitcodeReader.h"
-#include "llvm/Config/Targets.h"
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLibcallStubs.h"
@@ -24,11 +23,9 @@
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/TargetSelect.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
-#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -53,53 +50,6 @@ using namespace llvm;
 using namespace llvm::ejit;
 
 #define DEBUG_TYPE "ejit-orc-engine"
-
-namespace {
-
-// Target registration belongs to the compile runtime, not to the producer
-// facade. In shared-async builds EJitOrcEngine::Create runs only on the elected
-// worker owner, so peer cores can attach without initializing the LLVM backend
-// or running its init-array entries.
-void initializeEJitTargets() {
-#ifdef EJIT_TRIM_LLVM_BACKEND
-#ifdef EJIT_DEFAULT_TRIPLE
-  Triple TT(EJIT_DEFAULT_TRIPLE);
-#if LLVM_HAS_AARCH64_TARGET
-  if (TT.isAArch64()) {
-    LLVMInitializeAArch64TargetInfo();
-    LLVMInitializeAArch64Target();
-    LLVMInitializeAArch64TargetMC();
-    LLVMInitializeAArch64AsmPrinter();
-    LLVMInitializeAArch64AsmParser();
-    return;
-  }
-#endif
-#if LLVM_HAS_X86_TARGET
-  if (TT.isX86()) {
-    LLVMInitializeX86TargetInfo();
-    LLVMInitializeX86Target();
-    LLVMInitializeX86TargetMC();
-    LLVMInitializeX86AsmPrinter();
-    return;
-  }
-#endif
-#endif
-#ifndef EJIT_FREESTANDING
-  if (!InitializeNativeTarget()) {
-    InitializeNativeTargetAsmPrinter();
-    return;
-  }
-#endif
-#endif
-
-  InitializeAllTargetInfos();
-  InitializeAllTargets();
-  InitializeAllTargetMCs();
-  InitializeAllAsmPrinters();
-  InitializeAllAsmParsers();
-}
-
-} // namespace
 
 static const GlobalVariable *rootGlobal(Value *V) {
   while (V) {
@@ -166,12 +116,7 @@ struct EJitOrcEngine::Impl {
   /// Tier-1 code uses the previous dynamic SRE allocation path. Both outlive
   /// LLJIT and its routing memory manager.
   std::unique_ptr<EJitCodePoolManager> nearCodePool;
-  std::array<std::unique_ptr<EJitCodePoolManager>, kEJitNearHotPoolCount>
-      nearHotCodePools;
   std::unique_ptr<EJitCodePoolManager> farCodePool;
-  /// Controlled allocation metadata. The key is the exact name of a
-  /// JITDylib created by loadBitcodeModule; the MemoryManager never parses it.
-  std::map<std::string, EJitCodePoolManager *> specPoolByDylib;
 #endif
   std::unique_ptr<orc::LLJIT> J;
   PeriodArrayRegistry *periodReg = nullptr;
@@ -200,8 +145,8 @@ namespace ejit {
 
 // Mutex type for the dump store. On SRE/freestanding std::mutex is
 // unavailable and BareMetalMutex is a no-op, so use a real CAS spinlock (built
-// on the __atomic wrappers in EJitAtomic.h). The dump store is per-core (each
-// core has its own process image, so there is no cross-core race on it), but a
+// on the __atomic wrappers in EJitAtomic.h). gDumpStore is per-core (each core
+// has its own process image, so there is no cross-core race on it), but a
 // same-core overlap between the worker capture and a producer print must still
 // be guarded. Hosted builds keep std::mutex. The spinlock has a trivial
 // default constructor, so a static instance is zero-initialized (unlocked)
@@ -226,31 +171,21 @@ using DumpMutexType = DumpSpinLock;
 using DumpMutexType = std::mutex;
 #endif
 
-// These objects are deliberately function-local statics. The SRE deployment
-// may skip LLVM/EJIT init-array execution on producer-only cores; first use
-// still constructs the local diagnostic state correctly, while a peer that
-// never dumps pays no startup cost and has no dynamic initializer dependency.
-static DumpMutexType &dumpMutex() {
-  static DumpMutexType M;
-  return M;
-}
-
-static std::string &dumpFuncFilter() {
-  static std::string Filter;
-  return Filter;
-}
-
+// Process-wide function-name filter and payload store. The mutex protects both
+// because the shell may update/print while the worker captures.
+static DumpMutexType gDumpMutex;
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 EJitSharedTaskPoolState *gDumpSharedState = nullptr;
 #endif
+static std::string gDumpFuncFilter;
 
 void setDumpFuncFilter(const std::string &name) {
-  std::string &Filter = dumpFuncFilter();
   {
-    std::lock_guard<DumpMutexType> lock(dumpMutex());
-    Filter = name;
+    std::lock_guard<DumpMutexType> lock(gDumpMutex);
+    gDumpFuncFilter = name;
     EJIT_DIAG_DEBUG("set_dump_filter value=%s &filter=%p",
-                    Filter.empty() ? "(off)" : Filter.c_str(), (void *)&Filter);
+                    gDumpFuncFilter.empty() ? "(off)" : gDumpFuncFilter.c_str(),
+                    (void *)&gDumpFuncFilter);
   }
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (gDumpSharedState) {
@@ -295,8 +230,8 @@ void setDumpSharedState(EJitSharedTaskPoolState *state) {
   // even though the producer thinks dump is armed.
   std::string filter;
   {
-    std::lock_guard<DumpMutexType> lock(dumpMutex());
-    filter = dumpFuncFilter();
+    std::lock_guard<DumpMutexType> lock(gDumpMutex);
+    filter = gDumpFuncFilter;
   }
   if (gDumpSharedState && !filter.empty())
     setDumpFuncFilter(filter);
@@ -334,11 +269,10 @@ static bool getActiveDumpFilter(std::string &out) {
   if (getSharedDumpFilter(out))
     return true;
 #endif
-  std::lock_guard<DumpMutexType> lock(dumpMutex());
-  std::string &Filter = dumpFuncFilter();
-  if (Filter.empty())
+  std::lock_guard<DumpMutexType> lock(gDumpMutex);
+  if (gDumpFuncFilter.empty())
     return false;
-  out = Filter;
+  out = gDumpFuncFilter;
   return true;
 }
 
@@ -354,14 +288,10 @@ struct DumpEntry {
 
 // Process-wide store of captured IR+ASM, filled by the IR transform layer
 // (worker thread) when the filter matches, read by ejit_print_dumped() (user
-// thread). Guarded by dumpMutex(). This is ordinary process-local state, not
-// part of the shared taskpool state; cross-core visibility depends on the
-// worker running in the same process image (addresses are logged to diagnose
-// this).
-static std::map<std::string, DumpEntry> &dumpStore() {
-  static std::map<std::string, DumpEntry> Store;
-  return Store;
-}
+// thread). Guarded by gDumpMutex. These are ordinary process statics, not part
+// of the shared taskpool state; cross-core visibility depends on the worker
+// running in the same process image (addresses are logged to diagnose this).
+static std::map<std::string, DumpEntry> gDumpStore;
 
 static void dumpBytesSafe(const char *label, const char *data, size_t n) {
   EJIT_DIAG_RAW("=== %s begin size=%u ===", label, (unsigned)n);
@@ -502,21 +432,20 @@ static void captureDump(const std::string &fnName, uint64_t cacheKey,
                         CompileTier tier,
                         std::string FunctionIR, std::string FunctionASM,
                         std::string ModuleIR, std::string ModuleASM) {
-  auto &Store = dumpStore();
   EJIT_DIAG_DEBUG("capture enter func=%s func_ir=%u func_asm=%u module_ir=%u "
                   "module_asm=%u &store=%p",
                   fnName.c_str(), (unsigned)FunctionIR.size(),
                   (unsigned)FunctionASM.size(), (unsigned)ModuleIR.size(),
-                  (unsigned)ModuleASM.size(), (void *)&Store);
-  std::lock_guard<DumpMutexType> lock(dumpMutex());
-  EJIT_DIAG_DEBUG("capture store_size before=%u", (unsigned)Store.size());
-  Store[fnName] =
+                  (unsigned)ModuleASM.size(), (void *)&gDumpStore);
+  std::lock_guard<DumpMutexType> lock(gDumpMutex);
+  EJIT_DIAG_DEBUG("capture store_size before=%u", (unsigned)gDumpStore.size());
+  gDumpStore[fnName] =
       DumpEntry{cacheKey, tier, std::move(FunctionIR), std::move(FunctionASM),
                 std::move(ModuleIR), std::move(ModuleASM)};
-  EJIT_DIAG_DEBUG("capture store_size after=%u", (unsigned)Store.size());
+  EJIT_DIAG_DEBUG("capture store_size after=%u", (unsigned)gDumpStore.size());
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   // Publish only small metadata. Full text remains in the worker-local map.
-  const DumpEntry &E = Store[fnName];
+  const DumpEntry &E = gDumpStore[fnName];
   captureSharedDumpMetadata(fnName, cacheKey, E.FunctionIR.size(),
                             E.FunctionASM.size());
 #endif
@@ -624,26 +553,24 @@ static void printOneModuleDumpSafe(const char *requestedName,
 /// Print saved IR+ASM through EJIT_DIAG, one line per IR/ASM line. A null/empty
 /// name prints all payloads available on this core.
 bool printDumped(const char *name) {
-  auto &Filter = dumpFuncFilter();
-  auto &Store = dumpStore();
-  (void)Filter;
   EJIT_DIAG_DEBUG("print_dumped enter name=%s &filter=%p &store=%p",
-                  (name && name[0]) ? name : "(all)", (void *)&Filter,
-                  (void *)&Store);
+                  (name && name[0]) ? name : "(all)", (void *)&gDumpFuncFilter,
+                  (void *)&gDumpStore);
   bool hasName = name && name[0];
   // The complete payloads are worker-local. A specific name prints one entry;
   // an empty name prints every entry captured by this core.
   {
-    std::lock_guard<DumpMutexType> lock(dumpMutex());
+    std::lock_guard<DumpMutexType> lock(gDumpMutex);
     if (hasName) {
-      auto it = Store.find(name);
-      if (it != Store.end()) {
+      auto it = gDumpStore.find(name);
+      if (it != gDumpStore.end()) {
         printOneDumpSafe(name, it->first, it->second);
         return true;
       }
-    } else if (!Store.empty()) {
-      EJIT_DIAG_RAW("print_dumped saved entries=%u", (unsigned)Store.size());
-      for (auto &kv : Store) {
+    } else if (!gDumpStore.empty()) {
+      EJIT_DIAG_RAW("print_dumped saved entries=%u",
+                    (unsigned)gDumpStore.size());
+      for (auto &kv : gDumpStore) {
         printOneDumpSafe(nullptr, kv.first, kv.second);
         ejitDiagPrintThrottle();
       }
@@ -658,32 +585,32 @@ bool printDumped(const char *name) {
 #endif
   if (hasName)
     EJIT_DIAG_DEBUG("print_dumped miss name=%s store_size=%u", name,
-                    (unsigned)Store.size());
+                    (unsigned)gDumpStore.size());
   else
     EJIT_DIAG_RAW("print_dumped: nothing saved");
   return false;
 }
 
 bool printDumpedModule(const char *name) {
-  auto &Store = dumpStore();
   bool hasName = name && name[0];
-  std::lock_guard<DumpMutexType> lock(dumpMutex());
+  std::lock_guard<DumpMutexType> lock(gDumpMutex);
   if (hasName) {
-    auto it = Store.find(name);
-    if (it != Store.end()) {
+    auto it = gDumpStore.find(name);
+    if (it != gDumpStore.end()) {
       printOneModuleDumpSafe(name, it->first, it->second);
       return true;
     }
     EJIT_DIAG_DEBUG("print_dumped_module miss name=%s store_size=%u", name,
-                    (unsigned)Store.size());
+                    (unsigned)gDumpStore.size());
     return false;
   }
-  if (Store.empty()) {
+  if (gDumpStore.empty()) {
     EJIT_DIAG_RAW("print_dumped_module: nothing saved");
     return false;
   }
-  EJIT_DIAG_RAW("print_dumped_module saved entries=%u", (unsigned)Store.size());
-  for (auto &kv : Store) {
+  EJIT_DIAG_RAW("print_dumped_module saved entries=%u",
+                (unsigned)gDumpStore.size());
+  for (auto &kv : gDumpStore) {
     printOneModuleDumpSafe(nullptr, kv.first, kv.second);
     ejitDiagPrintThrottle();
   }
@@ -699,10 +626,6 @@ EJitOrcEngine::~EJitOrcEngine() = default;
 Expected<std::unique_ptr<EJitOrcEngine>>
 EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
                       EJitRuntimeState &runtimeState) {
-  // This is intentionally inside Create rather than EJit::EJit: shared-async
-  // peers never create an engine, while the fixed worker owner initializes the
-  // LLVM backend before ordinary, Tier-1, or Tier-2 compilation can begin.
-  initializeEJitTargets();
   EJIT_DIAG_VERBOSE("create: opt=%d dump=%s", static_cast<int>(config.optLevel),
                     config.dumpJITDir.empty() ? "(off)"
                                               : config.dumpJITDir.c_str());
@@ -766,46 +689,11 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // engine (so it outlives the LLJIT); the object linking layer owns a memory
   // manager that references it. Pages are kept RW here and sealed to RX later,
   // at lookup time, by the pool manager's enable_ex sealing.
-#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
-  for (uint32_t I = 0; I < kEJitNearHotPoolCount; ++I) {
-    engine->P->nearHotCodePools[I] = makeSreNearHotCodePoolManager(I);
-    if (!engine->P->nearHotCodePools[I]) {
-      return make_error<StringError>(
-          "EJitOrcEngine: fixed near-hot pool layout unavailable",
-          inconvertibleErrorCode());
-    }
-  }
-#else
   engine->P->nearCodePool =
       makeSreCodePoolManager(EJitCodePoolPlacement::NearFixed);
-#endif
   engine->P->farCodePool =
-      makeSreCodePoolManager(EJitCodePoolPlacement::FarDynamic, kEJitFarPoolId);
+      makeSreCodePoolManager(EJitCodePoolPlacement::FarDynamic);
   {
-#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
-    std::vector<EJitCodePoolManager *> NearPools;
-    NearPools.reserve(kEJitNearHotPoolCount);
-    for (auto &Pool : engine->P->nearHotCodePools)
-      NearPools.push_back(Pool.get());
-    auto *FarPool = engine->P->farCodePool.get();
-    auto Selector =
-        [State = engine->P.get()](
-            const jitlink::JITLinkDylib *JD) -> EJitCodePoolManager * {
-      if (!JD)
-        return nullptr;
-      auto It = State->specPoolByDylib.find(JD->getName());
-      return It == State->specPoolByDylib.end() ? nullptr : It->second;
-    };
-    Builder.setObjectLinkingLayerCreator(
-        [NearPools = std::move(NearPools), FarPool,
-         Selector](orc::ExecutionSession &ES)
-            -> Expected<std::unique_ptr<orc::ObjectLayer>> {
-          constexpr size_t JitPageSize = 4096;
-          return std::make_unique<orc::ObjectLinkingLayer>(
-              ES, std::make_unique<EJitCodePoolMemoryManager>(
-                      NearPools, *FarPool, JitPageSize, Selector));
-        });
-#else
     EJitCodePoolManager *NearPool = engine->P->nearCodePool.get();
     EJitCodePoolManager *FarPool = engine->P->farCodePool.get();
     Builder.setObjectLinkingLayerCreator(
@@ -819,7 +707,6 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
               ES, std::make_unique<EJitCodePoolMemoryManager>(
                       *NearPool, *FarPool, JitPageSize));
         });
-#endif
   }
 #endif
 
@@ -932,7 +819,7 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
           // ejit_print_dumped(). Bare-metal-safe (strings only, no
           // raw_fd_ostream). Captures the post-optimization IR and the emitted
           // assembly (from the same TargetMachine the JIT compiles with).
-          // Capture is exact-name only. The local dump store keeps one dynamic
+          // Capture is exact-name only. The local gDumpStore keeps one dynamic
           // IR/ASM payload per captured function name (overwritten on
           // re-compile); the shared dump table keeps cross-core visible dynamic
           // payloads for recent captures.
@@ -951,7 +838,7 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
                             ctx->fnName.c_str(),
                             (uint32_t)(ctx->cacheKey >> 32),
                             (uint32_t)(ctx->cacheKey & 0xffffffffu),
-                            match ? 1 : 0, (void *)&dumpFuncFilter());
+                            match ? 1 : 0, (void *)&gDumpFuncFilter);
             if (match) {
               // IR capture always runs first so it succeeds even if the ASM
               // diagnostic path is disabled or fails. Capture only the entry
@@ -1041,8 +928,7 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
 }
 
 Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
-                                       const std::string &origFnName,
-                                       uint32_t poolId) {
+                                       const std::string &origFnName) {
   EJIT_DIAG_VERBOSE("loadBitcode key=0x%016lx func=%s size=%zu", cacheKey,
                     origFnName.c_str(), bitcodeData.size());
   auto Ctx = std::make_unique<LLVMContext>();
@@ -1137,9 +1023,6 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
   // would be needed for reclaimable memory managers (§5 JD lifecycle).
   auto it = P->specDylibs.find(cacheKey);
   if (it != P->specDylibs.end()) {
-#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
-    P->specPoolByDylib.erase(it->second->getName());
-#endif
     if (auto Err = P->J->getExecutionSession().removeJITDylib(*it->second))
       EJIT_DIAG("loadBitcode key=0x%016lx: remove stale JD FAILED: %s",
                 cacheKey, toString(std::move(Err)).c_str());
@@ -1151,30 +1034,12 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
           ? "t1"
           : P->activeCtx && P->activeCtx->tier == CompileTier::PGOUse ? "t2"
                                                                       : "base";
-  std::string JDName =
-      "spec_" + std::string(TierTag) + "_" + std::to_string(cacheKey);
-  auto JDOrErr = P->J->createJITDylib(JDName);
+  auto JDOrErr = P->J->createJITDylib("spec_" + std::string(TierTag) + "_" +
+                                      std::to_string(cacheKey));
   if (!JDOrErr) {
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: create JITDylib error", cacheKey);
     return JDOrErr.takeError();
   }
-
-#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
-  EJitCodePoolManager *SelectedPool = nullptr;
-  if (P->activeCtx && P->activeCtx->tier == CompileTier::Instrumented) {
-    if (P->farCodePool && poolId == kEJitFarPoolId)
-      SelectedPool = P->farCodePool.get();
-  } else if (poolId < kEJitNearHotPoolCount) {
-    SelectedPool = P->nearHotCodePools[poolId].get();
-  }
-  if (!SelectedPool) {
-    (void)P->J->getExecutionSession().removeJITDylib(*JDOrErr);
-    return make_error<StringError>(
-        "EJitOrcEngine: invalid or unavailable allocation pool",
-        inconvertibleErrorCode());
-  }
-  P->specPoolByDylib.emplace(JDName, SelectedPool);
-#endif
 
   // Resolve undefined function symbols from user-registered table.
   // Required for bare-metal where dynamic lookup (dlsym) is unavailable.
@@ -1262,12 +1127,6 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
           *JDOrErr,
           orc::ThreadSafeModule(std::move(*ModuleOrErr), std::move(Ctx)))) {
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: add IR module error", cacheKey);
-#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
-    P->specPoolByDylib.erase(JDName);
-#endif
-    if (auto RemoveErr = P->J->getExecutionSession().removeJITDylib(*JDOrErr))
-      EJIT_DIAG("loadBitcode key=0x%016lx: remove failed JD FAILED: %s",
-                cacheKey, toString(std::move(RemoveErr)).c_str());
     return Err;
   }
 
@@ -1377,34 +1236,8 @@ EJitCodePoolManager::Stats EJitOrcEngine::getCodePoolStats() const {
 
 EJitTieredCodePoolStats EJitOrcEngine::getTieredCodePoolStats() const {
   EJitTieredCodePoolStats Out;
-#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
-  for (size_t I = 0; I < P->nearHotCodePools.size(); ++I) {
-    Out.nearHot[I] = P->nearHotCodePools[I]->getStats();
-    Out.near.poolCount += Out.nearHot[I].poolCount;
-    Out.near.sealedCount += Out.nearHot[I].sealedCount;
-    Out.near.activeCount += Out.nearHot[I].activeCount;
-    Out.near.usedBytes += Out.nearHot[I].usedBytes;
-    Out.near.reservedBytes += Out.nearHot[I].reservedBytes;
-    Out.near.wastedBytes += Out.nearHot[I].wastedBytes;
-    Out.near.sealInvocations += Out.nearHot[I].sealInvocations;
-    Out.near.splitInvocations += Out.nearHot[I].splitInvocations;
-    Out.near.rwEnableInvocations += Out.nearHot[I].rwEnableInvocations;
-    Out.near.finalizedRangeCount += Out.nearHot[I].finalizedRangeCount;
-    Out.near.pendingBytes += Out.nearHot[I].pendingBytes;
-    Out.near.pendingRangeCount += Out.nearHot[I].pendingRangeCount;
-    Out.near.fallbackCount += Out.nearHot[I].fallbackCount;
-    Out.near.full = Out.near.full || Out.nearHot[I].full;
-    if (Out.nearHot[I].baseAddress != 0 &&
-        (Out.near.baseAddress == 0 ||
-         Out.nearHot[I].baseAddress < Out.near.baseAddress))
-      Out.near.baseAddress = Out.nearHot[I].baseAddress;
-    if (Out.nearHot[I].endAddress > Out.near.endAddress)
-      Out.near.endAddress = Out.nearHot[I].endAddress;
-  }
-#else
   if (P->nearCodePool)
     Out.near = P->nearCodePool->getStats();
-#endif
   if (P->farCodePool)
     Out.far = P->farCodePool->getStats();
 #define EJIT_SUM_STAT(Field) Out.total.Field = Out.near.Field + Out.far.Field
@@ -1418,80 +1251,29 @@ EJitTieredCodePoolStats EJitOrcEngine::getTieredCodePoolStats() const {
   EJIT_SUM_STAT(splitInvocations);
   EJIT_SUM_STAT(rwEnableInvocations);
   EJIT_SUM_STAT(finalizedRangeCount);
-  Out.total.pendingBytes = Out.near.pendingBytes + Out.far.pendingBytes;
-  Out.total.pendingRangeCount =
-      Out.near.pendingRangeCount + Out.far.pendingRangeCount;
-  Out.total.fallbackCount = Out.near.fallbackCount + Out.far.fallbackCount;
-  Out.total.full = Out.near.full || Out.far.full;
-  Out.total.baseAddress =
-      Out.near.baseAddress != 0 ? Out.near.baseAddress : Out.far.baseAddress;
-  Out.total.endAddress = Out.far.endAddress > Out.near.endAddress
-                             ? Out.far.endAddress
-                             : Out.near.endAddress;
 #undef EJIT_SUM_STAT
   return Out;
 }
 
 bool EJitOrcEngine::findCodeRange(const void *FnPtr,
                                   EJitCompiledCodeInfo &Out) const {
-  if (!P->nearCodePool && P->nearHotCodePools[0] == nullptr &&
-      !P->farCodePool) {
+  if (!P->nearCodePool && !P->farCodePool) {
     EJIT_DIAG("findCodeRange FAIL: no code pool (fnPtr=%p)", FnPtr);
     return false;
   }
-#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
-  for (const auto &Pool : P->nearHotCodePools)
-    if (Pool && Pool->findRange(FnPtr, Out))
-      return true;
-#else
   if (P->nearCodePool && P->nearCodePool->findRange(FnPtr, Out))
     return true;
-#endif
   return P->farCodePool && P->farCodePool->findRange(FnPtr, Out);
 }
 
-bool EJitOrcEngine::findPendingCodeRange(const void *FnPtr,
-                                         EJitCompiledCodeInfo &Out) const {
-#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
-  for (const auto &Pool : P->nearHotCodePools)
-    if (Pool && Pool->findPendingRange(FnPtr, Out))
-      return true;
-#else
-  if (P->nearCodePool && P->nearCodePool->findPendingRange(FnPtr, Out))
-    return true;
-#endif
-  return P->farCodePool && P->farCodePool->findPendingRange(FnPtr, Out);
-}
-
 bool EJitOrcEngine::isCodeReady(const void *FnPtr) const {
-#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
-  for (const auto &Pool : P->nearHotCodePools)
-    if (Pool && Pool->isRangeReady(FnPtr))
-      return true;
-#else
-  if (P->nearCodePool && P->nearCodePool->isRangeReady(FnPtr))
-    return true;
-#endif
-  return P->farCodePool && P->farCodePool->isRangeReady(FnPtr);
+  EJitCompiledCodeInfo Info{};
+  return findCodeRange(FnPtr, Info);
 }
 
-Error EJitOrcEngine::flushPendingCode(uint32_t poolId) {
-  Error Result = Error::success();
-#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
-  if (poolId != 0xFFFFFFFFu) {
-    if (poolId >= kEJitNearHotPoolCount || !P->nearHotCodePools[poolId])
-      return make_error<StringError>("EJitOrcEngine: invalid near-hot pool id",
-                                     inconvertibleErrorCode());
-    return P->nearHotCodePools[poolId]->flushPendingRanges();
-  }
-  for (auto &Pool : P->nearHotCodePools)
-    if (Pool)
-      Result = joinErrors(std::move(Result), Pool->flushPendingRanges());
-#else
-  (void)poolId;
-  if (P->nearCodePool)
-    Result = P->nearCodePool->flushPendingRanges();
-#endif
-  return Result;
+Error EJitOrcEngine::flushPendingCode() {
+  if (!P->nearCodePool)
+    return Error::success();
+  return P->nearCodePool->flushPendingRanges();
 }
 #endif
