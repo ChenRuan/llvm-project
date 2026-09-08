@@ -5230,6 +5230,13 @@ def EjitMayConst : InheritableAttr {
   let Documentation = [EjitMayConstDocs];
 }
 
+// Marks a scalar global whose value is immutable after application init.
+def EjitConstAfterInit : InheritableAttr {
+  let Spellings = [Clang<"ejit_const_after_init">];
+  let Subjects = SubjectList<[Var]>;
+  let Documentation = [EjitConstAfterInitDocs];
+}
+
 // Marks the time window a global variable belongs to
 def EjitPeriod : InheritableAttr {
   let Spellings = [Clang<"ejit_in_period">,
@@ -5247,6 +5254,8 @@ def EjitPeriodArr : InheritableAttr {
   let Subjects = SubjectList<[Var]>;
   let Documentation = [EjitPeriodArrDocs];
 }
+
+def : MutualExclusions<[EjitConstAfterInit, EjitPeriod, EjitPeriodArr]>;
 
 // Marks a function parameter as a specialization dimension index
 def EjitPeriodArrInd : InheritableParamAttr {

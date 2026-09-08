@@ -4644,6 +4644,19 @@ void Sema::MergeVarDecl(VarDecl *New, LookupResult &Previous) {
     New->setInvalidDecl();
   }
 
+  // const-after-init addresses use a process-wide registry keyed by the
+  // external symbol name. Catch redeclarations that inherit internal linkage
+  // only after the previous declaration is known.
+  if ((New->hasAttr<EjitConstAfterInitAttr>() ||
+       Old->hasAttr<EjitConstAfterInitAttr>()) &&
+      (New->getLinkageInternal() != Linkage::External ||
+       Old->getLinkageInternal() != Linkage::External)) {
+    Diag(New->getLocation(),
+         diag::err_ejit_const_after_init_requires_external_linkage) << New;
+    Diag(Old->getLocation(), diag::note_previous_declaration);
+    return New->setInvalidDecl();
+  }
+
   mergeDeclAttributes(New, Old);
   // Warn if an already-defined variable is made a weak_import in a subsequent
   // declaration
@@ -8051,6 +8064,18 @@ NamedDecl *Sema::ActOnVariableDeclarator(
 
   // Handle attributes prior to checking for duplicates in MergeVarDecl
   ProcessDeclAttributes(S, NewVD, D);
+
+  // Anonymous-namespace variables acquire unique-external linkage as their
+  // declarations are completed. Recheck here so the process-wide registry
+  // accepts only a true external symbol name.
+  if (NewVD->hasAttr<EjitConstAfterInitAttr>() &&
+      (NewVD->getLinkageInternal() != Linkage::External ||
+       NewVD->isInAnonymousNamespace())) {
+    Diag(NewVD->getLocation(),
+         diag::err_ejit_const_after_init_requires_external_linkage)
+        << NewVD;
+    NewVD->setInvalidDecl();
+  }
 
   if (getLangOpts().HLSL)
     HLSL().ActOnVariableDeclarator(NewVD);

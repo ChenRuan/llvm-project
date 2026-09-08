@@ -739,33 +739,51 @@ static void *resolveBase(const GlobalVariable *GV, const GVPeriodInfo &info,
   return reg.getStaticVarAddr(GV->getName().str());
 }
 
+static APInt readAPIntFromMemory(const void *Addr, unsigned BitWidth,
+                                 unsigned ByteSize, bool IsLittleEndian) {
+  const unsigned StorageBitWidth = std::max(BitWidth, ByteSize * 8);
+  APInt Bits(StorageBitWidth, 0);
+  const auto *Bytes = static_cast<const uint8_t *>(Addr);
+  if (IsLittleEndian) {
+    for (unsigned I = 0; I < ByteSize; ++I)
+      Bits |= APInt(StorageBitWidth, Bytes[I]).shl(I * 8);
+  } else {
+    for (unsigned I = 0; I < ByteSize; ++I) {
+      Bits <<= 8;
+      Bits |= Bytes[I];
+    }
+  }
+  return Bits.trunc(BitWidth);
+}
+
 /// Create an LLVM Constant from raw memory bytes.
 static Constant *createConstantFromMemory(const void *addr, Type *Ty,
                                           const DataLayout &DL) {
   LLVMContext &Ctx = Ty->getContext();
-  unsigned byteSize = DL.getTypeStoreSize(Ty);
+  TypeSize StoreSize = DL.getTypeStoreSize(Ty);
+  if (StoreSize.isScalable())
+    return nullptr;
+  uint64_t ByteSize64 = StoreSize.getFixedValue();
+  if (!ByteSize64 || ByteSize64 > std::numeric_limits<unsigned>::max())
+    return nullptr;
+  unsigned ByteSize = static_cast<unsigned>(ByteSize64);
 
   if (Ty->isIntegerTy()) {
-    // Only integers that fit in a single 64-bit word are materialized here.
-    // Wider integers (e.g. __int128, or _BitInt(N) with N > 64) are left
-    // un-substituted.
-    if (byteSize > 8)
+    unsigned BitWidth = cast<IntegerType>(Ty)->getBitWidth();
+    return ConstantInt::get(
+        Ty, readAPIntFromMemory(addr, BitWidth, ByteSize,
+                                DL.isLittleEndian()));
+  }
+  if (Ty->isFloatingPointTy()) {
+    TypeSize PrimitiveSize = Ty->getPrimitiveSizeInBits();
+    if (PrimitiveSize.isScalable())
       return nullptr;
-    uint64_t raw = 0;
-    std::memcpy(&raw, addr, byteSize);
-    if (!DL.isLittleEndian())
-      raw >>= (8 - byteSize) * 8;
-    return ConstantInt::get(Ty, APInt(byteSize * 8, raw));
-  }
-  if (Ty->isFloatTy()) {
-    float v;
-    std::memcpy(&v, addr, sizeof(v));
-    return ConstantFP::get(Ty, v);
-  }
-  if (Ty->isDoubleTy()) {
-    double v;
-    std::memcpy(&v, addr, sizeof(v));
-    return ConstantFP::get(Ty, v);
+    unsigned BitWidth = PrimitiveSize.getFixedValue();
+    if (!BitWidth || ByteSize * 8 < BitWidth)
+      return nullptr;
+    APInt Bits = readAPIntFromMemory(addr, BitWidth, (BitWidth + 7) / 8,
+                                     DL.isLittleEndian());
+    return ConstantFP::get(Ctx, APFloat(Ty->getFltSemantics(), Bits));
   }
   if (Ty->isPointerTy()) {
     const unsigned PointerSize = DL.getPointerSize(Ty->getPointerAddressSpace());

@@ -13486,6 +13486,17 @@ def note_amdgcn_load_lds_size_valid_value : Note<"size must be %select{1, 2, or 
 // EmbeddedJIT diagnostics
 def err_ejit_period_conflict : Error<
   "variable %0 cannot have multiple ejit_period or ejit_period_arr attributes">;
+def err_ejit_const_after_init_invalid_type : Error<
+  "ejit_const_after_init variable %0 must have integral, enumeration, or real "
+  "floating type; %1 is not supported">;
+def err_ejit_const_after_init_qualified : Error<
+  "ejit_const_after_init variable %0 cannot be volatile, atomic, or thread-local">;
+def err_ejit_const_after_init_period_conflict : Error<
+  "variable %0 cannot combine ejit_const_after_init with ejit_period or "
+  "ejit_period_arr">;
+def err_ejit_const_after_init_requires_external_linkage : Error<
+  "ejit_const_after_init variable %0 must have external linkage; internal "
+  "and no-linkage objects cannot use the process-wide name registry">;
 def err_ejit_period_not_array : Error<
   "ejit_period attribute cannot be used on array variable %0; "
   "use ejit_period_arr for arrays">;

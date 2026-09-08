@@ -82,6 +82,45 @@ void handleEjitMayConstAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   D->addAttr(::new (S.Context) EjitMayConstAttr(S.Context, AL));
 }
 
+void handleEjitConstAfterInitAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  auto *VD = dyn_cast<VarDecl>(D);
+  if (!VD || !VD->isFileVarDecl()) {
+    S.Diag(AL.getLoc(), diag::warn_attribute_wrong_decl_type_str)
+        << AL << AL.isRegularKeywordAttribute()
+        << "file-scope variable declarations";
+    return;
+  }
+
+  if (VD->getLinkageInternal() != Linkage::External) {
+    S.Diag(AL.getLoc(), diag::err_ejit_const_after_init_requires_external_linkage)
+        << VD;
+    return;
+  }
+
+  QualType Ty = VD->getType();
+  if (Ty->isDependentType()) {
+    S.Diag(AL.getLoc(), diag::err_ejit_const_after_init_invalid_type)
+        << VD << Ty;
+    return;
+  }
+  if (Ty.isVolatileQualified() || Ty->isAtomicType() ||
+      VD->getTLSKind() != VarDecl::TLS_None) {
+    S.Diag(AL.getLoc(), diag::err_ejit_const_after_init_qualified) << VD;
+    return;
+  }
+  if (!Ty->isIntegralOrEnumerationType() && !Ty->isRealFloatingType()) {
+    S.Diag(AL.getLoc(), diag::err_ejit_const_after_init_invalid_type)
+        << VD << Ty;
+    return;
+  }
+  if (VD->hasAttr<EjitPeriodAttr>() || VD->hasAttr<EjitPeriodArrAttr>()) {
+    S.Diag(AL.getLoc(), diag::err_ejit_const_after_init_period_conflict) << VD;
+    return;
+  }
+
+  D->addAttr(::new (S.Context) EjitConstAfterInitAttr(S.Context, AL));
+}
+
 /// handleEjitPeriodAttr - Process the ejit_period(name) attribute.
 /// Checks:
 ///   1. Applies only to VarDecl
@@ -106,6 +145,11 @@ void handleEjitPeriodAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   // Cannot be an array — use ejit_period_arr for arrays
   if (VD->getType()->isArrayType()) {
     S.Diag(AL.getLoc(), diag::err_ejit_period_not_array) << VD;
+    return;
+  }
+
+  if (VD->hasAttr<EjitConstAfterInitAttr>()) {
+    S.Diag(AL.getLoc(), diag::err_ejit_const_after_init_period_conflict) << VD;
     return;
   }
 
@@ -170,6 +214,11 @@ void handleEjitPeriodArrAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
     // No size validation for pointer types.
   } else {
     S.Diag(AL.getLoc(), diag::err_ejit_period_arr_not_scalar) << VD;
+    return;
+  }
+
+  if (VD->hasAttr<EjitConstAfterInitAttr>()) {
+    S.Diag(AL.getLoc(), diag::err_ejit_const_after_init_period_conflict) << VD;
     return;
   }
 

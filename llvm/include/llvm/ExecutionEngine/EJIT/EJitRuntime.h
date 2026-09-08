@@ -31,6 +31,7 @@
 
 #ifdef EJIT_DISABLE
 #define EJIT_PERIOD_CONST
+#define EJIT_CONST_AFTER_INIT
 #define ejit_may_const
 #define EJIT_IN_PERIOD(x)
 #define ejit_period(x)
@@ -46,6 +47,8 @@
 #else
 // New names (preferred)
 #define EJIT_PERIOD_CONST __attribute__((ejit_period_const))
+#define EJIT_CONST_AFTER_INIT \
+  __attribute__((ejit_const_after_init))
 #define EJIT_IN_PERIOD(x) __attribute__((ejit_in_period(#x)))
 #define EJIT_IN_PERIOD_ARRAY(x) __attribute__((ejit_in_period_array(#x)))
 #define EJIT_DIM(x)             __attribute__((ejit_dim(#x)))

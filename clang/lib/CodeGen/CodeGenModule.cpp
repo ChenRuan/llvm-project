@@ -5475,7 +5475,8 @@ llvm::Constant *CodeGenModule::GetAddrOfGlobalVar(const VarDecl *D,
   // already has metadata (e.g. the definition was emitted first) is not
   // re-worked.
   if (auto *GV = dyn_cast<llvm::GlobalVariable>(Addr))
-    if ((D->hasAttr<EjitPeriodAttr>() || D->hasAttr<EjitPeriodArrAttr>()) &&
+    if ((D->hasAttr<EjitPeriodAttr>() || D->hasAttr<EjitPeriodArrAttr>() ||
+         D->hasAttr<EjitConstAfterInitAttr>()) &&
         !GV->hasMetadata(llvm::ejit::MD_EJIT_METADATA))
       emitEjitGlobalMetadata(*this, D, GV);
 
@@ -5999,7 +6000,8 @@ void CodeGenModule::EmitGlobalVarDefinition(const VarDecl *D,
       DI->EmitGlobalVariable(GV, D);
 
   // EmbeddedJIT: emit !ejit.metadata for ejit_period/ejit_period_arr globals
-  if (D->hasAttr<EjitPeriodAttr>() || D->hasAttr<EjitPeriodArrAttr>())
+  if (D->hasAttr<EjitPeriodAttr>() || D->hasAttr<EjitPeriodArrAttr>() ||
+      D->hasAttr<EjitConstAfterInitAttr>())
     emitEjitGlobalMetadata(*this, D, GV);
 }
 

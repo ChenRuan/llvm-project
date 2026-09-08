@@ -9454,6 +9454,46 @@ Supported field types: integers, booleans, floating-point, nested structs.
   }];
 }
 
+def EjitConstAfterInitDocs : Documentation {
+  let Category = DocCatVariable;
+  let Content = [{
+EmbeddedJIT: marks a scalar global whose runtime value becomes immutable after
+application initialization.
+
+The variable remains ordinary writable storage in the AOT program. The
+attribute neither changes its ELF section nor removes initialization writes.
+When an EJIT specialization is compiled, EJIT reads the registered address and
+replaces marked loads in the JIT copy with the value present at that time.
+
+The application must finish all writes, publish them to every compilation core,
+and keep the storage alive before the first JIT-triggering call. It must never
+modify the object afterwards, including through aliases, another translation
+unit, or another core. Calling ``ejit_init`` may happen before the application
+writes the final value; the required boundary is before the first JIT compile.
+
+Supported types are integral and enumeration types, including target-supported
+extended integer types, and target-supported real floating types. The value is
+materialized using the target data layout without host numeric conversion, so
+wide integers, signed boundaries, negative zero, infinities, and NaN payloads
+retain their bits. Pointer, array, record, vector, complex, volatile, atomic,
+and thread-local objects are rejected.
+
+The attribute is inherited across redeclarations in one translation unit. Put
+it on each translation unit's visible ``extern`` declaration that is used by
+JIT code. The object must have external linkage. File-scope ``static`` and
+anonymous-namespace objects are rejected because the runtime address registry
+is process-wide and keyed by external symbol name.
+
+.. code-block:: c
+
+  extern __attribute__((ejit_const_after_init)) unsigned g_mode;
+
+  void application_init(void) {
+    g_mode = read_final_mode();
+  }
+  }];
+}
+
 def EjitPeriodDocs : Documentation {
   let Category = DocCatVariable;
   let Content = [{

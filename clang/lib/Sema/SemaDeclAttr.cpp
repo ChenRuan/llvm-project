@@ -75,6 +75,7 @@ using namespace sema;
 
 // EmbeddedJIT attribute handlers (defined in SemaEJIT.cpp)
 void handleEjitMayConstAttr(Sema &S, Decl *D, const ParsedAttr &AL);
+void handleEjitConstAfterInitAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleEjitPeriodAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleEjitPeriodArrAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL);
@@ -7895,6 +7896,9 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
   // EmbeddedJIT attributes
   case ParsedAttr::AT_EjitMayConst:
     handleEjitMayConstAttr(S, D, AL);
+    break;
+  case ParsedAttr::AT_EjitConstAfterInit:
+    handleEjitConstAfterInitAttr(S, D, AL);
     break;
   case ParsedAttr::AT_EjitPeriod:
     handleEjitPeriodAttr(S, D, AL);

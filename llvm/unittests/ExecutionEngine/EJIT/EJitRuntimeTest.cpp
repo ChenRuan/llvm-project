@@ -3691,6 +3691,183 @@ TEST(EJitEndToEnd, BranchFolding) {
   EXPECT_EQ(RetVal->getSExtValue(), 100);
 }
 
+static Constant *specializeScalarBytes(StringRef DataLayout,
+                                       Type *ScalarTy,
+                                       ArrayRef<uint8_t> Bytes) {
+  LLVMContext &Ctx = ScalarTy->getContext();
+  auto M = std::make_unique<Module>("const_after_init", Ctx);
+  M->setDataLayout(DataLayout);
+  auto *GV = new GlobalVariable(*M, ScalarTy, false,
+                                GlobalValue::ExternalLinkage, nullptr,
+                                "g_after_init");
+  Metadata *PeriodOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD),
+                           MDString::get(Ctx, "static")};
+  Metadata *MarkerOps[] = {MDString::get(Ctx, TAG_EJIT_CONST_AFTER_INIT)};
+  GV->setMetadata(MD_EJIT_METADATA,
+                  MDNode::get(Ctx, {MDNode::get(Ctx, PeriodOps),
+                                    MDNode::get(Ctx, MarkerOps)}));
+
+  Function *F = Function::Create(
+      FunctionType::get(ScalarTy, {}, false), GlobalValue::ExternalLinkage,
+      "read_after_init", M.get());
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(Entry);
+  LoadInst *Load = B.CreateLoad(ScalarTy, GV);
+  Load->setMetadata(MD_EJIT_MAY_CONST, MDNode::get(Ctx, {}));
+  ReturnInst *Ret = B.CreateRet(Load);
+
+  PeriodArrayRegistry Registry;
+  Registry.registerStaticVar("g_after_init",
+                             const_cast<uint8_t *>(Bytes.data()));
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+
+  FunctionAnalysisManager FAM;
+  Pass.run(*F, FAM);
+  return dyn_cast<Constant>(Ret->getReturnValue());
+}
+
+TEST(EJitConstAfterInit, MaterializesWideIntegerInTargetByteOrder) {
+  LLVMContext Ctx;
+  auto *I128 = Type::getInt128Ty(Ctx);
+  const uint8_t BigEndianBytes[] = {
+      0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+      0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10};
+  auto *Result = dyn_cast<ConstantInt>(specializeScalarBytes(
+      "E-i64:64-i128:128", I128, BigEndianBytes));
+  ASSERT_NE(Result, nullptr);
+  EXPECT_EQ(Result->getValue(),
+            APInt(128, "0123456789abcdeffedcba9876543210", 16));
+}
+
+TEST(EJitConstAfterInit, MaterializesNarrowIntegersWithoutOvershift) {
+  LLVMContext Ctx;
+  auto Check = [&](StringRef DL, unsigned Width, ArrayRef<uint8_t> Bytes,
+                   uint64_t Expected) {
+    auto *Result = dyn_cast<ConstantInt>(
+        specializeScalarBytes(DL, IntegerType::get(Ctx, Width), Bytes));
+    ASSERT_NE(Result, nullptr);
+    EXPECT_EQ(Result->getValue(), APInt(Width, Expected));
+  };
+
+  const uint8_t TrueWithPadding[] = {0xff};
+  Check("e-i64:64", 1, TrueWithPadding, 1);
+  Check("E-i64:64", 1, TrueWithPadding, 1);
+
+  const uint8_t I5WithPadding[] = {0xf5};
+  Check("e-i64:64", 5, I5WithPadding, 0x15);
+  Check("E-i64:64", 5, I5WithPadding, 0x15);
+
+  const uint8_t I9LE[] = {0xab, 0x01};
+  const uint8_t I9BE[] = {0x01, 0xab};
+  Check("e-i64:64", 9, I9LE, 0x1ab);
+  Check("E-i64:64", 9, I9BE, 0x1ab);
+}
+
+TEST(EJitConstAfterInit, FinalRuntimeValueFoldsAcrossCompileTiers) {
+  for (CompileTier Tier : {CompileTier::Baseline, CompileTier::Instrumented,
+                           CompileTier::PGOUse}) {
+    LLVMContext Ctx;
+    Module M("const_after_init_runtime_value", Ctx);
+    M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *Marked = new GlobalVariable(M, I32, false,
+                                      GlobalValue::ExternalLinkage, nullptr,
+                                      "g_after_init");
+    auto *Plain = new GlobalVariable(M, I32, false,
+                                     GlobalValue::ExternalLinkage, nullptr,
+                                     "g_plain_runtime");
+    Metadata *PeriodOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD),
+                             MDString::get(Ctx, "static")};
+    Metadata *MarkerOps[] = {
+        MDString::get(Ctx, TAG_EJIT_CONST_AFTER_INIT)};
+    Marked->setMetadata(
+        MD_EJIT_METADATA,
+        MDNode::get(Ctx, {MDNode::get(Ctx, PeriodOps),
+                          MDNode::get(Ctx, MarkerOps)}));
+
+    Function *F = Function::Create(FunctionType::get(I32, {}, false),
+                                   GlobalValue::ExternalLinkage,
+                                   "read_runtime_values", M);
+    Metadata *EntryOps[] = {MDString::get(Ctx, TAG_EJIT_ENTRY)};
+    F->setMetadata(MD_EJIT_METADATA,
+                   MDNode::get(Ctx, {MDNode::get(Ctx, EntryOps)}));
+    BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+    BasicBlock *Hot = BasicBlock::Create(Ctx, "hot", F);
+    BasicBlock *Cold = BasicBlock::Create(Ctx, "cold", F);
+    IRBuilder<> B(Entry);
+    LoadInst *MarkedLoad = B.CreateLoad(I32, Marked, "marked");
+    MarkedLoad->setMetadata(MD_EJIT_MAY_CONST, MDNode::get(Ctx, {}));
+    LoadInst *PlainLoad = B.CreateLoad(I32, Plain, "plain");
+    B.CreateCondBr(B.CreateICmpEQ(MarkedLoad, B.getInt32(17)), Hot, Cold);
+    B.SetInsertPoint(Hot);
+    B.CreateRet(B.CreateAdd(PlainLoad, B.getInt32(100)));
+    B.SetInsertPoint(Cold);
+    B.CreateRet(B.CreateAdd(PlainLoad, B.getInt32(200)));
+
+    int32_t RuntimeMarked = 0;
+    RuntimeMarked = 17;
+    PeriodArrayRegistry Registry;
+    Registry.registerStaticVar("g_after_init", &RuntimeMarked);
+
+    EJitOptimizer Optimizer(Registry);
+    SpecializationContext SC;
+    SC.fnName = "read_runtime_values";
+    SC.tier = Tier;
+    Optimizer.runPipeline(M, SC);
+
+    bool HasMarkedLoad = false;
+    bool HasPlainLoad = false;
+    for (Instruction &I : instructions(*F)) {
+      auto *LI = dyn_cast<LoadInst>(&I);
+      if (!LI)
+        continue;
+      Value *Pointer = LI->getPointerOperand()->stripPointerCasts();
+      HasMarkedLoad |= Pointer == Marked;
+      HasPlainLoad |= Pointer == Plain;
+    }
+    EXPECT_FALSE(HasMarkedLoad) << "tier=" << static_cast<unsigned>(Tier);
+    EXPECT_TRUE(HasPlainLoad) << "tier=" << static_cast<unsigned>(Tier);
+
+    std::string IR;
+    raw_string_ostream OS(IR);
+    M.print(OS, nullptr);
+    EXPECT_EQ(IR.find("i32 200"), std::string::npos) << IR;
+  }
+}
+
+TEST(EJitConstAfterInit, PreservesFloatingPointBits) {
+  LLVMContext Ctx;
+  auto *DoubleTy = Type::getDoubleTy(Ctx);
+  const uint8_t NegativeZeroBE[] = {0x80, 0x00, 0x00, 0x00,
+                                    0x00, 0x00, 0x00, 0x00};
+  auto *NegativeZero = dyn_cast<ConstantFP>(specializeScalarBytes(
+      "E-i64:64", DoubleTy, NegativeZeroBE));
+  ASSERT_NE(NegativeZero, nullptr);
+  EXPECT_TRUE(NegativeZero->getValueAPF().isZero());
+  EXPECT_TRUE(NegativeZero->getValueAPF().isNegative());
+
+  const uint8_t NaNPayloadLE[] = {0x34, 0x12, 0x00, 0x00,
+                                  0x00, 0x00, 0xf8, 0x7f};
+  auto *NaN = dyn_cast<ConstantFP>(specializeScalarBytes(
+      "e-i64:64", DoubleTy, NaNPayloadLE));
+  ASSERT_NE(NaN, nullptr);
+  EXPECT_TRUE(NaN->getValueAPF().isNaN());
+  EXPECT_EQ(NaN->getValueAPF().bitcastToAPInt(),
+            APInt(64, 0x7ff8000000001234ULL));
+}
+
+TEST(EJitConstAfterInit, SupportsTargetQuadPrecision) {
+  LLVMContext Ctx;
+  auto *QuadTy = Type::getFP128Ty(Ctx);
+  const uint8_t OneBE[] = {0x3f, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                           0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  auto *One = dyn_cast<ConstantFP>(
+      specializeScalarBytes("E-i64:64", QuadTy, OneBE));
+  ASSERT_NE(One, nullptr);
+  EXPECT_TRUE(One->getValueAPF().isExactlyValue(1.0));
+}
+
 // Second collapse-proof, on a different function shape: a may_const field
 // driving a branch (not a loop). Specialize it through the full pipeline at L1,
 // L2, and L3 and confirm the output IR is byte-identical (level does not change

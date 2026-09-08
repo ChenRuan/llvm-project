@@ -326,13 +326,15 @@ static const GlobalVariable *findRootGV(const Value *V, APInt &Offset,
 /// Re-annotate loads with !ejit.may_const using GV-level offset metadata.
 /// Optimization passes may drop per-load metadata; this restores it from
 /// the !ejit.may_const_field entries on the GV's !ejit.metadata.
-static void reAnnotateMayConst(Module &M) {
+static void reAnnotateMayConst(Module &M,
+                               bool IncludeFieldMetadata = true) {
   const DataLayout &DL = M.getDataLayout();
   LLVMContext &Ctx = M.getContext();
   auto MayConstKind = Ctx.getMDKindID(MD_EJIT_MAY_CONST);
 
   // Build offset map from GV metadata
   DenseMap<const GlobalVariable *, SmallVector<uint64_t, 4>> mayConstMap;
+  DenseSet<const GlobalVariable *> constAfterInit;
   for (GlobalVariable &GV : M.globals()) {
     MDNode *MD = GV.getMetadata(MD_EJIT_METADATA);
     if (!MD)
@@ -340,10 +342,15 @@ static void reAnnotateMayConst(Module &M) {
     SmallVector<uint64_t, 4> offsets;
     for (const MDOperand &Op : MD->operands()) {
       auto *Sub = dyn_cast<MDNode>(Op.get());
-      if (!Sub || Sub->getNumOperands() < 2)
+      if (!Sub || Sub->getNumOperands() == 0)
         continue;
       auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-      if (!Tag || Tag->getString() != TAG_EJIT_MAY_CONST_FIELD)
+      if (Tag && Tag->getString() == TAG_EJIT_CONST_AFTER_INIT) {
+        constAfterInit.insert(&GV);
+        continue;
+      }
+      if (!IncludeFieldMetadata || !Tag || Sub->getNumOperands() < 2 ||
+          Tag->getString() != TAG_EJIT_MAY_CONST_FIELD)
         continue;
       if (auto *CI = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(1)))
         offsets.push_back(CI->getZExtValue());
@@ -351,7 +358,7 @@ static void reAnnotateMayConst(Module &M) {
     if (!offsets.empty())
       mayConstMap[&GV] = std::move(offsets);
   }
-  if (mayConstMap.empty())
+  if (mayConstMap.empty() && constAfterInit.empty())
     return;
 
   // Re-annotate matching loads
@@ -366,6 +373,23 @@ static void reAnnotateMayConst(Module &M) {
           continue;
         // Never folded, so never re-annotated.
         if (LI->isVolatile() || LI->isAtomic())
+          continue;
+
+        APInt TotalOffset;
+        const GlobalVariable *DirectGV =
+            findRootGV(LI->getPointerOperand(), TotalOffset, DL);
+        if (DirectGV && constAfterInit.contains(DirectGV) &&
+            TotalOffset.isZero()) {
+          TypeSize LoadSize = DL.getTypeStoreSize(LI->getType());
+          TypeSize GlobalSize = DL.getTypeStoreSize(DirectGV->getValueType());
+          if (!LoadSize.isScalable() && !GlobalSize.isScalable() &&
+              LoadSize == GlobalSize) {
+            LI->setMetadata(MayConstKind, MDNode::get(Ctx, {}));
+            ++count;
+            continue;
+          }
+        }
+        if (!IncludeFieldMetadata)
           continue;
         // The recorded offsets are element-relative, so match on the field
         // coordinate rather than the total offset from the global.
@@ -468,7 +492,7 @@ static void preOptimizeBitcode(Module &M) {
         FPM.run(F, FAM);
   }
 
-  // 6. Restore !ejit.may_const metadata that passes may have dropped
+  // 6. Restore !ejit.may_const metadata that passes may have dropped.
   reAnnotateMayConst(M);
 }
 #else
@@ -880,6 +904,9 @@ static std::string extractAndSerialize(Module &M,
   // allocas, and cleans up dead branches before serialization.
   logEJitGlobalMeta("extract-after-clone", *Extracted);
   preOptimizeBitcode(*Extracted);
+  // Restore the dedicated whole-scalar marker in every build mode. Existing
+  // field metadata keeps its historical release-only pre-optimization path.
+  reAnnotateMayConst(*Extracted, /*IncludeFieldMetadata=*/false);
   logEJitGlobalMeta("extract-after-preOpt", *Extracted);
 
   // Specialization diagnostics on the post-preOptimize extracted module (the

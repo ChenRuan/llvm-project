@@ -66,6 +66,7 @@ constexpr const char *TAG_EJIT_BOUND_PTR = "ejit_bound_ptr";
 constexpr const char *TAG_EJIT_PERIOD_ARR = "ejit_period_arr";
 constexpr const char *TAG_EJIT_PERIOD = "ejit_period";
 constexpr const char *TAG_EJIT_MAY_CONST_FIELD = "ejit_may_const_field";
+constexpr const char *TAG_EJIT_CONST_AFTER_INIT = "ejit_const_after_init";
 
 // PASS1 records the process-unique AOT wrapper symbol for local ejit_entry
 // functions on the embedded-bitcode clone. The JIT uses it only when that

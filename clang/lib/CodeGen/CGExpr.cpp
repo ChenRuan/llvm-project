@@ -3020,10 +3020,14 @@ static LValue EmitGlobalVarDeclLValue(CodeGenFunction &CGF,
     return EmitThreadPrivateVarDeclLValue(CGF, VD, T, Addr, RealVarTy,
                                           E->getExprLoc());
   }
+  LValueBaseInfo BaseInfo(AlignmentSource::Decl);
+  if (VD->hasAttr<EjitConstAfterInitAttr>())
+    BaseInfo.setEjitMayConst(true);
   LValue LV = VD->getType()->isReferenceType() ?
       CGF.EmitLoadOfReferenceLValue(Addr, VD->getType(),
                                     AlignmentSource::Decl) :
-      CGF.MakeAddrLValue(Addr, T, AlignmentSource::Decl);
+      CGF.MakeAddrLValue(Addr, T, BaseInfo,
+                         CGF.CGM.getTBAAAccessInfo(T));
   setObjCGCLValueClass(CGF.getContext(), E, LV);
   return LV;
 }

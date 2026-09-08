@@ -194,6 +194,17 @@ void clang::CodeGen::emitEjitGlobalMetadata(CodeGenModule &CGM,
     }));
   }
 
+  // A const-after-init scalar is registered through the existing static
+  // period address table. The dedicated marker lets extraction restore load
+  // metadata without making the LLVM GlobalVariable constant.
+  if (VD->hasAttr<EjitConstAfterInitAttr>()) {
+    Entries.push_back(llvm::MDNode::get(
+        Ctx, llvm::MDString::get(Ctx, TAG_EJIT_CONST_AFTER_INIT)));
+    Entries.push_back(llvm::MDNode::get(
+        Ctx, {llvm::MDString::get(Ctx, TAG_EJIT_PERIOD),
+              llvm::MDString::get(Ctx, "static")}));
+  }
+
   // ejit_may_const_field: encode byte offsets for PASS6 fallback
   QualType VT = VD->getType();
   if (const auto *AT = CGM.getContext().getAsArrayType(VT))
