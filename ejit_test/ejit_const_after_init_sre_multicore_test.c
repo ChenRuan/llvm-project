@@ -28,7 +28,9 @@ typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
 typedef long long int64_t;
 
+#ifndef NULL
 #define NULL ((void *)0)
+#endif
 #ifdef EJIT_CONST_AFTER_INIT_HOST_TEST
 #define EJIT_CONST_AFTER_INIT
 #define EJIT_ENTRY_ATTR
@@ -83,6 +85,7 @@ extern uint8_t g_ucLocalCoreID;
 #define CONST_RUN_IDLE 0u
 #define CONST_RUN_ACTIVE 1u
 #define CONST_RUN_COMPLETE 2u
+#define CONST_RUN_FAILED 3u
 
 typedef enum ConstMode {
   CONST_MODE_ADD = 0,
@@ -197,6 +200,10 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   SRE_printf("\n=== EJIT const-after-init test (core=%u) ===\n", core);
 
   uint32_t state = __atomic_load_n(&g_const_run_state, __ATOMIC_ACQUIRE);
+  if (state == CONST_RUN_FAILED) {
+    SRE_printf("[CONST-AI] previous run failed; recover or reset before retry\n");
+    return -10;
+  }
 
   if (core == CONST_WORKER_CORE) {
     if (state == CONST_RUN_COMPLETE)
@@ -238,7 +245,7 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
 
   int rc = ensure_ejit_ready(core);
   if (rc != 0) {
-    __atomic_store_n(&g_const_run_state, CONST_RUN_IDLE, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_const_run_state, CONST_RUN_FAILED, __ATOMIC_RELEASE);
     return rc;
   }
 
@@ -258,7 +265,8 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
       SRE_printf("[CONST-AI] FAIL round=%u got=0x%llx expected=0x%llx\n",
                  round, (unsigned long long)got,
                  (unsigned long long)expected);
-      __atomic_store_n(&g_const_run_state, CONST_RUN_IDLE, __ATOMIC_RELEASE);
+      __atomic_store_n(&g_const_run_state, CONST_RUN_FAILED,
+                       __ATOMIC_RELEASE);
       return -5;
     }
 
@@ -267,7 +275,8 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     if (now.compileFailed != before.compileFailed ||
         now.publishFailed != before.publishFailed) {
       SRE_printf("[CONST-AI] FAIL compile/publish failure\n");
-      __atomic_store_n(&g_const_run_state, CONST_RUN_IDLE, __ATOMIC_RELEASE);
+      __atomic_store_n(&g_const_run_state, CONST_RUN_FAILED,
+                       __ATOMIC_RELEASE);
       return -6;
     }
     if (now.asyncCompiles >=
@@ -283,7 +292,7 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   ejit_taskpool_print_stats();
   if (!complete) {
     SRE_printf("[CONST-AI] FAIL: PGO completion timeout\n");
-    __atomic_store_n(&g_const_run_state, CONST_RUN_IDLE, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_const_run_state, CONST_RUN_FAILED, __ATOMIC_RELEASE);
     return -7;
   }
 
@@ -292,7 +301,7 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   // published Tier-2 version.
   rc = verify_published_version();
   if (rc != 0) {
-    __atomic_store_n(&g_const_run_state, CONST_RUN_IDLE, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_const_run_state, CONST_RUN_FAILED, __ATOMIC_RELEASE);
     return rc;
   }
   ejit_taskpool_print_compiled();

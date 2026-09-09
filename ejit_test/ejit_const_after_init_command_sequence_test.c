@@ -16,6 +16,12 @@ static uint32_t g_dump_arm_calls;
 static uint32_t g_function_dump_calls;
 static uint32_t g_module_dump_calls;
 static uint32_t g_failures;
+static uint32_t g_delay_calls;
+static uint32_t g_delay_mode;
+
+#define DELAY_COMPLETE 0u
+#define DELAY_FAIL 1u
+#define DELAY_TIMEOUT 2u
 
 #define CHECK(condition, message)                                               \
   do {                                                                          \
@@ -65,8 +71,13 @@ void SRE_printf(const char *format, ...) { (void)format; }
 
 uint32_t SRE_TaskDelay(uint32_t tick) {
   (void)tick;
-  g_stats.asyncCompiles = CONST_EXPECTED_COMPILES;
-  g_stats.readyEntries = 1u;
+  ++g_delay_calls;
+  if (g_delay_mode == DELAY_COMPLETE) {
+    g_stats.asyncCompiles = CONST_EXPECTED_COMPILES;
+    g_stats.readyEntries = 1u;
+  } else if (g_delay_mode == DELAY_FAIL) {
+    g_stats.compileFailed = 1u;
+  }
   return 0u;
 }
 
@@ -80,7 +91,28 @@ static int dump_on(uint8_t core) {
   return test_ejit_const_dump(0, 0, 0, 0);
 }
 
+static void reset_fixture(uint32_t delayMode) {
+  for (uint32_t i = 0; i < 256u; ++i)
+    g_runtime_ready[i] = 0u;
+  ejit_taskpool_stats_t empty = {0};
+  g_stats = empty;
+  g_init_calls = 0u;
+  g_dump_arm_calls = 0u;
+  g_function_dump_calls = 0u;
+  g_module_dump_calls = 0u;
+  g_delay_calls = 0u;
+  g_delay_mode = delayMode;
+  g_const_scale = 0u;
+  g_const_bias = 0;
+  g_const_mode = CONST_MODE_ADD;
+  g_const_initialized = 0u;
+  g_const_run_state = CONST_RUN_IDLE;
+  g_const_worker_armed = 0u;
+  g_const_sink = 0u;
+}
+
 int main(void) {
+  reset_fixture(DELAY_COMPLETE);
   CHECK(run_on(CONST_WORKER_CORE) == 0, "first worker setup");
   CHECK(g_init_calls == 1u, "worker initialized exactly once");
   CHECK(g_dump_arm_calls == 1u, "dump armed exactly once");
@@ -129,6 +161,31 @@ int main(void) {
 
   CHECK(g_runtime_ready[CONST_WORKER_CORE] != 0u,
         "worker remains live after all commands");
+
+  reset_fixture(DELAY_FAIL);
+  CHECK(run_on(CONST_WORKER_CORE) == 0, "failure case worker setup");
+  CHECK(run_on(CONST_PRODUCER_CORE) == -6, "compile failure is reported");
+  CHECK(g_const_run_state == CONST_RUN_FAILED,
+        "compile failure enters terminal failed state");
+  const uint32_t initAfterFailure = g_init_calls;
+  const uint32_t delaysAfterFailure = g_delay_calls;
+  CHECK(run_on(CONST_PRODUCER_CORE) == -10,
+        "compile failure rerun requires recovery");
+  CHECK(g_init_calls == initAfterFailure && g_delay_calls == delaysAfterFailure,
+        "compile failure rerun neither initializes nor waits");
+
+  reset_fixture(DELAY_TIMEOUT);
+  CHECK(run_on(CONST_WORKER_CORE) == 0, "timeout case worker setup");
+  CHECK(run_on(CONST_PRODUCER_CORE) == -7, "timeout is reported");
+  CHECK(g_const_run_state == CONST_RUN_FAILED,
+        "timeout enters terminal failed state");
+  const uint32_t initAfterTimeout = g_init_calls;
+  const uint32_t delaysAfterTimeout = g_delay_calls;
+  CHECK(run_on(CONST_PRODUCER_CORE) == -10,
+        "timeout rerun requires recovery");
+  CHECK(g_init_calls == initAfterTimeout && g_delay_calls == delaysAfterTimeout,
+        "timeout rerun neither initializes nor waits");
+
   if (g_failures != 0u)
     return 1;
   printf("PASS: const-after-init board command lifecycle\n");

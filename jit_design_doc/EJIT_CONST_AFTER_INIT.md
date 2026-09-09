@@ -101,6 +101,9 @@ does not run init-array, initialize or shut down EJIT, register functions, or
 rewrite the const-after-init globals. Re-running `test_ejit_period` on core 16
 only revalidates the already-published code and does not wait for another pair
 of compiles; a concurrent duplicate producer invocation is rejected. A
+failed or timed-out run enters a terminal failed state because it may already
+have partial queue/cache progress; subsequent commands require explicit
+platform recovery or reset rather than pretending to be a fresh first run. A
 standalone environment without product startup must provide a separate,
 explicit one-shot init-array command rather than adding initialization to
 either repeatable entry. This demo validates only the PGO path; the ordinary
