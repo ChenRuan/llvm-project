@@ -120,33 +120,182 @@ static GlobalVariable *rootGlobal(Value *V, const DataLayout &DL) {
   return const_cast<GlobalVariable *>(findRootGV(V, Offset, DL));
 }
 
+/// Resolve the global that roots an entry-reachable operand, including aliases
+/// used as whole-table names. This is deliberately separate from rootGlobal:
+/// may-const offsets and symbol registration retain their existing alias-free
+/// semantics. Constant GEP handling matches findRootGV, and the alias set
+/// prevents malformed alias cycles from making closure discovery unbounded.
+static GlobalVariable *closureRootGlobal(Value *V, const DataLayout &DL) {
+  APInt Offset(DL.getPointerSizeInBits(0), 0);
+  SmallPtrSet<const GlobalAlias *, 4> VisitedAliases;
+  while (V) {
+    V = V->stripPointerCasts();
+    if (auto *GV = dyn_cast<GlobalVariable>(V))
+      return GV;
+    if (auto *GA = dyn_cast<GlobalAlias>(V)) {
+      if (!VisitedAliases.insert(GA).second)
+        return nullptr;
+      V = GA->getAliasee();
+      continue;
+    }
+    auto *GEP = dyn_cast<GEPOperator>(V);
+    if (!GEP)
+      return nullptr;
+    SmallVector<Value *, 4> IdxList;
+    for (auto I = GEP->idx_begin(), E = GEP->idx_end(); I != E; ++I) {
+      if (!isa<ConstantInt>(*I))
+        return nullptr;
+      IdxList.push_back(*I);
+    }
+    Offset += DL.getIndexedOffsetInType(GEP->getSourceElementType(), IdxList);
+    V = GEP->getPointerOperand();
+  }
+  return nullptr;
+}
+
+/// An alias in serialized bitcode may not ultimately point at a declaration.
+/// Mutable globals are deliberately externalized below so the JIT resolves the
+/// host object instead of receiving a private initializer copy. Before that
+/// conversion, dissolve aliases rooted at those globals into their aliasee
+/// expressions. RAUW preserves constant GEP offsets, and processing every
+/// matching alias also collapses arbitrary alias chains.
+static void dissolveAliasesToMutableGlobals(Module &M) {
+  const DataLayout &DL = M.getDataLayout();
+  SmallVector<GlobalAlias *, 8> ToErase;
+  for (GlobalAlias &GA : M.aliases()) {
+    GlobalVariable *Root = closureRootGlobal(&GA, DL);
+    if (Root && !Root->isDeclaration() && !Root->isConstant())
+      ToErase.push_back(&GA);
+  }
+
+  for (GlobalAlias *GA : ToErase) {
+    GA->replaceAllUsesWith(GA->getAliasee());
+    GA->eraseFromParent();
+  }
+}
+
+static Function *aliasRootFunction(Value *V) {
+  SmallPtrSet<const GlobalAlias *, 4> VisitedAliases;
+  while (V) {
+    V = V->stripPointerCasts();
+    if (auto *F = dyn_cast<Function>(V))
+      return F;
+    auto *GA = dyn_cast<GlobalAlias>(V);
+    if (!GA || !VisitedAliases.insert(GA).second)
+      return nullptr;
+    V = GA->getAliasee();
+  }
+  return nullptr;
+}
+
+/// Externalized functions become declarations in the serialized clone, so an
+/// alias rooted at one would violate LLVM's alias-must-target-a-definition
+/// rule. Dissolve only aliases that target this extraction's externalized
+/// functions; unrelated aliases and the original AOT module remain unchanged.
+static void dissolveAliasesToExternalizedFunctions(
+    Module &M, const SmallPtrSetImpl<Function *> &ExternalizedFunctions) {
+  SmallVector<GlobalAlias *, 8> ToErase;
+  for (GlobalAlias &GA : M.aliases())
+    if (Function *Root = aliasRootFunction(&GA))
+      if (ExternalizedFunctions.contains(Root))
+        ToErase.push_back(&GA);
+
+  for (GlobalAlias *GA : ToErase) {
+    GA->replaceAllUsesWith(GA->getAliasee());
+    GA->eraseFromParent();
+  }
+}
+
 static void collectReferencedGlobals(Function &F,
                                      SetVector<GlobalVariable *> &Globals) {
   const DataLayout &DL = F.getParent()->getDataLayout();
   for (BasicBlock &BB : F)
     for (Instruction &I : BB)
       for (Value *Op : I.operands())
-        if (auto *GV = rootGlobal(Op, DL))
+        if (auto *GV = closureRootGlobal(Op, DL))
           Globals.insert(GV);
 }
 
-static void computeTransitiveClosure(
-    const SmallVectorImpl<Function *> &EntryFuncs,
-    SetVector<Function *> &ClosureFuncs,
-    SetVector<GlobalVariable *> &ClosureGlobals) {
+/// Collect functions and globals referenced by a reachable global initializer.
+/// Referenced globals are queued separately so their initializers are processed
+/// exactly once; this follows table-to-table links without scanning unrelated
+/// module globals. Function aliases are transparent, while ifuncs remain at the
+/// existing unsupported boundary because their resolver semantics are not an
+/// ordinary function-pointer edge.
+static void
+collectInitializerClosureRefs(Constant *C, SmallPtrSetImpl<Constant *> &Visited,
+                              SetVector<Function *> &Functions,
+                              SetVector<GlobalVariable *> &Globals) {
+  if (!Visited.insert(C).second)
+    return;
+  if (auto *F = dyn_cast<Function>(C)) {
+    Functions.insert(F);
+    return;
+  }
+  if (auto *GV = dyn_cast<GlobalVariable>(C)) {
+    Globals.insert(GV);
+    return;
+  }
+  if (isa<GlobalIFunc>(C))
+    return;
+  if (auto *GA = dyn_cast<GlobalAlias>(C)) {
+    collectInitializerClosureRefs(GA->getAliasee(), Visited, Functions,
+                                  Globals);
+    return;
+  }
+  if (isa<GlobalValue>(C))
+    return;
+  for (Value *Op : C->operands())
+    if (auto *OpC = dyn_cast<Constant>(Op))
+      collectInitializerClosureRefs(OpC, Visited, Functions, Globals);
+}
 
-  SmallVector<Function *, 16> Worklist(EntryFuncs.begin(), EntryFuncs.end());
-  while (!Worklist.empty()) {
-    Function *F = Worklist.pop_back_val();
-    if (!ClosureFuncs.insert(F))
+static void
+computeTransitiveClosure(const SmallVectorImpl<Function *> &EntryFuncs,
+                         SetVector<Function *> &ClosureFuncs,
+                         SetVector<GlobalVariable *> &ClosureGlobals) {
+
+  SmallVector<Function *, 16> FunctionWorklist(EntryFuncs.begin(),
+                                               EntryFuncs.end());
+  SmallVector<GlobalVariable *, 16> GlobalWorklist;
+  while (!FunctionWorklist.empty() || !GlobalWorklist.empty()) {
+    while (!FunctionWorklist.empty()) {
+      Function *F = FunctionWorklist.pop_back_val();
+      if (!ClosureFuncs.insert(F))
+        continue;
+
+      size_t FirstNewGlobal = ClosureGlobals.size();
+      collectReferencedGlobals(*F, ClosureGlobals);
+      for (size_t I = FirstNewGlobal; I < ClosureGlobals.size(); ++I)
+        GlobalWorklist.push_back(ClosureGlobals[I]);
+
+      for (BasicBlock &BB : *F)
+        for (Instruction &I : BB)
+          if (auto *CB = dyn_cast<CallBase>(&I))
+            if (Function *Callee = CB->getCalledFunction())
+              if (!Callee->isDeclaration() && !Callee->isIntrinsic())
+                FunctionWorklist.push_back(Callee);
+    }
+
+    if (GlobalWorklist.empty())
       continue;
-    collectReferencedGlobals(*F, ClosureGlobals);
-    for (BasicBlock &BB : *F)
-      for (Instruction &I : BB)
-        if (auto *CB = dyn_cast<CallBase>(&I))
-          if (Function *Callee = CB->getCalledFunction())
-            if (!Callee->isDeclaration() && !Callee->isIntrinsic())
-              Worklist.push_back(Callee);
+    GlobalVariable *GV = GlobalWorklist.pop_back_val();
+    // Mutable globals become external declarations in the extracted module,
+    // so their host initializer cannot provide a JIT-reachable call edge.
+    if (!GV->isConstant() || !GV->hasInitializer())
+      continue;
+
+    SmallPtrSet<Constant *, 16> Visited;
+    SetVector<Function *> ReferencedFunctions;
+    SetVector<GlobalVariable *> ReferencedGlobals;
+    collectInitializerClosureRefs(GV->getInitializer(), Visited,
+                                  ReferencedFunctions, ReferencedGlobals);
+    for (Function *F : ReferencedFunctions)
+      if (!F->isDeclaration() && !F->isIntrinsic() && !ClosureFuncs.contains(F))
+        FunctionWorklist.push_back(F);
+    for (GlobalVariable *ReferencedGV : ReferencedGlobals)
+      if (ClosureGlobals.insert(ReferencedGV))
+        GlobalWorklist.push_back(ReferencedGV);
   }
 }
 
@@ -714,6 +863,7 @@ static std::string extractAndSerialize(Module &M,
   // already process-unique name. Runs before the internalize step below so
   // the original linkage is still visible here.
   unsigned Externalized = 0;
+  SmallPtrSet<Function *, 8> ExternalizedFunctions;
   for (Function *F : ToExternalize) {
     Function *Cur = Extracted->getFunction(F->getName());
     if (!Cur || Cur->isDeclaration())
@@ -728,8 +878,10 @@ static std::string extractAndSerialize(Module &M,
     Cur->setDSOLocal(false);
     if (WasLocal)
       Cur->setName(ejitRegistrationKey(M, *F));
+    ExternalizedFunctions.insert(Cur);
     ++Externalized;
   }
+  dissolveAliasesToExternalizedFunctions(*Extracted, ExternalizedFunctions);
   LLVM_DEBUG(dbgs() << "ejit-register-bitcode: externalized " << Externalized
                     << " of " << ToExternalize.size()
                     << " closure helper(s) in bitcode\n");
@@ -738,6 +890,7 @@ static std::string extractAndSerialize(Module &M,
   // so the JIT linker resolves them from the host process. Constants (e.g.
   // version strings, lookup tables) are kept as-is since they're embedded
   // in the bitcode and don't need external resolution.
+  dissolveAliasesToMutableGlobals(*Extracted);
   for (GlobalVariable &GV : Extracted->globals()) {
     if (GV.isDeclaration() || GV.isConstant())
       continue;
@@ -885,6 +1038,26 @@ static void generateSymbolRegisters(
           }
         }
       }
+    }
+  }
+
+  // Alias-rooted globals are present in ClosureGlobals even though rootGlobal
+  // intentionally does not follow aliases. Register those closure members as
+  // a fallback so an extracted clone whose mutable aliases were dissolved can
+  // resolve the same host object. The set keeps the direct-reference path
+  // above unchanged and avoids duplicate registrations.
+  for (GlobalVariable *GV : ClosureGlobals) {
+    if ((GV->isConstant() && !GV->isDeclaration()) ||
+        GV->getName().starts_with("llvm."))
+      continue;
+    if (!GV->isDeclaration() && isPeriodVar(*GV))
+      continue;
+    std::string Name = GV->getName().str();
+    if (registered.insert(Name).second) {
+      IRBuilder<> Builder(InsertBefore);
+      Builder.CreateCall(
+          M.getFunction(FN_REGISTER_SYMBOL),
+          {Builder.CreateGlobalString(Name), Builder.CreateBitCast(GV, PtrTy)});
     }
   }
 
@@ -1120,6 +1293,26 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
         }
       }
     }
+  }
+
+  // Closure discovery follows aliases, while rootGlobal above deliberately
+  // retains its existing alias-free behavior. Add any remaining externally
+  // resolved closure globals so the static registry mirrors ctor registration
+  // after mutable aliases are dissolved in the extracted clone.
+  for (GlobalVariable *GV : ClosureGlobals) {
+    if ((GV->isConstant() && !GV->isDeclaration()) ||
+        GV->getName().starts_with("llvm.") || !GVsDone.insert(GV).second)
+      continue;
+    Constant *NameStr = ConstantDataArray::getString(Ctx, GV->getName(), true);
+    auto *NameGV =
+        new GlobalVariable(M, NameStr->getType(), true,
+                           GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
+    Entries.push_back(
+        ConstantStruct::get(EntryTy, {ConstantInt::get(I32Ty, EJIT_REG_SYMBOL),
+                                      ConstantExpr::getBitCast(NameGV, PtrTy),
+                                      ConstantPointerNull::get(PtrTy),
+                                      ConstantExpr::getBitCast(GV, PtrTy),
+                                      ConstantInt::get(I64Ty, 0)}));
   }
 
   // Externalized closure helpers: same keys as generateSymbolRegisters, so
