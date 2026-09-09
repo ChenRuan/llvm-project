@@ -312,10 +312,12 @@ static cl::opt<unsigned> PGOVerifyBFICutoff(
     cl::desc("Set the threshold for pgo-verify-bfi: skip the counts whose "
              "profile count value is below."));
 
+#ifndef EJIT_FREESTANDING
 static cl::opt<std::string> PGOTraceFuncHash(
     "pgo-trace-func-hash", cl::init("-"), cl::Hidden,
     cl::value_desc("function name"),
     cl::desc("Trace the hash of the function with this name."));
+#endif
 
 static cl::opt<unsigned> PGOFunctionSizeThreshold(
     "pgo-function-size-threshold", cl::Hidden,
@@ -748,9 +750,11 @@ void FuncPGOInstrumentation<Edge, BBInfo>::computeCFGHash() {
                     << ", High32 CRC = " << JCH.getCRC()
                     << ", Hash = " << FunctionHash << "\n";);
 
+#ifndef EJIT_FREESTANDING
   if (PGOTraceFuncHash != "-" && F.getName().contains(PGOTraceFuncHash))
     dbgs() << "Funcname=" << F.getName() << ", Hash=" << FunctionHash
            << " in building " << F.getParent()->getSourceFileName() << "\n";
+#endif
 }
 
 // Check if we can safely rename this Comdat function.
