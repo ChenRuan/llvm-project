@@ -88,11 +88,21 @@ do not change.
 ## Board demo
 
 `ejit_test/ejit_const_after_init_sre_multicore_test.c` is a self-contained SRE
-demo with no header dependency. Reset the board, run `test_ejit_period` on core
-6 to start the fixed worker and arm capture, then run it on core 16. Core 16
-finalizes three globals before its first entry call, waits for PGO Tier-1 and
-Tier-2 compilation and publication, and verifies additional
-calls after Tier-2 is ready. Run `test_ejit_period` on core 6 again to print the
-captured function and module views. This demo validates only the PGO path; the
-ordinary non-PGO initialization path is covered by host-side tests rather than
-this board acceptance scenario.
+demo with no header dependency. Product startup, not this repeatable shell
+command, must run the platform init-array path exactly once. Run
+`test_ejit_period` on core 6 to start the fixed worker and arm capture, then run
+it on core 16. Core 16 finalizes three globals before its first entry call,
+waits for PGO Tier-1 and Tier-2 compilation and publication, and verifies
+additional calls after Tier-2 is ready.
+
+After completion, run `test_ejit_const_dump` on core 6 to print the captured
+function and module views. It is a read-only command and may be repeated: it
+does not run init-array, initialize or shut down EJIT, register functions, or
+rewrite the const-after-init globals. Re-running `test_ejit_period` on core 16
+only revalidates the already-published code and does not wait for another pair
+of compiles; a concurrent duplicate producer invocation is rejected. A
+standalone environment without product startup must provide a separate,
+explicit one-shot init-array command rather than adding initialization to
+either repeatable entry. This demo validates only the PGO path; the ordinary
+non-PGO initialization path is covered by host-side tests rather than this
+board acceptance scenario.
