@@ -57,8 +57,10 @@ int multi_bound_entry(__attribute__((ejit_period_arr_ind("cell"))) int cellIdx,
 // CHECK-DAG: ![[IND]] = !{!"ejit_period_arr_ind", !"cell", i32 0}
 // CHECK-DAG: ![[MAYCONST]] = !{}
 // CHECK-DAG: ![[BOUND_META]] = distinct !{![[ENTRY]], ![[IND]], ![[BOUND:[0-9]+]]}
-// CHECK-DAG: ![[BOUND]] = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, ![[BOUND_FIELD:[0-9]+]]}
+// The node carries the pointee's size AND alignment; opaque pointers erase the
+// pointee type, so the alignment cannot be recovered from the IR without it.
+// CHECK-DAG: ![[BOUND]] = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, i64 4, ![[BOUND_FIELD:[0-9]+]]}
 // CHECK-DAG: ![[BOUND_FIELD]] = !{i64 0, i64 4}
 // The first multi-bound node is structurally identical to BOUND and is uniqued.
 // CHECK-DAG: ![[MULTI_BOUND_META]] = distinct !{![[ENTRY]], ![[IND]], ![[BOUND]], ![[BOUND_B:[0-9]+]]}
-// CHECK-DAG: ![[BOUND_B]] = !{!"ejit_bound_ptr", !"cell", i32 2, i64 8, ![[BOUND_FIELD]]}
+// CHECK-DAG: ![[BOUND_B]] = !{!"ejit_bound_ptr", !"cell", i32 2, i64 8, i64 4, ![[BOUND_FIELD]]}

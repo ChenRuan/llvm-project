@@ -101,6 +101,12 @@ public:
   bool printMayConstRanking() const;
 
 private:
+  /// Attach the pointer facts the ejit_bound_ptr contract already guarantees
+  /// to the entry's bound-pointer parameters, so the alias analysis, LICM and
+  /// GVN in the simplification pipeline can use them. See the definition for
+  /// which facts are implied by the contract and which are deliberately not.
+  void applyBoundPointerFacts(Module &M, const SpecializationContext &ctx);
+
   /// Replace ejit_period_arr_ind parameters with their runtime constants.
   void preReplacePeriodIndices(Module &M, const SpecializationContext &ctx);
 
