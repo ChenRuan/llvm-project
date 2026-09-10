@@ -25,6 +25,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/ExecutionEngine/EJIT/EJitCodeReuse.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
@@ -244,6 +245,21 @@ protected:
     if (!Mod)
       Err.print("SharedSpecializationTest", errs());
     return Mod;
+  }
+
+  /// Logical identity of one instance of the entry under test. Mirrors what
+  /// the compile driver would build; used to show that two versions sharing an
+  /// emission are still two distinct logical versions.
+  static LogicalKey makeLogical(StringRef Fn, unsigned Cell, unsigned Trp) {
+    LogicalKey Key;
+    Key.entry = Fn.str();
+    Key.sourceId = "src-rev-1";
+    Key.dimensions.push_back({"cell", Cell});
+    Key.dimensions.push_back({"trp", Trp});
+    Key.lifecycleVersions.push_back(0);
+    Key.lifecycleVersions.push_back(0);
+    Key.runtimeGeneration = 1;
+    return Key;
   }
 
   static SpecializationContext makeCtx(StringRef Fn, unsigned Cell,
@@ -648,6 +664,109 @@ TEST_F(SharedSpecializationTest, NonSharedModeStillRewritesArguments) {
   ASSERT_NE(F, nullptr);
   EXPECT_FALSE(argumentIsUsed(*F, 0))
       << "the pre-existing mode still specializes the whole argument";
+}
+
+//===----------------------------------------------------------------------===//
+// Stage 1 + stage 2 composition: what the shared pipeline emits is what the
+// reuse table compares. Two instances whose folded configuration agrees must
+// canonicalize to the same emission and share one physical record; a changed
+// may_const value must produce a different emission and compile independently.
+//===----------------------------------------------------------------------===//
+
+TEST_F(SharedSpecializationTest, IdenticalEmissionsShareOneRecord) {
+  const char *IR = R"(
+    target datalayout = "e-p:64:64-i64:64-n8:16:32:64-S128"
+    %S = type { i32, i32 }
+    @g_cfg = external global [4 x %S], !ejit.metadata !4
+    define i32 @f(i32 %cell, i32 %trp, i32 %x) !ejit.metadata !0 {
+    entry:
+      %p = getelementptr [4 x %S], ptr @g_cfg, i32 0, i32 %cell, i32 0
+      %gain = load i32, ptr %p, !ejit.may_const !9
+      %lp = getelementptr [4 x %S], ptr @g_cfg, i32 0, i32 %cell, i32 1
+      %live = load i32, ptr %lp
+      %m = mul i32 %gain, %x
+      %s = add i32 %m, %live
+      %r = add i32 %s, %trp
+      ret i32 %r
+    }
+    !0 = distinct !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !3 = !{!"ejit_period_arr_ind", !"trp", i32 1}
+    !4 = distinct !{!5, !6}
+    !5 = !{!"ejit_period_arr", !"cell", i32 32}
+    !6 = !{!"ejit_may_const_field", i32 0}
+    !9 = !{!"ejit"}
+  )";
+  buildArrayStorage();
+  // Instances 1 and 2 carry the same may_const gain, so their shared-mode
+  // emissions must be identical; instance 3 differs.
+  Storage[1].Gain = 4242;
+  Storage[2].Gain = 4242;
+  Storage[3].Gain = 99;
+
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "g_cfg", Storage.data(), kArrayBytes);
+
+  struct Emission {
+    CanonicalModule Canon;
+    LogicalKey Logical;
+  };
+  auto compileFor = [&](unsigned Cell) {
+    LLVMContext LocalCtx;
+    SMDiagnostic Err;
+    auto Mod = parseAssemblyString(IR, Err, LocalCtx);
+    EXPECT_TRUE(Mod) << Err.getMessage().str();
+    EJitOptimizerTestAccess Opt(Registry);
+    SpecializationContext CtxSpec = makeCtx("f", Cell, 1);
+    CtxSpec.tier = CompileTier::Baseline;
+    Opt.runPipeline(*Mod, CtxSpec);
+    Emission Result;
+    Result.Canon = canonicalizeModule(*Mod);
+    // The physical identity deliberately excludes the instance value.
+    Result.Logical = makeLogical("f", Cell, 1);
+    return Result;
+  };
+
+  Emission E1 = compileFor(1);
+  Emission E2 = compileFor(2);
+  Emission E3 = compileFor(3);
+  EXPECT_EQ(E1.Canon.bytes, E2.Canon.bytes)
+      << "equal configuration must produce one canonical emission";
+  EXPECT_NE(E1.Canon.bytes, E3.Canon.bytes)
+      << "a differing may_const value must stay a different emission";
+
+  CodeReuseTable Table;
+  CodeKey Key;
+  Key.sourceId = "src-rev-1";
+  Key.entry = "f";
+  Key.compilerPolicy = "async+pgo+shared-v1";
+  Key.bindings = BindingEnvironment();
+  Key.finalIrDigest = E1.Canon.digest;
+
+  auto Add = Table.addCandidate(Key, E1.Canon);
+  ASSERT_TRUE(Add.ok);
+  ASSERT_TRUE(Table.markLinked(Add.codeId, 0x1000, {{0x1000, 64}}, {}, "near"));
+  ASSERT_TRUE(Table.markPublished(Add.codeId));
+
+  // Instance 2 reuses the same physical record ...
+  ReuseLookup Hit = Table.lookup(Key, E2.Canon.bytes);
+  EXPECT_EQ(Hit.decision, ReuseDecision::ReusedPublished);
+  EXPECT_EQ(Hit.codeId, Add.codeId);
+  // ... while remaining a distinct logical version.
+  EXPECT_NE(E1.Logical.encode(), E2.Logical.encode());
+  ASSERT_TRUE(Table.bindLogical(E1.Logical, Add.codeId));
+  ASSERT_TRUE(Table.bindLogical(E2.Logical, Add.codeId));
+  EXPECT_EQ(Table.logicalRefs(Add.codeId), 2u);
+  EXPECT_EQ(Table.stats().execBytesUnique, 64u);
+  EXPECT_EQ(Table.stats().reusedVersions, 2u);
+
+  // Instance 3's changed configuration finds no match.
+  CodeKey Key3 = Key;
+  Key3.finalIrDigest = E3.Canon.digest;
+  ReuseLookup Miss = Table.lookup(Key3, E3.Canon.bytes);
+  EXPECT_EQ(Miss.decision, ReuseDecision::CompileIndependently);
+  EXPECT_FALSE(Miss.digestCollision);
 }
 
 } // namespace
