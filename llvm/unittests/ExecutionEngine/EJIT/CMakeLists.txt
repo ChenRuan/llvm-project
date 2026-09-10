@@ -19,6 +19,7 @@ add_llvm_unittest(EJITTests
   EJitFieldOffsetTest.cpp
   EJitLinkOptimizationPluginTest.cpp
   EJitPgoTest.cpp
+  EJitCodeReuseTest.cpp
   EJitSharedSpecializationTest.cpp
   EJitVpMergeTest.cpp
   EJitVpScalarSpecTest.cpp
