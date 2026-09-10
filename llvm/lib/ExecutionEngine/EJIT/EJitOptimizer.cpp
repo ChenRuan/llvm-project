@@ -342,7 +342,8 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
       // publish module profile-free so audit-only mode is behaviorally the
       // same optimization pipeline as ejit_init() Baseline.
       clearAnalyses();
-      runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline);
+      runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline,
+                              &ctx);
 #if defined(EJIT_DIAG_ENABLE)
       auto FinalSites = collectMayConstSites(M, registry_);
       recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -401,7 +402,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
           SpecFPM.run(F, FAM_);
     }
 #endif
-    runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+    runOptimizationPipeline(M, ctx.optLevel, ctx.tier, &ctx);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
     auto FinalSites = collectMayConstSites(M, registry_);
     recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -413,7 +414,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 
   // Baseline (PGO off): the existing full specialization pipeline.
-  runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+  runOptimizationPipeline(M, ctx.optLevel, ctx.tier, &ctx);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   auto FinalSites = collectMayConstSites(M, registry_);
   recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -695,6 +696,19 @@ void EJitOptimizer::preReplacePeriodIndices(Module &M,
                                             const SpecializationContext &ctx) {
   LLVM_DEBUG(dbgs() << "ejit-optimizer: preReplacePeriodIndices, "
                     << ctx.dimensions.size() << " dim(s)\n");
+  if (ctx.sharedSpecialization) {
+    // PR230 §3.1/§3.2: the cell/TRP arguments are business call arguments as
+    // well as cache identity. Rewriting them here would turn the *requested
+    // instance* into a whole-function assumption and redirect every dynamic
+    // load, store, pointer computation and call argument. Shared mode keeps
+    // them intact and instead hands the same values to the pass as a read-only
+    // evaluation environment, consumed only where a may_const load's address is
+    // computed.
+    EJIT_DIAG_VERBOSE("preReplacePeriodIndices: shared mode, %zu dim(s) kept "
+                      "as evaluation environment",
+                      ctx.dimensions.size());
+    return;
+  }
   for (Function &F : M.functions()) {
     MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
     if (!MD)
@@ -803,10 +817,60 @@ void EJitOptimizer::runStructFieldPass(Module &M,
     }
   }
   EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName);
+  if (ctx.sharedSpecialization) {
+    // §3.2/§4: every replace round in shared mode runs the same
+    // load-only strategy against the same evaluation environment.
+    AssumedArgMap DimAssumptions = buildDimensionAssumptions(M, ctx);
+    structField.setDimensionAssumptions(std::move(DimAssumptions));
+    // §3.2: an unmarked pointer-form period global load must not be rewritten
+    // to the real base address; it is resolved during address evaluation only.
+    structField.setRewritePeriodPointerBase(false);
+  }
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration())
       structField.run(F, FAM_);
+}
+
+AssumedArgMap
+EJitOptimizer::buildDimensionAssumptions(Module &M,
+                                         const SpecializationContext &ctx) {
+  AssumedArgMap Assumed;
+  Function *Root = M.getFunction(ctx.fnName);
+  if (!Root)
+    return Assumed;
+  MDNode *MD = Root->getMetadata(MD_EJIT_METADATA);
+  if (!MD)
+    return Assumed;
+
+  for (const MDOperand &Op : MD->operands()) {
+    auto *Sub = dyn_cast<MDNode>(Op.get());
+    if (!Sub || Sub->getNumOperands() < 3)
+      continue;
+    auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+    // Same tag set as preReplacePeriodIndices: free dims carry their own
+    // invariant witness and are collected by the pass independently.
+    if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
+      continue;
+    auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
+    auto *IdxC = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+    if (!PN || !IdxC)
+      continue;
+    const uint64_t ArgIdx = IdxC->getZExtValue();
+    if (ArgIdx >= Root->arg_size())
+      continue;
+    Argument *Arg = Root->getArg(static_cast<unsigned>(ArgIdx));
+    if (!Arg->getType()->isIntegerTy())
+      continue;
+    for (const auto &Dim : ctx.dimensions)
+      if (Dim.periodName == PN->getString()) {
+        Assumed[Arg] = Dim.cellIdx;
+        break;
+      }
+  }
+  EJIT_DIAG_VERBOSE("shared mode: %zu root dimension assumption(s) for %s",
+                    Assumed.size(), ctx.fnName.c_str());
+  return Assumed;
 }
 
 void EJitOptimizer::runStructFieldPass(Module &M) {
@@ -829,7 +893,8 @@ EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {
 
 void EJitOptimizer::runOptimizationPipeline(Module &M,
                                             ejit::OptimizationLevel level,
-                                            CompileTier tier) {
+                                            CompileTier tier,
+                                            const SpecializationContext *ctx) {
   EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s opt=%d",
                   M.getName().str().c_str(), static_cast<int>(level));
 
@@ -850,7 +915,16 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
   // Phase 4: unrolling exposed new constant-index array accesses
   // (g_arr[k].field -> g_arr[0].field, g_arr[1].field, ...). Substitute them,
   // then fold/propagate/simplify the freshly-constant values.
-  runStructFieldPass(M);
+  //
+  // §4: shared mode must run this last round with the same evaluation
+  // environment as the earlier rounds — a context-less round would fall back to
+  // the full-specialization empty environment and silently restore whatever
+  // argument specialization this mode removes. Non-shared compiles keep the
+  // pre-existing context-less round.
+  if (ctx && ctx->sharedSpecialization)
+    runStructFieldPass(M, *ctx);
+  else
+    runStructFieldPass(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration())
       cleanupFPM_.run(F, FAM_);

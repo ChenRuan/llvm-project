@@ -107,6 +107,11 @@ struct SpecializationContext {
   OptimizationLevel optLevel = OptimizationLevel::L2;
   /// PGO tier (Baseline when PGO is disabled or for the first compile).
   CompileTier tier = CompileTier::Baseline;
+  /// PR230 shared specialization: keep the real cell/TRP arguments and fold
+  /// only authorized may_const loads through a read-only evaluation
+  /// environment built from `dimensions`. false keeps the existing
+  /// full-argument specialization pipeline unchanged.
+  bool sharedSpecialization = false;
   /// Tier-2 indexed profile buffer (synthesized from Tier-1 counters by
   /// EJitProfileMerge before loadBitcode). Empty for Baseline/Instrumented.
   /// Owned by the context; lives through the JIT transform that consumes it.

@@ -53,7 +53,57 @@ struct Config {
 #else
   bool enableProfileAudit = false;
 #endif
+  /// PR230 shared-version code reuse (EJIT_VERSION_CODE_REUSE_SPEC.md §8.3),
+  /// default OFF and opt-in only.
+  ///
+  /// When ON the JIT keeps the real cell/TRP call arguments in the IR and
+  /// builds a read-only evaluation environment that is consulted only to fold
+  /// authorized `!ejit.may_const` loads (§3.2). The per-(entry, cell, trp,
+  /// versions) logical cache and lifecycle are unchanged; the wrapper and the
+  /// cell/TRP argument ABI are unchanged.
+  ///
+  /// V1 supports Async + normal online PGO only. Use
+  /// checkSharedSpecializationSupport() to reject the unsupported combinations
+  /// before any queue/waiter/admission side effect exists.
+  bool enableSharedSpecialization = false;
 };
+
+/// Result of validating a Config against the PR230 V1 support matrix (§8.3).
+/// `supported` is false when shared specialization was requested in a
+/// combination this version cannot run; `reason` then carries a stable,
+/// human-readable explanation for the diagnostic log.
+struct SharedSpecializationSupport {
+  bool supported = true;
+  const char *reason = "";
+};
+
+/// Validate \p C against the V1 shared-specialization support matrix:
+///
+///   OFF                        -> supported (nothing to check)
+///   ON + Async + normal PGO    -> supported
+///   ON + Sync                  -> rejected (no T1 progress source)
+///   ON + PGO off               -> rejected (no group profile)
+///   ON + audit-only PGO        -> rejected (diagnostic sampling is not a
+///                                 normal PGO group lifecycle)
+///
+/// A rejected combination must fail initialization/compilation explicitly
+/// rather than silently disabling PGO or creating a group that can never make
+/// progress. Changing the policy requires a safe shutdown/drain and a fresh
+/// initialization.
+inline SharedSpecializationSupport
+checkSharedSpecializationSupport(const Config &C) {
+  if (!C.enableSharedSpecialization)
+    return {true, ""};
+  if (C.compileMode != CompileMode::Async)
+    return {false, "shared specialization requires Async compile mode"};
+  if (!C.enablePgo) {
+    if (C.enableProfileAudit)
+      return {false, "shared specialization rejects audit-only sampling "
+                     "(enablePgo is required)"};
+    return {false, "shared specialization requires online PGO (enablePgo)"};
+  }
+  return {true, ""};
+}
 
 } // namespace ejit
 } // namespace llvm

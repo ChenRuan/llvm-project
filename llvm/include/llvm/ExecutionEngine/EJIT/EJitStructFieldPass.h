@@ -73,6 +73,25 @@ public:
   /// Pre-build GV metadata maps from the Module (call once before run()).
   void initFromModule(Module &M);
 
+  /// PR230 shared specialization: install the read-only dimension evaluation
+  /// environment. Each entry maps a function formal to the cell instance the
+  /// caller asked this compile to evaluate *addresses* at. The map is consumed
+  /// only by the may_const address evaluation (accumulateFullOffset /
+  /// getBoundPointerOffset); the argument itself, every dynamic load/store,
+  /// every pointer computation and every call argument stays live. Call before
+  /// initFromModule(), or again after (the merged map is rebuilt either way).
+  void setDimensionAssumptions(AssumedArgMap Assumed);
+
+  /// PR230 shared specialization: when \p Rewrite is false, an *unmarked*
+  /// pointer-valued period global load is no longer rewritten to the
+  /// registered absolute address. That rewrite publishes the real base address
+  /// into the IR, which the shared mode must not do; the indirect-field
+  /// pattern still resolves the same slot from the evaluation environment
+  /// without materializing it.
+  void setRewritePeriodPointerBase(bool Rewrite) {
+    rewritePeriodPointerBase_ = Rewrite;
+  }
+
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
   /// Identify loads using the same metadata and field-offset fallback as the
   /// replacement pass. The returned sites are read-only audit data.
@@ -115,6 +134,33 @@ private:
   /// initFreeDimAssumptions().
   AssumedArgMap freeDimArgs_;
   void initFreeDimAssumptions(Module &M);
+
+  /// PR230 shared specialization: period-dimension instances the caller asked
+  /// this compile to evaluate addresses at. Used exactly like freeDimArgs_ —
+  /// address evaluation only, never an argument rewrite. Populated from
+  /// SpecializationContext::dimensions in shared mode.
+  AssumedArgMap dimArgs_;
+
+  /// Seeds of dimArgs_: the entry function's own dimension formals. Kept
+  /// separate so the interprocedural expansion below can be re-run against the
+  /// current IR at every replace round without losing the original seeds.
+  AssumedArgMap rootDimArgs_;
+
+  /// Expand rootDimArgs_ into dimArgs_ over provable direct-call edges: a
+  /// callee formal joins the environment only when EVERY call site of that
+  /// callee passes the same assumed value for it, and the callee's address is
+  /// never taken (otherwise the call set cannot be enumerated). Re-run per
+  /// replace round because inlining rewrites the call graph.
+  void propagateDimensionAssumptions(Module &M);
+
+  /// freeDimArgs_ + dimArgs_ merged, rebuilt whenever either changes. Address
+  /// evaluation consults this single map.
+  AssumedArgMap evalAssumptions_;
+  void rebuildEvalAssumptions();
+
+  /// See setRewritePeriodPointerBase(). true preserves the pre-existing
+  /// behavior for every non-shared compile.
+  bool rewritePeriodPointerBase_ = true;
 
   // Cached metadata maps — built once per module, reused across functions.
   GVPeriodMap gvPeriodMap_;

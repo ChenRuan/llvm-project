@@ -511,6 +511,26 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   ctx.fnName = funcName;
   ctx.cacheKey = cacheKey;
   ctx.optLevel = config_.optLevel;
+  // PR230 shared specialization (§8.3). The support-matrix check runs before
+  // the context exists and before any compile side effect: an unsupported
+  // combination is a hard failure, not a silent downgrade to PGO-off or a
+  // group that can never progress. `init_` already rejected it at
+  // initialization; this covers a live policy switch that raced the check.
+  ctx.sharedSpecialization = config_.enableSharedSpecialization;
+  if (ctx.sharedSpecialization) {
+    SharedSpecializationSupport Support =
+        checkSharedSpecializationSupport(config_);
+    if (!Support.supported) {
+      EJIT_DIAG("compile REJECT key=0x%016lx func=%s: %s", cacheKey,
+                funcName.c_str(), Support.reason);
+#ifndef EJIT_FREESTANDING
+      if (logger_)
+        logger_->log(EJIT_ERR_INVALID_PARAM, Support.reason, funcName,
+                     std::to_string(cacheKey));
+#endif
+      return nullptr;
+    }
+  }
   for (unsigned i = 0; i < dimCount; ++i)
     ctx.dimensions.push_back({periodNames[i], dims[i]});
   if (request && request->boundCount) {

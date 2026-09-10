@@ -14,6 +14,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
@@ -111,6 +112,14 @@ private:
   void runStructFieldPass(Module &M);
   void runStructFieldPass(Module &M, const SpecializationContext &ctx);
 
+  /// PR230 shared specialization: build the read-only dimension evaluation
+  /// environment for \p ctx from the entry function's
+  /// `ejit_period_arr_ind` metadata and ctx.dimensions. The returned map is
+  /// consumed only as assumed values for may_const *address* evaluation; no
+  /// argument, store, pointer computation or call argument is rewritten.
+  AssumedArgMap buildDimensionAssumptions(Module &M,
+                                          const SpecializationContext &ctx);
+
   /// Push the specialized constants across call edges. The AOT inliner keeps a
   /// call edge wherever it chose not to inline, so after phase 1 every call
   /// site passes the period dims (and values derived from them) as ordinary
@@ -139,8 +148,14 @@ private:
   /// constant, re-specializes the array accesses that unrolling turns into
   /// constant-index GEPs, then does a final cleanup. `level` is accepted for
   /// ABI compatibility and does not affect the pipeline.
+  ///
+  /// `ctx` supplies the evaluation environment for the final load-replace
+  /// round. Shared specialization requires it so all three rounds use the same
+  /// preserved-dimension strategy; a null ctx keeps the pre-existing
+  /// empty-context round for non-shared compiles.
   void runOptimizationPipeline(Module &M, OptimizationLevel level,
-                               CompileTier tier);
+                               CompileTier tier,
+                               const SpecializationContext *ctx = nullptr);
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   void recordMayConstBenefit(const SpecializationContext &ctx,

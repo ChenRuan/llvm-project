@@ -62,6 +62,15 @@ EJit::EJit(const Config &config) : config_(config) {
                     (int)config.compileMode, (int)config.optLevel,
                     config.maxCacheSize, (unsigned)config.maxCacheEntries);
 
+  // PR230 §8.3: reject an unsupported shared-specialization combination before
+  // any queue, waiter or admission state exists. A rejected config fails
+  // initialization explicitly instead of silently disabling PGO or creating a
+  // group that can never make progress.
+  if (SharedSpecializationSupport Support =
+          checkSharedSpecializationSupport(config);
+      !Support.supported)
+    recordInitError(EJIT_ERR_INVALID_PARAM, Support.reason, "");
+
   // Create all runtime components
   runtimeState_ = std::make_unique<EJitRuntimeState>();
   moduleLoader_ = std::make_unique<EJitModuleLoader>();
@@ -647,6 +656,21 @@ bool EJit::setCompileMode(CompileMode mode) {
   EJitTaskPool *tp = taskPool();
   if (!tp)
     return false;
+
+  // PR230 §8.3: a live switch that would leave shared specialization in an
+  // unsupported combination is rejected and the current state kept. The
+  // switch must not migrate in-flight groups: changing the policy requires a
+  // safe shutdown/drain and a fresh initialization.
+  if (config_.enableSharedSpecialization && mode != config_.compileMode) {
+    Config Probe = config_;
+    Probe.compileMode = mode;
+    SharedSpecializationSupport Support =
+        checkSharedSpecializationSupport(Probe);
+    if (!Support.supported) {
+      EJIT_DIAG("compile mode switch rejected: %s", Support.reason);
+      return false;
+    }
+  }
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   // The generation asyncServiceAvailable() validated, so the publish below can
   // only commit against the same one.

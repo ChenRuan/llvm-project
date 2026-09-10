@@ -28,6 +28,14 @@ using namespace llvm::ejit;
 
 #define DEBUG_TYPE "ejit-struct-field"
 
+/// Constant-fold an integer expression, taking the value of any argument in
+/// \p Assumed from that map. Defined below; declared here because
+/// propagateDimensionAssumptions() (also below, but reached from
+/// initFromModule()) resolves call arguments with it.
+static std::optional<APInt> evalWithAssumed(const Value *V,
+                                            const AssumedArgMap &Assumed,
+                                            unsigned Depth);
+
 void EJitStructFieldPass::initFromModule(Module &M) {
   EJIT_DIAG_VERBOSE("struct-field initFromModule module=%s globals=%zu",
                     M.getName().str().c_str(), M.global_size());
@@ -80,6 +88,8 @@ void EJitStructFieldPass::initFromModule(Module &M) {
 
   initBoundArgumentPropagation(M);
   initFreeDimAssumptions(M);
+  propagateDimensionAssumptions(M);
+  rebuildEvalAssumptions();
   mapsBuilt_ = true;
 #ifdef EJIT_DIAG_ENABLE
   EJIT_DIAG_DEBUG("struct-field initFromModule module=%s globals=%zu "
@@ -630,6 +640,120 @@ void EJitStructFieldPass::initFreeDimAssumptions(Module &M) {
     }
   }
   EJIT_DIAG_VERBOSE("struct-field free dims: %zu", freeDimArgs_.size());
+}
+
+void EJitStructFieldPass::setDimensionAssumptions(AssumedArgMap Assumed) {
+  rootDimArgs_ = std::move(Assumed);
+  dimArgs_.clear();
+  rebuildEvalAssumptions();
+}
+
+/// Expand rootDimArgs_ over direct-call edges (PR230 §3.4).
+///
+/// A helper formals must not inherit `root.cell` merely because it is also
+/// named `cell`. The fact that is actually available is: this module contains
+/// every call to the callee, and at each of those calls the corresponding
+/// actual is a value the entry's dimension environment already fixes to V. The
+/// callee body may then evaluate addresses of its own may_const loads at V.
+///
+/// Rejections are deliberate and conservative:
+///   - a function whose address escapes (any non-call use) has call sites this
+///     walk cannot enumerate, so no formal of it is assumed;
+///   - an indirect call / unresolved callee is skipped;
+///   - disagreeing actuals, unfoldable actuals, or a formal whose type cannot
+///     hold the APInt all leave the formal out.
+///
+/// The walk is monotone (values are only ever added) and bounded by
+/// kMaxAssumedPropagationRounds, which caps how deep a chain of helpers this
+/// reasoning follows.
+void EJitStructFieldPass::propagateDimensionAssumptions(Module &M) {
+  dimArgs_ = rootDimArgs_;
+  if (dimArgs_.empty())
+    return;
+
+  /// A function participates only when every use of it is a direct call: the
+  /// walk then sees all call sites and can require unanimity.
+  auto collectCallSites = [](Function &F, SmallVectorImpl<CallBase *> &Sites) {
+    for (User *U : F.users()) {
+      auto *CB = dyn_cast<CallBase>(U);
+      if (!CB || CB->getCalledFunction() != &F)
+        return false;
+      Sites.push_back(CB);
+    }
+    return true;
+  };
+
+  constexpr unsigned kMaxAssumedPropagationRounds = 8;
+  for (unsigned Round = 0; Round < kMaxAssumedPropagationRounds; ++Round) {
+    bool Changed = false;
+    for (Function &F : M) {
+      if (F.isDeclaration())
+        continue;
+      SmallVector<CallBase *, 8> Sites;
+      if (!collectCallSites(F, Sites) || Sites.empty())
+        continue;
+
+      for (unsigned ArgIdx = 0; ArgIdx < F.arg_size(); ++ArgIdx) {
+        Argument *Arg = F.getArg(ArgIdx);
+        if (!Arg->getType()->isIntegerTy() || dimArgs_.count(Arg))
+          continue;
+
+        std::optional<uint64_t> Agreed;
+        bool Unanimous = true;
+        for (CallBase *CB : Sites) {
+          auto V = evalWithAssumed(CB->getArgOperand(ArgIdx), evalAssumptions_,
+                                   /*Depth=*/0);
+          if (!V) {
+            // evalAssumptions_ is stale within the round; fall back to the map
+            // being built so a chain A -> B -> C resolves in one pass.
+            V = evalWithAssumed(CB->getArgOperand(ArgIdx), dimArgs_,
+                                /*Depth=*/0);
+          }
+          if (!V) {
+            Unanimous = false;
+            break;
+          }
+          const uint64_t Value = V->getZExtValue();
+          if (Agreed && *Agreed != Value) {
+            Unanimous = false;
+            break;
+          }
+          Agreed = Value;
+        }
+        if (!Unanimous || !Agreed)
+          continue;
+
+        dimArgs_[Arg] = *Agreed;
+        Changed = true;
+      }
+    }
+    if (!Changed)
+      break;
+  }
+
+  EJIT_DIAG_VERBOSE("struct-field dim assumptions: roots=%zu expanded=%zu",
+                    rootDimArgs_.size(), dimArgs_.size());
+}
+
+/// Merge the free-dim witness map with the PR230 dimension environment into the
+/// single map address evaluation consults.
+///
+/// A formal carrying BOTH annotations is a malformed contract: ejit_free_dim
+/// asserts the marked fields do not vary with the parameter, while a period
+/// dimension is exactly the value a shared group is specialized for. The
+/// invariant witness (0) is the safe side of that conflict — it is legal for
+/// every value — so the free-dim entry wins and the dimension entry is dropped
+/// rather than silently read at an address the caller never authorized.
+void EJitStructFieldPass::rebuildEvalAssumptions() {
+  evalAssumptions_ = freeDimArgs_;
+  for (const auto &[Arg, Value] : dimArgs_) {
+    if (freeDimArgs_.count(Arg))
+      continue;
+    evalAssumptions_[Arg] = Value;
+  }
+  EJIT_DIAG_VERBOSE("struct-field eval assumptions: free=%zu dim=%zu merged=%zu",
+                    freeDimArgs_.size(), dimArgs_.size(),
+                    evalAssumptions_.size());
 }
 
 void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
@@ -1408,16 +1532,23 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       // may_const fields. It has no may_const marker of its own, but replacing
       // it here exposes a concrete address to IPSCCP and later StructFieldPass
       // rounds, including when the field access lives in a non-inlined helper.
-      if (Constant *C = tryReplacePeriodPointerBase(
-              LI, gvPeriodMap_, registry_, DL)) {
-        replacements.push_back({LI, C});
-        continue;
-      }
+      // PR230 shared mode disables this rewrite: it writes the registered base
+      // address into the IR, and the shared group must keep address
+      // observability intact. The field loads it enabled are still resolvable
+      // through tryReplaceIndirect, which reads the slot from the evaluation
+      // environment without materializing it.
+      if (rewritePeriodPointerBase_)
+        if (Constant *C = tryReplacePeriodPointerBase(LI, gvPeriodMap_, registry_,
+                                                      DL)) {
+          replacements.push_back({LI, C});
+          continue;
+        }
 
       bool BoundMayConst = false;
       for (const BoundPointerState &State : boundStates_)
         BoundMayConst |= isBoundMayConstLoad(
-            LI, State.boundArguments, State.mayConstFields, DL, freeDimArgs_);
+            LI, State.boundArguments, State.mayConstFields, DL,
+            evalAssumptions_);
       if (!BoundMayConst && !isMayConstLoad(LI, mayConstFieldMap_, DL))
         continue;
 #ifdef EJIT_DIAG_ENABLE
@@ -1436,7 +1567,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       if (!C) {
         for (const BoundPointerState &State : boundStates_) {
           C = tryReplaceBoundPointer(LI, State.view.rawPtr, State.view.size,
-                                     State.boundArguments, DL, freeDimArgs_);
+                                     State.boundArguments, DL,
+                                     evalAssumptions_);
           if (C)
             break;
         }
@@ -1451,7 +1583,7 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       // Pattern 2: GEP-based access (array or struct field).
       if (!C)
         C = tryReplaceDirectGEP(LI, PtrOp, gvPeriodMap_, registry_, DL,
-                                freeDimArgs_);
+                                evalAssumptions_);
 
       // Pattern 3: indirect pointer access (pointer-type period variable).
       if (!C)
@@ -1461,7 +1593,7 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
         replacements.push_back({LI, C});
 #ifdef EJIT_DIAG_ENABLE
       else
-        logReplaceFailure(LI, gvPeriodMap_, registry_, DL, freeDimArgs_);
+        logReplaceFailure(LI, gvPeriodMap_, registry_, DL, evalAssumptions_);
 #endif
     }
   }
