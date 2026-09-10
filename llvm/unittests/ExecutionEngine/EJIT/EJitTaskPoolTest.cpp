@@ -75,6 +75,22 @@ struct MockCompiler {
   }
 };
 
+static int FreeSlotFn(int Slot, int Live) { return Slot * 100 + Live; }
+static int RefreshedFreeSlotFn(int Slot, int Live) {
+  return 1000 + Slot * 100 + Live;
+}
+
+struct FreeSlotCompiler {
+  EJitAtomicU32 calls{0};
+  void *currentFn = reinterpret_cast<void *>(&FreeSlotFn);
+
+  static bool compile(void *Ctx, const EJitCompileRequest &, void **OutFn) {
+    auto *Self = static_cast<FreeSlotCompiler *>(Ctx);
+    Self->calls.fetchAdd(1);
+    *OutFn = Self->currentFn;
+    return true;
+  }
+};
 struct PublishObserver {
   uint32_t calls = 0;
   bool lastPublished = false;
@@ -1479,6 +1495,60 @@ TEST(EJitTaskPoolTest, PollCompilesAndCaches) {
   P.releaseRead(hit.bucketIndex);
 }
 
+// free_dim values stay ordinary call arguments and are therefore absent from
+// the taskpool key. One compiled function must serve every slot value while
+// the retained cell/TRP dimensions remain distinct and own invalidation.
+TEST(EJitTaskPoolTest, FreeRuntimeValuesShareTrackedLifecycleIdentity) {
+  EJitTaskPool P(16, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  FreeSlotCompiler Compiler;
+  P.setCompiler(&FreeSlotCompiler::compile, &Compiler);
+  using FnTy = int (*)(int, int);
+
+  EJitDimPair Cell1Trp2[2] = {{0, 1}, {1, 2}};
+  ASSERT_EQ(
+      P.compileOrGet(63, Cell1Trp2, 2, reinterpret_cast<void *>(&FreeSlotFn))
+          .status,
+      EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(P.pollOne());
+  ASSERT_EQ(Compiler.calls.loadAcquire(), 1u);
+
+  auto First = P.compileOrGet(63, Cell1Trp2, 2, nullptr);
+  ASSERT_EQ(First.status, EJitCompileOrGetStatus::CacheHit);
+  ASSERT_NE(First.fnPtr, nullptr);
+  auto *Compiled = reinterpret_cast<FnTy>(First.fnPtr);
+  EXPECT_EQ(Compiled(0, 7), 7);
+  EXPECT_EQ(Compiled(4, 7), 407)
+      << "different free-slot values must use the same live function";
+  P.releaseRead(First.bucketIndex);
+
+  EJitDimPair Cell2Trp2[2] = {{0, 2}, {1, 2}};
+  ASSERT_EQ(P.compileOrGet(63, Cell2Trp2, 2, nullptr).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(P.pollOne());
+  EJitDimPair Cell1Trp3[2] = {{0, 1}, {1, 3}};
+  ASSERT_EQ(P.compileOrGet(63, Cell1Trp3, 2, nullptr).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(P.pollOne());
+  EXPECT_EQ(Compiler.calls.loadAcquire(), 3u)
+      << "cell and TRP instances must remain distinct cache identities";
+
+  ASSERT_TRUE(P.switchController().setEnabled(0, 1, false));
+  // Model the producer update while the tracked cell is inactive. A fresh
+  // compile after reactivation must publish the implementation that observes
+  // the updated data/version.
+  Compiler.currentFn = reinterpret_cast<void *>(&RefreshedFreeSlotFn);
+  ASSERT_TRUE(P.switchController().setEnabled(0, 1, true));
+  ASSERT_EQ(P.compileOrGet(63, Cell1Trp2, 2, nullptr).status,
+            EJitCompileOrGetStatus::EnqueuedPending)
+      << "reactivation must reject the retained stale version";
+  ASSERT_TRUE(P.pollOne());
+  EXPECT_EQ(Compiler.calls.loadAcquire(), 4u);
+  auto Refreshed = P.compileOrGet(63, Cell1Trp2, 2, nullptr);
+  ASSERT_EQ(Refreshed.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(reinterpret_cast<FnTy>(Refreshed.fnPtr)(3, 9), 1309);
+  P.releaseRead(Refreshed.bucketIndex);
+}
 TEST(EJitTaskPoolTest, PollEmptyAndBudget) {
   EJitTaskPool P(8, false);
   EXPECT_FALSE(P.pollOne());

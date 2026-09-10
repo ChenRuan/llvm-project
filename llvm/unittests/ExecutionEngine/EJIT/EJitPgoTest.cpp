@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
@@ -25,6 +26,7 @@
 #include "llvm/ProfileData/InstrProfWriter.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "gtest/gtest.h"
 #include <atomic>
@@ -477,8 +479,202 @@ bool readCounterInfo(const Module &M, const std::string &name, uint64_t &hash,
   numCounters = cast<ArrayType>(Profc->getValueType())->getNumElements();
   return true;
 }
+static std::unique_ptr<Module> makeFreeDimPgoModule(LLVMContext &Ctx) {
+  auto M = std::make_unique<Module>("free_dim_pgo", Ctx);
+  M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+
+  auto *I32 = Type::getInt32Ty(Ctx);
+  auto *CellTy = StructType::create(Ctx, "struct.FreeDimPgoCell");
+  CellTy->setBody({I32, I32});
+  auto *CellsTy = ArrayType::get(CellTy, 10);
+  auto *Cells =
+      new GlobalVariable(*M, CellsTy, false, GlobalValue::InternalLinkage,
+                         ConstantAggregateZero::get(CellsTy), "g_free_cells");
+  Metadata *PeriodOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+                           MDString::get(Ctx, "cell"),
+                           ConstantAsMetadata::get(ConstantInt::get(I32, 10))};
+  Metadata *FieldOps[] = {MDString::get(Ctx, TAG_EJIT_MAY_CONST_FIELD),
+                          ConstantAsMetadata::get(ConstantInt::get(I32, 0))};
+  Cells->setMetadata(MD_EJIT_METADATA,
+                     MDNode::get(Ctx, {MDNode::get(Ctx, PeriodOps),
+                                       MDNode::get(Ctx, FieldOps)}));
+
+  auto *SinkTy = FunctionType::get(Type::getVoidTy(Ctx), {I32, I32}, false);
+  FunctionCallee Even = M->getOrInsertFunction("free_dim_sink_even", SinkTy);
+  FunctionCallee Odd = M->getOrInsertFunction("free_dim_sink_odd", SinkTy);
+  auto *F =
+      Function::Create(FunctionType::get(I32, {I32, I32, I32}, false),
+                       Function::ExternalLinkage, "free_dim_pgo", M.get());
+  Argument *Cell = F->getArg(0);
+  Argument *Slot = F->getArg(1);
+  Argument *Live = F->getArg(2);
+  Cell->setName("cell");
+  Slot->setName("slot");
+  Live->setName("live");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  BasicBlock *EvenBB = BasicBlock::Create(Ctx, "even", F);
+  BasicBlock *OddBB = BasicBlock::Create(Ctx, "odd", F);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", F);
+  IRBuilder<> B(Entry);
+  Value *Index = B.CreateAdd(B.CreateMul(Cell, B.getInt32(5)),
+                             B.CreateURem(Slot, B.getInt32(5)), "index");
+  Value *Elem =
+      B.CreateInBoundsGEP(CellsTy, Cells, {B.getInt32(0), Index}, "element");
+  Value *FrozenPtr = B.CreateStructGEP(CellTy, Elem, 0, "frozen.ptr");
+  Value *DynamicPtr = B.CreateStructGEP(CellTy, Elem, 1, "dynamic.ptr");
+  auto *Frozen = B.CreateLoad(I32, FrozenPtr, "frozen");
+  Frozen->setMetadata(MD_EJIT_MAY_CONST, MDNode::get(Ctx, {}));
+  Value *Dynamic = B.CreateLoad(I32, DynamicPtr, "dynamic");
+  B.CreateStore(Live, DynamicPtr);
+  Value *IsOdd =
+      B.CreateICmpNE(B.CreateAnd(Dynamic, B.getInt32(1)), B.getInt32(0));
+  B.CreateCondBr(IsOdd, OddBB, EvenBB);
+  B.SetInsertPoint(EvenBB);
+  B.CreateCall(Even, {Slot, Live});
+  B.CreateBr(Exit);
+  B.SetInsertPoint(OddBB);
+  B.CreateCall(Odd, {Slot, Live});
+  B.CreateBr(Exit);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(B.CreateAdd(Frozen, Dynamic));
+
+  Metadata *DimOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_ARR_IND),
+                        MDString::get(Ctx, "cell"),
+                        ConstantAsMetadata::get(ConstantInt::get(I32, 0))};
+  Metadata *FreeOps[] = {MDString::get(Ctx, TAG_EJIT_FREE_DIM),
+                         MDString::get(Ctx, ""),
+                         ConstantAsMetadata::get(ConstantInt::get(I32, 1))};
+  F->setMetadata(
+      MD_EJIT_METADATA,
+      MDNode::getDistinct(
+          Ctx, {MDNode::get(Ctx, {MDString::get(Ctx, TAG_EJIT_ENTRY)}),
+                MDNode::get(Ctx, DimOps), MDNode::get(Ctx, FreeOps)}));
+  return M;
+}
+
+static bool dependsOnArgument(const Value *V, const Argument &Arg,
+                              SmallPtrSetImpl<const Value *> &Seen) {
+  if (V == &Arg)
+    return true;
+  if (!Seen.insert(V).second)
+    return false;
+  const auto *U = dyn_cast<User>(V);
+  if (!U)
+    return false;
+  for (const Value *Operand : U->operand_values())
+    if (dependsOnArgument(Operand, Arg, Seen))
+      return true;
+  return false;
+}
+
+static bool dependsOnArgument(const Value *V, const Argument &Arg) {
+  SmallPtrSet<const Value *, 32> Seen;
+  return dependsOnArgument(V, Arg, Seen);
+}
 } // namespace
 
+// Production-shape regression: the same original module goes through Tier-1
+// PGO Gen and Tier-2 PGO Use. The retained cell is the only specialization
+// identity; the free slot authorizes a witness only for the may_const load.
+// Dynamic memory, stores, and live call operands must still use the real slot.
+TEST(EJitPgo, FreeDimFoldsOnlyAuthorizedLoadAcrossGenUse) {
+  LLVMContext Ctx;
+  auto Original = makeFreeDimPgoModule(Ctx);
+  struct CellData {
+    int32_t frozen;
+    int32_t dynamic;
+  } Data[10];
+  for (unsigned I = 0; I != 5; ++I) {
+    Data[I] = {100, static_cast<int32_t>(I)};
+    Data[5 + I] = {200, static_cast<int32_t>(10 + I)};
+  }
+
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "g_free_cells", Data, 10);
+  EJitOptimizer Optimizer(Registry);
+  SpecializationContext Gen;
+  Gen.fnName = "free_dim_pgo";
+  Gen.dimensions.push_back({"cell", 1});
+  Gen.tier = CompileTier::Instrumented;
+  auto Tier1 = CloneModule(*Original);
+  Optimizer.runPipeline(*Tier1, Gen);
+
+  std::string PgoName = findCapturedPgoName(Optimizer, "free_dim_pgo");
+  ASSERT_FALSE(PgoName.empty());
+  uint64_t FuncHash = 0;
+  unsigned NumCounters = 0;
+  ASSERT_TRUE(readCounterInfo(*Tier1, PgoName, FuncHash, NumCounters));
+  ASSERT_GE(NumCounters, 2u) << "expected an entry and conditional site";
+
+  InstrProfWriter Writer;
+  consumeError(Writer.mergeProfileKind(InstrProfKind::IRInstrumentation));
+  std::vector<uint64_t> Counts(NumCounters, 1);
+  Counts[0] = 1000;
+  Counts[1] = 900;
+  NamedInstrProfRecord Record(PgoName, FuncHash, Counts);
+  Writer.addRecord(std::move(Record), 1, [](Error) {});
+  auto Profile = Writer.writeBuffer();
+  ASSERT_NE(Profile, nullptr);
+
+  Optimizer.clearAnalyses();
+  auto Tier2 = CloneModule(*Original);
+  SpecializationContext Use;
+  Use.fnName = "free_dim_pgo";
+  Use.dimensions.push_back({"cell", 1});
+  Use.tier = CompileTier::PGOUse;
+  Use.profileData = std::string(Profile->getBuffer());
+  Optimizer.runPipeline(*Tier2, Use);
+
+  Function *F = Tier2->getFunction("free_dim_pgo");
+  ASSERT_NE(F, nullptr);
+  Argument &Slot = *F->getArg(1);
+  Argument &Live = *F->getArg(2);
+  EXPECT_GT(Slot.getNumUses(), 0u);
+
+  unsigned Loads = 0;
+  unsigned Stores = 0;
+  unsigned SinkCalls = 0;
+  bool SawProfiledBranch = false;
+  bool SawFrozen200 = false;
+  for (BasicBlock &BB : *F) {
+    for (Instruction &I : BB) {
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        ++Loads;
+        EXPECT_FALSE(LI->hasMetadata(MD_EJIT_MAY_CONST));
+        EXPECT_TRUE(dependsOnArgument(LI->getPointerOperand(), Slot))
+            << "the remaining dynamic load lost the live slot";
+      }
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        ++Stores;
+        EXPECT_TRUE(dependsOnArgument(SI->getPointerOperand(), Slot));
+        EXPECT_TRUE(dependsOnArgument(SI->getValueOperand(), Live));
+      }
+      if (auto *BI = dyn_cast<BranchInst>(&I))
+        SawProfiledBranch |= BI->isConditional() && BI->hasMetadata("prof");
+      if (auto *CB = dyn_cast<CallBase>(&I)) {
+        Function *Callee = CB->getCalledFunction();
+        if (Callee && Callee->getName().starts_with("free_dim_sink_")) {
+          ++SinkCalls;
+          ASSERT_EQ(CB->arg_size(), 2u);
+          EXPECT_TRUE(dependsOnArgument(CB->getArgOperand(0), Slot));
+          EXPECT_TRUE(dependsOnArgument(CB->getArgOperand(1), Live));
+        }
+      }
+      for (const Value *Operand : I.operand_values())
+        if (const auto *CI = dyn_cast<ConstantInt>(Operand))
+          SawFrozen200 |= CI->getSExtValue() == 200;
+    }
+  }
+
+  EXPECT_EQ(Loads, 1u) << "only the dynamic field load should remain";
+  EXPECT_EQ(Stores, 1u);
+  EXPECT_EQ(SinkCalls, 2u);
+  EXPECT_TRUE(SawProfiledBranch) << "Tier-2 did not consume the Gen profile";
+  EXPECT_TRUE(SawFrozen200)
+      << "cell 1 witness did not freeze the uniform field";
+}
 // PGO stage 3: Tier-2 PGOUse + ModuleInlinerWrapperPass inlines a hot callee
 // (bar) into its caller (foo). Verifies the CGSCC inline pass runs in the
 // Tier-2 pipeline and inlines (foo no longer has a call to bar).
