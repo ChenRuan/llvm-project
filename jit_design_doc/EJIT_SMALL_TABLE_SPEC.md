@@ -1,11 +1,11 @@
-# EJIT 全局小表路线：规格与可行性评估
+# EJIT cell/TRP 字段特化与差异小表：规格与可行性评估
 
 日期：2026-09-10；2026-09-14 修订。状态：独立 RFC / 仅文档 Draft PR；下述核心特化规则已确认，功能完成度另行验收。
 目标基线：`dongjianqiang2:ejit_dev_spec5@3f0e190dd54752f9c1dcb4bcd1fcb5d6349ae59c`。
 规格分支：`ChenRuan:codex/ejit-small-table-spec`；仅文档，不依赖 PR230 实现。
 最新产品确认：实例边跑边初始化，首次业务前不能给出全部就绪的 cell/TRP 域。
 9月10日补充确认：目标优先降低CPU负载/DCache压力；每TTI各函数都会调用，但可能只有1或6个cell活跃，activate不完整对应就绪集。允许冷路径接入校验和更新期间AOT，不允许跳过业务或要求停流量排空。详见§1.2。
-9月14日核心澄清：cell、TRP、slot/phase 统一按字段判等；全等直接常量特化，部分维度相同则消掉对应表轴，仅差异维度保留小表。这是本路线的默认目标与验收要求，不是可选增强。`%5/%10` 表索引与独立的余数多版本功能见§4.2。
+9月14日最新范围确认：PR231聚焦cell/TRP字段特化；全等直接常量特化，部分维度相同则消掉对应表轴，仅差异维度保留小表。这是本路线的默认目标与验收要求，不是可选增强。slot/phase及`%5/%10`的查表、余数多版本、attribute与接入设计整体拆到独立TTI-C规格，不作为231前置或验收项，见§4.2。
 
 这不是 PR230 的追加需求，不改变6号当前的版本合并任务。
 本文借鉴已验证的 preserved-dim/load-only 替换基础，但不以 IR hash 合并作为主机制。
@@ -21,6 +21,7 @@
 - 在已证明的特化域与接入合同内，相同字段必须直接常量化且不建该字段的表；部分相同则按字段消轴，只有差异维度保留小表 load；无法证明安全的字段保持原始读取并说明原因。
 - 单份共同代码会牺牲部分逐实例分支折叠，可能换来更少的代码和重复编译；不能预先保证产品加速。
 - 本路线目标是每 entry、每配置域代际一份最终 T2 代码，不是整个程序只有一个函数，也不是所有历史代际只有一份代码。
+- 当前规划轴是已声明的cell/TRP。独立slot工作不阻塞这些字段的优化；同一entry仍可包含普通动态slot逻辑，但不能因此将未建模的slot相关配置读误当成cell/TRP-only字段。
 
 最重要的取舍：不能同时无条件要求“任意时刻增加或修改实例”“不做任何就绪声明”“跨全部实例常量化”“永不重编”“热路径零额外检查”。必须明确选择。
 
@@ -63,10 +64,10 @@
 
 ## 3. 概念与身份
 
-- `DomainSchema`：entry 涉及的 cell/TRP、可用组合、可选 phase 表达式、来源字段布局和类型。
+- `DomainSchema`：entry 涉及的cell/TRP、可用组合、来源字段布局和类型；当前不包含slot派生轴。
 - `DomainEpoch`：封闭模式的一组已确认就绪成员、配置代际及其读借用契约；不是采样 session，也不是编译队列水位。
 - `TableCodeEpoch / RowGeneration`：在线模式分别表示固定schema/表地址/代码代际和每行配置代际。晚接入行不改变TableCodeEpoch，不冒充封闭DomainEpoch扩容。
-- `RowKey`：实际 cell/TRP/phase 组成的合法数据行身份；phase 不产生额外 JIT 版本。
+- `RowKey`：实际cell/TRP组成的合法数据行身份；本规格不定义slot/phase版本或数据行身份。
 - `FieldPlan / AdmissionContract`：每字段的类型、来源、保留轴/消去轴、位精确常量或投影表值、就绪证明与依赖代际。字段消轴不删除 RowKey 或生命周期依赖。
 - `LogicalKey`：沿用 entry、生命周期维度及版本，用于缓存、关闭、失效和诊断。
 - `CodeIdentity`：entry、源位码、编译策略、schema、所选模式的DomainEpoch或TableCodeEpoch和有效绑定。
@@ -82,70 +83,60 @@
 原始行为示意，may_const 的真实语法沿用所选基线：
 
 ```c
-unsigned process(unsigned cell, unsigned trp, unsigned slotNo, unsigned x) {
-    unsigned phase = slotNo % 10;
-    unsigned gain = cfg[cell][trp][phase].gain; /* may_const */
-    unsigned mode = cfg[cell][trp][phase].mode; /* may_const */
-    unsigned live = cfg[cell][trp][phase].pending; /* ordinary load */
-    out[cell][trp] = slotNo;                     /* ordinary store */
-    return mode == 1 ? x * gain + live : slow(cell, trp, slotNo, x);
+unsigned process(unsigned cell, unsigned trp, unsigned x) {
+    unsigned gain = cfg[cell][trp].gain; /* may_const */
+    unsigned mode = cfg[cell][trp].mode; /* may_const */
+    unsigned live = cfg[cell][trp].pending; /* ordinary load */
+    out[cell][trp] = x;                    /* ordinary store */
+    return mode == 1 ? x * gain + live : slow(cell, trp, x);
 }
 ```
 
 若整个有效域内 mode=1、gain=7，则目标等价于：
 
 ```c
-unsigned process_common(unsigned cell, unsigned trp, unsigned slotNo, unsigned x) {
-    unsigned phase = slotNo % 10;
-    unsigned live = cfg[cell][trp][phase].pending;
-    out[cell][trp] = slotNo;
+unsigned process_common(unsigned cell, unsigned trp, unsigned x) {
+    unsigned live = cfg[cell][trp].pending;
+    out[cell][trp] = x;
     return x * 7 + live;
 }
 ```
 
-若 mode 全等、gain 随 phase 不同，则目标等价于：
+若mode全等、gain随cell不同但在各cell内部跨TRP相同，则gain读取目标等价于：
 
 ```c
 /* Illustrative generated immutable data, not a per-call stack array. */
-static const unsigned gain_by_phase[10] = {7, 8, 7, 8, 7, 8, 7, 8, 7, 9};
-unsigned gain = gain_by_phase[slotNo % 10];
+static const unsigned gain_by_cell[6] = {7, 8, 7, 9, 8, 10};
+unsigned gain = gain_by_cell[cell];
 ```
 
-如果 gain 还随 cell/TRP 变化，表必须保留对应轴。只有精确证明某轴无关，才可消掉该轴。
+如果gain还随TRP变化，表必须保留cell/TRP联合索引。只有精确证明某轴无关，才可消掉该轴。
 封闭模式与第6.6节在线默认模式都必须落实下述逐字段规则。全等折叠和可证明的按轴降维不是后续可选收益；尚未实现时必须标为未完成，不能用完整小表冒充特化完成。
-原始 slotNo 仍为 0..1023 的参数，回绕后继续计算真实 `%5/%10`，不能用连续循环计数替代。
-不把 slotNo 本身 RAUW 成 phase，不假定有函数内部循环，不依赖分支预测正确性保证语义。
+cell/TRP及其他原始参数仍按真实值传入，不把整个参数替换成代表实例值，不依赖分支预测正确性保证语义。
 
 ### 4.1 核心规则：逐字段判等、消轴与常量特化
 
-判等只覆盖该 entry 当前合同内、已就绪且能稳定安全读取的合法依赖行，不扫描未初始化的预留槽，也不靠PGO样本判定。cell、TRP、slot/phase 使用同一规则；不同字段独立规划。
+判等只覆盖该entry当前合同内、已就绪且能稳定安全读取的合法依赖行，不扫描未初始化的预留槽，也不靠PGO样本判定。cell、TRP使用同一规则；不同字段独立规划。
 
 | 字段在有效域内的取值 | 必须生成的字段策略 |
 | --- | --- |
 | 跨全部相关维度全等 | 位精确常量；无该字段的表列、payload 或表load；消除仅由该常量决定的可折叠分支 |
-| 跨cell相同，但随phase变化，且TRP无关 | 仅 `field_by_phase[slotNo % N]`，不重复存每个cell |
-| 每个cell内部跨phase相同，但不同cell取值不同，且TRP无关 | 仅 `field_by_cell[cell]`，消掉phase轴；不能误折成所有cell共享的常量 |
-| 跨TRP相同，但随cell/phase变化 | 仅保留cell/phase轴；TRP仍是原始参数和生命周期依赖 |
+| 固定TRP时跨cell相同，但不同TRP取值不同 | 仅 `field_by_trp[trp]`，消掉cell轴；cell仍是原始参数和生命周期依赖 |
+| 每个cell内部跨TRP相同，但不同cell取值不同 | 仅 `field_by_cell[cell]`，消掉TRP轴；不能误折成所有cell共享的常量 |
 | 多轴确有差异 | 保留必要的联合索引和表值，不将代表行冒充其余行 |
 | 类型、读取、合法域或判等无法证明 | 保持原load并诊断；入口安全本身无法证明则AOT |
 
 正式判据：为字段选择保留轴集合 R 后，任意两条合法依赖行若投影到 R 的坐标相同，其字段值必须按类型位精确相同。R 为空时必须证明整个有效域全等。每次消轴后都重新验证最终联合投影；稀疏域不能因为某单轴没有可比较邻居，就把多个轴分别“证明无关”后一起删空。
 此规则要求支持已声明、可枚举轴上的判等/消轴，不要求首版求任意索引表达式的全局最优压缩。超出支持范围或预算必须显式报告，不影响安全回退。
 
-在线域允许以已就绪成员形成合同，但未来成员必须通过§6.6的投影一致性检查；“目前相同”本身不是未来保证。特别是一个cell可在后续调用访问的全部合法phase依赖，都要先有就绪和读取证明，不能只读本次slot对应的一格就消掉phase轴。
-常量和消轴均保留实际cell/TRP/slotNo实参、原对象地址、普通load/store及原生命周期。只改获准字段的读取及由此合法派生的优化，不要求业务再加一个“全等”attribute。
+在线域允许以已就绪成员形成合同，但未来成员必须通过§6.6的投影一致性检查；“目前相同”本身不是未来保证。当前合同覆盖的全部可达cell/TRP依赖都要先有就绪和读取证明，不能只读本次请求命中的一格就消掉仍有差异的轴。
+常量和消轴均保留实际cell/TRP及其他实参、原对象地址、普通load/store及原生命周期。只改获准字段的读取及由此合法派生的优化，不要求业务再加一个“全等”attribute。
 
-### 4.2 slot余数：小表索引与TTI-C多版本的边界
+### 4.2 排除项：slot/phase独立设计
 
-`cfg[cell * N + slotNo % N]` 中，同一cell的N格可以不同。这不妨碍跨cell判等，但不同phase的字段不能在一份共同代码中无条件折成同一常量。
+slot/phase、`%5/%10`余数查表、按余数生成特化版本、对应attribute/wrapper/生命周期接入及策略选择，整体归独立TTI-C规格。PR231不单独承诺其中的“余数查表”，也不把这些工作列为cell/TRP交付的依赖。具体设计与既有实现状态由独立规格维护，本文不重复定义。
 
-- **PR231本路线**：`phase = rawSlotNo % N` 是数据索引，不进入新的版本key。同phase跨cell相同可消cell轴；phase仍不同则保留phase表。识别已声明schema中的取余索引，不等于已经实现业务attribute、wrapper或运行时接入。
-- **独立TTI-C路线**：若要在N格本来不同的情况下仍获得各phase的load/branch折叠，就按余数选择特化版本。接口设计为 `__attribute__((ejit_mod_dim(owner, N)))`，N首版限定5/10；原始slotNo仍完整传入，只把获证匹配的余数表达式作为特化事实，phase归cell/TRP所有者生命周期，不单独activate。
-- 已知 `slotNo % 5 == p` 不能固定 `%10`。同entry混用时必须记录精确模数和表达式；N=10虽可推导对应`%5`，是否实施该推导需单独验证。未支持的表达式保持动态，不暗中扩大版本数。
-- raw slotNo按业务0..1023回绕，1023到0必须重新计算真实余数；不以phase加一状态机、8bit截断或`&1023`代替原始输入。
-
-状态边界（2026-09-14）：目标spec5 `3f0e190d` 的前端没有 `ejit_mod_dim`。独立分支 `codex/ejit-tti-mod-dimension` 在另一基线 `f2e7649e` 上已有实现；9月9日记录的审查点 `c676cbcb` 已通过主机N5/N10多phase的真实driver/PGO/发布验证，但未推送，最终BE工具链/产物门槛仍未完成。本次未重新验证该远端工作区，不宣称它已进入spec5或已可出包。
-因此后续应完成并评审已有TTI-C功能的目标验收与集成，而不是重新发明一个slot attribute。它不属于PR231本次核心规则补齐的实现范围，也不自动恢复该分支开发；未来组合两条策略需另行约定代码版本、表及PGO身份。
+拆分不撤销cell/TRP全等常量化、按字段消轴、差异小表及新成员接入校验。函数中普通动态slot运算照常保留；可独立证明只依赖cell/TRP的字段继续优化。若候选地址还依赖未建模的slot/phase，就保持该读取原样并说明原因，不能忽略该依赖而错误常量化，也不因此让整个entry丧失其他安全优化。
 
 ## 5. 替换的安全条件
 
@@ -154,7 +145,7 @@ unsigned gain = gain_by_phase[slotNo % 10];
 1. 来源有实际生效的 may_const 授权；类型、字段偏移、宽度、地址空间及 provenance 可验证。
 2. 地址可以表达为有效域内的行和字段；读取范围完全属于登记对象及相应生命周期子对象。
 3. 全部将读取的行都已初始化、可访问且在读借用期间稳定。数据在未执行分支中也不能因此随意解引用。
-4. cell/TRP/phase 依赖完整，不能仅跟踪 cell 却读取未登记的 TRP 或相邻 cell。
+4. cell/TRP依赖完整，不能仅跟踪cell却读取未登记的TRP或相邻cell；额外未建模的动态索引不得被忽略。
 5. 非 volatile、非 atomic、非设备/MMIO；不是函数指针、对象地址、带有身份语义的指针值。
 6. 调用实参、普通 load、store 目标和可能逃逸的原始对象指针仍保持动态语义。
 
@@ -192,7 +183,7 @@ entry 首次业务 miss -> owner 读取并冻结 E 的获准字段
 代码与数据就绪 -> 发布属于 E 的逻辑缓存记录
 ```
 
-可以读取 cell5 的已就绪配置，即使 cell5 从没执行业务。不等待所有 entry 调用，也不等待所有 phase 采样。
+可以读取cell5的已就绪配置，即使cell5从没执行业务。不等待所有entry或所有cell/TRP组合被采样。
 “所有配置”只指该 entry 本轮声明的合法域，不是所有可能的16/256个预留槽或整个进程的全部结构体。
 cell 与 TRP 各自 active 并不自动证明任意笛卡尔组合可访问；组合有效性和初始化仍需有来源。
 
@@ -324,8 +315,8 @@ NO_RECLAIM 下旧 T1/T2/表存储不能自动回收，必须统计保留字节�
 - 禁止为了更新表去重开已经发布代码页的写权限。本方案不负责修改 enable_ex/enable_rw 策略。
 - 布局先按字段建连续列；若多个字段总一起读，再独立比较按行或分组布局，不承诺 SoA 在所有业务最好。
 
-估算：20个 entry，每个域6 cell x 2 TRP x 10 phase，保留8个4B字段，未去重/降维 payload 为
-`20 x 6 x 2 x 10 x 8 x 4 = 76,800 B`。还要计算对齐、映射页、metadata、T1/T2及历史代际，不是全部成本。
+估算：20个entry，每个域6 cell x 2 TRP，保留8个4B字段，未去重/降维payload为
+`20 x 6 x 2 x 8 x 4 = 7,680 B`。还要计算对齐、映射页、metadata、T1/T2及历史代际，不是全部成本。
 字段全等时该字段没有表 payload或表load；部分相同按字段消轴后计算实际payload。不同字段可有不同保留轴与stride，不能强制共用一张全维布局以规避消轴。多个字段/entry 跨表去重不是首版必须项。
 表可能引入地址物化、索引、GOT或额外load；原结构体已命中L1D、相关行其他字段仍必读时，实际节省可能很少。
 
@@ -347,7 +338,7 @@ NO_RECLAIM 下旧 T1/T2/表存储不能自动回收，必须统计保留字节�
 
 上图适用于封闭模式和第6.6节在线默认模式；后者必须把判等/消轴结果交给运行时作为接入合同，不能仅凭当前行相同生成无约束代码。只有第6.5节纯表化对照不执行基于当前成员的判等折叠。
 共同前缀的具体 pass 顺序须按实际基线提炼并测试，不直接把上图当作可随意重排的命令序列。
-实例值只用于分析；不得把 cell/TRP 或 slotNo 整个参数替换成代表值，也不得冻结普通指针基址以帮助求值。
+实例值只用于分析；不得把cell/TRP或其他动态参数整体替换成代表值，也不得冻结普通指针基址以帮助求值。
 不得借用free_dim的0见证值假装证明开放域全等；只有独立明确的永久不变量契约才可使用对应常量化规则。
 inline 后暴露的新字段仍应处理，不能删掉末轮。不得长期保存已经删除的 Instruction/Value 指针。
 合成表读取需要可验证的来源标签，以免下一轮把它当原始配置再次提取；普通优化后标签若丢失则重新证明或放弃，不能凭标签制造合法性。
@@ -367,7 +358,7 @@ PGO 只能指导布局/代价决策，不能把有可能出现的第10格当成�
 - 非就绪或本核权限准备失败的 AOT 调用不计入额度；计数并发与阈值转换需要真实 worker/producer 回归。
 - 64次进入允许近似有界快照，原始 edge/IC/memop/scalar 数据按 entry/epoch/session 隔离。
 - 采样有明确可配置的上限/超时；只调用一次的冷 entry 不能永久占 admission 或阻塞其他 entry 编译/发布。
-- 不要求所有 cell/phase 都出现。样本可能被首个热 cell 主导，应报告覆盖和质量，而非假装均匀采样。
+- 不要求所有cell/TRP组合都出现。样本可能被首个热cell主导，应报告覆盖和质量，而非假装均匀采样。
 - 冻结完整 ProfileBundle，再生成共同 T2；只有来自同一配置/站点 schema 的 profile 可使用。
 - 在线模式晚加入行在常量/投影合同相容时可复用代码，独立差异表项可有新值；合同冲突按§6.6先AOT并准备新代。profile只能作为热度反馈，不能证明未见值不可能出现。采样时行配置更新须按明确策略取消/重启该session或标注混合质量，不得冒充同一冻结配置观测。
 - “配置读齐才能判全等”与“采样不要求覆盖全域”并不矛盾，二者分别证明语义与估计热度。
@@ -377,7 +368,7 @@ PGO 只能指导布局/代价决策，不能把有可能出现的第10格当成�
 不直接用当前基线 function-level dedup/finish 同时承担域编译、采样完成和所有逻辑成员发布。
 
 第10节PGO策略仍待用户确认：候选为每entry/代码代际一套通用T1，汇总已就绪且已接入成员的实际调用，而非每cell64次，也不默认固定第一个cell代表全部。
-总64次仅为初始可配置预算，诊断记录参与cell/phase与覆盖偏差，不要求未开启cell到齐。T1仅用于热度与有守卫优化，不能证明配置全等或未采路径不可达。
+总64次仅为初始可配置预算，诊断记录参与cell/TRP与覆盖偏差，不要求未开启cell到齐。T1仅用于热度与有守卫优化，不能证明配置全等或未采路径不可达。
 后续纯表内容更新若要复用profile，必须验证Gen/Use CFG、站点schema与映射等兼容条件；折叠合同或IR结构变化需新session或明确回退，不无条件沿用旧profile。
 
 ## 11. 快路径、间接调用与共享发布
@@ -425,7 +416,7 @@ ranking 的近似hits与cycles若不在同一窗口，标记approximate，不用
 
 1. 6 cell x 20 entry，1KiB结构体，动态load/少量store/普通helper调用；封闭模式及在线默认模式的获证全等字段都必须无对应表列/payload/load，且可由这些常量决定的分支真实消失。纯表化对照单列，不能算此项通过。
 2. 同样场景改一个cell字段：仅该字段恢复必要的cell轴，其他全等字段保持常量。新调用AOT，准备好新代后验证所有成员与本代AOT一致；在途旧调用允许约定的旧配置效果。每个当前代码代际一份共同T2，不隐瞒历史代码/表残留。
-3. TTI `%5/%10`，raw slotNo两个0..1023回绕；保留其它原始slotNo用途，不新增phase版本。
+3. 排除项隔离回归：同一entry包含普通动态slot逻辑或未支持的slot相关配置读时，保留其原始语义；独立的cell/TRP字段仍能常量化/表化，不错误扩大候选域。slot优化收益和余数策略矩阵属于独立规格。
 4. cell/TRP稀疏合法组合、域外输入、邻居cell、未初始化行、借用地址缺失、错误生命周期：均不得误读/错误常量化。
 5. 初始化顺序不同但最终相同域：配置Ready后输出等价。冷实例从不被调用也不得卡住域编译。
 6. 配置事务中断、并发更新、编译/发布前代际切换、取消旧回调、长期反复更新、容量失败、shutdown。
@@ -435,15 +426,15 @@ ranking 的近似hits与cycles若不在同一窗口，标记approximate，不用
 10. 板端单.c，worker6/producer16，持续轮询所有6cell x20entry；init-array由启动负责，打印不重init，第二次调用可验已发布代码。
 11. 在线默认模式专测晚接入三类：常量及已有投影值相同则复用代码；只在独立保留轴新坐标上不同且容量/发布证明成立则补表接入；常量或已有投影值冲突则保持AOT，直到新代就绪。前两类不额外CodeGen/封代码页，第三类不得调用旧特化代码；未就绪行不提前填逻辑槽。
 12. 不停业务更新：新调用可AOT、在途调用可持旧代码/表，已发布行与共享投影值不覆盖；容量耗尽/非本行依赖/字段schema改变保持受控行为，不虚假标constant。停读者原地改行仅作为非默认协议的独立对照。
-13. 逐字段消轴矩阵：跨cell同值但phase不同、同cell内phase相同但跨cell不同、跨TRP相同、全维全等、多轴混合；检查真实IR索引、表尺寸、load/branch形态及动态参数/live load/store保持。
-14. 稀疏合法域、只有首个cell就绪、尚未调用但已就绪的phase、未就绪phase、字段不同位宽和浮点位模式：不得凭采样/缺少邻居误消轴或越域读取。新成员破坏单个投影时只扩展必要字段计划，其他常量优化仍保留。
+13. 逐字段消轴矩阵：固定TRP时跨cell同值但TRP间不同、同cell内跨TRP相同但cell间不同、全维全等、cell/TRP联合差异及字段混用；检查真实IR索引、表尺寸、load/branch形态及动态参数/live load/store保持。
+14. 稀疏合法cell/TRP组合、只有首个cell就绪、尚未调用但已就绪的依赖行、未就绪依赖行、字段不同位宽和浮点位模式：不得凭采样/缺少邻居误消轴或越域读取。新成员破坏单个投影时只扩展必要字段计划，其他常量优化仍保留。
 
 不靠手写宏展开出来的共同函数冒充编译器实现；若先做行为模型必须明确标注。
 首批重点验证“语义正确、就绪不死等、真实load/branch结果、总体收益”，而非只有静态表尺寸好看。
 
 ## 15. 分阶段交付与待确认规格
 
-阶段A（编译器能力）：在明确就绪域/合同输入上，用真实planner、IR/ORC验证自动逐字段判等、全等无表、部分消轴、差异表与保守拒绝，导出可验证的常量/投影合同。先修复当前原型并独立审查；仅手动uniform合同或全维表通过不算A完整完成。
+阶段A（编译器能力）：在明确cell/TRP就绪域/合同输入上，用真实planner、IR/ORC验证自动逐字段判等、全等无表、部分消轴、差异表与保守拒绝，导出可验证的常量/投影合同。先修复当前原型并独立审查；仅手动uniform合同或全维表通过不算A完整完成。slot/phase的识别扩展、attribute和策略选择不在本阶段。
 阶段B（在线闭环）：真实生命周期、就绪信号、常量/消轴合同接入、固定容量增量表、共同T1/T2和逻辑发布，补晚成员冲突、取消/借用/超时/不停业务新代更新回归。A的测试合同不冒充runtime已自动接入。
 阶段C：调测、目标产物及标准板端用例；默认开关是否开启由A/B收益决定。
 全局策略可覆盖全部entry入口，但先逐类证明候选安全性；不支持项必须有解释和回退，不暗中沿用会冻结真实参数的旧路径。
@@ -458,15 +449,15 @@ ranking 的近似hits与cycles若不在同一窗口，标记approximate，不用
 - 性能合同：wrapper不增步骤，但函数体允许差异表索引/load，必要的安全检查不能伪装成零成本。
 - 覆盖面：注册数组可枚举；任意borrowed结构体目前不能从一个调用参数推导全域地址，需要可靠resolver/注册信息，否则该load保留。
 
-总评：本路线是“共同代码中的逐字段特化 + 仅差异数据的小表”，不是单纯把大结构体load搬到另一张表。在线就绪、合同接入和异步新代负责让核心特化在分批初始化时仍然安全成立；纯表化只是对照，TTI-C余数多版本则是独立的后续集成功能。
+总评：本路线是“cell/TRP共同代码中的逐字段特化 + 仅差异数据的小表”，不是单纯把大结构体load搬到另一张表。在线就绪、合同接入和异步新代负责让核心特化在分批初始化时仍然安全成立；纯表化只是对照。slot余数查表与余数多版本一起在独立TTI-C规格中设计，不阻塞本路线。
 
 ## 16. 依据与证据边界
 
 本文件规定设计目标与验收，不是功能完成或板端收益报告。本次修订仅同步规格和任务约束，不改运行时代码、PR230或TTI-C实现，也不发布PR231本地未审查的实现提交。
-PR231本地编译器原型 `750c32c8` 已有显式调用方uniform合同及ModuloArgument计划支持；这不证明自动判等/按字段消轴、业务attribute、在线接入和共同T1/T2已完成。实现状态应以独立实现记录和实测为准。
+PR231本地编译器原型 `750c32c8` 已有显式调用方uniform合同；这不证明自动判等/按字段消轴、在线接入和共同T1/T2已完成。原型中已有的ModuloArgument代码/测试只保留为历史实验，不因本次文档拆分删除；不得将它作为231的slot交付承诺或继续扩大该功能范围。实现状态应以独立实现记录和实测为准。
 参考源点为服务器仓库 `1d7ad493dedb3f10e4af2cdf9c3ab9ea4b091a59`，
 `llvm/include/llvm/ExecutionEngine/EJIT/EJitRuntime.h` 与
 `llvm/lib/ExecutionEngine/EJIT/EJitRuntime.cpp` 的 activate/deactivate 公共路径；它们不构成完整配置域协议的实现证明。
-参考本地 `EJIT_TTI_CLASS_C_MULTIVERSION_PLAN.md` 的业务模型，未沿用其多版本/phase key设计。
+独立的slot/phase设计记录为 `EJIT_TTI_CLASS_C_MULTIVERSION_PLAN.md`；它维护本次拆出的余数查表/特化策略，不是PR231依赖。
 LLVM 对只读global、volatile/atomic load及invariant读取有明确语义，本文保守排除对应不安全变换，而不是发明更强保证。
 [Global Variables](https://llvm.org/docs/LangRef.html#global-variables)、[load](https://llvm.org/docs/LangRef.html#load-instruction)、[invariant.load](https://llvm.org/docs/LangRef.html#invariant-load-metadata)。
