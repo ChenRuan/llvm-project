@@ -76,11 +76,22 @@ static bool periodConstSitesCorrespond(const EJitPeriodConstLoadSite &L,
 }
 #endif
 
+namespace {
+#ifdef EJIT_EXPERIMENTAL_PRESERVED_DIMS
+constexpr bool DefaultPreservedDimensions = true;
+#else
+constexpr bool DefaultPreservedDimensions = false;
+#endif
+} // namespace
+
 EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
-    : registry_(reg) {
-  // The function-simplification pipeline queries more than the analyses
-  // referenced directly by EJIT. Register the full LLVM analysis set and
-  // wire its proxies before constructing the per-tier pass managers.
+    : EJitOptimizer(reg, DefaultPreservedDimensions, TM) {}
+
+EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, bool PreserveDimensions,
+                             TargetMachine *TM)
+    : registry_(reg), preserveDimensions_(PreserveDimensions) {
+  // Register the full LLVM analysis set and its proxies before constructing
+  // the per-tier pass managers.
   PassBuilder PB(TM);
   PB.registerFunctionAnalyses(FAM_);
   PB.registerLoopAnalyses(LAM_);
@@ -147,7 +158,8 @@ void EJitOptimizer::clearAnalyses() {
 // Only cache the entry's resolved runtime views. The pass must rediscover
 // arguments, calls, globals and local witnesses in each new IR snapshot.
 static SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers>
-resolveBoundViews(const Module &M, const SpecializationContext &ctx) {
+resolveBoundViews(const Module &M, const SpecializationContext &ctx,
+                  bool PreserveDimensions) {
   auto Views = ctx.boundPointers;
   if (Views.empty())
     return Views;
@@ -167,6 +179,9 @@ resolveBoundViews(const Module &M, const SpecializationContext &ctx) {
         Periods.try_emplace(Index->getZExtValue(), Period->getString());
     }
   for (auto &View : Views) {
+    if (PreserveDimensions &&
+        View.periodInstance != std::numeric_limits<uint32_t>::max())
+      continue;
     StringRef Period = Periods.lookup(View.argIndex);
     for (const auto &Dim : ctx.dimensions)
       if (Dim.periodName == Period) {
@@ -237,9 +252,9 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 #endif
 
-  // Phase 1 - specialize (common to all tiers): turn the period index and
-  // every period_const field into a compile-time constant.
-  const auto BoundViews = resolveBoundViews(M, ctx);
+  // Phase 1 is common to Gen/Use. In preserved mode, period values exist
+  // only in the load evaluator; the real arguments remain in executable IR.
+  const auto BoundViews = resolveBoundViews(M, ctx, preserveDimensions_);
   applyBoundPointerFacts(M, ctx);
   preReplacePeriodIndices(M, ctx);
   runInstCombine(M);
@@ -838,6 +853,8 @@ void EJitOptimizer::applyBoundPointerFacts(Module &M,
 
 void EJitOptimizer::preReplacePeriodIndices(Module &M,
                                             const SpecializationContext &ctx) {
+  if (preserveDimensions_)
+    return;
   LLVM_DEBUG(dbgs() << "ejit-optimizer: preReplacePeriodIndices, "
                     << ctx.dimensions.size() << " dim(s)\n");
   for (Function &F : M.functions()) {
@@ -921,6 +938,8 @@ void EJitOptimizer::runStructFieldPass(
   for (const auto &Dim : ctx.dimensions)
     LocalPeriods.push_back({Dim.periodName, Dim.cellIdx});
   EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName, LocalPeriods);
+  if (preserveDimensions_)
+    structField.setPreservedDimensions(ctx);
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration()) {
@@ -930,6 +949,8 @@ void EJitOptimizer::runStructFieldPass(
       PreservedAnalyses PA = structField.run(F, FAM_);
       FAM_.invalidate(F, PA);
     }
+  if (preserveDimensions_)
+    clearAnalyses();
 }
 
 FunctionPassManager &

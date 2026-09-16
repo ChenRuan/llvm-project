@@ -48,9 +48,11 @@ struct EJitVpFunctionInfo {
 class EJitOptimizer {
 public:
   EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM = nullptr);
+  EJitOptimizer(PeriodArrayRegistry &reg, bool PreserveDimensions,
+                TargetMachine *TM = nullptr);
 
   /// Run the full JIT specialization pipeline:
-  ///   1. Parameter substitution (ejit_dim → constants)
+  ///   1. Substitute ejit_dim values, or preserve them for analysis only
   ///   2. InstCombine (fold GEP chains from substituted params)
   ///   3. Inline (L2+: expand callee bodies so period_const GEPs are traceable)
   ///   4. StructFieldPass (period_const loads → runtime constants)
@@ -160,6 +162,7 @@ private:
   FunctionPassManager &simplifyFPMForLevel(OptimizationLevel level);
 
   PeriodArrayRegistry &registry_;
+  const bool preserveDimensions_;
 
   // Persistent analysis managers — registered once, reused across compilations.
   // Invalidated per-function by the pass infrastructure as needed.
