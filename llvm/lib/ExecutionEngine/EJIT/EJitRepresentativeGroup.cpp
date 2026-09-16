@@ -511,6 +511,15 @@ Expected<EJitGroupHandle> EJitRepresentativeGroupRegistry::invalidateRepresentat
   G->hasPhysical = false;
   G->physicalCodeId = 0;
   G->physicalFn = nullptr;
+  // Every waiter belongs to the retired generation. Mark it cancelled before
+  // incrementing the handle generation so a late waiter callback cannot settle
+  // against the replacement session or keep its source borrow alive.
+  for (MemberRecord &M : G->members) {
+    if (M.waiter && !M.settled && !M.cancelled) {
+      M.cancelled = true;
+      ++P->diag.waitersCancelled;
+    }
+  }
   ++G->generation;
   ++P->diag.representativeReElections;
   return EJitGroupHandle{G->groupId, G->generation};
@@ -540,6 +549,12 @@ bool EJitRepresentativeGroupRegistry::cancelRepresentative(
   G->hasPhysical = false;
   G->physicalCodeId = 0;
   G->physicalFn = nullptr;
+  for (MemberRecord &M : G->members) {
+    if (M.waiter && !M.settled && !M.cancelled) {
+      M.cancelled = true;
+      ++P->diag.waitersCancelled;
+    }
+  }
   ++G->generation;
   ++P->diag.representativeReElections;
   return true;

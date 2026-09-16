@@ -3,6 +3,16 @@
 This table tracks implementation evidence for PR230. `independently-verified` is
 reserved for coordinator review. The experimental feature remains default off.
 
+## Latest Closeout - 2026-09-16
+
+The production-lock repair has independent read-only review. Final shared-pool
+suites pass NRC205/205 and token187/187; corrected concurrent stress passes
+1000/1000 NRC and100/100 token independent processes without relaxing quota64.
+See [host closeout](EJIT_CODE_REUSE_HOST_CLOSEOUT.md) for actual captured
+status-5 fallback evidence, source-matching runtime results, and remaining gates.
+Everything below is historical milestone evidence. The feature remains OFF,
+the PR remains Draft, and board/product acceptance is not claimed.
+
 ## Current local host evidence — 2026-09-15
 
 The following status supersedes the historical milestone table below. These are
@@ -76,6 +86,28 @@ recorded under the control root's cold-final logs.
 Source-borrow lifetime across classified waiters is still a separate open gate;
 these timeout results do not establish caller-visible permission to mutate or
 release registered source data.
+
+### Classified waiter borrow fence and member final retries
+
+Candidate classification now leaves the request's `BorrowPending` event live
+after the no-code prefix pass. The owner schedules a waiter PGOUse request when
+the group's bundle is ready, and the driver clears the borrow only after the
+final transform has consumed the source identity. `completeRequestBorrow()` is
+idempotent and clears copied bound descriptors before the attempt can retire.
+`ejit_representative_deactivate_begin()` returns a generation/dimension/
+instance/version fence; `ejit_representative_borrow_status()` is bounded over
+the fixed attempt table and reports `EJIT_PENDING` until compiler reads end.
+Stale or re-enabled fences are rejected. These APIs confirm compiler-source
+completion only; they do not extend AOT or generated-code object lifetimes.
+
+Waiter PGOUse attempts use their own request token without a sampling admission.
+Their final transform has a bounded retry count (`representativeMaxFinalRetries`,
+default 2). A failed member attempt is cancelled and retried while budget
+remains; exhaustion marks that logical member failed, ends its source borrow,
+and leaves subsequent calls on AOT. This avoids retaining a representative's
+function-level PGO admission for a member that never owned one. Fault-injected
+member failure and borrow-fence tests are present in the latest runtime source;
+their final rebuild is pending the host RAM gate.
 
 ## Historical milestone evidence
 

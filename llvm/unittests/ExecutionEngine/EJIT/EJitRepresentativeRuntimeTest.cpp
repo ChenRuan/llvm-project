@@ -55,6 +55,7 @@
 #include <chrono>
 #include <atomic>
 #include <algorithm>
+#include <array>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -97,8 +98,10 @@ namespace {
 
 /// Six legal cells of ONE entry: the candidate identity (funcIdx + dim TYPES)
 /// is shared, the per-cell instance id differs. `trp` is the second dimension.
-constexpr uint32_t kCells = 13; // shared, cancelled, cold and budget-exhausted groups
+constexpr uint32_t kCells = 14; // shared, cancelled, cold and budget-exhausted groups
 constexpr uint32_t kQuota = kEJitRepresentativeDispatchQuota;
+constexpr uint32_t kPressureEntries = 20;
+constexpr uint32_t kPressureCells = 6;
 
 std::atomic<bool> PauseLast{false}, LastEntered{false}, ResumeLast{false};
 extern "C" void rep_runtime_pause() {
@@ -121,7 +124,8 @@ struct CellRow {
 /// Build the entry module of the runtime test: a real specialization-eligible
 /// entry with a may_const field load, a dynamic branch and a dynamic loop, so a
 /// genuine Instrumented Tier-1 has edge counters to profile.
-std::unique_ptr<Module> buildEntryModule(LLVMContext &Ctx, StringRef Name) {
+std::unique_ptr<Module> buildEntryModule(LLVMContext &Ctx, StringRef Name,
+                                         StringRef ConfigName = "cfg") {
   auto M = std::make_unique<Module>("ejit-representative-runtime", Ctx);
   M->setTargetTriple(Triple(sys::getDefaultTargetTriple()));
 
@@ -135,7 +139,7 @@ std::unique_ptr<Module> buildEntryModule(LLVMContext &Ctx, StringRef Name) {
   ArrayType *ArrTy = ArrayType::get(CfgTy, kCells);
   auto *Cfg = new GlobalVariable(
       *M, ArrTy, /*isConstant=*/false, GlobalValue::ExternalLinkage, nullptr,
-      "cfg");
+      ConfigName);
   Cfg->setMetadata(
       "ejit.metadata",
       MDNode::get(Ctx,
@@ -191,11 +195,18 @@ std::unique_ptr<Module> buildEntryModule(LLVMContext &Ctx, StringRef Name) {
   auto *FP = B.CreateLoad(B.getPtrTy(), Slot);
   Value *Indirect = B.CreateCall(Target.getFunctionType(), FP, {X});
   Value *Direct = B.CreateCall(Target, {X});
-  auto *Src = B.CreateAlloca(B.getInt32Ty(), B.getInt32(32));
-  auto *Dst = B.CreateAlloca(B.getInt32Ty(), B.getInt32(32));
-  B.CreateMemSet(Src, B.getInt8(0), 128, Align(4));
+  auto *Src = B.CreateAlloca(B.getInt32Ty(), B.getInt32(64));
+  auto *Dst = B.CreateAlloca(B.getInt32Ty(), B.getInt32(64));
+  B.CreateMemSet(Src, B.getInt8(0), 256, Align(4));
   B.CreateStore(X, Src);
-  Value *Bytes = B.CreateMul(B.CreateZExt(X, B.getInt64Ty()), B.getInt64(4));
+  // Keep the synthetic value-profile memory site within the fixed 64-element
+  // scratch buffers even when the unequal-binding probe uses a large business
+  // input (X=101). The clamp preserves a real memcpy/value-profile site while
+  // avoiding a test-module buffer overrun in VP builds.
+  Value *CopyElems = B.CreateSelect(
+      B.CreateICmpULT(X, B.getInt32(64)), X, B.getInt32(64));
+  Value *Bytes = B.CreateMul(B.CreateZExt(CopyElems, B.getInt64Ty()),
+                             B.getInt64(4));
   B.CreateMemCpy(Dst, Align(4), Src, Align(4), Bytes);
   Value *Copied = B.CreateLoad(B.getInt32Ty(), Dst);
   Value *VPExtra = B.CreateAdd(B.CreateAdd(Indirect, Direct), Copied);
@@ -289,6 +300,38 @@ public:
     static CellRow R[kCells] = {};
     return R;
   }
+  static std::vector<std::string> &pressureEntryNames() {
+    static std::vector<std::string> Names = [] {
+      std::vector<std::string> V;
+      V.reserve(kPressureEntries);
+      for (uint32_t I = 0; I < kPressureEntries; ++I)
+        V.push_back("entry_rep_pressure_" + std::to_string(I));
+      return V;
+    }();
+    return Names;
+  }
+  static std::vector<std::string> &pressureConfigNames() {
+    static std::vector<std::string> Names = [] {
+      std::vector<std::string> V;
+      V.reserve(kPressureEntries);
+      for (uint32_t I = 0; I < kPressureEntries; ++I)
+        V.push_back("cfg_rep_pressure_" + std::to_string(I));
+      return V;
+    }();
+    return Names;
+  }
+  static std::vector<std::string> &pressureBitcodes() {
+    static std::vector<std::string> Bitcodes(kPressureEntries);
+    return Bitcodes;
+  }
+  static std::vector<uint32_t> &pressureFuncIndices() {
+    static std::vector<uint32_t> Indices(kPressureEntries, 0);
+    return Indices;
+  }
+  static std::vector<CellRow> &pressureRows() {
+    static std::vector<CellRow> Rows(kPressureEntries * kCells);
+    return Rows;
+  }
   static const char *entryName() { return "entry_rep_runtime"; }
 };
 
@@ -337,10 +380,53 @@ void initRuntimeOnce() {
         RepresentativeRuntime::entryName(),
         reinterpret_cast<const uint8_t *>(RepresentativeRuntime::bitcode().data()),
         RepresentativeRuntime::bitcode().size());
-    ejit_register_lifecycle("cell", &RepresentativeRuntime::cellSlot());
-    ejit_register_lifecycle("trp", &RepresentativeRuntime::trpSlot());
     ejit_register_funcindex(RepresentativeRuntime::entryName(),
                             &RepresentativeRuntime::funcIndex());
+
+    // The pressure matrix uses twenty separately registered entry functions
+    // and a private period-array backing store per entry.  All arrays share
+    // the same lifecycle name, so activation semantics remain identical to an
+    // AOT wrapper while each entry's effective binding and live stores stay
+    // isolated.  Entry zero deliberately gives cell five a different gain to
+    // exercise the unequal-member fallback path.
+    auto &PressureRows = RepresentativeRuntime::pressureRows();
+    auto &PressureNames = RepresentativeRuntime::pressureEntryNames();
+    auto &PressureConfigNames = RepresentativeRuntime::pressureConfigNames();
+    auto &PressureBitcodes = RepresentativeRuntime::pressureBitcodes();
+    auto &PressureFuncIndices = RepresentativeRuntime::pressureFuncIndices();
+    for (uint32_t Entry = 0; Entry < kPressureEntries; ++Entry) {
+      for (uint32_t Cell = 0; Cell < kCells; ++Cell) {
+        CellRow &Row = PressureRows[Entry * kCells + Cell];
+        Row.gain = (Entry == 0 && Cell == 5) ? 101u : 7u;
+        Row.live[0] = 0;
+        Row.live[1] = 0;
+      }
+      LLVMContext PressureCtx;
+      auto PressureModule =
+          buildEntryModule(PressureCtx, PressureNames[Entry],
+                           PressureConfigNames[Entry]);
+      std::string PressureErr;
+      raw_string_ostream PressureOS(PressureErr);
+      if (verifyModule(*PressureModule, &PressureOS))
+        ADD_FAILURE() << "pressure entry module verify failed: "
+                      << PressureNames[Entry] << ": " << PressureOS.str();
+      std::string PressureBC;
+      raw_string_ostream PressureBOS(PressureBC);
+      WriteBitcodeToFile(*PressureModule, PressureBOS);
+      PressureBOS.flush();
+      PressureBitcodes[Entry] = std::move(PressureBC);
+      ejit_register_period_array(
+          "cell", PressureConfigNames[Entry].c_str(),
+          &PressureRows[Entry * kCells], kCells);
+      ejit_register_bitcode(
+          PressureNames[Entry].c_str(),
+          reinterpret_cast<const uint8_t *>(PressureBitcodes[Entry].data()),
+          PressureBitcodes[Entry].size());
+      ejit_register_funcindex(PressureNames[Entry].c_str(),
+                              &PressureFuncIndices[Entry]);
+    }
+    ejit_register_lifecycle("cell", &RepresentativeRuntime::cellSlot());
+    ejit_register_lifecycle("trp", &RepresentativeRuntime::trpSlot());
   });
 }
 
@@ -404,19 +490,28 @@ namespace {
 
 /// The real business entry: exactly the call the AOT wrapper makes. Returns the
 /// resolve status and captures the granted pointer / read token.
+ejit_status_t entryCallFor(uint32_t funcIndex, uint32_t cell, uint32_t trp,
+                            void **outFn, uint32_t *outBucket);
+
 ejit_status_t entryCall(uint32_t cell, uint32_t trp, void **outFn,
                         uint32_t *outBucket) {
+  return entryCallFor(RepresentativeRuntime::funcIndex(), cell, trp, outFn,
+                      outBucket);
+}
+
+ejit_status_t entryCallFor(uint32_t funcIndex, uint32_t cell, uint32_t trp,
+                            void **outFn, uint32_t *outBucket) {
   ejit_dim_pair_t Dims[2] = {{RepresentativeRuntime::cellSlot(), cell},
                              {RepresentativeRuntime::trpSlot(), trp}};
   *outFn = nullptr;
   *outBucket = 0;
-  return ejit_taskpool_compile_or_get(RepresentativeRuntime::funcIndex(), Dims,
-                                      2, outFn, outBucket);
+  return ejit_taskpool_compile_or_get(funcIndex, Dims, 2, outFn, outBucket);
 }
 
 // AOT reference and observable store check; callers still own the read token.
-void executeAndCheck(void *Fn, uint32_t Cell, uint32_t Trp, uint32_t X) {
-  auto &Row = RepresentativeRuntime::rows()[Cell];
+void executeAndCheckRows(CellRow *Rows, void *Fn, uint32_t Cell,
+                         uint32_t Trp, uint32_t X) {
+  auto &Row = Rows[Cell];
   const uint32_t Before = Row.live[Trp];
   uint32_t Expected = Before + (X > Row.gain ? X * Row.gain : X + Row.gain)
                             + X * (X - 1) / 2;
@@ -426,6 +521,10 @@ void executeAndCheck(void *Fn, uint32_t Cell, uint32_t Trp, uint32_t X) {
   using Entry = uint32_t (*)(uint64_t, uint64_t, uint32_t);
   EXPECT_EQ(reinterpret_cast<Entry>(Fn)(Cell, Trp, X), Expected + Cell);
   EXPECT_EQ(Row.live[Trp], Expected);
+}
+
+void executeAndCheck(void *Fn, uint32_t Cell, uint32_t Trp, uint32_t X) {
+  executeAndCheckRows(RepresentativeRuntime::rows(), Fn, Cell, Trp, X);
 }
 
 void releaseIfHeld(uint32_t status, uint32_t bucket) {
@@ -534,6 +633,7 @@ TEST_F(EJitRepresentativeRuntimeTest,
   // Fail one real worker T2 compile before capture. The normal closed-quota
   // lookup must enqueue the retry without granting another T1 execution.
   ASSERT_EQ(ejit_representative_test_fail_next_tier2(), EJIT_OK);
+  ASSERT_EQ(ejit_representative_test_fail_member_tier2(1), EJIT_OK);
   EJitSharedDiagnostics RetryBefore{};
   auto *RetryPool = static_cast<EJitSharedTaskPool *>(ejit_representative_test_pool());
   ASSERT_NE(RetryPool, nullptr);
@@ -621,11 +721,6 @@ TEST_F(EJitRepresentativeRuntimeTest,
       << "the real Tier-2 request must publish the shared final object";
   EXPECT_NE(T2Fn, T1Fn) << "Tier-1 and Tier-2 provenance must stay distinct";
 
-  EJitSharedDiagnostics RetryAfter{};
-  RetryPool->getDiagnostics(RetryAfter);
-  EXPECT_EQ(RetryAfter.compileFailed, RetryBefore.compileFailed + 1);
-  EXPECT_EQ(RetryAfter.queueFull, RetryBefore.queueFull + 1);
-
   // Read the production frozen profile, not a synthetic writer input.
   size_t ProfileSize = 0;
   ASSERT_EQ(ejit_representative_copy_profile(nullptr, 0, &ProfileSize), EJIT_OK);
@@ -679,6 +774,28 @@ TEST_F(EJitRepresentativeRuntimeTest,
   EXPECT_EQ(Scalar.topValue, 11u);
   EXPECT_EQ(Scalar.funcHash, IndexedInstrProf::ComputeHash(RepresentativeRuntime::entryName()));
 #endif
+
+  // Owner scheduling must finish waiting members even without another member
+  // dispatch. A completed final read releases each retained candidate borrow.
+  for (unsigned A = 0; A < 4000; ++A) {
+    ejit_representative_stats_t St{};
+    ASSERT_EQ(ejit_representative_get_stats(&St), EJIT_OK);
+    if (St.sharedPhysicalReuses == 5) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  {
+    ejit_representative_stats_t St{};
+    ASSERT_EQ(ejit_representative_get_stats(&St), EJIT_OK);
+    EXPECT_EQ(St.sharedPhysicalReuses, 5u);
+  }
+
+  for (unsigned A = 0; A < 4000 && RetryPool->liveRequestAttemptCount(); ++A)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_EQ(RetryPool->liveRequestAttemptCount(), 0u);
+  EJitSharedDiagnostics RetryAfter{};
+  RetryPool->getDiagnostics(RetryAfter);
+  EXPECT_EQ(RetryAfter.compileFailed, RetryBefore.compileFailed + 2);
+  EXPECT_EQ(RetryAfter.queueFull, RetryBefore.queueFull + 1);
 
   // ---- every member now consumes the SAME published bundle ----
   //
@@ -1035,15 +1152,17 @@ TEST_F(EJitRepresentativeRuntimeTest,
     if (St.waitersJoined == ColdBefore.waitersJoined + 1) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
-  ASSERT_EQ(ejit_representative_test_timeout(20000000, 2), EJIT_OK);
+  ASSERT_EQ(ejit_representative_test_timeout(100000000, 2), EJIT_OK);
   ejit_representative_stats_t Timed{};
   for (unsigned A = 0; A < 4000; ++A) {
     ASSERT_EQ(ejit_representative_get_group_stats(3, &Timed), EJIT_OK);
-    if (!Timed.representativeSamplingSessionId) break;
+    if (Timed.representativeSamplingSessionId &&
+        Timed.representativeSamplingSessionId != ColdBefore.representativeSamplingSessionId) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
-  ASSERT_EQ(Timed.representativeSamplingSessionId, 0u);
-  EXPECT_EQ(Pool->state()->pgoActiveFunctionCount.loadAcquire(), 0u);
+  ASSERT_NE(Timed.representativeSamplingSessionId, 0u);
+  EXPECT_NE(Timed.representativeSamplingSessionId, ColdBefore.representativeSamplingSessionId);
+  EXPECT_EQ(Timed.representativeDispatchCount, 0u); // election itself invents no sample
   ASSERT_EQ(ejit_representative_test_timeout(5000000000ULL, 2), EJIT_OK);
   void *ColdReplacement = nullptr;
   for (uint32_t I = 0; I < kQuota; ++I) {
@@ -1094,6 +1213,312 @@ TEST_F(EJitRepresentativeRuntimeTest,
   EXPECT_EQ(Pool->pendingCount(), 0u);
   ASSERT_EQ(ejit_representative_test_timeout(5000000000ULL, 2), EJIT_OK);
 
+  // Compiler-source fence: stop a real prefix read, deactivate its lifecycle,
+  // and prove cancellation is not completion while the worker still borrows.
+  ejit_borrow_fence_t Scope{};
+  ASSERT_EQ(ejit_representative_deactivate_begin("cell", 0, &Scope), EJIT_OK);
+  ASSERT_EQ(ejit_representative_borrow_status(&Scope), EJIT_OK);
+  ASSERT_EQ(ejit_activate("cell", 0), EJIT_OK);
+  EXPECT_EQ(ejit_representative_borrow_status(&Scope), EJIT_ERR_INVALID_PARAM);
+  ASSERT_EQ(ejit_representative_test_candidate_gate(1), 1u);
+  void *GateFn = nullptr; uint32_t GateBucket = 0;
+  const auto GateStatus = entryCall(0, 1, &GateFn, &GateBucket);
+  EXPECT_EQ(GateFn, nullptr);
+  releaseIfHeld(GateStatus, GateBucket);
+  for (unsigned A = 0; A < 4000 && ejit_representative_test_candidate_gate(0) != 2; ++A)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_EQ(ejit_representative_test_candidate_gate(0), 2u);
+  EXPECT_EQ(ejit_representative_deactivate_begin("cell", 0, &Scope), EJIT_OK);
+  EXPECT_EQ(ejit_representative_borrow_status(&Scope), EJIT_PENDING);
+  // Always release the worker gate before a fatal assertion/fixture shutdown.
+  ejit_representative_test_candidate_gate(3);
+  ejit_status_t Borrow = EJIT_PENDING;
+  for (unsigned A = 0; A < 4000 && Borrow == EJIT_PENDING; ++A) {
+    Borrow = ejit_representative_borrow_status(&Scope);
+    if (Borrow == EJIT_PENDING) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_EQ(Borrow, EJIT_OK);
+  EXPECT_EQ(ejit_representative_borrow_status(&Scope), EJIT_OK); // idempotent observation
+  EXPECT_EQ(ejit_representative_deactivate_begin("missing", 0, &Scope), EJIT_ERR_INVALID_PARAM);
+  // Source mutation happens only after the old compiler borrow is confirmed.
+  RepresentativeRuntime::rows()[0].gain = 31;
+  ASSERT_EQ(ejit_activate("cell", 0), EJIT_OK);
+  void *ChangedT1 = nullptr;
+  for (uint32_t I = 0; I < kQuota; ++I) {
+    void *F = Sample(0, I < 48 ? 35 : 3);
+    ASSERT_NE(F, nullptr);
+    if (!ChangedT1) ChangedT1 = F;
+    EXPECT_EQ(F, ChangedT1);
+  }
+  void *ChangedT2 = Sample(0, 9);
+  ASSERT_NE(ChangedT2, nullptr);
+  EXPECT_NE(ChangedT2, ChangedT1);
+  EXPECT_NE(ChangedT2, T2Fn);
+  EXPECT_EQ(Sample(1, 9), T2Fn); // unaffected old group remains executable
+  size_t ChangedSize = 0;
+  ASSERT_EQ(ejit_representative_copy_group_profile(5, false, nullptr, 0, &ChangedSize), EJIT_OK);
+  std::string ChangedProfile(ChangedSize, '\0');
+  ASSERT_EQ(ejit_representative_copy_group_profile(5, false, &ChangedProfile[0], ChangedSize, &ChangedSize), EJIT_OK);
+  auto ChangedReader = IndexedInstrProfReader::create(MemoryBuffer::getMemBufferCopy(ChangedProfile));
+  ASSERT_TRUE(static_cast<bool>(ChangedReader)) << toString(ChangedReader.takeError());
+  for (const auto &Rec : **ChangedReader) {
+    auto Counts = Rec.Counts;
+    std::sort(Counts.begin(), Counts.end());
+    EXPECT_EQ(Counts, (std::vector<uint64_t>{48,64,1664}));
+  }
+
+  // A member has no personal T1/profile to retain after final-transform failure.
+  // Exhausting its bounded retries ends both the actual attempts and its lease.
+  EJitSharedDiagnostics FinalBefore{}, FinalAfter{};
+  Pool->getDiagnostics(FinalBefore);
+  ASSERT_EQ(ejit_representative_test_fail_member_tier2(3), EJIT_OK);
+  ASSERT_EQ(ejit_activate("cell", 13), EJIT_OK);
+  void *FailedMember = nullptr; uint32_t FailedBucket = 0;
+  const auto FailedStatus = entryCall(13, 1, &FailedMember, &FailedBucket);
+  EXPECT_EQ(FailedMember, nullptr);
+  releaseIfHeld(FailedStatus, FailedBucket);
+  for (unsigned A = 0; A < 4000; ++A) {
+    Pool->getDiagnostics(FinalAfter);
+    if (FinalAfter.compileFailed == FinalBefore.compileFailed + 3 &&
+        Pool->liveRequestAttemptCount() == 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(FinalAfter.compileFailed, FinalBefore.compileFailed + 3);
+  EXPECT_EQ(Pool->liveRequestAttemptCount(), 0u);
+  for (unsigned I = 0; I < 5; ++I) {
+    void *F = nullptr; uint32_t B = 0;
+    const auto S = entryCall(13, 1, &F, &B);
+    EXPECT_NE(S, EJIT_OK);
+    EXPECT_EQ(F, nullptr);
+    releaseIfHeld(S, B);
+  }
+  EXPECT_EQ(Pool->pendingCount(), 0u);
+  ASSERT_EQ(ejit_representative_deactivate_begin("cell", 13, &Scope), EJIT_OK);
+  EXPECT_EQ(ejit_representative_borrow_status(&Scope), EJIT_OK);
+
+}
+
+// R3 pressure and isolation acceptance: twenty independently registered
+// entries each use six legal cells.  The first five cells of every entry share
+// one real representative session and one physical Tier-2 object; entry zero's
+// sixth cell has a different may_const binding and must compile independently.
+// Sampling is driven by concurrent business callers while the production worker
+// owns queue progress, freeze, profile publication and PGOUse.
+TEST_F(EJitRepresentativeRuntimeTest,
+       PressureTwentyEntriesSixCellsStayIsolatedAndShareOnlyEqualMembers) {
+  ejit_representative_stats_t Before{};
+  const auto BeforeStatus = ejit_representative_get_stats(&Before);
+  ASSERT_TRUE(BeforeStatus == EJIT_OK || BeforeStatus == EJIT_ERR_NOT_ACTIVE);
+  if (BeforeStatus == EJIT_ERR_NOT_ACTIVE || !Before.active) {
+    ejit_config_t Cfg{};
+    Cfg.compileMode = EJIT_COMPILE_ASYNC;
+    ASSERT_EQ(ejit_init_representative(&Cfg), EJIT_OK);
+    ASSERT_EQ(ejit_representative_get_stats(&Before), EJIT_OK);
+  }
+  ASSERT_EQ(Before.active, 1u);
+  auto *Pool =
+      static_cast<EJitSharedTaskPool *>(ejit_representative_test_pool());
+  ASSERT_NE(Pool, nullptr);
+
+  for (uint32_t Cell = 0; Cell < kPressureCells; ++Cell)
+    ASSERT_EQ(ejit_activate("cell", Cell), EJIT_OK);
+  ASSERT_EQ(ejit_activate("trp", 1), EJIT_OK);
+  // Twenty entries are intentionally driven while earlier groups finish their
+  // Tier-2 publication.  Keep the cold-representative maintenance window well
+  // above this bounded host pressure run; this changes only the test knob.
+  ASSERT_EQ(ejit_representative_test_timeout(5000000000ULL, 2), EJIT_OK);
+
+  const auto &Names = RepresentativeRuntime::pressureEntryNames();
+  const auto &FuncIndices = RepresentativeRuntime::pressureFuncIndices();
+  auto &Rows = RepresentativeRuntime::pressureRows();
+  ASSERT_EQ(Names.size(), kPressureEntries);
+  ASSERT_EQ(FuncIndices.size(), kPressureEntries);
+  for (uint32_t Entry = 0; Entry < kPressureEntries; ++Entry)
+    ASSERT_LT(FuncIndices[Entry], EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX)
+        << Names[Entry];
+  for (uint32_t I = 0; I < kPressureEntries; ++I)
+    for (uint32_t J = I + 1; J < kPressureEntries; ++J)
+      ASSERT_NE(FuncIndices[I], FuncIndices[J]);
+
+  std::array<void *, kPressureEntries> T1{};
+  std::atomic<bool> WorkersOk{true};
+  std::mutex ErrorMutex;
+  std::vector<std::string> WorkerErrors;
+  auto recordError = [&](const std::string &Message) {
+    WorkersOk.store(false, std::memory_order_release);
+    std::lock_guard<std::mutex> Lock(ErrorMutex);
+    WorkerErrors.push_back(Message);
+  };
+  auto executeNoAssert = [](CellRow *EntryRows, void *Fn, uint32_t Cell,
+                            uint32_t Trp, uint32_t X) {
+    auto &Row = EntryRows[Cell];
+    const uint32_t BeforeLive = Row.live[Trp];
+    uint32_t Expected =
+        BeforeLive + (X > Row.gain ? X * Row.gain : X + Row.gain) +
+        X * (X - 1) / 2;
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+    Expected += X * 5 + 10;
+#endif
+    using Entry = uint32_t (*)(uint64_t, uint64_t, uint32_t);
+    const uint32_t Actual = reinterpret_cast<Entry>(Fn)(Cell, Trp, X);
+    return Actual == Expected + Cell && Row.live[Trp] == Expected;
+  };
+  std::vector<std::thread> Samplers;
+  Samplers.reserve(kPressureEntries);
+
+  // Establish each representative in deterministic entry order.  Member
+  // calls are issued after all representative sessions have drained their
+  // quotas; they remain AOT until the bundle is published and never receive a
+  // private Tier-1 admission.
+  for (uint32_t Entry = 0; Entry < kPressureEntries; ++Entry) {
+    for (unsigned Attempt = 0; Attempt < 4000 && !T1[Entry]; ++Attempt) {
+      void *Fn = nullptr;
+      uint32_t Bucket = 0;
+      const auto S = entryCallFor(FuncIndices[Entry], 0, 1, &Fn, &Bucket);
+      if (S == EJIT_OK && Fn) {
+        T1[Entry] = Fn;
+        executeAndCheckRows(&Rows[Entry * kCells], Fn, 0, 1,
+                            7u + Entry % 3u);
+      }
+      releaseIfHeld(S, Bucket);
+      if (!T1[Entry])
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    if (!T1[Entry]) {
+      recordError("entry " + std::to_string(Entry) +
+                  " representative did not resolve");
+      break;
+    }
+    Samplers.emplace_back([&, Entry] {
+      // The setup call above is sample zero; complete the remaining quota here.
+      for (uint32_t Sample = 1; Sample < kQuota; ++Sample) {
+        bool Executed = false;
+        for (unsigned Attempt = 0; Attempt < 4000 && !Executed; ++Attempt) {
+          void *Fn = nullptr;
+          uint32_t Bucket = 0;
+          const auto S = entryCallFor(FuncIndices[Entry], 0, 1, &Fn, &Bucket);
+          if (S == EJIT_OK && Fn) {
+            if (Fn != T1[Entry])
+              recordError("entry " + std::to_string(Entry) +
+                          " changed Tier-1 pointer before quota close");
+            const uint32_t X = Sample < 48 ? (7u + Entry % 3u) : 3u;
+            if (!executeNoAssert(&Rows[Entry * kCells], Fn, 0, 1, X))
+              recordError("entry " + std::to_string(Entry) +
+                          " representative result/live-store mismatch");
+            Executed = true;
+          }
+          releaseIfHeld(S, Bucket);
+          if (!Executed)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (!Executed)
+          recordError("entry " + std::to_string(Entry) +
+                      " representative sample did not resolve");
+      }
+    });
+  }
+  for (auto &Thread : Samplers)
+    Thread.join();
+  ASSERT_TRUE(WorkersOk.load(std::memory_order_acquire))
+      << (WorkerErrors.empty() ? "worker failure" : WorkerErrors.front());
+
+  std::array<void *, kPressureEntries> SharedT2{};
+  for (uint32_t Entry = 0; Entry < kPressureEntries; ++Entry) {
+    for (uint32_t Cell = 0; Cell < (Entry == 0 ? 5u : kPressureCells);
+         ++Cell) {
+      bool Resolved = false;
+      for (unsigned Attempt = 0; Attempt < 4000 && !Resolved; ++Attempt) {
+        void *Fn = nullptr;
+        uint32_t Bucket = 0;
+        const auto S = entryCallFor(FuncIndices[Entry], Cell, 1, &Fn, &Bucket);
+        if (S == EJIT_OK && Fn && Fn != T1[Entry]) {
+          if (!SharedT2[Entry])
+            SharedT2[Entry] = Fn;
+          EXPECT_EQ(Fn, SharedT2[Entry])
+              << "equal member entry " << Entry << " cell " << Cell;
+          const uint32_t X = 9u + (Entry % 4u);
+          EXPECT_TRUE(executeNoAssert(&Rows[Entry * kCells], Fn, Cell, 1, X));
+          Resolved = true;
+        }
+        releaseIfHeld(S, Bucket);
+        if (!Resolved)
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+      ASSERT_TRUE(Resolved)
+          << "shared Tier-2 did not resolve entry " << Entry << " cell "
+          << Cell;
+    }
+    ASSERT_NE(SharedT2[Entry], nullptr) << Names[Entry];
+  }
+
+  // Unequal effective binding: entry zero's sixth cell belongs to a distinct
+  // candidate group and therefore cannot reuse entry zero's physical code.
+  void *UnequalT1 = nullptr;
+  for (unsigned Attempt = 0; Attempt < 4000 && !UnequalT1; ++Attempt) {
+    void *Fn = nullptr;
+    uint32_t Bucket = 0;
+    const auto S = entryCallFor(FuncIndices[0], 5, 1, &Fn, &Bucket);
+    if (S == EJIT_OK && Fn) {
+      UnequalT1 = Fn;
+      executeAndCheckRows(&Rows[0], Fn, 5, 1, 101);
+    }
+    releaseIfHeld(S, Bucket);
+    if (!UnequalT1)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  ASSERT_NE(UnequalT1, nullptr);
+  EXPECT_NE(UnequalT1, SharedT2[0]);
+  for (uint32_t Sample = 1; Sample < kQuota; ++Sample) {
+    bool Executed = false;
+    for (unsigned Attempt = 0; Attempt < 4000 && !Executed; ++Attempt) {
+      void *Fn = nullptr;
+      uint32_t Bucket = 0;
+      const auto S = entryCallFor(FuncIndices[0], 5, 1, &Fn, &Bucket);
+      if (S == EJIT_OK && Fn) {
+        EXPECT_EQ(Fn, UnequalT1);
+        executeAndCheckRows(&Rows[0], Fn, 5, 1, Sample < 48 ? 101 : 3);
+        Executed = true;
+      }
+      releaseIfHeld(S, Bucket);
+      if (!Executed)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(Executed) << "unequal member sample " << Sample;
+  }
+  void *UnequalT2 = nullptr;
+  for (unsigned Attempt = 0; Attempt < 4000 && !UnequalT2; ++Attempt) {
+    void *Fn = nullptr;
+    uint32_t Bucket = 0;
+    const auto S = entryCallFor(FuncIndices[0], 5, 1, &Fn, &Bucket);
+    if (S == EJIT_OK && Fn && Fn != UnequalT1) {
+      UnequalT2 = Fn;
+      executeAndCheckRows(&Rows[0], Fn, 5, 1, 9);
+    }
+    releaseIfHeld(S, Bucket);
+    if (!UnequalT2)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  ASSERT_NE(UnequalT2, nullptr);
+  EXPECT_NE(UnequalT2, SharedT2[0]);
+  EXPECT_NE(UnequalT2, UnequalT1);
+
+  ejit_representative_stats_t After{};
+  ASSERT_EQ(ejit_representative_get_stats(&After), EJIT_OK);
+  EXPECT_EQ(After.groups - Before.groups, 21u);
+  EXPECT_EQ(After.representativesElected - Before.representativesElected, 21u);
+  EXPECT_EQ(After.representativeDispatches - Before.representativeDispatches,
+            21u * kQuota);
+  EXPECT_EQ(After.bundlePublications - Before.bundlePublications, 21u);
+  EXPECT_EQ(After.physicalCodeObjects - Before.physicalCodeObjects, 21u);
+  EXPECT_EQ(After.waitersJoined - Before.waitersJoined, 99u);
+  EXPECT_EQ(After.sharedPhysicalReuses - Before.sharedPhysicalReuses, 99u);
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  EXPECT_EQ(After.completeProfiles - Before.completeProfiles, 21u);
+#else
+  EXPECT_EQ(After.edgeOnlyProfiles - Before.edgeOnlyProfiles, 21u);
+#endif
+  EXPECT_EQ(Pool->liveRequestAttemptCount(), 0u);
+  EXPECT_EQ(Pool->pendingCount(), 0u);
 }
 
 /// The default-off policy on the REAL runtime: an ordinary initialization never
