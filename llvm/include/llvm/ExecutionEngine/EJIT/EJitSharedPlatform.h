@@ -56,7 +56,7 @@ namespace ejit {
 /// value so a partially-zeroed or foreign blob is rejected.
 constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 
-/// ABI v20. Bump on any layout change; peers must match the owner's ABI,
+/// ABI v22. Bump on any layout change; peers must match the owner's ABI,
 /// generation and registration fingerprint before resolving an entry.
 ///
 /// Published code and counters use separate page ranges. On a fixed RX
@@ -67,8 +67,10 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 ///
 /// Dump payloads stay on the worker; only capture metadata is shared. The
 /// v18 queue borrows bound-pointer descriptors, never pointee bytes or
-/// ownership. Each queued request and published slot carries its exact\n/// attempt token; the shared blob keeps bounded live and completed attempts.
-constexpr uint32_t kEJitSharedAbiVersion = 18u;
+/// ownership. Each queued request and published slot carries its exact
+/// attempt token; the shared blob keeps bounded live and completed attempts.
+constexpr uint32_t kEJitSharedAbiVersion = 22u;
+// Tier-1 dispatch counts and quota closure are tied to each published attempt.
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

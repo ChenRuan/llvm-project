@@ -8,6 +8,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h" // EJitCompileRequest (v21)
 #include "llvm/ProfileData/InstrProf.h"
 #include "llvm/ProfileData/InstrProfWriter.h"
 #include "llvm/Support/Error.h"
@@ -299,3 +300,66 @@ bool ejit::aggregateValueSamples(ArrayRef<EJitVpSiteSample> samples,
 }
 
 #endif // EJIT_SRE_PGO_VALUE_PROFILE
+
+//===----------------------------------------------------------------------===//
+// Observed Tier-1 dispatch boundary (ABI v21, experimental sharing contract).
+//
+// The bundle must never present the configured threshold or the Tier-2 compile
+// time as if it were an observation. This is the only place the request's
+// frozen observation crosses into the bundle, and it validates the exact
+// attempt/generation identity first.
+//===----------------------------------------------------------------------===//
+llvm::ejit::Tier1ProfileAttemptIdentity
+llvm::ejit::captureTier1ProfileAttemptIdentity(
+    const EJitCompileRequest *Tier1Request) {
+  Tier1ProfileAttemptIdentity Identity;
+  if (!Tier1Request)
+    return Identity;
+  Identity.representativeAttemptToken = Tier1Request->attemptToken;
+  Identity.generation = Tier1Request->generation;
+  return Identity;
+}
+
+void llvm::ejit::applyT1DispatchObservation(
+    EJitProfileBundle &Bundle, const EJitCompileRequest *Request,
+    const Tier1ProfileAttemptIdentity &Tier1Attempt) {
+  applyT1DispatchObservation(Bundle, Request,
+                             Tier1Attempt.representativeAttemptToken,
+                             Tier1Attempt.generation);
+}
+
+void llvm::ejit::applyT1DispatchObservation(EJitProfileBundle &Bundle,
+                                            const EJitCompileRequest *Request,
+                                            uint64_t expectedAttemptToken,
+                                            uint32_t expectedGeneration) {
+  Bundle.actualDispatchCount = 0;
+  Bundle.quotaEnd = 0;
+  Bundle.dispatchLimit = 0;
+  Bundle.dispatchQuality = T1DispatchObservationQuality::Unavailable;
+  // Legacy/tokenless requests carry no observation at all.
+  if (!Request || expectedAttemptToken == 0)
+    return;
+  // The request must still identify the exact Tier-1 attempt that produced the
+  // profile. A replacement attempt (cancel + reissue) or an owner generation
+  // change makes the carried numbers belong to another session.
+  if (Request->attemptToken != expectedAttemptToken ||
+      Request->generation != expectedGeneration)
+    return;
+  const uint64_t Limit = Request->t1DispatchLimit;
+  const uint64_t Count = Request->t1DispatchCount;
+  if (Limit == 0 || Count > Limit)
+    return;
+  Bundle.dispatchLimit = Limit;
+  Bundle.actualDispatchCount = Count;
+  if (Count == Limit) {
+    // Frozen boundary: the final allowed dispatch timestamp, or 0 (unknown)
+    // when the taskpool had no clock configured. Never the compile time.
+    Bundle.quotaEnd = Request->t1QuotaEnd;
+    Bundle.dispatchQuality = T1DispatchObservationQuality::FrozenAtQuota;
+  } else {
+    // Admission was still open when this Tier-2 request was built; the count is
+    // a real observation but the window is incomplete and the boundary time is
+    // unknown (quotaEnd stays 0).
+    Bundle.dispatchQuality = T1DispatchObservationQuality::PartialOpenQuota;
+  }
+}

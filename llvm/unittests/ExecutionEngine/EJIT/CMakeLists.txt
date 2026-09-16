@@ -87,17 +87,21 @@ add_custom_target(check-ejit-code-pool
 # Cross-core SHARED taskpool tests: compile the shared sources directly with the
 # shared-taskpool macros so they build and run independently of LLVMEJIT and need
 # no real SRE platform symbols. Many cores are simulated in one host process via
-# the injectable EJitCoreId; no real thread is required. Only LLVMSupport is
-# linked (the gtest harness).
+# the injectable EJitCoreId; no real thread is required. Only LLVMSupport and
+# LLVMProfileData are linked (the gtest harness plus the production ProfileBundle
+# mapping helper exercised by EJitObservedT1DispatchTest.cpp); OrcJIT/EJIT are
+# never pulled in.
 set(EJIT_SHARED_TASKPOOL_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
-set(LLVM_LINK_COMPONENTS Support)
+set(LLVM_LINK_COMPONENTS Support ProfileData)
 add_llvm_unittest(EJITSharedTaskPoolTests
   EJitSharedTaskPoolTest.cpp
   EJitTaskPoolTypesTest.cpp
+  EJitObservedT1DispatchTest.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
   # This standalone target does not link LLVMEJIT.
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitDiag.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitProfileMerge.cpp
 
   PARTIAL_SOURCES_INTENDED
   )
