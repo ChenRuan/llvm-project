@@ -61,6 +61,18 @@ EJit::EJit(const Config &config) : config_(config) {
   EJIT_DIAG_VERBOSE("constructing: mode=%d opt=%d", (int)config.compileMode,
                     (int)config.optLevel);
 
+  // Reject unsupported representative policy before consuming registrations,
+  // constructing a driver/collector, or starting a worker.
+  if (config_.enableRepresentativeSharing &&
+      (!config_.enablePgo || config_.enableProfileAudit ||
+       config_.representativeIdleTimeoutTicks == 0 ||
+       config_.compileMode != CompileMode::Async)) {
+    recordInitError(EJIT_ERR_INVALID_PARAM,
+                    "representative sharing requires Async + normal online PGO",
+                    "");
+    return;
+  }
+
   // Create all runtime components
   runtimeState_ = std::make_unique<EJitRuntimeState>();
   moduleLoader_ = std::make_unique<EJitModuleLoader>();
@@ -283,6 +295,9 @@ EJit::EJit(const Config &config) : config_(config) {
   if (!initFailed_) {
     regPhase_ = RegistrationPhase::Frozen;
     if (config_.compileMode == CompileMode::Async) {
+      if (config_.enablePgo || config_.enableProfileAudit)
+        compileDriver_->sharedTaskPool()->setPgoEnabled(
+            true, kEJitRepresentativeDispatchQuota);
       bool poolOk = compileDriver_->startSharedTaskPool();
       if (!poolOk) {
         // Distinguish "the engine failed to build on the winner" from a genuine
@@ -320,11 +335,16 @@ EJit::EJit(const Config &config) : config_(config) {
         // PGO and the default-off profile audit share the temporary
         // Instrumented-tier hit window. Audit-only mode publishes ordinary
         // Baseline code after collecting the window.
+        //
+        // Shared taskpool: already published above, before Ready (the values are
+        // immutable once Ready). The per-instance pool has no such window.
+#ifndef EJIT_SRE_SHARED_TASKPOOL
         if (config_.enablePgo || config_.enableProfileAudit) {
           constexpr uint32_t kDefaultPgoThreshold = 64;
           compileDriver_->sharedTaskPool()->setPgoEnabled(
               true, kDefaultPgoThreshold);
         }
+#endif
       }
     } else {
       EJIT_DIAG_VERBOSE("taskpool off: AOT only");

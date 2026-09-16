@@ -380,6 +380,14 @@ EJitPreparedCodeEmitter::Stats EJitPreparedCodeEmitter::stats() const {
   return P->stats;
 }
 
+bool EJitPreparedCodeEmitter::linkedIdentityEquals(
+    uint64_t CodeId, const EJitFinalCodeIdentity &Other) const {
+  for (const Impl::Record &R : P->records)
+    if (R.codeId == CodeId)
+      return R.identity.equals(Other);
+  return false;
+}
+
 namespace {
 struct CandidateIdentity {
   EJitCodeIdentityScope scope;

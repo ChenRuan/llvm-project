@@ -492,6 +492,26 @@ protected:
 #endif
   }
 
+
+  // Ordinary hits retain code forever in NO_RECLAIM. Representative sampling
+  // has a separate lifetime contract and is checked by its execution tests.
+  void expectOrdinaryHitToken(const EJitSharedTaskPool::CompileOrGetResult &Hit) {
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    EXPECT_FALSE(Hit.hasReadToken);
+    EXPECT_EQ(Hit.bucketIndex, kEJitSharedCacheBuckets);
+    expectNoReaders();
+#else
+    EXPECT_TRUE(Hit.hasReadToken);
+    ASSERT_LT(Hit.bucketIndex, kEJitSharedCacheBuckets);
+    EXPECT_GT(state_->buckets[Hit.bucketIndex].readers.loadAcquire(), 0u);
+#endif
+  }
+
+  void expectNoReaders() {
+    for (uint32_t B = 0; B < kEJitSharedCacheBuckets; ++B)
+      EXPECT_EQ(state_->buckets[B].readers.loadAcquire(), 0u) << "bucket " << B;
+  }
+
   // Register a test-local stand-in for the wrapper's @__ejit_icache_fn_<name>
   // cell table. \p missFn non-null models a SENTINEL-form slot (NumDims <= 2,
   // timing off): the table is defined pre-filled with &MissFn and the runtime
@@ -3653,6 +3673,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   ASSERT_EQ(h2.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h2.fnPtr, codeFor(3));
   owner.releaseRead(h2.bucketIndex);
+  expectNoReaders();
 
   // 3D
   EJitDimPair d3[3] = {dim(0, 1), dim(1, 2), dim(2, 3)};
@@ -3661,6 +3682,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   ASSERT_EQ(h3.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h3.fnPtr, codeFor(4));
   owner.releaseRead(h3.bucketIndex);
+  expectNoReaders();
 
   // 4D
   EJitDimPair d4[4] = {dim(0, 1), dim(1, 2), dim(2, 3), dim(3, 4)};
@@ -3669,6 +3691,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   ASSERT_EQ(h4.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h4.fnPtr, codeFor(5));
   owner.releaseRead(h4.bucketIndex);
+  expectNoReaders();
 
   // Cache hits do not enqueue/dedup.
   EJitSharedDiagnostics d;
