@@ -83,6 +83,14 @@ void taskpoolPgoLifecycleDropThunk(void *ctx, const EJitCompileRequest &req) {
 }
 
 #ifdef EJIT_SRE_SHARED_TASKPOOL
+// Owner-private timestamp source for the observed Tier-1 dispatch boundary
+// (quotaEnd). It is a thunk on purpose: the taskpool TU stays independent of
+// the runtime library (its focused test links only LLVMSupport) and a test can
+// inject a deterministic clock instead.
+uint64_t sharedTraceClockThunk(void * /*ctx*/) {
+  return ejit_taskpool_trace_now();
+}
+
 [[maybe_unused]] bool sharedPrepareCodeThunk(void * /*ctx*/,
                                              const void *fnPtr) {
 #ifdef EJIT_SRE_CODE_POOL
@@ -275,6 +283,10 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   // a platform asserts same-VA, sealed, I/D-coherent code (spec §11).
   sharedPool_.bind(&gEJitSharedTaskPoolState);
   sharedPool_.setCompiler(&taskpoolCompileThunk, this);
+  // Observed Tier-1 dispatch boundary clock (experimental sharing contract):
+  // quotaEnd is frozen at the final granted Tier-1 dispatch, so it must come
+  // from the runtime trace clock, never from a Tier-2 compile-time timestamp.
+  sharedPool_.setTraceClock(&sharedTraceClockThunk, nullptr);
   sharedPool_.setPublishCallback(&taskpoolPublishThunk, this);
   sharedPool_.setPgoLifecycleDropCallback(&taskpoolPgoLifecycleDropThunk, this);
   sharedPool_.setMayConstRankingCallback(&sharedMayConstRankingThunk, this);
@@ -778,8 +790,15 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       }
 #endif
       Tier1ProfileIdentity &Identity = tier1ProfileIdentities_[cacheKey];
-      Identity.representativeAttemptToken = request ? request->attemptToken : 0;
-      Identity.generation = request ? request->generation : 0;
+      // Production join (experimental sharing contract, ABI v21): capture the
+      // exact Tier-1 attempt/generation that the Tier-2 bundle is later
+      // validated against. Kept in one helper so the observed-dispatch
+      // integration gate drives the same capture with a real pool-published
+      // Tier-1 request instead of a replica.
+      const Tier1ProfileAttemptIdentity Attempt =
+          captureTier1ProfileAttemptIdentity(request);
+      Identity.representativeAttemptToken = Attempt.representativeAttemptToken;
+      Identity.generation = Attempt.generation;
       Identity.numDims = request ? request->numDims : 0;
       for (uint32_t I = 0; I < kEJitMaxRequestDims; ++I)
         Identity.versions[I] =
@@ -817,15 +836,25 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     Bundle->samplingSessionId = ctx.samplingSessionId;
     Bundle->representativeLogicalKey = cacheKey;
     auto Identity = tier1ProfileIdentities_.find(cacheKey);
-    if (Identity != tier1ProfileIdentities_.end())
-      Bundle->representativeAttemptToken =
-          Identity->second.representativeAttemptToken;
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-    Bundle->actualDispatchCount = sharedPool_.tier2Threshold();
-#else
-    Bundle->actualDispatchCount = 0;
-#endif
-    Bundle->quotaEnd = ejit_taskpool_trace_now();
+    const uint64_t RepresentativeToken =
+        Identity != tier1ProfileIdentities_.end()
+            ? Identity->second.representativeAttemptToken
+            : 0;
+    const uint32_t RepresentativeGeneration =
+        Identity != tier1ProfileIdentities_.end() ? Identity->second.generation
+                                                  : 0;
+    Bundle->representativeAttemptToken = RepresentativeToken;
+    // Observed Tier-1 dispatch boundary (experimental sharing contract, ABI
+    // v21): the Tier-2 request carries the count/quotaEnd frozen at the real
+    // granted Tier-1 dispatch by the shared taskpool. The helper accepts them
+    // only when the request still identifies this exact Tier-1
+    // attempt/generation; otherwise the bundle honestly reports Unavailable
+    // with count/quotaEnd 0. The configured threshold and the Tier-2 compile
+    // time are never substituted for an observation.
+    applyT1DispatchObservation(
+        *Bundle, request,
+        Tier1ProfileAttemptIdentity{RepresentativeToken,
+                                    RepresentativeGeneration});
     Bundle->quality = ProfileSnapshotQuality::ApproximateInFlight;
     Bundle->hasEdgeProfile = true;
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
@@ -865,10 +894,14 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       Bundle->freezeCompletedAt = ejit_taskpool_trace_now();
       ctx.profileBundle = Bundle;
       frozenProfileBundles_[cacheKey] = Bundle;
-      EJIT_DIAG("profile bundle frozen key=0x%016lx session=%llu dispatch=%llu",
+      EJIT_DIAG("profile bundle frozen key=0x%016lx session=%llu dispatch=%llu "
+                "limit=%llu quotaEnd=%llu quality=%u",
                 cacheKey,
                 static_cast<unsigned long long>(ctx.samplingSessionId),
-                static_cast<unsigned long long>(Bundle->actualDispatchCount));
+                static_cast<unsigned long long>(Bundle->actualDispatchCount),
+                static_cast<unsigned long long>(Bundle->dispatchLimit),
+                static_cast<unsigned long long>(Bundle->quotaEnd),
+                static_cast<unsigned>(Bundle->dispatchQuality));
     }
   }
 

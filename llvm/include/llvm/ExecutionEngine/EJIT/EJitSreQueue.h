@@ -79,14 +79,26 @@ struct EJitCompileRequest {
   // explicitly acknowledges the final compiler read before releasing them.
   uint32_t boundCount;
   EJitBoundPtrDescriptor boundPointers[kEJitMaxBoundPointers];
+  // Frozen observed Tier-1 dispatch metadata (v21, experimental sharing
+  // contract). Captured from the published Tier-1 slot under the bucket lock
+  // when this Tier-2 request is built, and re-captured identically from the
+  // same frozen slot on a queue-full retry. All zero when the observation is
+  // unavailable (legacy/tokenless mode, non-shared pool, or a request that was
+  // not armed by a Tier-1 slot). t1QuotaEnd is the timestamp of the final
+  // allowed dispatch; 0 means unknown, never the compile time. These fields do
+  // not affect request routing.
+  uint64_t t1DispatchCount;
+  uint64_t t1QuotaEnd;
+  uint64_t t1DispatchLimit;
 };
 
 // Size is stable per pointer width and independent of pointee size. Some
 // 32-bit ABIs align uint64_t to 8 bytes and therefore add tail padding.
+// v21 added the three 64-bit observed-dispatch fields (208 -> 232 on 64-bit).
 static_assert(
     sizeof(EJitCompileRequest) ==
-        (sizeof(uintptr_t) == 8 ? 208u
-                                : (alignof(uint64_t) == 8 ? 176u : 172u)),
+        (sizeof(uintptr_t) == 8 ? 232u
+                                : (alignof(uint64_t) == 8 ? 200u : 196u)),
     "EJitCompileRequest size must stay fixed and payload-independent");
 static_assert(alignof(EJitCompileRequest) <= 8,
               "EJitCompileRequest alignment must stay <= 8 bytes");

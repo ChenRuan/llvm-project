@@ -721,6 +721,16 @@ public:
     workerIdle_ = fn;
     workerIdleCtx_ = ctx;
   }
+  /// Injectable timestamp source for the observed Tier-1 dispatch boundary
+  /// (quotaEnd). Unset (the default) means the boundary has no trustworthy
+  /// timestamp: the observation records the count and reports the timestamp as
+  /// unknown (0) instead of fabricating one. Owner-private configuration, like
+  /// the other callbacks; the driver wires the production trace clock.
+  using TraceClockFn = uint64_t (*)(void *ctx);
+  void setTraceClock(TraceClockFn fn, void *ctx) {
+    traceClockFn_ = fn;
+    traceClockCtx_ = ctx;
+  }
   /// Owner publishes this digest of its funcIndex/dimType registration mapping
   /// into the shared state; a peer attaching to a Ready blob compares its own
   /// digest and cleanly fails (FingerprintMismatch) on any divergence, so a
@@ -1122,6 +1132,19 @@ public:
   }
 #endif
 
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  /// Test-only hook fired inside the NO_RECLAIM seqlock lookups AFTER a
+  /// matched-slot resolve and BEFORE the outer publishSeq stability check, so a
+  /// single-threaded test can force exactly one retry where a racing publish
+  /// would (used to prove an abandoned retry consumes no observed dispatch).
+  /// Receives the bucket index.
+  using SeqRetryHook = void (*)(void *ctx, uint32_t bucketIndex);
+  void setSeqlockRetryHookForTest(SeqRetryHook fn, void *ctx) {
+    seqlockRetryHook_ = fn;
+    seqlockRetryHookCtx_ = ctx;
+  }
+#endif
+
   /// Empty every cell of every registered icache slot, bracketed by
   /// icacheDrainsInFlight and closed by an icacheDrainSeq bump, so any resolve
   /// this overlaps drops its fill. This is THE cross-core
@@ -1238,10 +1261,29 @@ private:
     bool tier2Arm = false;
     /// Exact slot coordinates and originating attempt observed while the
     /// bucket snapshot was valid. The cold enqueue path reacquires the bucket
-    /// lock and validates all identity fields before claiming Tier-2.
+    /// lock and validates all identity fields before claiming Tier-2. Filled by
+    /// the resolve path and by peerPrepareSlot() (from the re-validated slot,
+    /// so a cold peer's final admission carries the real identity instead of
+    /// zeroes).
     uint32_t tier2BucketIndex = 0;
     uint32_t tier2SlotIndex = 0;
     uint64_t tier2AttemptToken = 0;
+    /// Experimental sharing contract (v21): the resolved slot is a live
+    /// Instrumented publish with an active observed-dispatch quota. The
+    /// admission commit and the Tier-2 arm decision are deferred to the single
+    /// committed-return point (classifyHit) so that only a real granted Tier-1
+    /// dispatch consumes quota. t1SlotAttemptToken/t1SlotGeneration are the
+    /// exact publish identity captured with fnPtr; the commit refuses to
+    /// attribute a dispatch when the slot no longer carries it (NO_RECLAIM can
+    /// legally republish between the resolve and the commit).
+    bool t1Observation = false;
+    uint64_t t1SlotAttemptToken = 0;
+    uint32_t t1SlotGeneration = 0;
+    /// Captured from the slot while the bucket snapshot was valid: the frozen
+    /// observation to carry into the Tier-2 request.
+    uint64_t t1DispatchCount = 0;
+    uint64_t t1QuotaEnd = 0;
+    uint64_t t1DispatchLimit = 0;
   };
 
   // shared cache helpers (POD table in the shared blob)
@@ -1320,8 +1362,75 @@ private:
   /// cache-hit counter is incremented exactly once and the semantics stay
   /// identical. Does NOT perform the Ready or instance-enabled checks (the
   /// callers do those first).
-  CompileOrGetResult classifyHit(const SharedLookup &Hit,
-                                 bool enqueueTier2 = true);
+  ///
+  /// This is also the single committed-return point for the experimental
+  /// observed Tier-1 dispatch contract (v21): the admission commit happens here
+  /// because every shareability/pointer/peer-preparation gate has already
+  /// passed AND every NO_RECLAIM seqlock retry has already been discarded by
+  /// the caller. A lookup abandoned by a seqlock retry therefore never reaches
+  /// this commit. \p boundPointers/\p boundCount are attached when a deferred
+  /// Tier-2 claim has to be made.
+  CompileOrGetResult
+  classifyHit(const SharedLookup &Hit,
+              const EJitBoundPtrDescriptor *boundPointers = nullptr,
+              uint32_t boundCount = 0);
+
+  /// Outcome of committing one committed Tier-1 lookup against the observed
+  /// dispatch quota.
+  enum class T1DispatchOutcome : uint8_t {
+    NotApplicable,   ///< not a live observed Tier-1 publish.
+    Admitted,        ///< a real dispatch was granted below the limit.
+    FinalAdmitted,   ///< the last allowed dispatch; quotaEnd was frozen.
+    Exhausted,       ///< quota already closed; no Tier-1 dispatch granted.
+    IdentityChanged, ///< slot republished since the resolve snapshot.
+  };
+  /// Commit one granted Tier-1 dispatch for \p Hit. Increments the slot's
+  /// observed count by CAS while it is below the frozen limit, freezes
+  /// quotaEnd exactly once on the dispatch that reaches the limit, and updates
+  /// the diagnostic progress quarter. Never fabricates a count for a rejected
+  /// lookup: only the committed-return path calls this.
+  ///
+  /// Exclusion: the identity re-check, the CAS and the freeze run as one
+  /// critical section against cachePublish()/cancelRequestAttempt(). The token
+  /// build relies on the bucket read token the committed lookup already holds;
+  /// NO_RECLAIM takes the separate leaf bucket observationLock (ABI v22), which
+  /// does not set writeFlag or bump publishSeq, so a granted dispatch never
+  /// invalidates a concurrent load-only lookup. The lock is released before the
+  /// Tier-2 enqueue (which takes the bucket writeFlag and then the
+  /// observationLock again, in that fixed order).
+  T1DispatchOutcome admitObservedT1Dispatch(const SharedLookup &Hit);
+
+  /// Body of admitObservedT1Dispatch() executed under the observation exclusion
+  /// of the build (caller guarantees no republish can interleave).
+  T1DispatchOutcome admitObservedT1DispatchLocked(const SharedLookup &Hit);
+
+  /// Snapshot the observed Tier-1 dispatch identity/quota of a matched cache
+  /// slot into \p R (experimental sharing contract, ABI v21). Returns true only
+  /// for a live Instrumented publish that carries a nonzero observed-dispatch
+  /// limit while the observed contract is armed; the fields are an
+  /// informational snapshot, the commit re-reads the slot. Shared by the
+  /// resolve path and the cold peer-preparation path so a real granted dispatch
+  /// is counted exactly once on either path.
+  bool captureT1Observation(const EJitSharedCacheSlot &Slot,
+                            SharedLookup &R) const;
+
+  /// Timestamp source for the observed dispatch boundary. 0 when unconfigured
+  /// (the caller reports the timestamp as unknown).
+  uint64_t traceNow() const {
+    return traceClockFn_ ? traceClockFn_(traceClockCtx_) : 0;
+  }
+
+  /// Fire the optional NO_RECLAIM test hook at the exact point where a racing
+  /// publish would invalidate a seqlock read (after the matched-slot resolve,
+  /// before the outer publishSeq stability check). Compiled out of production.
+  void fireSeqlockRetryHook(uint32_t bucketIndex) {
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+    if (seqlockRetryHook_)
+      seqlockRetryHook_(seqlockRetryHookCtx_, bucketIndex);
+#else
+    (void)bucketIndex;
+#endif
+  }
   EJitPublishStatus cachePublish(const EJitCompileRequest &req, void *fnPtr,
                                  const EJitCompiledCodeInfo *info,
                                  bool pgoClearExclusive = false);
@@ -1347,6 +1456,11 @@ private:
     uint32_t funcIndex = 0;
     uint32_t numDims = 0;
     uint32_t generation = 0;
+    /// Exact logical attempt that published the snapshotted fn. The observation
+    /// identity of a successful cold preparation is pinned to THIS token (not a
+    /// load-only re-read), so a republish during the platform preparation makes
+    /// the commit fail closed instead of attributing old code to a replacement.
+    uint64_t attemptToken = 0;
     EJitDimPair dims[4] = {};
     uint32_t versions[4] = {};
     uintptr_t codeStart = 0;
@@ -1469,9 +1583,13 @@ private:
   void *workerCtx_ = nullptr;
   WorkerIdleFn workerIdle_ = nullptr;
   void *workerIdleCtx_ = nullptr;
+  TraceClockFn traceClockFn_ = nullptr;
+  void *traceClockCtx_ = nullptr;
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   TestHookFn pgoAdmissionTestHook_ = nullptr;
   void *pgoAdmissionTestHookCtx_ = nullptr;
+  SeqRetryHook seqlockRetryHook_ = nullptr;
+  void *seqlockRetryHookCtx_ = nullptr;
 #endif
   OwnerElectedFn ownerElected_ = nullptr;
   void *ownerElectedCtx_ = nullptr;
