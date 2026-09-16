@@ -1,8 +1,45 @@
 # PR230 Host Closeout - 2026-09-16
 
 Status: host implementation and the latest legacy concurrency follow-up are
-ready to publish for review. The feature remains OFF by default and the PR
+published for review. The feature remains OFF by default and the PR
 remains Draft. This is not product, board, or whole-specification acceptance.
+
+## Rebase Onto PR233
+
+On user request, all eleven published PR230 commits were replayed onto PR233
+`812f6474b706e0bb8f0cd1b93e9b0413bd5457cf`. The former remote head
+`25b36dfee5a138832013e5542cdc813cbb792f79` is retained on
+`codex/ejit-spec5-code-reuse-backup-before-233-20260916` in the head repository.
+The previous local development branch is also retained. No spec5/PR233 history
+is rewritten, and PR231 is not imported.
+
+The only explicit conflict was in the common optimizer prefix: retain PR233's
+`applyBoundPointerFacts` call alongside PR230's load-only preserved-dimension
+policy. The remaining ten commits replayed without semantic patch changes.
+
+Fresh current-source checks: shared pool NRC 205/205, token 187/187, and the
+folding/optimizer/preserved-dimension/prepared-code selection 129 passed with
+two ELF-only native cases skipped on Windows. Real runtime NRC and VP+NRC
+each pass 5/5,
+including a new single-producer round-robin of all 120 identities followed by
+cell deactivation, compiler-borrow completion, mutation and reactivation. The
+20 renewed entries reuse the original T2 pointers without new physical code or
+new representative samples. This complements the earlier concurrent sampling
+pressure test; it does not replace it.
+
+The header-free board source and startup/acceptance instructions are in
+[EJIT_CODE_REUSE_BOARD.md](EJIT_CODE_REUSE_BOARD.md). Mock tests passed with
+both startup modes (including a real-public-header build); the attribute-disabled
+AArch64 BE syntax/object check also passed. That object check does NOT test EJIT
+attributes, generated wrappers, bitcode registration, JIT codegen or SRE execution.
+
+Current evidence: `reports/rebase-233-20260916/` under the PR230 control root.
+The initial pipeline harness failures are retained: the wider EJitPgoTest TU
+requires code-pool APIs absent from this host configuration, and the first link
+lacked the same host libcall/AsmParser adapters already used by the runtime
+suite. The final focused build excludes that unrelated TU and uses those
+host-only adapters; production code was not changed to satisfy the harness.
+The older stress counts below describe the pre-rebase closeout, not new runs.
 
 ## Implemented Host Path
 
@@ -83,8 +120,8 @@ The latter retains strict-capture and corrected results separately.
 
 - Current-source AArch64 big-endian artifacts, ELF/dependency inspection,
   stable-wrapper comparison, cross-core permissions and actual board execution.
-- The PR230 single-C six-cell/twenty-entry board scenario and product
-  correctness/performance/resource acceptance from specification sections 9/11.
+- Execute the supplied PR230 single-C six-cell/twenty-entry board scenario;
+  product correctness/performance/resource acceptance from sections 9/11.
 - Bound-pointer representative source borrowing/shared-code support; current
   fallback is independent compilation, not a claim of shared support.
 - Broader whole-feature review and final commit organization before merge.
