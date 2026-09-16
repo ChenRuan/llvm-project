@@ -2080,6 +2080,24 @@ ejit_status_t ejit_representative_copy_scalar_profile(void *buffer, size_t capac
 #endif
 
 #ifdef EJIT_SRE_TASKPOOL_TESTING
+ejit_status_t ejit_representative_test_fail_member_tier2(uint32_t count) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (gEJIT && gEJIT->compileDriver()) {
+    gEJIT->compileDriver()->failMemberTier2ForTest(count);
+    return EJIT_OK;
+  }
+#endif
+  return EJIT_ERR_NOT_ACTIVE;
+}
+
+uint32_t ejit_representative_test_candidate_gate(uint32_t command) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (gEJIT && gEJIT->compileDriver())
+    return gEJIT->compileDriver()->candidateGateForTest(command);
+#endif
+  return UINT32_MAX;
+}
+
 ejit_status_t ejit_representative_test_fail_next_tier2(void) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (!gEJIT || !gEJIT->compileDriver()) return EJIT_ERR_NOT_ACTIVE;
@@ -2176,6 +2194,47 @@ static ejit_status_t representativeGroupStats(uint32_t groupIndex, ejit_represen
 #else
   return EJIT_OK;
 #endif
+}
+
+static_assert(sizeof(ejit_borrow_fence_t) == 4 * sizeof(uint32_t),
+              "borrow fence C ABI is four uint32 fields");
+
+ejit_status_t ejit_representative_deactivate_begin(const char *periodName,
+    uint32_t instanceId, ejit_borrow_fence_t *out) {
+  if (!periodName || !out || instanceId >= kEJitMaxInstances)
+    return EJIT_ERR_INVALID_PARAM;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (!gEJIT || !gEJIT->compileDriver() ||
+      !gEJIT->compileDriver()->representativeSharingActive()) return EJIT_ERR_NOT_ACTIVE;
+  const uint32_t Dim = EJitLifecycleRegistry::instance().lookup(periodName);
+  if (Dim == kEJitInvalidDimType) return EJIT_ERR_INVALID_PARAM;
+  const auto Status = ejit_deactivate(periodName, instanceId);
+  if (Status != EJIT_OK) return Status;
+  auto *Pool = activeTaskPool();
+  out->generation = Pool->state()->generation.loadAcquire();
+  out->dimType = Dim;
+  out->instanceId = instanceId;
+  out->version = Pool->instanceVersionPublic(Dim, instanceId);
+  return EJIT_OK;
+#else
+  return EJIT_ERR_NOT_ACTIVE;
+#endif
+}
+
+ejit_status_t ejit_representative_borrow_status(const ejit_borrow_fence_t *scope) {
+  if (!scope) return EJIT_ERR_INVALID_PARAM;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (!gEJIT || !gEJIT->compileDriver() ||
+      !gEJIT->compileDriver()->representativeSharingActive()) return EJIT_ERR_NOT_ACTIVE;
+  const auto Status = activeTaskPool()->instanceBorrowStatus(scope->dimType,
+      scope->instanceId, scope->generation, scope->version);
+  switch (Status) {
+  case EJitSharedTaskPool::BorrowScopeStatus::Complete: return EJIT_OK;
+  case EJitSharedTaskPool::BorrowScopeStatus::Pending: return EJIT_PENDING;
+  case EJitSharedTaskPool::BorrowScopeStatus::Invalid: return EJIT_ERR_INVALID_PARAM;
+  }
+#endif
+  return EJIT_ERR_NOT_ACTIVE;
 }
 
 ejit_status_t ejit_representative_get_stats(ejit_representative_stats_t *out) {

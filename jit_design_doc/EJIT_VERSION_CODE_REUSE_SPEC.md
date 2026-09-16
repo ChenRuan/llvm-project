@@ -1,6 +1,8 @@
 # EJIT 多版本代码复用方案
 
-更新：2026-09-10。状态：规格与实现跟踪稿；初始PR只有文档，尚未实现、构建或上板验收。
+更新：2026-09-16。状态：已接入实现并完成当前 host 回归，默认关闭，仍保持 Draft；
+尚未完成本功能的目标产物、上板和产品验收。初始 PR 仅有文档，后续实现与证据见
+[host 收尾记录](EJIT_CODE_REUSE_HOST_CLOSEOUT.md)及[实现跟踪](EJIT_CODE_REUSE_IMPLEMENTATION.md)。
 
 目标分支：`dongjianqiang2/llvm-project:ejit_dev_spec5`。
 个人开发分支：`ChenRuan/llvm-project:codex/ejit-spec5-code-reuse`。
@@ -743,7 +745,8 @@ bytes、L1I/L2I misses、ITLB、前端/后端停滞、吞吐和p99。命中率�
 - [LLVM StructuralHash接口范围](https://llvm.org/doxygen/IR_2StructuralHash_8h_source.html)
 - [LLVM ORCv2资源与materialization](https://llvm.org/docs/ORCv2.html)
 
-上游文档解释机制，不能替代本仓库/本目标验证。本稿无实现、构建、上板或性能结论。
+上游文档解释机制，不能替代本仓库/本目标验证。当前 host 实现与构建结论见收尾记录，
+不能据此宣称本功能已完成上板或性能验收。
 
 ## 11. 本PR交付跟踪
 

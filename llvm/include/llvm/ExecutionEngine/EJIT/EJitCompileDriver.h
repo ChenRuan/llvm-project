@@ -104,6 +104,14 @@ public:
   /// instead of the per-instance taskPool_.
   EJitSharedTaskPool *sharedTaskPool() { return &sharedPool_; }
 #ifdef EJIT_SRE_TASKPOOL_TESTING
+  void failMemberTier2ForTest(uint32_t Count) { failMemberT2_.storeRelease(Count); }
+  uint32_t candidateGateForTest(uint32_t Command) {
+    if (Command == 1)
+      candidateGate_.storeRelease(1);
+    else if (Command == 3)
+      candidateGate_.storeRelease(0);
+    return candidateGate_.loadAcquire();
+  }
   void failNextRepresentativeTier2ForTest() { failRepresentativeT2_.storeRelease(1); }
   void setRepresentativeTimeoutForTest(uint64_t Ticks, uint32_t MaxReelections) {
     repMaxReelections_.storeRelease(MaxReelections);
@@ -336,9 +344,13 @@ private:
   /// what proves both requests belong to the same sampling session.
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   EJitAtomicU32 failRepresentativeT2_{0};
+  EJitAtomicU32 candidateGate_{0};
+  EJitAtomicU32 failMemberT2_{0};
 #endif
   static bool representativeMaintenanceThunk(void *Ctx);
   bool serviceRepresentativeTimeouts();
+  bool serviceRepresentativeWaiters();
+  void completeCandidateBorrow(uint64_t LogicalKey, const EJitCompileRequest *Request = nullptr);
   EJitAtomicU64 repTimeoutTicks_{0};
   EJitAtomicU32 repMaxReelections_{0};
   std::unordered_map<uint64_t, uint32_t> repTimeoutCounts_;
@@ -352,6 +364,7 @@ private:
     uint32_t requestGeneration = 0;
     uint64_t logicalKey = 0;
     uint64_t lastProgressAt = 0;
+    EJitCompileRequest requestIdentity{};
   };
   std::vector<RepTier1Binding> repTier1Bindings_;
   /// Every waiter token this driver registered, so a coalesced/retried request
@@ -365,6 +378,10 @@ private:
   struct CandidateBinding {
     uint64_t groupId = 0;
     EJitCompileRequest request{};
+    bool finalReadPending = true;
+    bool finalFailed = false;
+    uint32_t finalFailures = 0;
+    uint64_t finalReadyAt = 0;
   };
   std::unique_ptr<EJitCandidateDirectory> candidateDirectory_;
   std::unordered_map<uint64_t, CandidateBinding> candidateBindings_;
