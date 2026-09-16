@@ -461,7 +461,10 @@ uint64_t EJitCompileDriver::candidateGroupKey(uint32_t funcIndex,
                 R.dims[I].instanceId == dims[I].instanceId &&
                 R.versions[I] == sharedPool_.instanceVersionPublic(
                     dims[I].dimType, dims[I].instanceId);
-    if (Current) Group = It->second.groupId;
+    const auto Failed = repFailedGroups_.find(It->second.groupId);
+    const bool Terminal = Failed != repFailedGroups_.end() && Failed->second;
+    if (Current && (It->second.finalReadPending || It->second.finalFailed || Terminal ||
+                    It->second.groupId == UINT64_MAX)) Group = It->second.groupId;
   }
   unlockRepGroups();
   return Group;
@@ -487,6 +490,13 @@ bool EJitCompileDriver::candidateClassifyThunk(void *Ctx,
 
 bool EJitCompileDriver::classifyRepresentativeRequest(const EJitCompileRequest &Req) {
   if (!repGroups_ || !candidateDirectory_ || !jitEngine_) return false;
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  uint32_t Armed = 1;
+  if (candidateGate_.compareExchange(Armed, 2)) {
+    while (candidateGate_.loadAcquire() == 2) {}
+    candidateGate_.storeRelease(0);
+  }
+#endif
   if (Req.numDims > kEJitMaxRequestDims) return false;
   for (unsigned I = 0; I < Req.numDims; ++I)
     if (Req.dims[I].instanceId > 255u) return false;
@@ -536,9 +546,12 @@ bool EJitCompileDriver::classifyRepresentativeRequest(const EJitCompileRequest &
         ++W;
       }
     }
-    candidateBindings_[LogicalKey] = CandidateBinding{Group, Req};
+    const bool NeedsFinalRead = Group != UINT64_MAX && !repFailedGroups_[Group];
+    candidateBindings_[LogicalKey] = CandidateBinding{Group, Req, NeedsFinalRead};
   }
+  const bool KeepBorrow = Current && candidateBindings_[LogicalKey].finalReadPending;
   unlockRepGroups();
+  if (Current && !KeepBorrow) sharedPool_.completeRequestBorrow(Req.attemptToken);
   EJIT_DIAG("candidate classified key=0x%016lx group=%llu current=%u no emit/no sampling",
             LogicalKey, static_cast<unsigned long long>(Group), Current);
   return Current;
@@ -551,7 +564,88 @@ EJitSharedTaskPool::SamplingAdmission EJitCompileDriver::samplingAdmissionThunk(
 }
 
 bool EJitCompileDriver::representativeMaintenanceThunk(void *Ctx) {
-  return static_cast<EJitCompileDriver *>(Ctx)->serviceRepresentativeTimeouts();
+  auto *Driver = static_cast<EJitCompileDriver *>(Ctx);
+  return Driver->serviceRepresentativeTimeouts() || Driver->serviceRepresentativeWaiters();
+}
+
+void EJitCompileDriver::completeCandidateBorrow(uint64_t Key,
+                                               const EJitCompileRequest *Request) {
+  uint64_t Token = 0;
+  lockRepGroups();
+  auto It = candidateBindings_.find(Key);
+  if (It != candidateBindings_.end() && It->second.finalReadPending) {
+    const auto &Original = It->second.request;
+    bool Same = !Request || (Original.generation == Request->generation &&
+                             Original.numDims == Request->numDims);
+    for (uint32_t I = 0; Same && Request && I < Original.numDims; ++I)
+      Same = Original.dims[I].dimType == Request->dims[I].dimType &&
+             Original.dims[I].instanceId == Request->dims[I].instanceId &&
+             Original.versions[I] == Request->versions[I];
+    if (Same) {
+      Token = Original.attemptToken;
+      It->second.finalReadPending = false;
+    }
+  }
+  unlockRepGroups();
+  if (Token) sharedPool_.completeRequestBorrow(Token);
+}
+
+bool EJitCompileDriver::serviceRepresentativeWaiters() {
+  if (!repGroups_) return false;
+  CandidateBinding Work;
+  uint64_t Key = 0;
+  bool Found = false;
+  lockRepGroups();
+  for (auto &C : candidateBindings_) {
+    if (!C.second.finalReadPending || C.second.groupId == UINT64_MAX ||
+        repFailedGroups_[C.second.groupId] || repRetiringGroups_[C.second.groupId]) continue;
+    auto G = repGroupHandles_.find(C.second.groupId);
+    if (G == repGroupHandles_.end()) continue;
+    const bool HasBundle = repGroups_->bundleFor(G->second) != nullptr;
+    // A cancelled/cold representative need not call again to unblock waiters.
+    // Elect one existing legal member; only actual business calls sample it.
+    if (HasBundle || !repGroups_->currentRepresentative(G->second)) {
+      if (HasBundle && !C.second.finalReadyAt)
+        C.second.finalReadyAt = ejit_taskpool_trace_now();
+      Work = C.second;
+      Key = C.first;
+      Found = true;
+      break;
+    }
+  }
+  unlockRepGroups();
+  if (!Found) return false;
+  const auto &R = Work.request;
+  bool Current = R.generation == sharedPool_.state()->generation.loadAcquire();
+  for (uint32_t I = 0; Current && I < R.numDims; ++I)
+    Current = R.versions[I] == sharedPool_.instanceVersionPublic(
+        R.dims[I].dimType, R.dims[I].instanceId);
+  if (!Current) {
+    completeCandidateBorrow(Key, &R);
+    return true;
+  }
+  const uint64_t Now = ejit_taskpool_trace_now();
+  if (Work.finalReadyAt && Now >= Work.finalReadyAt &&
+      Now - Work.finalReadyAt >= repTimeoutTicks_.loadAcquire()) {
+    lockRepGroups();
+    auto C = candidateBindings_.find(Key);
+    if (C != candidateBindings_.end() && C->second.request.attemptToken == R.attemptToken)
+      C->second.finalFailed = true;
+    unlockRepGroups();
+    completeCandidateBorrow(Key, &R);
+    EJIT_DIAG("member final wait timed out key=0x%016lx; source lease ended", Key);
+    return false; // queued stale work still drains and observes finalFailed
+  }
+  // This is owner scheduling after group publication/re-election, never execution:
+  // waiters have no private T1 and a representative's closed T1 routes AOT.
+  auto Result = sharedPool_.compileOrGet(stripReqTier(R.funcIndex), R.dims,
+                                         R.numDims, nullptr);
+  if (Result.hasReadToken) sharedPool_.releaseRead(Result.bucketIndex);
+  if (Result.status == EJitCompileOrGetStatus::CacheHit)
+    completeCandidateBorrow(Key, &R);
+  // Let pollOne consume an already queued request in this same worker step;
+  // otherwise a maintenance return of Consumed could starve its own work.
+  return false;
 }
 
 bool EJitCompileDriver::serviceRepresentativeTimeouts() {
@@ -562,7 +656,8 @@ bool EJitCompileDriver::serviceRepresentativeTimeouts() {
   uint64_t Key = 0;
   lockRepGroups();
   for (const auto &H : repGroupHandles_) {
-    if (repGroups_->bundleFor(H.second) || repRetiringGroups_[H.first] ||
+    if (repGroups_->bundleFor(H.second) ||
+        repGroups_->snapshot(H.second).hasPhysical || repRetiringGroups_[H.first] ||
         repFailedGroups_[H.first]) continue;
     const auto *Live = repGroups_->currentRepresentative(H.second);
     if (!Live || Live->dispatchCount >= Live->dispatchLimit) continue;
@@ -596,6 +691,19 @@ bool EJitCompileDriver::serviceRepresentativeTimeouts() {
               static_cast<unsigned long long>(H->second.groupId), Count,
               static_cast<unsigned>(repFailedGroups_[Key]));
   }
+  SmallVector<uint64_t, 8> Ended;
+  if (Cancelled) {
+    Ended.push_back(Expired.logicalKey);
+    if (repFailedGroups_[Key])
+      for (const auto &C : candidateBindings_)
+        if (C.second.groupId == Key && C.second.finalReadPending)
+          Ended.push_back(C.first);
+  }
+  unlockRepGroups();
+  for (uint64_t LogicalKey : Ended)
+    completeCandidateBorrow(LogicalKey, LogicalKey == Expired.logicalKey
+                                          ? &Expired.requestIdentity : nullptr);
+  lockRepGroups();
   repRetiringGroups_[Key] = false;
   unlockRepGroups();
   return Cancelled;
@@ -606,6 +714,10 @@ void EJitCompileDriver::refreshRepresentativeGroup(uint64_t GroupKey) {
   RepTier1Binding Binding;
   bool Found = false;
   lockRepGroups();
+  if (repRetiringGroups_[GroupKey]) {
+    unlockRepGroups();
+    return;
+  }
   auto It = repGroupHandles_.find(GroupKey);
   if (It != repGroupHandles_.end() && !repGroups_->bundleFor(It->second))
     for (const auto &B : repTier1Bindings_)
@@ -626,12 +738,22 @@ void EJitCompileDriver::refreshRepresentativeGroup(uint64_t GroupKey) {
   if (!Cancelled) return;
   lockRepGroups();
   It = repGroupHandles_.find(GroupKey);
-  if (It != repGroupHandles_.end() &&
+  bool Changed = false;
+  if (!repRetiringGroups_[GroupKey] && It != repGroupHandles_.end() &&
       It->second.generation == Binding.group.generation &&
       !repGroups_->bundleFor(It->second) &&
-      repGroups_->cancelRepresentative(It->second, Binding.session))
+      repGroups_->cancelRepresentative(It->second, Binding.session)) {
+    repRetiringGroups_[GroupKey] = true;
     ++It->second.generation;
+    Changed = true;
+  }
   unlockRepGroups();
+  if (Changed) {
+    completeCandidateBorrow(Binding.logicalKey, &Binding.requestIdentity);
+    lockRepGroups();
+    repRetiringGroups_[GroupKey] = false;
+    unlockRepGroups();
+  }
 }
 
 EJitSharedTaskPool::SamplingAdmission
@@ -649,6 +771,15 @@ EJitCompileDriver::admitSamplingRequest(uint32_t funcIndex,
   if (repRetiringGroups_[GroupKey] || repFailedGroups_[GroupKey]) {
     unlockRepGroups();
     return Admission::Deny;
+  }
+  auto Candidate = candidateBindings_.find(requestLogicalKey(funcIndex, dims, numDims));
+  if (Candidate != candidateBindings_.end() && Candidate->second.finalFailed) {
+    unlockRepGroups();
+    return Admission::Deny;
+  }
+  if (Candidate == candidateBindings_.end() || !Candidate->second.finalReadPending) {
+    unlockRepGroups();
+    return Admission::Classify;
   }
 
   // This request's per-cell logical identity: the exact cacheKey the wrapper
@@ -858,6 +989,7 @@ bool EJitCompileDriver::bindRepresentativeTier1(
   }
   Binding->requestAttemptToken = Request->attemptToken;
   Binding->requestGeneration = Request->generation;
+  Binding->requestIdentity = *Request;
   Binding->logicalKey = LogicalKey;
   Binding->lastProgressAt = ejit_taskpool_trace_now();
   if (OutSession)
@@ -1229,6 +1361,16 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
                                      const EJitCompileRequest *request) {
 #if defined(EJIT_SRE_SHARED_TASKPOOL) && defined(EJIT_SRE_TASKPOOL_TESTING)
   if (repGroups_ && tier == kEJitTierPgoUse) {
+    EJitSharedTaskPool::RequestAttemptSnapshot Status;
+    if (request && sharedPool_.requestAttemptStatus(request->attemptToken, Status) &&
+        !(Status.flags & EJitAttemptHoldsAdmission)) {
+      uint32_t Count = failMemberT2_.loadAcquire();
+      while (Count && !failMemberT2_.compareExchange(Count, Count - 1)) {}
+      if (Count) {
+        EJIT_DIAG("member Tier-2 test failure before final read");
+        return nullptr;
+      }
+    }
     uint32_t Armed = 1;
     if (failRepresentativeT2_.compareExchange(Armed, 0)) {
       EJIT_DIAG("representative Tier-2 test failure before profile capture");
@@ -2073,7 +2215,36 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
   EJIT_DIAG("compileNow dispatch func=%u key=0x%016lx dims=[%u,%u,%u,%u]",
             funcIdx, cacheKey, packedDims[0], packedDims[1], packedDims[2],
             packedDims[3]);
-  return compileCold(cacheKey, tier, /*storeLru=*/false, &req);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (repGroups_ && tier == kEJitTierPgoUse) {
+    lockRepGroups();
+    auto C = candidateBindings_.find(cacheKey);
+    const bool Failed = C != candidateBindings_.end() && C->second.finalFailed;
+    unlockRepGroups();
+    if (Failed) return nullptr; // raced a terminal decision: no new source read
+  }
+#endif
+  void *Fn = compileCold(cacheKey, tier, /*storeLru=*/false, &req);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (repGroups_ && tier == kEJitTierPgoUse) {
+    bool Terminal = false;
+    if (!Fn) {
+      EJitSharedTaskPool::RequestAttemptSnapshot Status;
+      if (sharedPool_.requestAttemptStatus(req.attemptToken, Status) &&
+          !(Status.flags & EJitAttemptHoldsAdmission)) {
+        lockRepGroups();
+        auto C = candidateBindings_.find(cacheKey);
+        if (C != candidateBindings_.end() && C->second.finalReadPending) {
+          Terminal = ++C->second.finalFailures > config_.representativeMaxFinalRetries;
+          C->second.finalFailed = Terminal;
+        }
+        unlockRepGroups();
+      }
+    }
+    if (Fn || Terminal) completeCandidateBorrow(cacheKey, &req);
+  }
+#endif
+  return Fn;
 }
 
 void EJitCompileDriver::notifyTaskpoolPgoLifecycleDrop(
@@ -2118,6 +2289,15 @@ void EJitCompileDriver::notifyTaskpoolPgoLifecycleDrop(
 
 void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
                                                 bool published) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (repGroups_ && published && decodeReqTier(req.funcIndex) == kEJitTierInstrumented) {
+    lockRepGroups();
+    for (auto &B : repTier1Bindings_)
+      if (B.requestAttemptToken == req.attemptToken && B.requestGeneration == req.generation)
+        B.lastProgressAt = ejit_taskpool_trace_now();
+    unlockRepGroups();
+  }
+#endif
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   const uint32_t AuditTier = decodeReqTier(req.funcIndex);
   if (AuditTier == kEJitTierInstrumented) {
@@ -2161,4 +2341,3 @@ void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
 #endif
 }
 #endif
-
