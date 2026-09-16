@@ -126,19 +126,26 @@ add_custom_target(check-ejit-taskpool
 # Cross-core SHARED taskpool tests: compile the shared sources directly with the
 # shared-taskpool macros so they build and run independently of LLVMEJIT and need
 # no real SRE platform symbols. Many cores are simulated in one host process via
-# the injectable EJitCoreId; no real thread is required. Only LLVMSupport is
-# linked (the gtest harness).
+# the injectable EJitCoreId; no real thread is required. Only LLVMSupport and
+# LLVMProfileData are linked (the gtest harness plus the production ProfileBundle
+# mapping helper exercised by EJitObservedT1DispatchTest.cpp); OrcJIT/EJIT are
+# never pulled in.
 set(EJIT_SHARED_TASKPOOL_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
-set(LLVM_LINK_COMPONENTS Support)
+set(LLVM_LINK_COMPONENTS Support ProfileData)
 add_llvm_unittest(EJITSharedTaskPoolTests
   EJitSharedTaskPoolTest.cpp
+  EJitObservedT1DispatchTest.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
   # Defines gEJitDiagLevel (the level gate behind every EJIT_DIAG* call in the
   # two sources above). Needed when the global EJIT_DIAG_ENABLE is ON: without
   # it the test binary fails to link, since this target deliberately links only
-  # LLVMSupport and never the full LLVMEJIT (which carries EJitLogger.cpp).
+  # LLVMSupport/LLVMProfileData and never the full LLVMEJIT (which carries
+  # EJitLogger.cpp).
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
+  # The production Tier-2 request -> ProfileBundle mapping helper
+  # (applyT1DispatchObservation) under test; it has no ORC/JIT dependency.
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitProfileMerge.cpp
 
   PARTIAL_SOURCES_INTENDED
   )

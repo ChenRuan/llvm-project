@@ -310,6 +310,38 @@ struct EJitSharedCacheSlot {
   /// that has not been reused after publish. The ABI field is always present;
   /// it is meaningful only when EJIT_STATS_ENABLE updates it.
   EJitAtomicU8 postPublishSeen;
+
+  /// Observed real Tier-1 dispatch boundary (v21, experimental sharing
+  /// contract). These fields belong to the exact attempt that published this
+  /// slot: they are (re)written under the bucket write lock before state=Ready,
+  /// together with attemptToken/generation, and reset to zero by a publish that
+  /// does not carry an observation. They are meaningful only while the slot's
+  /// attemptToken is nonzero (request attempts enabled).
+  ///
+  /// Admission (identity re-check + count CAS + quotaEnd freeze) is serialized
+  /// with every such write by the bucket observationLock (v22): the token build
+  /// already excludes publish/cancel through its read token, while the
+  /// NO_RECLAIM load-only reader holds none, so it needs that separate word.
+  ///
+  /// `t1DispatchLimit` is the admission quota copied from the shared Tier-2
+  /// threshold at publish time; 0 means "no trustworthy observation" (legacy
+  /// mode, PGO off, or a Tier-2 publish) and selects the legacy behavior.
+  EJitAtomicU32 t1DispatchLimit;
+  /// Number of Tier-1 dispatches actually GRANTED for this published code. A
+  /// dispatch is granted only when a live Tier-1 pointer is really handed back,
+  /// so identity hits rejected for shareability, a null pointer, a failed peer
+  /// preparation, or a seqlock retry never increment it. Incremented by CAS so
+  /// the limit is never exceeded.
+  EJitAtomicU64 t1DispatchCount;
+  /// Timestamp of the final allowed dispatch (the one that reaches the limit),
+  /// frozen exactly once under the same bucket observationLock as the count CAS
+  /// (the token build uses its bucket read token, which already excludes
+  /// publish/cancel), so a replacement attempt can never be stamped by its
+  /// predecessor. 0 means the timestamp is unknown/unobserved; it is never the
+  /// Tier-2 queue or compile time. The admission boundary itself is
+  /// `t1DispatchCount >= t1DispatchLimit`, so a missing clock never re-opens
+  /// admission.
+  EJitAtomicU64 t1QuotaEnd;
 };
 
 //===----------------------------------------------------------------------===//
@@ -330,6 +362,17 @@ struct alignas(kEJitSharedCacheLine) EJitSharedCacheBucket {
   /// counter). Only bumped in a NO_RECLAIM build; stays 0 otherwise, so the
   /// default token path is byte-for-byte unchanged.
   EJitAtomicU32 publishSeq;
+  /// Leaf exclusion for the observed Tier-1 dispatch contract (ABI v22). The
+  /// admission commit (identity re-check + count CAS + quotaEnd freeze) and
+  /// every publish/cancel/reset that rewrites a slot's observation identity
+  /// take this lock. It is a separate word the load-only reader never reads, so
+  /// taking it neither sets writeFlag nor bumps publishSeq: a granted observed
+  /// dispatch no longer invalidates a concurrent seqlock read (R1R-1). Lock
+  /// order: writeFlag -> observationLock, and it is a leaf (never held while
+  /// acquiring any other lock). It reuses the header padding, so every field
+  /// offset and sizeof() are unchanged. Unused (always 0) in the default token
+  /// build, where the bucket read token already excludes publish/cancel.
+  EJitAtomicU32 observationLock;
   EJitSharedCacheSlot slots[kEJitSharedCacheSlots];
 };
 
@@ -697,6 +740,13 @@ static_assert(alignof(EJitSharedTaskPoolState) == kEJitSharedCacheLine,
 static_assert(
     alignof(EJitSharedCacheBucket) == kEJitSharedCacheLine,
     "cache buckets must be cache-line aligned to avoid false sharing");
+// The v22 observationLock MUST stay in the bucket header padding: it may not
+// move the slot array or change the shared blob size (the ABI bump is for the
+// new exclusion semantics, not for a layout change).
+static_assert(offsetof(EJitSharedCacheBucket, observationLock) == 12,
+              "observationLock must reuse the bucket header padding");
+static_assert(offsetof(EJitSharedCacheBucket, slots) == 16,
+              "observationLock must not move the bucket slot array");
 static_assert(
     offsetof(EJitSharedTaskPoolState, magic) == 0,
     "magic must be the first word so a foreign/zero blob is rejected");

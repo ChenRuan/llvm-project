@@ -114,7 +114,17 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// v20: each cache slot records the exact request-attempt token that published
 /// it, allowing Tier-2 admission and cancellation to validate one full
 /// identity.
-constexpr uint32_t kEJitSharedAbiVersion = 20u;
+/// v21: each cache slot records the observed real Tier-1 dispatch boundary of
+/// its published Instrumented code (dispatch count, dispatch limit, quota-end
+/// timestamp) so the profile bundle reports an observation instead of the
+/// configured threshold or the Tier-2 compile time; EJitCompileRequest carries
+/// the frozen observation to the Tier-2 compile.
+/// v22: each cache bucket carries a separate observationLock (in the bucket
+/// header padding: no offset or size change) that serializes the observed
+/// admission commit against every publish/cancel/reset of a slot's observation
+/// identity. The NO_RECLAIM load-only seqlock reader never reads it, so an
+/// admitted dispatch no longer sets writeFlag or bumps publishSeq.
+constexpr uint32_t kEJitSharedAbiVersion = 22u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;
