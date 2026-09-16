@@ -127,6 +127,11 @@ constexpr uint32_t kEJitFixedWorkerCore = kEJitInvalidCoreId;
 // monotonic per-bucket publishSeq (odd while writing, even when done) that the
 // reader uses to detect and discard a read that raced a publish. The default
 // (token) build is unchanged: publishSeq is never touched.
+//
+// The observed-dispatch admission commit does NOT take this writer lock (ABI
+// v22): it uses the separate leaf observationLock below, which the load-only
+// reader never reads, so granting a dispatch cannot invalidate a concurrent
+// lookup. writeFlag/publishSeq remain reserved for real publishes/cancels.
 //===----------------------------------------------------------------------===//
 bool bucketTryRead(EJitSharedCacheBucket &b) {
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
@@ -204,6 +209,44 @@ void bucketWriteRelease(EJitSharedCacheBucket &b) {
 #endif
   b.writeFlag.storeRelease(0);
 }
+
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+//===----------------------------------------------------------------------===//
+// Observation exclusion for the observed Tier-1 dispatch contract (ABI v22).
+//
+// A NO_RECLAIM lookup holds no read token, so the bucket writer lock cannot
+// serialize the admission commit: taking it sets writeFlag and bumps
+// publishSeq, which is exactly the state a concurrent load-only reader uses to
+// discard its read (R1R-1). observationLock is a separate word that reader
+// never reads, so an admitted dispatch invalidates no lookup. It serializes the
+// observation identity of one bucket:
+//
+//   * admission (admitObservedT1Dispatch): identity re-check + count CAS +
+//     quotaEnd freeze as ONE critical section;
+//   * cachePublish: the target-slot identity/observation writes through
+//     state=Ready;
+//   * cancelRequestAttempt / cacheDropPending / cacheStage{BatchRequest,
+//     Pending}: every reset or rewrite of a slot's identity/observation fields;
+//   * enqueueTier2FromLookup: the coherent count/quotaEnd read.
+//
+// Lock order: bucket writeFlag -> observationLock. observationLock is a LEAF: a
+// holder performs bounded atomic field work only and never acquires another
+// lock, so a waiter spins for a bounded duration and admission cannot deadlock
+// against a publish/cancel that holds writeFlag. The default token build never
+// takes it (the committed lookup holds the bucket read token and publish/cancel
+// drain readers), so the word stays 0 there.
+//===----------------------------------------------------------------------===//
+void bucketObservationLock(EJitSharedCacheBucket &b) {
+  uint32_t expected = 0;
+  while (!b.observationLock.compareExchange(expected, 1)) {
+    expected = 0;
+    cpuRelax();
+  }
+}
+void bucketObservationUnlock(EJitSharedCacheBucket &b) {
+  b.observationLock.storeRelease(0);
+}
+#endif
 
 constexpr uint32_t kReady = static_cast<uint32_t>(EJitSharedInitState::Ready);
 
@@ -1338,6 +1381,12 @@ bool EJitSharedTaskPool::cancelRequestAttempt(uint64_t Token,
   A->flags.storeRelaxed(Flags);
   A->terminalReason.storeRelaxed(static_cast<uint32_t>(Reason));
 
+  // Observation exclusion (v22): writeFlag alone no longer excludes a committed
+  // admission (which takes the leaf observationLock without writeFlag), so the
+  // identity/observation reset below must hold that same lock.
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationLock(Bucket);
+#endif
   for (EJitSharedCacheSlot &Slot : Bucket.slots) {
     if (Slot.state.loadRelaxed() !=
             static_cast<uint32_t>(EJitSharedSlotState::Ready) ||
@@ -1359,6 +1408,9 @@ bool EJitSharedTaskPool::cancelRequestAttempt(uint64_t Token,
     state_->dispatchEpoch.fetchAdd(1);
     break;
   }
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationUnlock(Bucket);
+#endif
   if (!HeldAdmission)
     maybeRetireAttemptLocked(state_, *A);
   requestAttemptUnlock(state_);
@@ -1694,6 +1746,7 @@ EJitSharedTaskPool::cacheLookupSeq(uint32_t funcIndex, const EJitDimPair *dims,
     // Validate that the scan + resolve observed a single stable publish epoch.
     // A cold peer preparation (coldPrepared) re-validates itself and may
     // legally span a publish, so it is exempt from the outer seq re-check.
+    fireSeqlockRetryHook(bucket);
     if (hit.fnPtr && !hit.coldPrepared && !bucketSeqStable(B, seq0)) {
       cpuRelax();
       continue; // publish raced the read -> retry
@@ -1742,6 +1795,7 @@ EJitSharedTaskPool::cacheLookupSeq0D(uint32_t funcIndex) {
       hit = resolveMatchedSlot(B, bucket, s);
       break;
     }
+    fireSeqlockRetryHook(bucket);
     if (hit.fnPtr && !hit.coldPrepared && !bucketSeqStable(B, seq0)) {
       cpuRelax();
       continue;
@@ -1786,6 +1840,7 @@ EJitSharedTaskPool::cacheLookupSeq1D(uint32_t funcIndex, uint32_t dim0,
       hit = resolveMatchedSlot(B, bucket, s);
       break;
     }
+    fireSeqlockRetryHook(bucket);
     if (hit.fnPtr && !hit.coldPrepared && !bucketSeqStable(B, seq0)) {
       cpuRelax();
       continue;
@@ -1837,6 +1892,7 @@ EJitSharedTaskPool::cacheLookupSeq2D(uint32_t funcIndex, uint32_t dim0,
       hit = resolveMatchedSlot(B, bucket, s);
       break;
     }
+    fireSeqlockRetryHook(bucket);
     if (hit.fnPtr && !hit.coldPrepared && !bucketSeqStable(B, seq0)) {
       cpuRelax();
       continue;
@@ -1873,21 +1929,26 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
     uint8_t slotTier = Slot.tier.loadRelaxed();
     if (slotTier < kEJitTierPgoUse) {
       uint32_t threshold = state_->tier2Threshold.loadAcquire();
-      uint64_t sampleIndex = 0;
-      if (slotTier == kEJitTierInstrumented && threshold) {
-        // Cap Tier-1 execution at the requested number of root samples. A
-        // plain fetchAdd lets peer cores overshoot, and continuing to dispatch
-        // Tier-1 while a large Tier-2 waits/compiles keeps every instrumented
-        // function in that module doing atomic counter updates for no benefit.
+      // Experimental sharing contract (v21): when this published Tier-1 slot
+      // carries an observed-dispatch quota, the admission boundary is the real
+      // granted-dispatch count, committed at the single granted-return point
+      // (classifyHit). hitCount keeps its legacy identity-hit/hotness meaning
+      // and no longer decides the boundary in this mode. Rejected lookups (no
+      // shareable pointer, failed peer preparation, seqlock retry) therefore
+      // consume no quota.
+      if (captureT1Observation(Slot, R)) {
+        // Legacy hotness/stats: unchanged raw identity-hit semantics, capped
+        // at the configured threshold exactly like the legacy path.
         uint64_t observed = Slot.hitCount.loadRelaxed();
         while (observed < threshold &&
                !Slot.hitCount.compareExchange(observed, observed + 1)) {
         }
-        if (observed >= threshold) {
-          // Retry the enqueue on every saturated lookup if a previous attempt
-          // lost to queue pressure. dedupMark makes the normal pending case a
-          // cheap no-op. The slot and Tier-1 code remain intact because Tier-2
-          // profile synthesis still reads their counter storage.
+        if (R.t1DispatchCount >= R.t1DispatchLimit) {
+          // The observed quota is already closed: grant no Tier-1 dispatch and
+          // keep the Tier-2 retry armed (a previous enqueue may have lost to
+          // queue pressure). The slot and Tier-1 code stay intact because the
+          // profile snapshot still reads their counter storage.
+          R.t1Observation = false;
           R.slot = &Slot;
           R.tier2Arm = true;
           R.tier2BucketIndex = bucket;
@@ -1899,49 +1960,83 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
           R.pgoSamplingComplete = true;
           return R;
         }
-        sampleIndex = observed + 1;
-      } else {
-        sampleIndex = Slot.hitCount.fetchAdd(1) + 1;
-      }
-      uint32_t admissionSlot = kEJitSharedMaxConcurrentProfiles;
-      if (slotTier == kEJitTierInstrumented && threshold) {
-        const uint32_t encoded = Slot.funcIndex + 1;
-        for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
-          if (state_->pgoActiveFunctions[i].loadAcquire() == encoded) {
-            admissionSlot = i;
-            break;
-          }
-        }
-      }
-      if (admissionSlot != kEJitSharedMaxConcurrentProfiles) {
-        uint32_t quarter = static_cast<uint32_t>(
-            std::min<uint64_t>(4, (sampleIndex * 4) / threshold));
-        uint32_t oldQuarter =
-            state_->pgoProgressQuarters[admissionSlot].loadRelaxed();
-        while (quarter > oldQuarter &&
-               !state_->pgoProgressQuarters[admissionSlot].compareExchange(
-                   oldQuarter, quarter)) {
-        }
-        if (quarter > oldQuarter)
-          EJIT_DIAG("PGO profile progress func=%u: %llu/%u", Slot.funcIndex,
-                    static_cast<unsigned long long>(sampleIndex), threshold);
-      }
-      // >= (not ==): if the enqueue fails (queue full / already pending),
-      // the next hit can still arm — a transient failure is not fatal (§7).
-      if (threshold && sampleIndex >= threshold) {
-        // Preserve the fixed slot address even when this producer cannot read
-        // the cross-core code pointer. tryCacheHit() performs the deferred
-        // enqueue after lookup so a bound call can attach its descriptors.
-        R.slot = &Slot;
-        R.tier2Arm = true;
+        // Admission is still open. Hand the exact publish identity and the
+        // frozen observation to the committed-return point; only that point may
+        // grant the dispatch, freeze the boundary, or claim Tier-2.
         R.tier2BucketIndex = bucket;
         R.tier2SlotIndex = slotIndex;
         R.tier2AttemptToken = Slot.attemptToken;
-        if (slotTier == kEJitTierInstrumented && sampleIndex == threshold)
-          EJIT_DIAG("PGO sampling complete func=%u: %llu/%u; routing AOT "
-                    "until Tier-2 publish",
-                    Slot.funcIndex,
-                    static_cast<unsigned long long>(sampleIndex), threshold);
+      } else {
+        uint64_t sampleIndex = 0;
+        if (slotTier == kEJitTierInstrumented && threshold) {
+          // Cap Tier-1 execution at the requested number of root samples. A
+          // plain fetchAdd lets peer cores overshoot, and continuing to dispatch
+          // Tier-1 while a large Tier-2 waits/compiles keeps every instrumented
+          // function in that module doing atomic counter updates for no benefit.
+          uint64_t observed = Slot.hitCount.loadRelaxed();
+          while (observed < threshold &&
+                 !Slot.hitCount.compareExchange(observed, observed + 1)) {
+          }
+          if (observed >= threshold) {
+            // Retry the enqueue on every saturated lookup if a previous attempt
+            // lost to queue pressure. dedupMark makes the normal pending case a
+            // cheap no-op. The slot and Tier-1 code remain intact because Tier-2
+            // profile synthesis still reads their counter storage.
+            R.slot = &Slot;
+            R.tier2Arm = true;
+            R.tier2BucketIndex = bucket;
+            R.tier2SlotIndex = slotIndex;
+            R.tier2AttemptToken = Slot.attemptToken;
+#ifndef EJIT_SRE_TASKPOOL_NO_RECLAIM
+            bucketReadRelease(B);
+#endif
+            R.pgoSamplingComplete = true;
+            return R;
+          }
+          sampleIndex = observed + 1;
+        } else {
+          sampleIndex = Slot.hitCount.fetchAdd(1) + 1;
+        }
+        uint32_t admissionSlot = kEJitSharedMaxConcurrentProfiles;
+        if (slotTier == kEJitTierInstrumented && threshold) {
+          const uint32_t encoded = Slot.funcIndex + 1;
+          for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
+            if (state_->pgoActiveFunctions[i].loadAcquire() == encoded) {
+              admissionSlot = i;
+              break;
+            }
+          }
+        }
+        if (admissionSlot != kEJitSharedMaxConcurrentProfiles) {
+          uint32_t quarter = static_cast<uint32_t>(
+              std::min<uint64_t>(4, (sampleIndex * 4) / threshold));
+          uint32_t oldQuarter =
+              state_->pgoProgressQuarters[admissionSlot].loadRelaxed();
+          while (quarter > oldQuarter &&
+                 !state_->pgoProgressQuarters[admissionSlot].compareExchange(
+                     oldQuarter, quarter)) {
+          }
+          if (quarter > oldQuarter)
+            EJIT_DIAG("PGO profile progress func=%u: %llu/%u", Slot.funcIndex,
+                      static_cast<unsigned long long>(sampleIndex), threshold);
+        }
+        // >= (not ==): if the enqueue fails (queue full / already pending),
+        // the next hit can still arm — a transient failure is not fatal (§7).
+        if (threshold && sampleIndex >= threshold) {
+          // Preserve the fixed slot address even when this producer cannot read
+          // the cross-core code pointer. tryCacheHit() performs the deferred
+          // enqueue after lookup so a bound call can attach its descriptors.
+          R.slot = &Slot;
+          R.tier2Arm = true;
+          R.tier2BucketIndex = bucket;
+          R.tier2SlotIndex = slotIndex;
+          R.tier2AttemptToken = Slot.attemptToken;
+          if (slotTier == kEJitTierInstrumented && sampleIndex == threshold)
+            EJIT_DIAG("PGO sampling complete func=%u: %llu/%u; routing AOT "
+                      "until Tier-2 publish",
+                      Slot.funcIndex,
+                      static_cast<unsigned long long>(sampleIndex), threshold);
+        }
       }
     }
   }
@@ -2013,8 +2108,22 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
   // Cold: this core has never prepared this code. Preserve the Tier-2 signal
   // across the out-of-line execute-permission preparation; the producer may
   // need to attach bound descriptors before enqueueing the recompile.
+  // peerPrepareSlot() re-validates the slot under the build's bucket exclusion
+  // and fills the exact publish coordinates into the lookup it returns, so the
+  // deferred claim (including the final observed admission) survives this path
+  // unchanged.
   SharedLookup Prepared = peerPrepareSlot(B, bucket, slotIndex);
-  Prepared.tier2Arm = R.tier2Arm;
+  // R2R-01: only a real prepared hit may carry the deferred arm. A failed
+  // preparation returns a clean fallback with the DEFAULT coordinates (bucket
+  // 0 / slot 0); propagating tier2Arm there would claim an unrelated Ready
+  // entry in bucket 0 on a documented failure path (legacy attempts-OFF). The
+  // saturated legacy lookup re-arms on its next identity hit, so dropping this
+  // one signal loses no retry, and no quota is consumed.
+  const bool PreparedHit =
+      Prepared.fnPtr != nullptr &&
+      Prepared.tier2BucketIndex < kEJitSharedCacheBuckets &&
+      Prepared.tier2SlotIndex < kEJitSharedCacheSlots;
+  Prepared.tier2Arm = R.tier2Arm && PreparedHit;
   return Prepared;
 }
 
@@ -2061,6 +2170,25 @@ void EJitSharedTaskPool::enqueueTier2FromLookup(
     T2.dims[I] = Slot.dims[I];
     T2.versions[I] = Slot.versions[I];
   }
+  // Experimental sharing contract (v21): carry the frozen observed dispatch
+  // boundary of THIS exact published attempt into the Tier-2 request. Validated
+  // under the bucket lock, then read under the bucket observationLock (v22, the
+  // same exclusion the admission commit uses for its count CAS + quotaEnd
+  // freeze), so a closed-quota lookup can only capture the frozen pair and a
+  // reusable slot address cannot supply another attempt's observation. The
+  // lock is released before requestAttemptLock/queuePush below (leaf-first lock
+  // order). A queue-full retry rebuilds the request from the same frozen
+  // fields, so count/quotaEnd survive unchanged. All zero when the slot carries
+  // no observation (legacy mode or a Tier-2 publish).
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationLock(Bucket);
+#endif
+  T2.t1DispatchCount = Slot.t1DispatchCount.loadRelaxed();
+  T2.t1QuotaEnd = Slot.t1QuotaEnd.loadRelaxed();
+  T2.t1DispatchLimit = Slot.t1DispatchLimit.loadRelaxed();
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationUnlock(Bucket);
+#endif
   bool Claimed = false;
   if (TrackAttempt) {
     T2.attemptToken = Slot.attemptToken;
@@ -2242,6 +2370,7 @@ EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
   Snap.funcIndex = Slot.funcIndex;
   Snap.numDims = Slot.numDims;
   Snap.generation = Slot.generation;
+  Snap.attemptToken = Slot.attemptToken;
   for (uint32_t i = 0; i < Snap.numDims && i < 4; ++i) {
     Snap.dims[i] = Slot.dims[i];
     Snap.versions[i] = Slot.versions[i];
@@ -2306,6 +2435,34 @@ EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
     S2.executableCoreMask.fetchOr(CoreBit);
   R.fnPtr = Snap.fn;
   R.slot = &S2;
+  // Exact validated publish identity of the code we are handing back: the
+  // deferred Tier-2 claim (the final observed admission, or a closed-quota /
+  // legacy retry) re-validates THIS attempt under the bucket lock. The cold
+  // path returns a different SharedLookup than resolveMatchedSlot's snapshot,
+  // so the coordinates must be filled here or the final real dispatch reaches
+  // classifyHit with zero coordinates and its Tier-2 request is silently
+  // dropped (R2-PR230-01).
+  R.tier2BucketIndex = Snap.bucket;
+  R.tier2SlotIndex = Snap.slotIndex;
+  R.tier2AttemptToken = Snap.attemptToken;
+  // Observed Tier-1 dispatch contract (v21): a cold peer preparation that
+  // succeeds hands back a real Tier-1 pointer, so it must be counted at the
+  // committed-return point like the owner/memoized paths. Re-snapshot the
+  // RE-VALIDATED slot identity (not the pre-drop snapshot) so a dispatch can
+  // never be attributed to a publish that replaced the slot during the
+  // platform preparation. A failed preparation returns above without this, so
+  // it consumes no quota.
+  (void)captureT1Observation(S2, R);
+  // Pin the observation identity to the SNAPSHOT publish whose pointer is
+  // returned. captureT1Observation re-reads the load-only slot, so in
+  // NO_RECLAIM a republish landing between the re-validation and the capture
+  // could supply the replacement attempt's token/count. The commit re-checks
+  // this identity under the bucket writer lock and fails closed
+  // (IdentityChanged) instead of attributing the old code's dispatch to the
+  // replacement (R1-3); the token build's read lock already excludes that
+  // republish.
+  R.t1SlotAttemptToken = Snap.attemptToken;
+  R.t1SlotGeneration = Snap.generation;
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
   // NO_RECLAIM: this cold path already fully re-validated
   // identity/versions/fnPtr above under a load-only re-read, so it hands back a
@@ -2857,6 +3014,12 @@ EJitSharedTaskPool::cacheStageBatchRequest(const EJitCompileRequest &req) {
     return EJitPublishStatus::Failed;
   }
 
+  // Observation exclusion (v22): a staged target is reset to Pending with a new
+  // identity, so an in-flight admission commit on a reused slot address must be
+  // serialized with it.
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationLock(B);
+#endif
   Target->state.storeRelease(
       static_cast<uint32_t>(EJitSharedSlotState::Publishing));
   Target->funcIndex = FuncIndex;
@@ -2877,6 +3040,9 @@ EJitSharedTaskPool::cacheStageBatchRequest(const EJitCompileRequest &req) {
   Target->fnPtr.storeRelease(0);
   Target->state.storeRelease(
       static_cast<uint32_t>(EJitSharedSlotState::Pending));
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationUnlock(B);
+#endif
   bucketWriteRelease(B);
   return EJitPublishStatus::Published;
 }
@@ -2926,6 +3092,11 @@ EJitSharedTaskPool::cacheStagePending(const EJitCompileRequest &req,
     return EJitPublishStatus::Failed;
   }
 
+  // Observation exclusion (v22): the target may be a Ready victim, so the
+  // identity rewrite must not interleave with an admission commit.
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationLock(B);
+#endif
   void *OldFn = reinterpret_cast<void *>(Target->fnPtr.loadAcquire());
   Target->state.storeRelease(
       static_cast<uint32_t>(EJitSharedSlotState::Publishing));
@@ -2948,6 +3119,9 @@ EJitSharedTaskPool::cacheStagePending(const EJitCompileRequest &req,
   Target->state.storeRelease(
       static_cast<uint32_t>(EJitSharedSlotState::Pending));
   state_->dispatchEpoch.fetchAdd(1);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationUnlock(B);
+#endif
   bucketWriteRelease(B);
 
   if (releaseFn_ && OldFn && OldFn != fnPtr)
@@ -2962,6 +3136,11 @@ void EJitSharedTaskPool::cacheDropPending(const EJitCompileRequest &req,
   EJitSharedCacheBucket &B =
       state_->buckets[static_cast<uint32_t>(Key % kEJitSharedCacheBuckets)];
   bucketWrite(B);
+  // Observation exclusion (v22): drop the staged identity under the same leaf
+  // lock as admission/publish, so a reused slot address is never half-reset.
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationLock(B);
+#endif
   for (uint32_t S = 0; S < kEJitSharedCacheSlots; ++S) {
     EJitSharedCacheSlot &Slot = B.slots[S];
     if (Slot.state.loadAcquire() !=
@@ -2985,6 +3164,9 @@ void EJitSharedTaskPool::cacheDropPending(const EJitCompileRequest &req,
     state_->dispatchEpoch.fetchAdd(1);
     break;
   }
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationUnlock(B);
+#endif
   bucketWriteRelease(B);
 }
 
@@ -3069,6 +3251,13 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
     }
   }
 
+  // Observation exclusion (v22): this writes the slot's identity and its
+  // observed quota (including the state=Ready publish), so it must not
+  // interleave with an admission commit that validated the previous publish.
+  // Lock order: writeFlag -> (requestAttemptLock) -> observationLock (leaf).
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationLock(B);
+#endif
   void *oldFn = reinterpret_cast<void *>(target->fnPtr.loadAcquire());
 
   target->state.storeRelease(
@@ -3131,6 +3320,20 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   // slots (§4 repeat-trigger).  Under the write lock + before state=Ready.
   target->hitCount.storeRelaxed(0);
   target->tier.storeRelaxed(static_cast<uint8_t>(tier));
+  // Experimental sharing contract (v21): bind the observed-dispatch quota to
+  // THIS exact published attempt. Only a Tier-1 publish under the request-
+  // attempt protocol carries an observation; every other publish leaves the
+  // limit at 0 (legacy behavior), so the bundle can never report a count or a
+  // quota-end time that was not observed. Written under the write lock before
+  // state=Ready, with the token/generation written just above.
+  const bool ObserveT1 =
+      tier == kEJitTierInstrumented &&
+      state_->requestAttemptsEnabled.loadAcquire() != 0 &&
+      state_->pgoEnabled.loadAcquire() != 0;
+  target->t1DispatchLimit.storeRelaxed(
+      ObserveT1 ? state_->tier2Threshold.loadAcquire() : 0u);
+  target->t1DispatchCount.storeRelaxed(0);
+  target->t1QuotaEnd.storeRelaxed(0);
   target->postPublishSeen.storeRelaxed(0);
   const uint32_t OwnerCore = state_->ownerCoreId.loadAcquire();
   target->executableCoreMask.storeRelease(
@@ -3138,6 +3341,9 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   target->state.storeRelease(static_cast<uint32_t>(EJitSharedSlotState::Ready));
   // Published a new fnPtr, or evicted the slot that held one.
   state_->dispatchEpoch.fetchAdd(1);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationUnlock(B);
+#endif
   if (AttemptLocked)
     requestAttemptUnlock(state_);
   bucketWriteRelease(B);
@@ -3351,6 +3557,9 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
     st->buckets[b].writeFlag.storeRelaxed(0);
     st->buckets[b].readers.storeRelaxed(0);
     st->buckets[b].publishSeq.storeRelaxed(0); // even => no publish in flight
+    // Observed-dispatch exclusion (ABI v22): a reused blob must never inherit a
+    // held observation lock from an aborted generation.
+    st->buckets[b].observationLock.storeRelaxed(0);
     for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
       EJitSharedCacheSlot &Slot = st->buckets[b].slots[s];
       Slot.state.storeRelaxed(
@@ -3387,6 +3596,12 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
       Slot.hitCount.storeRelaxed(0);
       Slot.tier.storeRelaxed(0);
       Slot.postPublishSeen.storeRelaxed(0);
+      // Observed Tier-1 dispatch boundary (ABI v21): cleared so a re-init
+      // cannot attribute a prior generation's dispatches or quota-end time to
+      // a new attempt that reuses this slot address.
+      Slot.t1DispatchLimit.storeRelaxed(0);
+      Slot.t1DispatchCount.storeRelaxed(0);
+      Slot.t1QuotaEnd.storeRelaxed(0);
     }
   }
 }
@@ -3631,11 +3846,194 @@ void EJitSharedTaskPool::ownerShutdown() {
 //===----------------------------------------------------------------------===//
 // Producer path (§5.2).
 //===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
+// Observed Tier-1 dispatch admission (v21, experimental sharing contract).
+//
+// The ONLY place a real Tier-1 dispatch is counted. classifyHit() is reached
+// once per committed lookup, after every shareability/pointer/peer-preparation
+// gate and after the NO_RECLAIM seqlock validated the read, so a lookup that
+// was rejected or abandoned consumes no quota and a seqlock retry cannot
+// double-count. The CAS caps the count at the frozen limit; the dispatch that
+// reaches the limit freezes quotaEnd exactly once.
+//
+// Attempt isolation: the identity re-check, the admission CAS and the quotaEnd
+// freeze must form ONE critical section with respect to cachePublish() /
+// cancelRequestAttempt(), otherwise a replacement attempt can absorb a stale
+// count or be stamped with the previous attempt's timestamp (R1-1/R2-PR230-02).
+// The token build already has that exclusion: the committed lookup holds the
+// bucket read token, and a publish drains readers. NO_RECLAIM holds no token and
+// must NOT take the bucket writer lock: that sets writeFlag and bumps
+// publishSeq, which is exactly what invalidates a concurrent load-only reader
+// (R1R-1). It takes the separate leaf observationLock instead (ABI v22), which
+// every publish/cancel/reset of the same bucket also takes around its identity
+// writes. The lock is released before the Tier-2 enqueue (which takes writeFlag
+// and then observationLock in that order), so there is no lock upgrade and no
+// reacquisition deadlock.
+//===----------------------------------------------------------------------===//
+bool EJitSharedTaskPool::captureT1Observation(const EJitSharedCacheSlot &Slot,
+                                              SharedLookup &R) const {
+  // Active only while the observed contract is armed (online PGO with a
+  // nonzero threshold), for a slot that is still a live Instrumented publish
+  // carrying an observed quota. A Tier-2 publish, a legacy tokenless publish
+  // and a PGO-off pool all leave t1DispatchLimit at 0, so they keep the
+  // legacy identity-hit behavior and never report an observed dispatch.
+  if (!state_ || state_->pgoEnabled.loadAcquire() == 0 ||
+      state_->tier2Threshold.loadAcquire() == 0 ||
+      Slot.tier.loadRelaxed() != kEJitTierInstrumented ||
+      Slot.t1DispatchLimit.loadRelaxed() == 0)
+    return false;
+  R.t1Observation = true;
+  R.t1SlotAttemptToken = Slot.attemptToken;
+  R.t1SlotGeneration = Slot.generation;
+  R.t1DispatchCount = Slot.t1DispatchCount.loadRelaxed();
+  R.t1QuotaEnd = Slot.t1QuotaEnd.loadRelaxed();
+  R.t1DispatchLimit = Slot.t1DispatchLimit.loadRelaxed();
+  return true;
+}
+
+EJitSharedTaskPool::T1DispatchOutcome
+EJitSharedTaskPool::admitObservedT1Dispatch(const SharedLookup &Hit) {
+  if (!Hit.t1Observation || !Hit.slot)
+    return T1DispatchOutcome::NotApplicable;
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  // No read token exists in this build, so take the bucket observationLock: the
+  // identity re-check, the admission CAS and the freeze below cannot be
+  // interleaved by a cancel/republish of the same slot address, and unlike the
+  // writer lock this leaves writeFlag/publishSeq untouched, so a concurrent
+  // load-only lookup is never invalidated by a granted dispatch (R1R-1). The
+  // observation snapshot always carries the exact coordinates of the publish it
+  // was captured from (resolveMatchedSlot/peerPrepareSlot); a hit without them
+  // cannot be committed safely and is reported as a changed identity, so the
+  // pointer is still returned but nothing is attributed.
+  if (Hit.tier2BucketIndex >= kEJitSharedCacheBuckets ||
+      Hit.tier2SlotIndex >= kEJitSharedCacheSlots)
+    return T1DispatchOutcome::IdentityChanged;
+  EJitSharedCacheBucket &Bucket = state_->buckets[Hit.tier2BucketIndex];
+  bucketObservationLock(Bucket);
+  const T1DispatchOutcome Outcome = admitObservedT1DispatchLocked(Hit);
+  bucketObservationUnlock(Bucket);
+  return Outcome;
+#else
+  // The committed lookup holds the bucket read token across this call, and a
+  // publish/cancel drains readers, so the identity is already exact here.
+  return admitObservedT1DispatchLocked(Hit);
+#endif
+}
+
+EJitSharedTaskPool::T1DispatchOutcome
+EJitSharedTaskPool::admitObservedT1DispatchLocked(const SharedLookup &Hit) {
+  EJitSharedCacheSlot &Slot = *Hit.slot;
+  // Exact-identity guard, evaluated INSIDE the observation exclusion (read token
+  // in the token build, bucket observationLock in NO_RECLAIM): the slot cannot
+  // be republished between this check and the CAS/freeze below, so a dispatch is
+  // never attributed to a replacement attempt and a stale attempt never writes
+  // into the replacement's counter or timestamp. The pointer itself is still
+  // safe to return (NO_RECLAIM never frees code).
+  //
+  // The guard re-checks the exact pointer being returned AND the publish
+  // identity snapshotted with it, so a NO_RECLAIM republish that landed during
+  // the cold peer preparation (mixed pointer/token snapshot) fails closed
+  // instead of counting old code against the replacement attempt (R1-3).
+  const uint64_t Limit = Slot.t1DispatchLimit.loadAcquire();
+  if (Limit == 0 || Slot.attemptToken != Hit.t1SlotAttemptToken ||
+      Slot.generation != Hit.t1SlotGeneration ||
+      Slot.tier.loadRelaxed() != kEJitTierInstrumented ||
+      reinterpret_cast<void *>(Slot.fnPtr.loadAcquire()) != Hit.fnPtr)
+    return T1DispatchOutcome::IdentityChanged;
+  uint64_t Cur = Slot.t1DispatchCount.loadAcquire();
+  for (;;) {
+    if (Cur >= Limit)
+      return T1DispatchOutcome::Exhausted;
+    if (Slot.t1DispatchCount.compareExchange(Cur, Cur + 1))
+      break;
+  }
+  const uint64_t Admitted = Cur + 1;
+  // Diagnostic progress quarter for this real admission (the legacy path
+  // updated it from the identity-hit counter; the observed count is the honest
+  // progress signal under the sharing contract).
+  const uint32_t Encoded = Slot.funcIndex + 1;
+  for (uint32_t I = 0; I < kEJitSharedMaxConcurrentProfiles; ++I) {
+    if (state_->pgoActiveFunctions[I].loadAcquire() != Encoded)
+      continue;
+    const uint32_t Quarter = static_cast<uint32_t>(
+        std::min<uint64_t>(4, (Admitted * 4) / Limit));
+    uint32_t Old = state_->pgoProgressQuarters[I].loadRelaxed();
+    while (Quarter > Old &&
+           !state_->pgoProgressQuarters[I].compareExchange(Old, Quarter)) {
+    }
+    if (Quarter > Old)
+      EJIT_DIAG("PGO profile progress func=%u: %llu/%llu", Slot.funcIndex,
+                static_cast<unsigned long long>(Admitted),
+                static_cast<unsigned long long>(Limit));
+    break;
+  }
+  if (Admitted == Limit) {
+    // The final allowed dispatch freezes the admission boundary exactly once:
+    // the CAS above never admits another dispatch past the limit, no later
+    // lookup can rewrite this timestamp, and the exclusion above keeps a
+    // replacement attempt from being stamped with it. The clock is injectable;
+    // when none is configured the timestamp stays 0 (unknown) rather than
+    // fabricated. It is a local timestamp source called under the exclusion, so
+    // it must not block on another core's cache admission; test clock gates use
+    // bounded waits for exactly that reason.
+    //
+    // Visibility: NO_RECLAIM freezes under the bucket observationLock and
+    // enqueueTier2FromLookup() re-reads the frozen fields under that same lock,
+    // so a closed-quota lookup either claims after this store (carrying the
+    // value) or before the CAS (impossible: it only arms at the limit). The
+    // token build holds only a shared read token, so a concurrent closed-quota
+    // claim may still win the Tier-2 dedup between the CAS and this store and
+    // queue a request with quotaEnd 0; that is reported as an unknown timestamp
+    // (FrozenAtQuota + quotaEnd 0), never as a queue/compile time and never as
+    // another attempt's value.
+    Slot.t1QuotaEnd.storeRelease(traceNow());
+    EJIT_DIAG("PGO sampling complete func=%u: observed %llu/%llu; routing AOT "
+              "until Tier-2 publish",
+              Slot.funcIndex, static_cast<unsigned long long>(Admitted),
+              static_cast<unsigned long long>(Limit));
+    return T1DispatchOutcome::FinalAdmitted;
+  }
+  return T1DispatchOutcome::Admitted;
+}
+
 __attribute__((always_inline)) EJitSharedTaskPool::CompileOrGetResult
-EJitSharedTaskPool::classifyHit(const SharedLookup &Hit, bool enqueueTier2) {
+EJitSharedTaskPool::classifyHit(const SharedLookup &Hit,
+                                const EJitBoundPtrDescriptor *boundPointers,
+                                uint32_t boundCount) {
   CompileOrGetResult R;
-  if (enqueueTier2 && Hit.tier2Arm)
-    enqueueTier2FromLookup(Hit);
+  // Experimental observed Tier-1 dispatch contract (v21): commit the granted
+  // real dispatch before any pointer is handed back. A lookup whose quota is
+  // already closed falls back to AOT instead of executing more Tier-1 code.
+  if (Hit.fnPtr && Hit.t1Observation) {
+    switch (admitObservedT1Dispatch(Hit)) {
+    case T1DispatchOutcome::Exhausted:
+      // Lost the final admission to a racing core (or the quota closed between
+      // the resolve and this commit): grant no Tier-1 pointer, fall back to
+      // AOT. No result pointer is handed back, so a read token this lookup
+      // still holds must be released here. The queue-full retry is owned by
+      // every later closed-quota lookup (resolveMatchedSlot arms it), so this
+      // path deliberately does not build a Tier-2 request from a snapshot that
+      // may predate the frozen boundary timestamp.
+      if (Hit.hasReadToken)
+        releaseRead(Hit.bucketIndex);
+      R.status = EJitCompileOrGetStatus::AlreadyPending;
+      R.fastPathTerminal = true;
+      return R;
+    case T1DispatchOutcome::FinalAdmitted:
+      // The last allowed dispatch freezes the boundary AND claims Tier-2.
+      enqueueTier2FromLookup(Hit, boundPointers, boundCount);
+      break;
+    case T1DispatchOutcome::NotApplicable:
+    case T1DispatchOutcome::Admitted:
+    case T1DispatchOutcome::IdentityChanged:
+      // IdentityChanged: the slot was republished; the validated pointer is
+      // still returned (NO_RECLAIM never frees it), but the dispatch is not
+      // attributed to the replacement's observation.
+      break;
+    }
+  }
+  if (Hit.tier2Arm)
+    enqueueTier2FromLookup(Hit, boundPointers, boundCount);
   if (Hit.hasReadToken && Hit.fnPtr) {
     if (Hit.slot)
       markPostPublishSeen(*Hit.slot);
@@ -3719,11 +4117,10 @@ EJitSharedTaskPool::CompileOrGetResult EJitSharedTaskPool::tryCacheHit(
 #else
   SharedLookup Hit = cacheLookup(funcIndex, dims, numDims);
 #endif
-  if (Hit.tier2Arm) {
-    enqueueTier2FromLookup(Hit, boundPointers, boundCount);
-    Hit.tier2Arm = false;
-  }
-  return classifyHit(Hit, /*enqueueTier2=*/false);
+  // classifyHit() owns the deferred Tier-2 claim (attaching this call's bound
+  // descriptors) and, under the observed-dispatch contract, the admission
+  // commit that decides whether this lookup may grant the Tier-1 pointer.
+  return classifyHit(Hit, boundPointers, boundCount);
 }
 
 //===----------------------------------------------------------------------===//

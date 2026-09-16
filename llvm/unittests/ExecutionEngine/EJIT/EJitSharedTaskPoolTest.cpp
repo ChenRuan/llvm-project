@@ -3144,8 +3144,16 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // v17 adds explicit batch publish state.
   // v18 replaced the inline bound-pointer payload with borrowed descriptors;
   // v19 adds non-reusable request attempts and exact dedup claims; v20 binds
-  // each published cache slot to the exact originating attempt.
-  EXPECT_EQ(kEJitSharedAbiVersion, 20u);
+  // each published cache slot to the exact originating attempt; v21 records the
+  // observed real Tier-1 dispatch boundary (count/limit/quotaEnd) in the slot
+  // and carries it through the Tier-2 request; v22 adds the per-bucket
+  // observationLock that serializes the observed admission commit with every
+  // publish/cancel/reset of the same bucket's observation identity. The v22
+  // word lives in the bucket header padding, so the blob size and every slot
+  // offset stay unchanged.
+  EXPECT_EQ(kEJitSharedAbiVersion, 22u);
+  EXPECT_EQ(offsetof(EJitSharedCacheBucket, observationLock), 12u);
+  EXPECT_EQ(offsetof(EJitSharedCacheBucket, slots), 16u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
