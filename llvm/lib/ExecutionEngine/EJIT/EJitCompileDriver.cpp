@@ -28,6 +28,37 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+namespace {
+constexpr unsigned kVpSnapshotAttempts = 3;
+
+bool retireVpSession(uint64_t SessionId, std::vector<EJitVpSiteSample> &Samples,
+                     bool PreserveForRetry = false) {
+  ejitVpEndSession(SessionId, PreserveForRetry);
+  for (unsigned Attempt = 0; Attempt < kVpSnapshotAttempts; ++Attempt)
+    if (ejitVpTakeSessionSnapshot(SessionId, Samples))
+      return true;
+  return false;
+}
+
+class VpSessionAbortGuard {
+public:
+  ~VpSessionAbortGuard() {
+    if (!SessionId)
+      return;
+    std::vector<EJitVpSiteSample> Discarded;
+    (void)retireVpSession(SessionId, Discarded);
+  }
+
+  void arm(uint64_t Id) { SessionId = Id; }
+  void dismiss() { SessionId = 0; }
+
+private:
+  uint64_t SessionId = 0;
+};
+} // namespace
+#endif
+
 #ifdef EJIT_SRE_TASKPOOL
 namespace {
 /// Adapter so the taskpool can call back into the driver's cold compile path
@@ -45,6 +76,10 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
                           bool published) {
   static_cast<EJitCompileDriver *>(ctx)->notifyTaskpoolPublished(req,
                                                                  published);
+}
+
+void taskpoolPgoLifecycleDropThunk(void *ctx, const EJitCompileRequest &req) {
+  static_cast<EJitCompileDriver *>(ctx)->notifyTaskpoolPgoLifecycleDrop(req);
 }
 
 #ifdef EJIT_SRE_SHARED_TASKPOOL
@@ -226,6 +261,7 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
                                              /*autoStartWorker=*/false);
   taskPool_->setCompiler(&taskpoolCompileThunk, this);
   taskPool_->setPublishCallback(&taskpoolPublishThunk, this);
+  taskPool_->setPgoLifecycleDropCallback(&taskpoolPgoLifecycleDropThunk, this);
   taskPool_->switchController().setMode(
       config_.compileMode == CompileMode::Async  ? EJitCompileMode::Async
       : config_.compileMode == CompileMode::Sync ? EJitCompileMode::Sync
@@ -240,6 +276,7 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   sharedPool_.bind(&gEJitSharedTaskPoolState);
   sharedPool_.setCompiler(&taskpoolCompileThunk, this);
   sharedPool_.setPublishCallback(&taskpoolPublishThunk, this);
+  sharedPool_.setPgoLifecycleDropCallback(&taskpoolPgoLifecycleDropThunk, this);
   sharedPool_.setMayConstRankingCallback(&sharedMayConstRankingThunk, this);
   sharedPool_.setWorkerHooks(&EJitCompileDriver::sharedWorkerStart,
                              &EJitCompileDriver::sharedWorkerStop, this);
@@ -419,6 +456,27 @@ bool EJitCompileDriver::ensureJitEngine() {
 }
 
 void EJitCompileDriver::releaseJitEngine() {
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  // This runs on the outgoing owner. No peer cancellation callback touches
+  // these maps; settle their shared sessions here before owner-private state
+  // and profd addresses become unusable.
+  for (const auto &Entry : tier1ProfileIdentities_) {
+    const uint64_t SessionId = Entry.second.samplingSessionId;
+    if (!SessionId)
+      continue;
+    auto Pending = pendingVpSamples_.find(SessionId);
+    std::vector<EJitVpSiteSample> Discarded;
+    std::vector<EJitVpSiteSample> &Samples =
+        Pending == pendingVpSamples_.end() ? Discarded : Pending->second;
+    (void)retireVpSession(SessionId, Samples,
+                          /*PreserveForRetry=*/false);
+  }
+  pendingVpSamples_.clear();
+  tier1Vp_.clear();
+  tier1Counters_.clear();
+  tier1ProfileIdentities_.clear();
+  frozenProfileBundles_.clear();
+#endif
   if (!jitEngine_)
     return;
   EJIT_DIAG("OrcJIT engine released: ownership given up");
@@ -543,6 +601,24 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     }
   }
 
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  // A production value-profile session is reserved before any expensive ORC
+  // work. Every early return retires it through this guard.
+  VpSessionAbortGuard VpSessionGuard;
+#endif
+
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  // Owner-only maintenance for cancellation that arrived while a T2 freeze
+  // was between bounded attempts. Shared cancellation marks the exact session;
+  // the next owner cold-path entry erases only that session's private samples.
+  for (auto It = pendingVpSamples_.begin(); It != pendingVpSamples_.end();) {
+    if (ejitVpSessionDiscarded(It->first))
+      It = pendingVpSamples_.erase(It);
+    else
+      ++It;
+  }
+#endif
+
   // PGO tier (EJIT_ONLINE_PGO.md §4). Gated by Config::enablePgo: off => the
   // default Baseline (unchanged pipeline). On => first compile is Tier-1
   // (Instrumented); a Tier-2 (PGOUse) recompile synthesizes the in-memory
@@ -554,6 +630,15 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   if (RunProfileStages) {
     if (static_cast<CompileTier>(tier) == CompileTier::PGOUse) {
       ctx.tier = CompileTier::PGOUse;
+      auto Identity = tier1ProfileIdentities_.find(cacheKey);
+      if (Identity != tier1ProfileIdentities_.end())
+        ctx.samplingSessionId = Identity->second.samplingSessionId;
+      auto Frozen = frozenProfileBundles_.find(cacheKey);
+      if (Frozen != frozenProfileBundles_.end()) {
+        ctx.profileBundle = Frozen->second;
+        ctx.profileData = Frozen->second->indexedProfile;
+        ctx.scalarValueSites = Frozen->second->scalarSites;
+      }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
       ctx.profileAuditOnly = !config_.enablePgo;
       auto mayConstIt = tier1MayConst_.find(cacheKey);
@@ -561,8 +646,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         ctx.mayConstLoadSites = mayConstIt->second.sites;
         const uint64_t SampleEnd = ejit_taskpool_trace_now();
         if (mayConstIt->second.sampleStart != 0)
-          ctx.mayConstSampleCycles =
-              SampleEnd - mayConstIt->second.sampleStart;
+          ctx.mayConstSampleCycles = SampleEnd - mayConstIt->second.sampleStart;
         const auto *Counters = reinterpret_cast<const EJitAtomicU64 *>(
             mayConstIt->second.counterBase);
         if (Counters) {
@@ -573,40 +657,59 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         }
       }
 #endif
-      auto it = tier1Counters_.find(cacheKey);
-      if (it != tier1Counters_.end() && !it->second.empty()) {
-        std::vector<PgoCounterRef> refs;
-        refs.reserve(it->second.size());
-        for (const auto &c : it->second)
-          refs.push_back({c.pgoName.c_str(), c.profcAddr, c.profdAddr});
+      if (!ctx.profileBundle) {
+        auto it = tier1Counters_.find(cacheKey);
+        if (it != tier1Counters_.end() && !it->second.empty()) {
+          std::vector<PgoCounterRef> refs;
+          refs.reserve(it->second.size());
+          for (const auto &c : it->second)
+            refs.push_back({c.pgoName.c_str(), c.profcAddr, c.profdAddr});
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
-        // Value-profile merge (EJIT_VALUE_PROFILE.md §5): snapshot every
-        // core's retired payload half, aggregate per site, map verified
-        // indirect-call targets to IR-PGO-name MD5s, and carry the official
-        // kinds in the SAME indexed profile as the edge counters. Scalar
-        // sites (with the min-samples / confidence thresholds applied) ride
-        // the ctx side table to the Tier-2 transform.
-        SmallVector<PgoValueSite, 8> valueSites;
-        SmallVector<PgoValueFunction, 8> vpFuncs;
-        SmallVector<PgoScalarSite, 8> scalarSites;
-        auto vpIt = tier1Vp_.find(cacheKey);
-        bool haveVp =
-            vpIt != tier1Vp_.end() && readValueSiteInventory(refs, vpFuncs);
-        if (haveVp) {
-          // Patch per-function scalar site counts from the Tier-1 capture.
-          // The counts are keyed by the IR-PGO-name hash (EJIT_VALUE_PROFILE.md
-          // §5.2); the inventory carries that hash as pgoNameHash (profd
-          // NameRef) next to the CFG hash funcHash.
-          DenseMap<uint64_t, uint32_t> scalarByHash;
-          for (const PgoValueFunction &f : vpIt->second.functions)
-            scalarByHash[f.pgoNameHash] = f.numScalarSites;
-          for (PgoValueFunction &f : vpFuncs)
-            f.numScalarSites = scalarByHash.lookup(f.pgoNameHash);
-          std::vector<EJitVpSiteSample> samples;
-          haveVp = ejitVpTakeSnapshot(samples);
+          // Value-profile merge (EJIT_VALUE_PROFILE.md §5): snapshot every
+          // core's retired payload half, aggregate per site, map verified
+          // indirect-call targets to IR-PGO-name MD5s, and carry the official
+          // kinds in the SAME indexed profile as the edge counters. Scalar
+          // sites (with the min-samples / confidence thresholds applied) ride
+          // the ctx side table to the Tier-2 transform.
+          SmallVector<PgoValueSite, 8> valueSites;
+          SmallVector<PgoValueFunction, 8> vpFuncs;
+          SmallVector<PgoScalarSite, 8> scalarSites;
+          auto vpIt = tier1Vp_.find(cacheKey);
+          bool haveVp =
+              vpIt != tier1Vp_.end() && readValueSiteInventory(refs, vpFuncs);
+          if (ejitVpSessionDiscarded(ctx.samplingSessionId)) {
+            pendingVpSamples_.erase(ctx.samplingSessionId);
+            EJIT_DIAG("VP freeze cancelled key=0x%016lx session=%llu", cacheKey,
+                      static_cast<unsigned long long>(ctx.samplingSessionId));
+            return nullptr;
+          }
+          std::vector<EJitVpSiteSample> &PendingSamples =
+              pendingVpSamples_[ctx.samplingSessionId];
+          if (!retireVpSession(ctx.samplingSessionId, PendingSamples,
+                               /*PreserveForRetry=*/true)) {
+            EJIT_DIAG("VP snapshot incomplete key=0x%016lx session=%llu "
+                      "partial=%zu",
+                      cacheKey,
+                      static_cast<unsigned long long>(ctx.samplingSessionId),
+                      PendingSamples.size());
+            return nullptr;
+          }
+          std::vector<EJitVpSiteSample> samples = std::move(PendingSamples);
+          pendingVpSamples_.erase(ctx.samplingSessionId);
           if (haveVp) {
-            (void)aggregateValueSamples(samples, vpFuncs, vpIt->second.targets,
-                                        valueSites, scalarSites);
+            // Patch per-function scalar site counts from the Tier-1 capture.
+            // The counts are keyed by the IR-PGO-name hash
+            // (EJIT_VALUE_PROFILE.md §5.2); the inventory carries that hash as
+            // pgoNameHash (profd NameRef) next to the CFG hash funcHash.
+            DenseMap<uint64_t, uint32_t> scalarByHash;
+            for (const PgoValueFunction &f : vpIt->second.functions)
+              scalarByHash[f.pgoNameHash] = f.numScalarSites;
+            for (PgoValueFunction &f : vpFuncs)
+              f.numScalarSites = scalarByHash.lookup(f.pgoNameHash);
+            haveVp =
+                aggregateValueSamples(samples, vpFuncs, vpIt->second.targets,
+                                      valueSites, scalarSites);
+            ctx.valueProfileSnapshotComplete = haveVp;
             const size_t totalScalar = scalarSites.size();
             size_t dropped = 0;
             for (PgoScalarSite &s : scalarSites) {
@@ -622,18 +725,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
             });
             ctx.scalarValueSites.assign(scalarSites.begin(), scalarSites.end());
             ctx.profileData = synthesizeProfileBuffer(refs, valueSites);
-            // Consume: forget this function's collected values so a later
-            // round starts clean (the instrumented Tier-1 stays live until
-            // publish, so post-snapshot records just re-populate the shard
-            // harmlessly for the retry path).
-            for (const PgoValueFunction &f : vpFuncs) {
-              EJitVpKindSiteCount counts[] = {
-                  {kEJitVpIndirectCall, f.numIcSites},
-                  {kEJitVpMemOpSize, f.numMemSites},
-                  {kEJitVpScalar, f.numScalarSites}};
-              ejitVpResetFunction(f.pgoNameHash,
-                                  ArrayRef<EJitVpKindSiteCount>(counts));
-            }
             size_t icSites = 0, memSites = 0;
             for (const PgoValueSite &s : valueSites)
               (s.valueKind == IPVK_IndirectCallTarget ? icSites : memSites)++;
@@ -643,31 +734,141 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
                       cacheKey, funcName.c_str(), samples.size(), icSites,
                       memSites, scalarSites.size(), dropped);
           }
-        }
-        if (!haveVp) {
-          // Edge-only profile: value data unavailable (no snapshot / no
-          // capture). Tier-2 still consumes the edge counters.
-          EJIT_DIAG_DEBUG("VP merge key=0x%016lx: value data unavailable, "
-                          "edge-only profile",
-                          cacheKey);
-          ctx.profileData = synthesizeProfileBuffer(refs, {});
-        }
+          if (!haveVp) {
+            // Edge-only profile: value data unavailable (no inventory / no
+            // capture). Tier-2 still consumes the edge counters.
+            EJIT_DIAG_DEBUG("VP merge key=0x%016lx: value data unavailable, "
+                            "edge-only profile",
+                            cacheKey);
+            ctx.profileData = synthesizeProfileBuffer(refs, {});
+          }
 #else
-        ctx.profileData = synthesizeProfileBuffer(refs, {});
+          ctx.profileData = synthesizeProfileBuffer(refs, {});
 #endif
-        if (ctx.profileData.empty())
-          EJIT_DIAG("compileCold Tier-2 key=0x%016lx: profile synthesis empty",
-                    cacheKey);
-      } else {
-        EJIT_DIAG(
-            "compileCold Tier-2 key=0x%016lx: no Tier-1 counters captured",
-            cacheKey);
+          if (ctx.profileData.empty())
+            EJIT_DIAG(
+                "compileCold Tier-2 key=0x%016lx: profile synthesis empty",
+                cacheKey);
+        } else {
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+          std::vector<EJitVpSiteSample> Discarded;
+          if (!retireVpSession(ctx.samplingSessionId, Discarded)) {
+            EJIT_DIAG("VP snapshot incomplete key=0x%016lx session=%llu",
+                      cacheKey,
+                      static_cast<unsigned long long>(ctx.samplingSessionId));
+            return nullptr;
+          }
+#endif
+          EJIT_DIAG(
+              "compileCold Tier-2 key=0x%016lx: no Tier-1 counters captured",
+              cacheKey);
+        }
       }
     } else {
       ctx.tier = CompileTier::Instrumented;
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+      auto OldIdentity = tier1ProfileIdentities_.find(cacheKey);
+      if (OldIdentity != tier1ProfileIdentities_.end() &&
+          OldIdentity->second.samplingSessionId) {
+        const uint64_t OldSessionId = OldIdentity->second.samplingSessionId;
+        std::vector<EJitVpSiteSample> Discarded;
+        (void)retireVpSession(OldSessionId, Discarded,
+                              /*PreserveForRetry=*/false);
+        pendingVpSamples_.erase(OldSessionId);
+      }
+#endif
+      Tier1ProfileIdentity &Identity = tier1ProfileIdentities_[cacheKey];
+      Identity.representativeAttemptToken = request ? request->attemptToken : 0;
+      Identity.generation = request ? request->generation : 0;
+      Identity.numDims = request ? request->numDims : 0;
+      for (uint32_t I = 0; I < kEJitMaxRequestDims; ++I)
+        Identity.versions[I] =
+            request && I < request->numDims ? request->versions[I] : 0;
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+      if (config_.enablePgo) {
+        Identity.samplingSessionId =
+            ejitVpCreateSession(Identity.representativeAttemptToken);
+        if (Identity.samplingSessionId == 0) {
+          tier1ProfileIdentities_.erase(cacheKey);
+          EJIT_DIAG("VP session capacity unavailable before Tier-1 codegen "
+                    "key=0x%016lx",
+                    cacheKey);
+          return nullptr;
+        }
+        VpSessionGuard.arm(Identity.samplingSessionId);
+      } else
+#endif
+      {
+        Identity.samplingSessionId = nextSamplingSessionId_++;
+        if (Identity.samplingSessionId == 0)
+          Identity.samplingSessionId = nextSamplingSessionId_++;
+      }
+      ctx.samplingSessionId = Identity.samplingSessionId;
+      frozenProfileBundles_.erase(cacheKey);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
       ctx.profileAuditOnly = !config_.enablePgo;
 #endif
+    }
+  }
+
+  if (ctx.tier == CompileTier::PGOUse && !ctx.profileBundle &&
+      !ctx.profileData.empty()) {
+    auto Bundle = std::make_shared<EJitProfileBundle>();
+    Bundle->samplingSessionId = ctx.samplingSessionId;
+    Bundle->representativeLogicalKey = cacheKey;
+    auto Identity = tier1ProfileIdentities_.find(cacheKey);
+    if (Identity != tier1ProfileIdentities_.end())
+      Bundle->representativeAttemptToken =
+          Identity->second.representativeAttemptToken;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+    Bundle->actualDispatchCount = sharedPool_.tier2Threshold();
+#else
+    Bundle->actualDispatchCount = 0;
+#endif
+    Bundle->quotaEnd = ejit_taskpool_trace_now();
+    Bundle->quality = ProfileSnapshotQuality::ApproximateInFlight;
+    Bundle->hasEdgeProfile = true;
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+    Bundle->valueProfileEnabled = true;
+    Bundle->valueProfileComplete = ctx.valueProfileSnapshotComplete;
+#endif
+    Bundle->indexedProfile = ctx.profileData;
+    Bundle->scalarSites = ctx.scalarValueSites;
+    std::vector<PgoCounterRef> BundleRefs;
+    auto Counters = tier1Counters_.find(cacheKey);
+    if (Counters != tier1Counters_.end())
+      for (const Tier1CounterInfo &C : Counters->second)
+        BundleRefs.push_back({C.pgoName.c_str(), C.profcAddr, C.profdAddr});
+    SmallVector<PgoValueFunction, 8> BundleFunctions;
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+    if (!BundleRefs.empty() &&
+        readValueSiteInventory(BundleRefs, BundleFunctions)) {
+      auto Vp = tier1Vp_.find(cacheKey);
+      if (Vp != tier1Vp_.end()) {
+        DenseMap<uint64_t, uint32_t> ScalarCounts;
+        for (const PgoValueFunction &F : Vp->second.functions)
+          ScalarCounts[F.pgoNameHash] = F.numScalarSites;
+        for (PgoValueFunction &F : BundleFunctions)
+          F.numScalarSites = ScalarCounts.lookup(F.pgoNameHash);
+        for (const PgoValueTarget &T : Vp->second.targets)
+          Bundle->verifiedTargets.push_back({T.addr, T.md5Hash});
+      }
+    }
+#endif
+    if (!readProfileSchema(BundleRefs, BundleFunctions, Bundle->schema)) {
+      EJIT_DIAG(
+          "profile bundle reject key=0x%016lx session=%llu: invalid schema",
+          cacheKey, static_cast<unsigned long long>(ctx.samplingSessionId));
+      ctx.profileData.clear();
+      ctx.scalarValueSites.clear();
+    } else {
+      Bundle->freezeCompletedAt = ejit_taskpool_trace_now();
+      ctx.profileBundle = Bundle;
+      frozenProfileBundles_[cacheKey] = Bundle;
+      EJIT_DIAG("profile bundle frozen key=0x%016lx session=%llu dispatch=%llu",
+                cacheKey,
+                static_cast<unsigned long long>(ctx.samplingSessionId),
+                static_cast<unsigned long long>(Bundle->actualDispatchCount));
     }
   }
 
@@ -796,7 +997,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       for (const auto &c : counters)
         refs.push_back({c.pgoName.c_str(), c.profcAddr, c.profdAddr});
       SmallVector<PgoValueFunction, 8> inv;
-      if (readValueSiteInventory(refs, inv)) {
+      if (ctx.samplingSessionId == 0 && readValueSiteInventory(refs, inv)) {
         for (const PgoValueFunction &pf : inv) {
           EJitVpKindSiteCount counts[] = {{kEJitVpIndirectCall, pf.numIcSites},
                                           {kEJitVpMemOpSize, pf.numMemSites},
@@ -807,9 +1008,17 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       }
     }
     if (config_.enablePgo) {
-      ejitVpEnsureInitialized();
-      ejitVpSetArmed(true);
-      ++vpRoundsActive_;
+      bool SessionReady = true;
+      for (const Tier1CounterInfo &Counter : counters)
+        SessionReady &=
+            ejitVpBindProfileData(ctx.samplingSessionId, Counter.profdAddr);
+      if (!SessionReady) {
+        EJIT_DIAG("VP profd binding unavailable key=0x%016lx session=%llu",
+                  cacheKey,
+                  static_cast<unsigned long long>(ctx.samplingSessionId));
+        return nullptr;
+      }
+      VpSessionGuard.dismiss();
     }
     EJIT_DIAG_DEBUG("VP capture key=0x%016lx: %zu function(s), %zu verified "
                     "target(s)",
@@ -905,6 +1114,46 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
   return compileCold(cacheKey, tier, /*storeLru=*/false, &req);
 }
 
+void EJitCompileDriver::notifyTaskpoolPgoLifecycleDrop(
+    const EJitCompileRequest &req) {
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  if (decodeReqTier(req.funcIndex) != kEJitTierPgoUse)
+    return;
+  const uint32_t FuncIdx = stripReqTier(req.funcIndex);
+  const auto &Meta = loader_.getOrCacheFuncMeta(FuncIdx);
+  uint8_t PackedDims[4] = {0, 0, 0, 0};
+  for (unsigned I = 0; I < Meta.dimCount && I < 4; ++I)
+    for (uint32_t J = 0; J < req.numDims; ++J)
+      if (req.dims[J].dimType == Meta.dimTypes[I])
+        PackedDims[I] = static_cast<uint8_t>(req.dims[J].instanceId);
+  const uint64_t CacheKey = (static_cast<uint64_t>(FuncIdx) << 32) |
+                            static_cast<uint64_t>(PackedDims[0]) |
+                            (static_cast<uint64_t>(PackedDims[1]) << 8) |
+                            (static_cast<uint64_t>(PackedDims[2]) << 16) |
+                            (static_cast<uint64_t>(PackedDims[3]) << 24);
+  auto Identity = tier1ProfileIdentities_.find(CacheKey);
+  if (Identity == tier1ProfileIdentities_.end() ||
+      Identity->second.representativeAttemptToken != req.attemptToken ||
+      Identity->second.generation != req.generation ||
+      Identity->second.numDims != req.numDims)
+    return;
+  for (uint32_t I = 0; I < req.numDims; ++I)
+    if (Identity->second.versions[I] != req.versions[I])
+      return;
+  const uint64_t SessionId = Identity->second.samplingSessionId;
+  std::vector<EJitVpSiteSample> Discarded;
+  (void)retireVpSession(SessionId, Discarded,
+                        /*PreserveForRetry=*/false);
+  pendingVpSamples_.erase(SessionId);
+  tier1Vp_.erase(CacheKey);
+  tier1Counters_.erase(CacheKey);
+  tier1ProfileIdentities_.erase(Identity);
+  frozenProfileBundles_.erase(CacheKey);
+#else
+  (void)req;
+#endif
+}
+
 void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
                                                 bool published) {
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
@@ -921,10 +1170,29 @@ void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
 #endif
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
   const uint32_t tier = decodeReqTier(req.funcIndex);
-  const bool consumesRound = (tier == kEJitTierPgoUse && published) ||
-                             (tier == kEJitTierInstrumented && !published);
-  if (consumesRound && vpRoundsActive_ > 0 && --vpRoundsActive_ == 0)
-    ejitVpSetArmed(false);
+  if (tier == kEJitTierInstrumented && !published) {
+    const uint32_t funcIdx = stripReqTier(req.funcIndex);
+    const auto &meta = loader_.getOrCacheFuncMeta(funcIdx);
+    uint8_t packedDims[4] = {0, 0, 0, 0};
+    for (unsigned I = 0; I < meta.dimCount && I < 4; ++I)
+      for (uint32_t J = 0; J < req.numDims; ++J)
+        if (req.dims[J].dimType == meta.dimTypes[I])
+          packedDims[I] = static_cast<uint8_t>(req.dims[J].instanceId);
+    const uint64_t cacheKey = (static_cast<uint64_t>(funcIdx) << 32) |
+                              static_cast<uint64_t>(packedDims[0]) |
+                              (static_cast<uint64_t>(packedDims[1]) << 8) |
+                              (static_cast<uint64_t>(packedDims[2]) << 16) |
+                              (static_cast<uint64_t>(packedDims[3]) << 24);
+    auto Identity = tier1ProfileIdentities_.find(cacheKey);
+    if (Identity != tier1ProfileIdentities_.end()) {
+      std::vector<EJitVpSiteSample> Discarded;
+      if (!retireVpSession(Identity->second.samplingSessionId, Discarded))
+        EJIT_DIAG("VP cancel snapshot incomplete key=0x%016lx session=%llu",
+                  cacheKey,
+                  static_cast<unsigned long long>(
+                      Identity->second.samplingSessionId));
+    }
+  }
 #else
   (void)req;
   (void)published;

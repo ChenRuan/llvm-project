@@ -68,6 +68,7 @@ public:
   /// Taskpool commit notification. A value-profile round is consumed only
   /// after Tier-2 is actually published, so failed commits keep collecting.
   void notifyTaskpoolPublished(const EJitCompileRequest &req, bool published);
+  void notifyTaskpoolPgoLifecycleDrop(const EJitCompileRequest &req);
 
   /// The SRE taskpool scheduler (non-null when EJIT_SRE_TASKPOOL is built).
   EJitTaskPool *taskPool() { return taskPool_.get(); }
@@ -192,6 +193,16 @@ private:
     uintptr_t profdAddr = 0;
   };
   std::unordered_map<uint64_t, std::vector<Tier1CounterInfo>> tier1Counters_;
+  struct Tier1ProfileIdentity {
+    uint64_t samplingSessionId = 0;
+    uint64_t representativeAttemptToken = 0;
+    uint32_t generation = 0;
+    uint32_t numDims = 0;
+    uint64_t versions[kEJitMaxRequestDims] = {};
+  };
+  std::unordered_map<uint64_t, Tier1ProfileIdentity> tier1ProfileIdentities_;
+  std::unordered_map<uint64_t, EJitFrozenProfileBundle> frozenProfileBundles_;
+  uint64_t nextSamplingSessionId_ = 1;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   struct Tier1MayConstState {
     uintptr_t counterBase = 0;
@@ -216,10 +227,9 @@ private:
     std::vector<PgoValueFunction> functions;
   };
   std::unordered_map<uint64_t, Tier1VpState> tier1Vp_;
-  /// Active collection rounds (Tier-1 publishes not yet consumed by a Tier-2
-  /// merge), touched only by the single owner worker: the collector is armed
-  /// at the first Tier-1 capture and disarmed once the last round merged.
-  uint32_t vpRoundsActive_ = 0;
+  /// Partial destructive snapshots retained across bounded T2 retries, keyed
+  /// by the exact shared sampling-session identity.
+  std::unordered_map<uint64_t, std::vector<EJitVpSiteSample>> pendingVpSamples_;
 #endif
 };
 

@@ -30,6 +30,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ProfileData/InstrProf.h"
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -96,6 +97,55 @@ struct PgoValueFunction {
   uint32_t numScalarSites = 0;
 };
 
+/// Exact schema captured with a representative Tier-1 and checked before a
+/// frozen profile is consumed by another logical member. The PGO name is kept
+/// alongside both hashes because neither hash is accepted as proof of equality.
+struct PgoFunctionSchema {
+  std::string pgoName;
+  uint64_t funcHash = 0;
+  uint64_t pgoNameHash = 0;
+  uint32_t numCounters = 0;
+  uint32_t numIcSites = 0;
+  uint32_t numMemSites = 0;
+  uint32_t numScalarSites = 0;
+};
+
+enum class ProfileSnapshotQuality : uint8_t {
+  Complete,
+  ApproximateInFlight,
+  EdgeOnly,
+  ValueDataDropped,
+};
+
+/// Immutable handoff from one representative sampling session to every Tier-2
+/// consumer in its candidate group. Ownership is shared and const after
+/// construction; no consumer borrows the representative's temporary vectors.
+struct EJitProfileBundle {
+  uint64_t groupId = 0;
+  uint64_t groupGeneration = 0;
+  uint64_t profileEpoch = 0;
+  uint64_t samplingSessionId = 0;
+  uint64_t representativeLogicalKey = 0;
+  uint64_t representativeAttemptToken = 0;
+  uint64_t actualDispatchCount = 0;
+  uint64_t quotaEnd = 0;
+  uint64_t freezeCompletedAt = 0;
+  ProfileSnapshotQuality quality = ProfileSnapshotQuality::ApproximateInFlight;
+  bool hasEdgeProfile = false;
+  bool valueProfileEnabled = false;
+  bool valueProfileComplete = false;
+  std::string indexedProfile;
+  std::vector<PgoScalarSite> scalarSites;
+  std::vector<PgoFunctionSchema> schema;
+  struct VerifiedTarget {
+    uintptr_t address = 0;
+    uint64_t pgoNameHash = 0;
+  };
+  std::vector<VerifiedTarget> verifiedTargets;
+};
+
+using EJitFrozenProfileBundle = std::shared_ptr<const EJitProfileBundle>;
+
 /// Synthesize an indexed profile buffer from captured Tier-1 counters.
 /// Returns an empty string on failure (caller skips Tier-2 / falls back to
 /// Tier-1). Reads the __llvm_profile_data layout via InstrProfData.inc
@@ -104,6 +154,13 @@ struct PgoValueFunction {
 /// buffer carries the value profile records (edge + value in one profile).
 std::string synthesizeProfileBuffer(ArrayRef<PgoCounterRef> counters,
                                     ArrayRef<PgoValueSite> valueSites);
+
+/// Capture the exact counter/value-site schema paired with a Tier-1 object.
+/// Returns false on malformed runtime data; callers must not freeze a bundle
+/// when this validation fails.
+bool readProfileSchema(ArrayRef<PgoCounterRef> counters,
+                       ArrayRef<PgoValueFunction> valueFunctions,
+                       std::vector<PgoFunctionSchema> &schema);
 
 /// Edge-only convenience overload (no value profile data).
 inline std::string synthesizeProfileBuffer(ArrayRef<PgoCounterRef> counters) {

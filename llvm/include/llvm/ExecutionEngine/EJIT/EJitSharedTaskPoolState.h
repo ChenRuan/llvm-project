@@ -77,6 +77,12 @@
 #ifndef EJIT_SRE_SHARED_DUMP_NAME_BYTES
 #define EJIT_SRE_SHARED_DUMP_NAME_BYTES 128u
 #endif
+#ifndef EJIT_SRE_REQUEST_ATTEMPT_CAPACITY
+#define EJIT_SRE_REQUEST_ATTEMPT_CAPACITY 256u
+#endif
+#ifndef EJIT_SRE_REQUEST_HISTORY_CAPACITY
+#define EJIT_SRE_REQUEST_HISTORY_CAPACITY 64u
+#endif
 namespace llvm {
 namespace ejit {
 
@@ -84,7 +90,7 @@ namespace ejit {
 // Fixed capacities and the cache-line size used to avoid false sharing.
 //===----------------------------------------------------------------------===//
 /// Max dims in one identity; matches EJitSharedCacheSlot::dims.
-constexpr uint32_t kEJitSharedMaxDims = 4u;
+constexpr uint32_t kEJitSharedMaxDims = kEJitMaxRequestDims;
 constexpr uint32_t kEJitSharedDimTypes = 8u;
 constexpr uint32_t kEJitSharedInstances = 256u;
 /// Max runtime-writable ranges carried per cache slot (v9). Kept in lockstep
@@ -111,6 +117,14 @@ static_assert(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES >= 1u &&
                       kEJitSharedMaxConcurrentProfiles,
               "EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES must be in [1, 16]");
 constexpr uint32_t kEJitSharedDumpNameBytes = EJIT_SRE_SHARED_DUMP_NAME_BYTES;
+constexpr uint32_t kEJitSharedRequestAttemptCapacity =
+    EJIT_SRE_REQUEST_ATTEMPT_CAPACITY;
+constexpr uint32_t kEJitSharedRequestHistoryCapacity =
+    EJIT_SRE_REQUEST_HISTORY_CAPACITY;
+static_assert(kEJitSharedRequestAttemptCapacity != 0,
+              "request-attempt table must have at least one live slot");
+static_assert(kEJitSharedRequestHistoryCapacity != 0,
+              "request-attempt history must have at least one slot");
 constexpr uint32_t kEJitSharedCacheLine = 64u;
 /// Execute-permission seal granularity (the platform's per-page enable_ex unit)
 /// and the large-page / split granularity. Fixed platform constants.
@@ -169,6 +183,52 @@ enum class EJitCodeBatchRequestState : uint32_t {
   Failed = 4,
 };
 
+enum EJitRequestAttemptFlag : uint32_t {
+  EJitAttemptSamplingPending = 1u << 0,
+  EJitAttemptBorrowPending = 1u << 1,
+  EJitAttemptPublicationPending = 1u << 2,
+  EJitAttemptQueueOwned = 1u << 3,
+  EJitAttemptCompileActive = 1u << 4,
+  EJitAttemptCancelRequested = 1u << 5,
+  EJitAttemptWaitingProfile = 1u << 6,
+  EJitAttemptHoldsAdmission = 1u << 7,
+};
+
+enum class EJitRequestAttemptReason : uint32_t {
+  None = 0,
+  Published = 1,
+  Cancelled = 2,
+  QueueFailure = 3,
+  CompileFailure = 4,
+  LifecycleChanged = 5,
+  GenerationChanged = 6,
+  Shutdown = 7,
+  PublishFailure = 8,
+};
+
+/// One live logical request. All fields are read or written while attemptLock
+/// is held; token is cleared last when the record is retired.
+struct EJitSharedRequestAttempt {
+  EJitAtomicU64 token;
+  EJitAtomicU32 generation;
+  EJitAtomicU32 funcIndex;
+  EJitAtomicU32 flags;
+  EJitAtomicU32 terminalReason;
+  uint32_t numDims;
+  EJitDimPair dims[kEJitSharedMaxDims];
+  uint32_t versions[kEJitSharedMaxDims];
+  uint32_t boundCount;
+  EJitBoundPtrDescriptor boundPointers[kEJitMaxBoundPointers];
+};
+
+/// Bounded diagnostic tombstone. It never occupies a live-attempt slot.
+struct EJitSharedRequestAttemptHistory {
+  EJitAtomicU64 token;
+  EJitAtomicU32 generation;
+  EJitAtomicU32 funcIndex;
+  EJitAtomicU32 terminalReason;
+};
+
 //===----------------------------------------------------------------------===//
 // EJitSharedWritableRange: one runtime-writable extent of a published code
 // allocation (e.g. the Tier-1 __profc_ counters). Plain fixed-width scalars so
@@ -190,6 +250,9 @@ struct EJitSharedCacheSlot {
   EJitDimPair dims[4];   ///< identity
   uint32_t versions[4];  ///< per-instance version snapshot at publish
   uint64_t identityHash; ///< hash(funcIndex, dims) — fast reject before compare
+  /// Exact logical attempt that published this slot, or zero when the
+  /// request-attempt protocol is disabled. Written under the bucket lock.
+  uint64_t attemptToken;
   EJitAtomicUPtr fnPtr;  ///< compiled function pointer (cross-core read gated)
   /// Bit N means core N has successfully installed execute permission for this
   /// code address. Core ids >= 64 are supported but cannot be memoized here,
@@ -515,6 +578,7 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU32 pgoMaxActiveFunctions;
   EJitAtomicU32 pgoActiveFunctionCount;
   EJitAtomicU32 pgoActiveFunctions[kEJitSharedMaxConcurrentProfiles];
+  EJitAtomicU64 pgoActiveAttemptTokens[kEJitSharedMaxConcurrentProfiles];
   /// Last logged progress quarter for each admission slot: 0..4.
   EJitAtomicU32 pgoProgressQuarters[kEJitSharedMaxConcurrentProfiles];
   EJitAtomicU64 pgoCompletedFunctions;
@@ -530,12 +594,24 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
                                       ///< with stats off the acquire-load gate
                                       ///< on the disabled path is compiled out.
 
-  //--- flat dedup slots (own cache line). Each slot stores the OWNER GENERATION
-  //    that claimed it (0 = free), not a 1-bit flag: a dedupMark CASes 0->gen
-  //    and a dedupClear CASes gen->0, so a stale worker from an earlier
-  //    generation can never clear a slot a newer generation re-claimed for the
-  //    same funcIndex (spec §11 generation-aware dedup).
-  alignas(kEJitSharedCacheLine) EJitAtomicU32 inFlight[kEJitSharedMaxFuncIndex];
+  //--- flat dedup slots (own cache line). Each slot stores the exact claim
+  //    (0 = free): the request-attempt token when that protocol is enabled,
+  //    otherwise the owner generation. Release uses a matching CAS, so an old
+  //    worker or callback cannot clear a newer claim for the same funcIndex.
+  alignas(kEJitSharedCacheLine) EJitAtomicU64 inFlight[kEJitSharedMaxFuncIndex];
+
+  //--- version-reuse logical request attempts (cold path, ABI v20)
+  alignas(kEJitSharedCacheLine) EJitAtomicU32 requestAttemptsEnabled;
+  EJitAtomicU32 attemptLock;
+  EJitAtomicU32 attemptLiveCount;
+  EJitAtomicU32 attemptHistoryWrite;
+  EJitAtomicU32 attemptHistoryCount;
+  /// Monotonic and deliberately preserved across owner re-initialization.
+  /// UINT64_MAX is terminal exhaustion; it never wraps back to an old token.
+  EJitAtomicU64 nextAttemptToken;
+  EJitSharedRequestAttempt requestAttempts[kEJitSharedRequestAttemptCapacity];
+  EJitSharedRequestAttemptHistory
+      requestHistory[kEJitSharedRequestHistoryCapacity];
 
   //--- MPSC queue: head and tail on SEPARATE cache lines (false-sharing), ring
   //    storage on its own.
