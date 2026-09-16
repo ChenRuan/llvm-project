@@ -52,11 +52,19 @@ struct EJitDimPair {
   uint32_t instanceId;
 };
 
+constexpr uint32_t kEJitMaxRequestDims = 4u;
+
 struct EJitCompileRequest {
   uint32_t funcIndex;
   uint32_t numDims;
-  EJitDimPair dims[4];
-  uint32_t versions[4];
+  EJitDimPair dims[kEJitMaxRequestDims];
+  uint32_t versions[kEJitMaxRequestDims];
+  // Nonzero only for the experimental version-reuse request lifecycle. This
+  // token identifies one logical attempt across its Tier-1 queue item, the
+  // later Tier-2 queue item, delayed publication, cancellation and callbacks.
+  // It is never reused, so an old callback cannot settle a newer attempt for
+  // the same function/generation.
+  uint64_t attemptToken;
   uintptr_t fallbackPtr;
   // Shared-taskpool owner generation captured at enqueue time. A worker drops a
   // request whose generation no longer equals the shared state's generation
@@ -65,16 +73,20 @@ struct EJitCompileRequest {
   // fixed-width scalar accessed by value, never byte-parsed.
   uint32_t generation;
   // Borrowed bound objects. The queue copies only these descriptors; it never
-  // owns, frees, or dereferences the pointed-to bytes. The compile callback
-  // must finish reading them before returning.
+  // owns, frees, or dereferences the pointed-to bytes. The default protocol
+  // ends the borrow when the compile callback returns. The opt-in request-
+  // attempt protocol can retain the descriptors across Tier-1/Tier-2, and
+  // explicitly acknowledges the final compiler read before releasing them.
   uint32_t boundCount;
   EJitBoundPtrDescriptor boundPointers[kEJitMaxBoundPointers];
 };
 
-// Size is stable per pointer width and independent of pointee size: 200 bytes
-// on 64-bit targets and 164 bytes on 32-bit targets.
+// Size is stable per pointer width and independent of pointee size. Some
+// 32-bit ABIs align uint64_t to 8 bytes and therefore add tail padding.
 static_assert(
-    sizeof(EJitCompileRequest) == (sizeof(uintptr_t) == 8 ? 200u : 164u),
+    sizeof(EJitCompileRequest) ==
+        (sizeof(uintptr_t) == 8 ? 208u
+                                : (alignof(uint64_t) == 8 ? 176u : 172u)),
     "EJitCompileRequest size must stay fixed and payload-independent");
 static_assert(alignof(EJitCompileRequest) <= 8,
               "EJitCompileRequest alignment must stay <= 8 bytes");

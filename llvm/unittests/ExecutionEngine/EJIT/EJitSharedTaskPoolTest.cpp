@@ -15,6 +15,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+#include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
+#endif
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "gtest/gtest.h"
 #include <algorithm>
@@ -58,6 +61,7 @@ bool mockCompile(void * /*ctx*/, const EJitCompileRequest &req, void **outFn) {
 }
 
 struct BoundPointerLog {
+  uint32_t calls = 0;
   uint32_t argIndex = 0;
   uint32_t size = 0;
   uint32_t value = 0;
@@ -67,6 +71,7 @@ struct BoundPointerLog {
 bool mockCompileBoundPointer(void *ctx, const EJitCompileRequest &req,
                              void **outFn) {
   auto *log = static_cast<BoundPointerLog *>(ctx);
+  ++log->calls;
   log->boundCount = req.boundCount;
   if (req.boundCount == 1) {
     const auto &Bound = req.boundPointers[0];
@@ -3137,8 +3142,10 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // requests; v14 introduced bound-pointer transport, and v15 adds
   // per-version post-publish reuse tracking; v16 adds near/far placement.
   // v17 adds explicit batch publish state.
-  // v18 replaces the inline bound-pointer payload with borrowed descriptors.
-  EXPECT_EQ(kEJitSharedAbiVersion, 18u);
+  // v18 replaced the inline bound-pointer payload with borrowed descriptors;
+  // v19 adds non-reusable request attempts and exact dedup claims; v20 binds
+  // each published cache slot to the exact originating attempt.
+  EXPECT_EQ(kEJitSharedAbiVersion, 20u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -6989,5 +6996,499 @@ TEST_F(SharedTaskPoolTest, AsyncServiceUnavailableWithoutAWorker) {
             static_cast<uint32_t>(EJitSharedInitState::Ready));
   EXPECT_FALSE(owner.asyncServiceAvailable());
 }
+
+TEST_F(SharedTaskPoolTest,
+       RequestAttemptSettlesThreeEventsOnRealTier1Tier2Path) {
+  BoundPointerLog log;
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompileBoundPointer, &log);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  uint32_t value = 0x12345678u;
+  EJitBoundPtrDescriptor bound{&value, sizeof(value), 2};
+  uint64_t token = 0;
+  ASSERT_EQ(
+      owner.compileOrGet(80, nullptr, 0, codeFor(80), &bound, 1, &token).status,
+      EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_NE(token, 0u);
+  EXPECT_EQ(state_->inFlight[80].loadAcquire(), token);
+
+  EJitSharedTaskPool::RequestAttemptSnapshot snapshot;
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_TRUE(snapshot.live);
+  EXPECT_NE(snapshot.flags & EJitAttemptSamplingPending, 0u);
+  EXPECT_NE(snapshot.flags & EJitAttemptBorrowPending, 0u);
+  EXPECT_NE(snapshot.flags & EJitAttemptPublicationPending, 0u);
+  EXPECT_NE(snapshot.flags & EJitAttemptQueueOwned, 0u);
+
+  ASSERT_TRUE(owner.pollOne()); // Tier-1 publishes; sampling continues.
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_NE(snapshot.flags & EJitAttemptWaitingProfile, 0u);
+  EXPECT_NE(snapshot.flags & EJitAttemptSamplingPending, 0u);
+  EXPECT_NE(snapshot.flags & EJitAttemptBorrowPending, 0u);
+  EXPECT_NE(snapshot.flags & EJitAttemptPublicationPending, 0u);
+
+  auto hit = owner.compileOrGet(80, nullptr, 0, codeFor(80), &bound, 1);
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  if (hit.hasReadToken)
+    owner.releaseRead(hit.bucketIndex);
+  ASSERT_EQ(owner.pendingCount(), 1u);
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_NE(snapshot.flags & EJitAttemptQueueOwned, 0u);
+
+  ASSERT_TRUE(owner.pollOne()); // Tier-2 publishes and settles all events.
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_FALSE(snapshot.live);
+  EXPECT_TRUE(snapshot.retained);
+  EXPECT_EQ(snapshot.terminalReason, EJitRequestAttemptReason::Published);
+  EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+  EXPECT_EQ(owner.retainedRequestAttemptCount(), 1u);
+  EXPECT_EQ(log.calls, 2u);
+  EXPECT_EQ(log.rawPtr, &value);
+  EXPECT_EQ(log.value, value);
+}
+
+TEST_F(SharedTaskPoolTest,
+       CancelReissueAndDelayedOldQueueCallbackPreserveNewAttempt) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 2);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  uint64_t r1 = 0;
+  ASSERT_EQ(
+      owner.compileOrGet(81, nullptr, 0, codeFor(81), nullptr, 0, &r1).status,
+      EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.cancelRequestAttempt(r1));
+  EXPECT_TRUE(owner.cancelRequestAttempt(r1)); // duplicate is idempotent
+  EXPECT_EQ(state_->inFlight[81].loadAcquire(), 0u);
+
+  uint64_t r2 = 0;
+  ASSERT_EQ(
+      owner.compileOrGet(81, nullptr, 0, codeFor(81), nullptr, 0, &r2).status,
+      EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_NE(r1, r2);
+  EXPECT_EQ(state_->inFlight[81].loadAcquire(), r2);
+
+  ASSERT_TRUE(owner.pollOne()); // delayed R1 callback/queue ownership
+  EXPECT_EQ(state_->inFlight[81].loadAcquire(), r2);
+  EJitSharedTaskPool::RequestAttemptSnapshot snapshot;
+  ASSERT_TRUE(owner.requestAttemptStatus(r2, snapshot));
+  EXPECT_TRUE(snapshot.live);
+  EXPECT_EQ(snapshot.flags & EJitAttemptCancelRequested, 0u);
+
+  ASSERT_TRUE(owner.pollOne()); // R2 Tier-1
+  ASSERT_TRUE(owner.cancelRequestAttempt(r2));
+  EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+  ASSERT_TRUE(owner.requestAttemptStatus(r1, snapshot));
+  EXPECT_EQ(snapshot.terminalReason, EJitRequestAttemptReason::Cancelled);
+  ASSERT_TRUE(owner.requestAttemptStatus(r2, snapshot));
+  EXPECT_EQ(snapshot.terminalReason, EJitRequestAttemptReason::Cancelled);
+}
+
+TEST_F(SharedTaskPoolTest, RequestAttemptQueueFailureRollsBackEveryOwner) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  // Make the first ring cell look full without filling the attempt table.
+  state_->ring[0].sequence.storeRelaxed(UINT32_MAX);
+  EXPECT_EQ(owner.compileOrGet(82, nullptr, 0, codeFor(82)).status,
+            EJitCompileOrGetStatus::QueueFullFallback);
+  EXPECT_EQ(state_->inFlight[82].loadAcquire(), 0u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+  EXPECT_EQ(owner.retainedRequestAttemptCount(), 1u);
+}
+
+TEST_F(SharedTaskPoolTest,
+       BorrowCanEndBeforeCancelAndPendingPublishCannotResurrectAttempt) {
+  BatchPublishCtx batch;
+  batch.tier1ReadyImmediately = true;
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockBatchCompile, &batch);
+  owner.setCodeBatchCallbacks(&mockBatchReady, &mockBatchFlush, &batch);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  uint64_t token = 0;
+  ASSERT_EQ(owner.compileOrGet(83, nullptr, 0, codeFor(83), nullptr, 0, &token)
+                .status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  auto hit = owner.tryCacheHit0D(83);
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  if (hit.hasReadToken)
+    owner.releaseRead(hit.bucketIndex);
+  ASSERT_TRUE(owner.pollOne()); // Tier-2 linked, still RW/NX.
+  ASSERT_EQ(owner.pendingPublishCount(), 1u);
+
+  EJitSharedTaskPool::RequestAttemptSnapshot snapshot;
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_EQ(snapshot.flags & EJitAttemptBorrowPending, 0u);
+  EXPECT_NE(snapshot.flags & EJitAttemptPublicationPending, 0u);
+  ASSERT_TRUE(owner.cancelRequestAttempt(token));
+  EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+
+  // A later flush sees the stale token and drops the linked result.
+  EXPECT_FALSE(owner.flushCodeBatch());
+  EXPECT_EQ(findReadySlot(83), nullptr);
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_EQ(snapshot.terminalReason, EJitRequestAttemptReason::Cancelled);
+}
+
+TEST_F(SharedTaskPoolTest, ShutdownAcknowledgesQueuedBorrowAndAllEvents) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  uint64_t token = 0;
+  ASSERT_EQ(owner.compileOrGet(84, nullptr, 0, codeFor(84), nullptr, 0, &token)
+                .status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  owner.ownerShutdown();
+  EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+  EJitSharedTaskPool::RequestAttemptSnapshot snapshot;
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_EQ(snapshot.terminalReason, EJitRequestAttemptReason::Shutdown);
+}
+
+TEST_F(SharedTaskPoolTest, AttemptTokenExhaustionFailsClosedWithoutAdmission) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  state_->nextAttemptToken.storeRelaxed(UINT64_MAX);
+  EXPECT_EQ(owner.compileOrGet(85, nullptr, 0, codeFor(85)).status,
+            EJitCompileOrGetStatus::QueueFullFallback);
+  EXPECT_EQ(owner.pendingCount(), 0u);
+  EXPECT_EQ(state_->inFlight[85].loadAcquire(), 0u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+}
+
+TEST_F(SharedTaskPoolTest, StaleGenerationSettlesOnlyItsAttempt) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  uint64_t token = 0;
+  ASSERT_EQ(owner.compileOrGet(86, nullptr, 0, codeFor(86), nullptr, 0, &token)
+                .status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  state_->generation.fetchAdd(1);
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+  EJitSharedTaskPool::RequestAttemptSnapshot snapshot;
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_EQ(snapshot.terminalReason,
+            EJitRequestAttemptReason::GenerationChanged);
+}
+
+TEST_F(SharedTaskPoolTest, RequestAttemptsRejectUnsupportedModesBeforeState) {
+  EJitSharedTaskPool noPgo;
+  EJitCoreId::setCurrentForTest(0);
+  noPgo.bind(state_.get());
+  noPgo.setCompiler(&mockCompile, nullptr);
+  noPgo.setMode(EJitCompileMode::Async);
+  ASSERT_TRUE(noPgo.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(noPgo.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  EXPECT_EQ(noPgo.compileOrGet(87, nullptr, 0, codeFor(87)).status,
+            EJitCompileOrGetStatus::OffMode);
+  EXPECT_EQ(noPgo.liveRequestAttemptCount(), 0u);
+  noPgo.setPgoEnabled(true, 1); // live policy mutation is rejected
+  EXPECT_EQ(state_->pgoEnabled.loadAcquire(), 0u);
+  noPgo.ownerShutdown();
+
+  // Re-init with both prerequisites enabled, then prove Sync cannot be
+  // published over the immutable request-attempt policy.
+  EJitSharedTaskPool supported;
+  supported.bind(state_.get());
+  supported.setCompiler(&mockCompile, nullptr);
+  supported.setMode(EJitCompileMode::Async);
+  supported.setPgoEnabled(true, 1);
+  ASSERT_TRUE(supported.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(supported.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  supported.setSharedMode(EJitCompileMode::Sync);
+  EXPECT_EQ(supported.getSharedMode(), EJitCompileMode::Async);
+  EXPECT_FALSE(supported.publishSharedMode(EJitCompileMode::Sync,
+                                           state_->generation.loadAcquire()));
+}
+
+TEST_F(SharedTaskPoolTest,
+       ThousandsOfCompletedAttemptsDoNotConsumeLiveCapacity) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  constexpr uint32_t count = 1000;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t func = 1000 + i;
+    ASSERT_EQ(owner.compileOrGet(func, nullptr, 0, codeFor(func)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(owner.pollOne());
+    auto hit = owner.tryCacheHit0D(func);
+    ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+    if (hit.hasReadToken)
+      owner.releaseRead(hit.bucketIndex);
+    ASSERT_TRUE(owner.pollOne());
+    ASSERT_EQ(owner.liveRequestAttemptCount(), 0u);
+  }
+  EXPECT_EQ(owner.retainedRequestAttemptCount(),
+            kEJitSharedRequestHistoryCapacity);
+  EXPECT_EQ(state_->pgoCompletedFunctions.loadRelaxed(), count);
+}
+
+TEST_F(SharedTaskPoolTest, CancelledPublishedTier1AllowsSameIdentityRetry) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  uint64_t oldToken = 0;
+  ASSERT_EQ(
+      owner.compileOrGet(90, nullptr, 0, codeFor(90), nullptr, 0, &oldToken)
+          .status,
+      EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  ASSERT_TRUE(owner.cancelRequestAttempt(oldToken));
+  EXPECT_EQ(findReadySlot(90), nullptr);
+
+  uint64_t newToken = 0;
+  ASSERT_EQ(
+      owner.compileOrGet(90, nullptr, 0, codeFor(90), nullptr, 0, &newToken)
+          .status,
+      EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_NE(newToken, 0u);
+  EXPECT_NE(newToken, oldToken);
+}
+
+struct AttemptIdentityLog {
+  std::vector<EJitCompileRequest> requests;
+};
+
+bool recordAttemptCompile(void *ctx, const EJitCompileRequest &req,
+                          void **outFn) {
+  static_cast<AttemptIdentityLog *>(ctx)->requests.push_back(req);
+  *outFn = codeFor(req.funcIndex);
+  return true;
+}
+
+TEST_F(SharedTaskPoolTest, OldCellCannotClaimAnotherCellAttempt) {
+  AttemptIdentityLog log;
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&recordAttemptCompile, &log);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_TRUE(owner.setInstanceEnabled(0, 0, true));
+  ASSERT_TRUE(owner.setInstanceEnabled(0, 1, true));
+
+  EJitDimPair cell0 = dim(0, 0);
+  EJitDimPair cell1 = dim(0, 1);
+  uint32_t value0 = 11;
+  uint32_t value1 = 22;
+  EJitBoundPtrDescriptor bound0{&value0, sizeof(value0), 2};
+  EJitBoundPtrDescriptor bound1{&value1, sizeof(value1), 2};
+  uint64_t r1 = 0;
+  uint64_t r2 = 0;
+  ASSERT_EQ(
+      owner.compileOrGet(91, &cell0, 1, codeFor(91), &bound0, 1, &r1).status,
+      EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  ASSERT_TRUE(owner.cancelRequestAttempt(r1));
+  ASSERT_EQ(
+      owner.compileOrGet(91, &cell1, 1, codeFor(91), &bound1, 1, &r2).status,
+      EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  auto oldHit = owner.tryCacheHit1D(91, 0, 0);
+  if (oldHit.hasReadToken)
+    owner.releaseRead(oldHit.bucketIndex);
+  EXPECT_FALSE(owner.pollOne());
+  for (const EJitCompileRequest &req : log.requests) {
+    if (req.attemptToken != r2)
+      continue;
+    ASSERT_EQ(req.numDims, 1u);
+    EXPECT_EQ(req.dims[0].instanceId, 1u);
+    ASSERT_EQ(req.boundCount, 1u);
+    EXPECT_EQ(req.boundPointers[0].rawPtr, &value1);
+  }
+  EJitSharedTaskPool::RequestAttemptSnapshot status;
+  ASSERT_TRUE(owner.requestAttemptStatus(r2, status));
+  EXPECT_TRUE(status.live);
+}
+
+struct CancelDuringReady {
+  EJitSharedTaskPool *pool;
+  uint64_t token;
+  bool cancelled = false;
+};
+
+bool cancelAttemptDuringReady(void *ctx, const void *) {
+  CancelDuringReady &cancel = *static_cast<CancelDuringReady *>(ctx);
+  cancel.cancelled = cancel.pool->cancelRequestAttempt(cancel.token);
+  return true;
+}
+
+TEST_F(SharedTaskPoolTest, CancelBeforeReadyCommitPreventsTier2Publication) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  uint64_t token = 0;
+  ASSERT_EQ(owner.compileOrGet(92, nullptr, 0, codeFor(92), nullptr, 0, &token)
+                .status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  auto hit = owner.tryCacheHit0D(92);
+  if (hit.hasReadToken)
+    owner.releaseRead(hit.bucketIndex);
+
+  CancelDuringReady cancel{&owner, token};
+  owner.setCodeBatchCallbacks(
+      &cancelAttemptDuringReady, +[](void *) { return true; }, &cancel);
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_TRUE(cancel.cancelled);
+  EXPECT_EQ(findReadySlot(92), nullptr);
+  EJitSharedTaskPool::RequestAttemptSnapshot status;
+  ASSERT_TRUE(owner.requestAttemptStatus(token, status));
+  EXPECT_EQ(status.terminalReason, EJitRequestAttemptReason::Cancelled);
+}
+
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+struct VpSessionCompilerProbe {
+  uint64_t sessionId = 0;
+};
+
+bool compileWithVpSession(void *Ctx, const EJitCompileRequest &Req,
+                          void **OutFn) {
+  auto &Probe = *static_cast<VpSessionCompilerProbe *>(Ctx);
+  Probe.sessionId = ejitVpCreateSession(Req.attemptToken);
+  *OutFn = Probe.sessionId ? codeFor(Req.funcIndex) : nullptr;
+  return *OutFn != nullptr;
+}
+
+void retireVpSessionOnLifecycleDrop(void *Ctx, const EJitCompileRequest &Req) {
+  auto &Probe = *static_cast<VpSessionCompilerProbe *>(Ctx);
+  EXPECT_EQ(decodeReqTier(Req.funcIndex), kEJitTierPgoUse);
+  ejitVpEndSession(Probe.sessionId);
+  std::vector<EJitVpSiteSample> Discarded;
+  EXPECT_TRUE(ejitVpTakeSessionSnapshot(Probe.sessionId, Discarded));
+  Probe.sessionId = 0;
+}
+
+TEST_F(SharedTaskPoolTest, TokenlessStaleTier2ReleasesVpSessions) {
+  gEJitVpState.magic.storeRelaxed(0);
+  ASSERT_TRUE(ejitVpEnsureInitialized());
+  VpSessionCompilerProbe Probe;
+  EJitSharedTaskPool Owner;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&compileWithVpSession, &Probe);
+  Owner.setPgoLifecycleDropCallback(&retireVpSessionOnLifecycleDrop, &Probe);
+  Owner.setPgoEnabled(true, 64);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(state_->requestAttemptsEnabled.loadAcquire(), 0u);
+  ASSERT_TRUE(Owner.setInstanceEnabled(0, 0, true));
+  const EJitDimPair Cell = dim(0, 0);
+  for (unsigned I = 0; I <= kEJitVpMaxSessions; ++I) {
+    ASSERT_EQ(Owner.compileOrGet(90, &Cell, 1, codeFor(90)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Owner.pollOne());
+    ASSERT_NE(Probe.sessionId, 0u) << "iteration=" << I;
+    for (unsigned Hit = 0; Hit < 64; ++Hit) {
+      auto Result = Owner.tryCacheHit1D(90, 0, 0);
+      ASSERT_NE(Result.fnPtr, nullptr);
+      if (Result.hasReadToken)
+        Owner.releaseRead(Result.bucketIndex);
+    }
+    ASSERT_TRUE(Owner.setInstanceEnabled(0, 0, false));
+    ASSERT_TRUE(Owner.setInstanceEnabled(0, 0, true));
+    ASSERT_TRUE(Owner.pollOne());
+    EXPECT_EQ(Probe.sessionId, 0u);
+  }
+}
+
+TEST_F(SharedTaskPoolTest, CancelledPublishedT1ClosesExactVpSession) {
+  gEJitVpState.magic.storeRelaxed(0);
+  ASSERT_TRUE(ejitVpEnsureInitialized());
+  VpSessionCompilerProbe Probe;
+  EJitSharedTaskPool Owner;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&compileWithVpSession, &Probe);
+  Owner.setPgoEnabled(true, 64);
+  ASSERT_TRUE(Owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  for (unsigned I = 0; I < kEJitVpMaxSessions; ++I) {
+    uint64_t Token = 0;
+    ASSERT_EQ(
+        Owner.compileOrGet(90, nullptr, 0, codeFor(90), nullptr, 0, &Token)
+            .status,
+        EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Owner.pollOne());
+    ASSERT_NE(Probe.sessionId, 0u);
+    ASSERT_TRUE(Owner.cancelRequestAttempt(Token));
+    ASSERT_EQ(Owner.liveRequestAttemptCount(), 0u);
+  }
+
+  unsigned OpenSessions = 0;
+  for (const EJitVpSessionSlot &Slot : gEJitVpState.sessions)
+    OpenSessions += (Slot.gate.loadAcquire() & 1u) != 0;
+  EXPECT_EQ(OpenSessions, 0u);
+  const uint64_t Replacement = ejitVpCreateSession();
+  ASSERT_NE(Replacement, 0u);
+  ejitVpEndSession(Replacement);
+  std::vector<EJitVpSiteSample> Discarded;
+  EXPECT_TRUE(ejitVpTakeSessionSnapshot(Replacement, Discarded));
+}
+#endif
 
 } // namespace

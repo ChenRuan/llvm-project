@@ -272,6 +272,9 @@ EJit::EJit(const Config &config) : config_(config) {
   compileDriver_->registerSymbol(
       "ejit_vp_record_scalar",
       reinterpret_cast<void *>(&ejit_vp_record_scalar));
+  compileDriver_->registerSymbol(
+      "ejit_vp_record_scalar_session",
+      reinterpret_cast<void *>(&ejit_vp_record_scalar_session));
 #endif
 
   // Build the ORC engine. On the shared-taskpool async path this is DEFERRED to

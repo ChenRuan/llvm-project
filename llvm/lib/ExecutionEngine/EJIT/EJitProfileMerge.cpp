@@ -132,6 +132,47 @@ std::string ejit::synthesizeProfileBuffer(ArrayRef<PgoCounterRef> counters,
   return std::string(Buf->getBuffer());
 }
 
+bool ejit::readProfileSchema(ArrayRef<PgoCounterRef> counters,
+                             ArrayRef<PgoValueFunction> valueFunctions,
+                             std::vector<PgoFunctionSchema> &schema) {
+  schema.clear();
+  std::vector<PgoFunctionSchema> Captured;
+  DenseMap<uint64_t, const PgoValueFunction *> ValuesByName;
+  for (const PgoValueFunction &F : valueFunctions)
+    ValuesByName[F.pgoNameHash] = &F;
+  for (const PgoCounterRef &C : counters) {
+    if (!C.pgoName || !C.profdAddr || !C.profcAddr)
+      return false;
+    const auto *Data = reinterpret_cast<const uint8_t *>(C.profdAddr);
+    const uint32_t NumCounters = loadU32(Data + kNumCountersOff);
+    if (NumCounters == 0 || NumCounters > kMaxCountersPerFunc)
+      return false;
+    PgoFunctionSchema S;
+    S.pgoName = C.pgoName;
+    S.funcHash = loadU64(Data + kFuncHashOff);
+    S.pgoNameHash = loadU64(Data + kNameRefOff);
+    S.numCounters = NumCounters;
+    S.numIcSites = loadU16(Data + kNumValueSitesOff);
+    S.numMemSites = loadU16(Data + kNumValueSitesOff + 2);
+    if (S.numIcSites > kMaxValueSitesPerKind ||
+        S.numMemSites > kMaxValueSitesPerKind)
+      return false;
+    auto It = ValuesByName.find(S.pgoNameHash);
+    if (It != ValuesByName.end()) {
+      if (It->second->funcHash != S.funcHash ||
+          It->second->numIcSites != S.numIcSites ||
+          It->second->numMemSites != S.numMemSites)
+        return false;
+      S.numScalarSites = It->second->numScalarSites;
+    }
+    Captured.push_back(std::move(S));
+  }
+  if (Captured.empty())
+    return false;
+  schema = std::move(Captured);
+  return true;
+}
+
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 
 bool ejit::readValueSiteInventory(ArrayRef<PgoCounterRef> counters,
