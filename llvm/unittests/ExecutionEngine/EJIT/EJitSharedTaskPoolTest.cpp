@@ -472,6 +472,25 @@ protected:
     EJitCoreId::resetForTest();
   }
 
+  // Ordinary hits retain code forever in NO_RECLAIM. Representative sampling
+  // has a separate lifetime contract and is checked by its execution tests.
+  void expectOrdinaryHitToken(const EJitSharedTaskPool::CompileOrGetResult &Hit) {
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    EXPECT_FALSE(Hit.hasReadToken);
+    EXPECT_EQ(Hit.bucketIndex, kEJitSharedCacheBuckets);
+    expectNoReaders();
+#else
+    EXPECT_TRUE(Hit.hasReadToken);
+    ASSERT_LT(Hit.bucketIndex, kEJitSharedCacheBuckets);
+    EXPECT_GT(state_->buckets[Hit.bucketIndex].readers.loadAcquire(), 0u);
+#endif
+  }
+
+  void expectNoReaders() {
+    for (uint32_t B = 0; B < kEJitSharedCacheBuckets; ++B)
+      EXPECT_EQ(state_->buckets[B].readers.loadAcquire(), 0u) << "bucket " << B;
+  }
+
   // Register a test-local stand-in for the wrapper's @__ejit_icache_fn_<name>
   // cell table. \p missFn non-null models a SENTINEL-form slot (NumDims <= 2,
   // timing off): the table is defined pre-filled with &MissFn and the runtime
@@ -1673,11 +1692,9 @@ TEST_F(SharedTaskPoolTest, PublishLookupAndReadTokenRelease) {
   auto hit = owner.compileOrGet(11, d0, 1, codeFor(11));
   ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(hit.fnPtr, codeFor(11));
-  EXPECT_TRUE(hit.hasReadToken);
-  // A held read token keeps readers > 0.
-  EXPECT_GT(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
+  expectOrdinaryHitToken(hit);
   owner.releaseRead(hit.bucketIndex);
-  EXPECT_EQ(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
+  expectNoReaders();
 }
 
 //===----------------------------------------------------------------------===//
@@ -2290,8 +2307,9 @@ TEST_F(SharedTaskPoolTest, CodeSharingOnReturnsSamePointerToPeer) {
   auto peerHit = peer.compileOrGet(61, nullptr, 0, codeFor(61));
   ASSERT_EQ(peerHit.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(peerHit.fnPtr, codeFor(61)); // same pointer cross-core
-  EXPECT_TRUE(peerHit.hasReadToken);
+  expectOrdinaryHitToken(peerHit);
   peer.releaseRead(peerHit.bucketIndex);
+  expectNoReaders();
 }
 
 // 七.7 — a request whose generation has been superseded is dropped at the
@@ -2471,8 +2489,9 @@ TEST_F(SharedTaskPoolTest, FourKPeerSplitsOnceSealsSinglePage) {
   auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
   ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(hit.fnPtr, codeFor(1));
-  EXPECT_TRUE(hit.hasReadToken);
+  expectOrdinaryHitToken(hit);
   owner.releaseRead(hit.bucketIndex);
+  expectNoReaders();
 
   ASSERT_EQ(fourK.splits.size(), 1u);
   EXPECT_EQ(fourK.splits[0].first, range.poolBase);
@@ -3392,11 +3411,8 @@ TEST_F(SharedTaskPoolTest, TryCacheHitServesHitWithoutEnqueue) {
   EXPECT_TRUE(fast.fastPathTerminal);
   EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(fast.fnPtr, codeFor(1));
-  EXPECT_TRUE(fast.hasReadToken);
+  expectOrdinaryHitToken(fast);
   EXPECT_FALSE(fast.readyButNotShareable);
-  // A held read token keeps readers > 0 (same ownership contract as
-  // compileOrGet — the caller must release through releaseRead).
-  EXPECT_GT(state_->buckets[fast.bucketIndex].readers.loadAcquire(), 0u);
 
   EJitSharedDiagnostics after;
   owner.getDiagnostics(after);
@@ -3406,7 +3422,7 @@ TEST_F(SharedTaskPoolTest, TryCacheHitServesHitWithoutEnqueue) {
   EXPECT_EQ(after.pendingCount, 0u);
 
   owner.releaseRead(fast.bucketIndex);
-  EXPECT_EQ(state_->buckets[fast.bucketIndex].readers.loadAcquire(), 0u);
+  expectNoReaders();
 }
 
 // 2/ A true miss is NOT terminal on the fast path (no enqueue), and the slow
@@ -3523,8 +3539,9 @@ TEST_F(SharedTaskPoolTest, TryCacheHitServesHitEvenWhenModeOff) {
   EXPECT_TRUE(fast.fastPathTerminal);
   EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(fast.fnPtr, codeFor(30));
-  EXPECT_TRUE(fast.hasReadToken);
+  expectOrdinaryHitToken(fast);
   owner.releaseRead(fast.bucketIndex);
+  expectNoReaders();
 }
 
 //===----------------------------------------------------------------------===//
@@ -3555,9 +3572,9 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   EXPECT_TRUE(h0.fastPathTerminal);
   EXPECT_EQ(h0.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h0.fnPtr, codeFor(1));
-  EXPECT_TRUE(h0.hasReadToken);
-  EXPECT_GT(state_->buckets[h0.bucketIndex].readers.loadAcquire(), 0u);
+  expectOrdinaryHitToken(h0);
   owner.releaseRead(h0.bucketIndex);
+  expectNoReaders();
 
   // 1D
   EJitDimPair d1[1] = {dim(0, 1)};
@@ -3565,8 +3582,9 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   auto h1 = owner.tryCacheHit1D(2, 0, 1);
   ASSERT_EQ(h1.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h1.fnPtr, codeFor(2));
-  EXPECT_TRUE(h1.hasReadToken);
+  expectOrdinaryHitToken(h1);
   owner.releaseRead(h1.bucketIndex);
+  expectNoReaders();
 
   // 2D
   EJitDimPair d2[2] = {dim(0, 1), dim(1, 2)};
@@ -3575,6 +3593,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   ASSERT_EQ(h2.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h2.fnPtr, codeFor(3));
   owner.releaseRead(h2.bucketIndex);
+  expectNoReaders();
 
   // 3D
   EJitDimPair d3[3] = {dim(0, 1), dim(1, 2), dim(2, 3)};
@@ -3583,6 +3602,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   ASSERT_EQ(h3.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h3.fnPtr, codeFor(4));
   owner.releaseRead(h3.bucketIndex);
+  expectNoReaders();
 
   // 4D
   EJitDimPair d4[4] = {dim(0, 1), dim(1, 2), dim(2, 3), dim(3, 4)};
@@ -3591,6 +3611,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   ASSERT_EQ(h4.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h4.fnPtr, codeFor(5));
   owner.releaseRead(h4.bucketIndex);
+  expectNoReaders();
 
   // Cache hits do not enqueue/dedup.
   EJitSharedDiagnostics d;
@@ -3683,8 +3704,9 @@ TEST_F(SharedTaskPoolTest, FixedDimServesHitEvenWhenModeOff) {
   EXPECT_TRUE(fast.fastPathTerminal);
   EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(fast.fnPtr, codeFor(40));
-  EXPECT_TRUE(fast.hasReadToken);
+  expectOrdinaryHitToken(fast);
   owner.releaseRead(fast.bucketIndex);
+  expectNoReaders();
 }
 
 // readyButNotShareable: a peer core that may not read the pointer gets a clean

@@ -108,6 +108,7 @@ set(EJIT_SOURCES
   EJitRegistryTable.c
   EJitOrcEngine.cpp
   EJitPreparedCode.cpp
+  EJitRepresentativeGroup.cpp
   EJitLinkDiagPlugin.cpp
   EJitLinkOptimizationPlugin.cpp
   EJitLibcallStubs.cpp
