@@ -13,6 +13,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitBoundPtr.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+#include "llvm/ExecutionEngine/EJIT/EJitPreparedCode.h"
+#endif
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
 #endif
@@ -160,6 +163,34 @@ public:
   /// Look up a compiled function symbol in the specialization JITDylib
   /// identified by cacheKey.
   Expected<void *> lookup(uint64_t cacheKey, const std::string &name);
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  Expected<EJitCandidateResult> classifyCandidate(
+      StringRef Bitcode, SpecializationContext Ctx,
+      EJitCandidateDirectory &Directory, const EJitCodeIdentityScope &Scope);
+  /// Owner-side final-code preparation for representative sharing. Runs the
+  /// REAL specialization pipeline (the same EJitOptimizer::runPipeline the ORC
+  /// transform layer runs, with the engine's active context) on this request's
+  /// bitcode and returns the final module plus its effective bindings as an
+  /// EJitPreparedCode, WITHOUT linking anything. The caller compares the
+  /// returned identity with the generation's physical object and only then
+  /// emits or reuses. Returns an error (never a partial object) when the module
+  /// cannot be shared or a referenced external symbol has no effective binding;
+  /// the caller must then fall back to the ordinary ORC route for that request.
+  Expected<std::unique_ptr<EJitPreparedCode>>
+  prepareFinalCode(StringRef bitcodeData, uint64_t cacheKey,
+                   const std::string &origFnName,
+                   const EJitCodeIdentityScope &Scope);
+
+  /// The owner-side prepared-code emitter of this engine, created on first use
+  /// and owned by the engine (so it is destroyed before the LLJIT it links
+  /// into). Null while no LLJIT exists. The representative's own Tier-2 and
+  /// every validated member go through this ONE emitter, so the reported
+  /// physical-object count is the real one and never a per-call replica.
+  EJitPreparedCodeEmitter *preparedEmitter();
+  /// Read-only emitter statistics (real physical objects / reuses / bytes).
+  EJitPreparedCodeEmitter::Stats preparedEmitterStats() const;
+#endif
 
   /// Set the active specialization context (used during compilation).
   void setActiveContext(const SpecializationContext *ctx);

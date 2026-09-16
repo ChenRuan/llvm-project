@@ -125,6 +125,14 @@ constexpr uint32_t kEJitTierMask = 0x3u << kEJitTierShift;
 constexpr uint32_t kEJitTierBaseline = 0;
 constexpr uint32_t kEJitTierInstrumented = 1;
 constexpr uint32_t kEJitTierPgoUse = 2;
+// Worker-only prefix/schema classification. Never emits executable code.
+constexpr uint32_t kEJitTierCandidate = 3;
+
+/// Real Tier-1 dispatches ONE representative sampling session of a
+/// representative-PGO group may consume (the group quota, and the default
+/// online-PGO Tier-2 trigger threshold). Named once so the product admission
+/// path and the group policy cannot drift apart.
+constexpr uint32_t kEJitRepresentativeDispatchQuota = 64;
 
 /// Encode a tier (CompileTier value) into funcIndex's top 2 bits.
 inline uint32_t encodeReqTier(uint32_t funcIndex, uint32_t tier) {

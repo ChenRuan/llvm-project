@@ -195,6 +195,15 @@ public:
   Expected<LinkedCode> link(std::unique_ptr<EJitPreparedCode> Prepared);
   Stats stats() const;
 
+  /// Exact full-identity compare of the object already stored under \p CodeId
+  /// against \p Other: scope, effective bindings, canonical IR and digest, the
+  /// same comparator link() uses - never a digest-only proof. Sharing decisions
+  /// for a representative group use this instead of trusting a hash. Returns
+  /// false for an unknown codeId. Audit query only: emits nothing, claims
+  /// nothing and consumes no budget.
+  bool linkedIdentityEquals(uint64_t CodeId,
+                            const EJitFinalCodeIdentity &Other) const;
+
 private:
   struct Impl;
   std::unique_ptr<Impl> P;

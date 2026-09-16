@@ -332,6 +332,81 @@ public:
   /// Owner notification for a terminal queued Tier-2 lifecycle drop.
   using PgoLifecycleDropCallback = void (*)(void *ctx,
                                             const EJitCompileRequest &req);
+  /// In-flight sampling admission for one async PGO request (representative
+  /// sharing). Asked BEFORE admitPgoFunction() takes the per-function profiling
+  /// slot, so a represented member whose group already owns its ONE
+  /// representative sampling session is deferred with no profiling admission,
+  /// no queue entry and no side effect. Unset (the default) keeps the legacy
+  /// path: every async PGO miss takes its own admission.
+  enum class SamplingAdmission : uint8_t {
+    Grant, ///< take the ordinary per-function PGO admission.
+    Deny,  ///< stay on the AOT fallback; the group owns the sampling session.
+    /// This member owns no sampling session of its own, but its group has
+    /// already published the shared profile: the pool must ask the wake-up
+    /// callback for the member's Tier-2 request and enqueue that INSTEAD of a
+    /// private Tier-1. No sampling admission is granted.
+    WakeTier2,
+    Classify, ///< worker prefix/schema work, without sampling admission.
+  };
+  using SamplingAdmissionCallback = SamplingAdmission (*)(
+      void *ctx, uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims);
+  void setSamplingAdmissionCallback(SamplingAdmissionCallback fn, void *ctx) {
+    samplingAdmissionFn_ = fn;
+    samplingAdmissionCtx_ = ctx;
+  }
+  using CandidateClassifyCallback = bool (*)(void *, const EJitCompileRequest &);
+  void setCandidateClassifyCallback(CandidateClassifyCallback fn, void *ctx) {
+    candidateClassifyFn_ = fn;
+    candidateClassifyCtx_ = ctx;
+  }
+  /// Representative-group WAKE-UP: asked for a represented member that owns no
+  /// Tier-1 slot at all (its sampling admission was denied), so the ordinary
+  /// slot-armed Tier-2 claim can never fire for it. The callback fills \p Out
+  /// with the member's Tier-2 request - the group's frozen observation plus this
+  /// member's own function/dims identity - and returns true, which makes the
+  /// pool claim and enqueue that compile immediately. A false return leaves the
+  /// request on the wrapper's AOT fallback.
+  ///
+  /// This is the ONLY way a member with no sampling session of its own reaches
+  /// PGOUse, and it grants no sampling admission: the request is a Tier-2
+  /// (kEJitTierPgoUse) that consumes the already published group bundle.
+  using RepresentativeWakeCallback = bool (*)(void *ctx, uint32_t funcIndex,
+                                              const EJitDimPair *dims,
+                                              uint32_t numDims,
+                                              EJitCompileRequest &Out);
+  void setRepresentativeWakeCallback(RepresentativeWakeCallback fn, void *ctx) {
+    representativeWakeFn_ = fn;
+    representativeWakeCtx_ = ctx;
+  }
+  /// Fired from the ONE committed-return point (classifyHit) for a REAL granted
+  /// Tier-1 dispatch, after the admission CAS/freeze and before the pointer is
+  /// handed back. This is the production bookkeeping hook for a representative
+  /// group quota: a denied or abandoned lookup never reaches it, so a group can
+  /// never count a dispatch it did not grant. Unset by default (legacy pools do
+  /// no extra work per dispatch).
+  struct DispatchObservation {
+    uint32_t funcIndex = 0;
+    /// Exact publish identity the dispatch was attributed to.
+    uint64_t attemptToken = 0;
+    uint32_t generation = 0;
+    /// Observed count AFTER this admission (the slot's own CAS result), never
+    /// the configured threshold.
+    uint64_t count = 0;
+    uint64_t limit = 0;
+    /// Timestamp of the final allowed dispatch; 0 = unknown clock.
+    uint64_t quotaEnd = 0;
+    /// True only for the dispatch that closed the quota.
+    bool closedQuota = false;
+    /// Slot coordinates of the dispatch (for owner-side diagnostics only; -1
+    /// sentinel values mean the build carries no bucket index).
+    uint32_t bucketIndex = kEJitSharedCacheBuckets;
+    uint32_t slotIndex = kEJitSharedCacheSlots;
+  };
+  using DispatchObserver = void (*)(void *ctx, const DispatchObservation &obs);
+  void setDispatchObserver(DispatchObserver fn, void *ctx) {
+    dispatchObserverFn_ = fn;
+    dispatchObserverCtx_ = ctx;
+  }
   /// Owner-private physical-code release callback for an overwritten/retired
   /// pointer. Optional; a purely logical drop happens when unset.
   using ReleaseCallback = void (*)(void *ctx, void *oldFn);
@@ -726,6 +801,11 @@ public:
   /// timestamp: the observation records the count and reports the timestamp as
   /// unknown (0) instead of fabricating one. Owner-private configuration, like
   /// the other callbacks; the driver wires the production trace clock.
+  using OwnerMaintenanceFn = bool (*)(void *ctx);
+  void setOwnerMaintenanceCallback(OwnerMaintenanceFn fn, void *ctx) {
+    ownerMaintenanceFn_ = fn;
+    ownerMaintenanceCtx_ = ctx;
+  }
   using TraceClockFn = uint64_t (*)(void *ctx);
   void setTraceClock(TraceClockFn fn, void *ctx) {
     traceClockFn_ = fn;
@@ -801,6 +881,7 @@ public:
   }
 
 #ifdef EJIT_SRE_TASKPOOL_TESTING
+  void failNextTier2QueuePushForTest() { failTier2QueuePush_.storeRelease(1); }
   void setPgoAdmissionTestHook(TestHookFn fn, void *ctx) {
     pgoAdmissionTestHook_ = fn;
     pgoAdmissionTestHookCtx_ = ctx;
@@ -1028,6 +1109,23 @@ public:
   /// truth the compile gate (compileCold) and ejit_is_active consult. Returns
   /// false for an out-of-range dimType/instanceId (never reads out of bounds).
   bool isInstanceActive(uint32_t dimType, uint32_t instanceId) const;
+
+  /// The ENABLED bit alone (not the activate bit): whether the lifecycle
+  /// instance currently exists for this build. Representative-group member
+  /// legality (an inactive cell may not be elected or join as a waiter) is
+  /// decided from this, so a disabled cell never becomes a group member. The
+  /// query is read-only and never touches the queue or the caches.
+  bool isInstanceEnabledPublic(uint32_t dimType, uint32_t instanceId) const {
+    return isInstanceEnabled(dimType, instanceId);
+  }
+
+  /// The live lifecycle version of one instance (the same value the producer
+  /// path stamps into a request). A caller that has to BUILD a request outside
+  /// compileOrGet (the representative-group wake-up) must carry the current
+  /// version, otherwise the worker's version checkpoints discard it.
+  uint32_t instanceVersionPublic(uint32_t dimType, uint32_t instanceId) const {
+    return instanceVersion(dimType, instanceId);
+  }
 
   //--- per-function inline cache (multi-version direct-indexed) --------------
   // NOTE: the production hit path does NOT use icacheTry. With -ejit-inline-cache
@@ -1554,6 +1652,14 @@ private:
   EJitSharedTaskPoolState *state_ = nullptr;
   CompileCallback compileFn_ = nullptr;
   void *compileCtx_ = nullptr;
+  CandidateClassifyCallback candidateClassifyFn_ = nullptr;
+  void *candidateClassifyCtx_ = nullptr;
+  SamplingAdmissionCallback samplingAdmissionFn_ = nullptr;
+  void *samplingAdmissionCtx_ = nullptr;
+  RepresentativeWakeCallback representativeWakeFn_ = nullptr;
+  void *representativeWakeCtx_ = nullptr;
+  DispatchObserver dispatchObserverFn_ = nullptr;
+  void *dispatchObserverCtx_ = nullptr;
   PublishCallback publishFn_ = nullptr;
   void *publishCtx_ = nullptr;
   PgoLifecycleDropCallback pgoLifecycleDropFn_ = nullptr;
@@ -1583,9 +1689,12 @@ private:
   void *workerCtx_ = nullptr;
   WorkerIdleFn workerIdle_ = nullptr;
   void *workerIdleCtx_ = nullptr;
+  OwnerMaintenanceFn ownerMaintenanceFn_ = nullptr;
+  void *ownerMaintenanceCtx_ = nullptr;
   TraceClockFn traceClockFn_ = nullptr;
   void *traceClockCtx_ = nullptr;
 #ifdef EJIT_SRE_TASKPOOL_TESTING
+  EJitAtomicU32 failTier2QueuePush_{0};
   TestHookFn pgoAdmissionTestHook_ = nullptr;
   void *pgoAdmissionTestHookCtx_ = nullptr;
   SeqRetryHook seqlockRetryHook_ = nullptr;
