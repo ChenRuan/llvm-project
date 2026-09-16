@@ -170,10 +170,30 @@ ejit_status_t ejit_init(const ejit_config_t *config);
 /// with LLVMProfileData + LLVMInstrumentation (a build without PGO support
 /// treats this as ejit_init). PGO is off for plain ejit_init().
 ejit_status_t ejit_init_pgo(const ejit_config_t *config);
+/// Initialize with online PGO AND representative-PGO group sharing enabled.
+/// Additive, ABI-compatible entry point exactly like ejit_init_pgo (the public
+/// config struct keeps its layout, so an old caller is never over-read):
+/// Config::enableRepresentativeSharing is forced on together with
+/// Config::enablePgo, which is what the V1 admission policy requires (Async +
+/// normal online PGO). The default product path stays OFF: only a caller of
+/// THIS entry point opts in. A configuration that cannot satisfy the policy
+/// (Sync/Off mode, audit-only) is rejected by the group admission gate before
+/// any group, queue or sampling side effect, and the runtime keeps the ordinary
+/// per-request PGO behavior.
+ejit_status_t ejit_init_representative(const ejit_config_t *config);
 void ejit_shutdown(void);
 
 // Symbol registration for bare-metal (no dlsym)
 void ejit_register_symbol(const char *name, void *addr);
+
+// Bitcode registration (the entry point the AOT auto-registration path calls
+// with the __ejit_bitcode section payload). Accepted before ejit_init (staged in
+// the process-global registration store) and, while registration is open, after
+// it; a null/zero payload, funcIndex capacity exhaustion or a conflicting
+// re-registration is rejected by the runtime. Declared here so a host harness
+// can register exactly what the AOT section would.
+void ejit_register_bitcode(const char *funcName, const uint8_t *bitcodeData,
+                           uint64_t bitcodeSize);
 
 // Lifecycle dimType-slot fixup. Resolves \p lifecycleName to its process-global
 // dimType slot (assigning the next free slot on first sight) and writes it to
@@ -361,8 +381,71 @@ unsigned ejit_taskpool_poll_one(void);
 unsigned ejit_taskpool_poll_budget(unsigned maxItems);
 #endif
 
-// SRE taskpool statistics. Separate from ejit_stats_t (which reports the legacy
-// LRU EJitCache); these counters describe the taskpool cache/dedup/queue
+// Representative-PGO group diagnostics (V1 sharing; all zero when the opt-in
+// was not accepted). Deliberately SEPARATE counters for logical requests,
+// representative sample scope, waiters, profile quality and retained bytes, so
+// a report cannot pass a fixture off as shared code. Fixed layout (uint64_t /
+// uint32_t only) for a stable ABI.
+typedef struct {
+  uint32_t active;              ///< 1 when representative sharing really drives
+                                ///< this runtime (opt-in accepted).
+  uint32_t groups;              ///< live candidate groups.
+  uint32_t representativeLive;  ///< groups with a live representative session.
+  uint32_t bundlesPublished;    ///< groups with a published immutable bundle.
+  uint32_t waitersLive;         ///< waiters of the first live group.
+  uint32_t representativesElected;
+  uint32_t representativeReElections;
+  uint32_t rejectedAdmissions;
+  uint32_t schemaRejections;
+  uint32_t staleSettlements;
+  uint64_t logicalRequests;
+  uint64_t representativeDispatches;
+  uint64_t waitersJoined;
+  uint64_t waitersCompleted;
+  uint64_t waitersCancelled;
+  uint64_t bundlePublications;
+  uint64_t retainedBundleBytes;
+  uint64_t physicalCodeObjects;
+  uint64_t sharedPhysicalReuses;
+  uint64_t independentPhysicalObjects;
+  uint64_t completeProfiles;
+  uint64_t approximateProfiles;
+  uint64_t edgeOnlyProfiles;
+  uint64_t valueDroppedProfiles;
+  /// The live representative session of the first group (0 when none).
+  uint64_t representativeAttemptToken;
+  uint64_t representativeSamplingSessionId;
+  uint64_t representativeLogicalKey;
+  uint64_t representativeDispatchCount;
+  uint64_t representativeDispatchLimit;
+  uint64_t representativeQuotaEnd;
+  /// The published bundle of the first group (0 when not published).
+  uint64_t bundleGeneration;
+  uint64_t bundleDispatchCount;
+  uint64_t bundleDispatchLimit;
+  uint64_t bundleQuotaEnd;
+} ejit_representative_stats_t;
+
+/// Fill \p out with the live representative-PGO group diagnostics. Returns
+/// EJIT_OK when the runtime is initialized (fields are zeroed when the opt-in is
+/// off), EJIT_ERR_NOT_ACTIVE otherwise.
+ejit_status_t ejit_representative_get_stats(ejit_representative_stats_t *out);
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+ejit_status_t ejit_representative_copy_profile(void *buffer, size_t capacity,
+                                               size_t *size);
+ejit_status_t ejit_representative_get_group_stats(uint32_t groupIndex,
+                                                  ejit_representative_stats_t *out);
+void *ejit_representative_test_pool(void);
+ejit_status_t ejit_representative_test_fail_next_tier2(void);
+ejit_status_t ejit_representative_test_timeout(uint64_t ticks, uint32_t maxReelections);
+ejit_status_t ejit_representative_copy_group_profile(uint32_t groupIndex,
+    bool scalars, void *buffer, size_t capacity, size_t *size);
+/// Test-only native PgoScalarSite array copied from the immutable bundle.
+ejit_status_t ejit_representative_copy_scalar_profile(void *buffer, size_t capacity,
+                                                      size_t *size);
+#endif
+
+// SRE taskpool statistics. Separate from ejit_stats_t (which reports the legacy// LRU EJitCache); these counters describe the taskpool cache/dedup/queue
 // pipeline used when EJIT_SRE_TASKPOOL is built. Fixed layout
 // (uint64_t/uint32_t only) for stable ABI across the aarch64_be target.
 typedef struct {

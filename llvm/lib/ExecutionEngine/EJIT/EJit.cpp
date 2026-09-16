@@ -62,6 +62,18 @@ EJit::EJit(const Config &config) : config_(config) {
                     (int)config.compileMode, (int)config.optLevel,
                     config.maxCacheSize, (unsigned)config.maxCacheEntries);
 
+  // Reject unsupported representative policy before consuming registrations,
+  // constructing a driver/collector, or starting a worker.
+  if (config_.enableRepresentativeSharing &&
+      (!config_.enablePgo || config_.enableProfileAudit ||
+       config_.representativeIdleTimeoutTicks == 0 ||
+       config_.compileMode != CompileMode::Async)) {
+    recordInitError(EJIT_ERR_INVALID_PARAM,
+                    "representative sharing requires Async + normal online PGO",
+                    "");
+    return;
+  }
+
   // Create all runtime components
   runtimeState_ = std::make_unique<EJitRuntimeState>();
   moduleLoader_ = std::make_unique<EJitModuleLoader>();
@@ -316,6 +328,15 @@ EJit::EJit(const Config &config) : config_(config) {
       // driver's owner-elected hook, and only on the winner. A clean failure
       // (engine build / worker start / ABI mismatch) fails init rather than
       // accepting requests no worker consumes.
+      //
+      // Online PGO and the representative-PGO group quota share the temporary
+      // Instrumented-tier window, so the policy is published BEFORE the blob
+      // goes Ready: a request that arrives immediately after init must already
+      // see the Tier-2 trigger and the observed-dispatch contract, which are
+      // immutable once Ready.
+      if (config_.enablePgo || config_.enableProfileAudit)
+        compileDriver_->sharedTaskPool()->setPgoEnabled(
+            true, kEJitRepresentativeDispatchQuota);
       bool poolOk = compileDriver_->startSharedTaskPool();
       engineReady = compileDriver_->hasJitEngine();
       if (!poolOk) {
@@ -363,15 +384,19 @@ EJit::EJit(const Config &config) : config_(config) {
         // PGO and the default-off profile audit share the temporary
         // Instrumented-tier hit window. Audit-only mode publishes ordinary
         // Baseline code after collecting the window.
+        //
+        // Shared taskpool: already published above, before Ready (the values are
+        // immutable once Ready). The per-instance pool has no such window.
+#ifndef EJIT_SRE_SHARED_TASKPOOL
         if (config_.enablePgo || config_.enableProfileAudit) {
-          constexpr uint32_t kDefaultPgoThreshold = 64;
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-          compileDriver_->sharedTaskPool()->setPgoEnabled(
-              true, kDefaultPgoThreshold);
-#else
+          // The Tier-1 sampling window and the representative-PGO group quota
+          // are the SAME number by construction: one representative session's
+          // real dispatches are exactly what online PGO needs to freeze.
+          constexpr uint32_t kDefaultPgoThreshold =
+              kEJitRepresentativeDispatchQuota;
           compileDriver_->taskPool()->setPgoEnabled(true, kDefaultPgoThreshold);
-#endif
         }
+#endif
       }
     } else {
       EJIT_DIAG_VERBOSE("taskpool sync init complete: worker remains stopped");
@@ -647,6 +672,11 @@ bool EJit::registerStaticVar(const std::string &varName, void *varAddr) {
 }
 
 bool EJit::setCompileMode(CompileMode mode) {
+  if (config_.enableRepresentativeSharing) {
+    // The request/session contract is immutable for this runtime lifetime.
+    // Reject before touching either the private controller or shared state.
+    return mode == config_.compileMode;
+  }
   EJitTaskPool *tp = taskPool();
   if (!tp)
     return false;
