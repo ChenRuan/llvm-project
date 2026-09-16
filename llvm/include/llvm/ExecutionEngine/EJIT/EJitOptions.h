@@ -60,6 +60,8 @@ struct Config {
   uint64_t representativeIdleTimeoutTicks = 5000000000ULL;
   /// Number of new sampling rounds allowed after timeout of the first round.
   uint32_t representativeMaxReelections = 2;
+  /// Failed member final transforms may retry this many times after the first.
+  uint32_t representativeMaxFinalRetries = 2;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   /// Build-option-gated runtime sampling. This reuses the temporary
   /// instrumented tier but does not require profile-guided optimization.

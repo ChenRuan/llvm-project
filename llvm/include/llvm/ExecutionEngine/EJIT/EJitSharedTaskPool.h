@@ -1073,6 +1073,13 @@ public:
       uint64_t token,
       EJitRequestAttemptReason reason = EJitRequestAttemptReason::Cancelled);
   bool requestAttemptStatus(uint64_t token, RequestAttemptSnapshot &out) const;
+  /// Owner acknowledgement after the last compiler read of a logical source.
+  bool completeRequestBorrow(uint64_t token);
+  /// Keep only the source borrow after successful no-code prefix classification.
+  void finishCandidateClassification(uint64_t token);
+  enum class BorrowScopeStatus { Invalid, Pending, Complete };
+  BorrowScopeStatus instanceBorrowStatus(uint32_t dimType, uint32_t instanceId,
+                                         uint32_t generation, uint32_t version) const;
   uint32_t liveRequestAttemptCount() const;
   uint32_t retainedRequestAttemptCount() const;
   /// Drive one end of a period-value mutation window for a lifecycle instance.
@@ -1382,6 +1389,26 @@ private:
     uint64_t t1DispatchCount = 0;
     uint64_t t1QuotaEnd = 0;
     uint64_t t1DispatchLimit = 0;
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    /// Legacy hitCount accounting deferred until the NO_RECLAIM seqlock
+    /// validation accepts this lookup.  A retry must not charge hotness or
+    /// Tier-1 quota for the discarded resolve snapshot.
+    bool legacyHitCountPending = false;
+    /// Settlement coordinates survive failed preparation independently of
+    /// Tier-2 eligibility; a clean fallback must not arm a recompile.
+    uint32_t legacyBucketIndex = kEJitSharedCacheBuckets;
+    uint32_t legacySlotIndex = kEJitSharedCacheSlots;
+    /// Exact publish identity captured with a deferred legacy lookup.  The
+    /// NO_RECLAIM cold path may span a publish after it revalidates its
+    /// pointer, so commitLegacyHit() must serialize against publication and
+    /// fail closed when this identity is no longer current.  The pointer is
+    /// retained by the NO_RECLAIM code pool and is therefore safe to compare.
+    uint64_t legacySlotAttemptToken = 0;
+    uint32_t legacySlotGeneration = 0;
+    uint64_t legacySlotIdentityHash = 0;
+    void *legacySlotFnPtr = nullptr;
+    uint8_t legacySlotTier = 0;
+#endif
   };
 
   // shared cache helpers (POD table in the shared blob)
@@ -1511,6 +1538,12 @@ private:
   /// is counted exactly once on either path.
   bool captureT1Observation(const EJitSharedCacheSlot &Slot,
                             SharedLookup &R) const;
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  /// Commit one legacy identity-hit charge after cacheLookupSeq has accepted
+  /// its publish sequence.  Keeping this after the outer validation prevents
+  /// a discarded resolve from consuming hitCount/quota.
+  void commitLegacyHit(SharedLookup &Hit);
+#endif
 
   /// Timestamp source for the observed dispatch boundary. 0 when unconfigured
   /// (the caller reports the timestamp as unknown).
@@ -1595,6 +1628,7 @@ private:
   bool versionsCurrent(const EJitCompileRequest &req) const;
 
   // queue/dedup helpers
+  EJitCompileOrGetStatus enqueueRepresentativeWake(EJitCompileRequest &req);
   bool queuePush(const EJitCompileRequest &req);
   bool queuePop(EJitCompileRequest &out);
   /// Claim the in-flight slot for \p funcIndex with \p claim: CAS 0->claim.

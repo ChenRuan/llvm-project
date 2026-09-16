@@ -430,6 +430,27 @@ typedef struct {
 /// EJIT_OK when the runtime is initialized (fields are zeroed when the opt-in is
 /// off), EJIT_ERR_NOT_ACTIVE otherwise.
 ejit_status_t ejit_representative_get_stats(ejit_representative_stats_t *out);
+
+/// Scope of a deactivated lifecycle's compiler-source borrows. This is additive
+/// to the existing C ABI and does not change ejit_config_t or shared POD layout.
+typedef struct ejit_borrow_fence_t {
+  uint32_t generation;
+  uint32_t dimType;
+  uint32_t instanceId;
+  uint32_t version;
+} ejit_borrow_fence_t;
+/// Stop future compiler reads for this instance and return its exact scope.
+/// Keep source fields/addresses stable until borrow_status returns EJIT_OK.
+/// Reclaiming deactivation may also wait for existing execution read tokens.
+ejit_status_t ejit_representative_deactivate_begin(const char *periodName,
+    uint32_t instanceId, ejit_borrow_fence_t *out);
+/// Bounded read-only query: EJIT_PENDING means an old compiler read is still
+/// possible; EJIT_OK confirms compiler borrow completion; stale/re-enabled
+/// scope returns EJIT_ERR_INVALID_PARAM. Timeout/pending never permits mutation.
+/// This confirms compiler reads only, not AOT/T1/T2 business-object lifetime.
+/// Callers serialize lifecycle changes until completion; then mutate and activate.
+ejit_status_t ejit_representative_borrow_status(const ejit_borrow_fence_t *scope);
+
 #ifdef EJIT_SRE_TASKPOOL_TESTING
 ejit_status_t ejit_representative_copy_profile(void *buffer, size_t capacity,
                                                size_t *size);
@@ -437,6 +458,8 @@ ejit_status_t ejit_representative_get_group_stats(uint32_t groupIndex,
                                                   ejit_representative_stats_t *out);
 void *ejit_representative_test_pool(void);
 ejit_status_t ejit_representative_test_fail_next_tier2(void);
+uint32_t ejit_representative_test_candidate_gate(uint32_t command);
+ejit_status_t ejit_representative_test_fail_member_tier2(uint32_t count);
 ejit_status_t ejit_representative_test_timeout(uint64_t ticks, uint32_t maxReelections);
 ejit_status_t ejit_representative_copy_group_profile(uint32_t groupIndex,
     bool scalars, void *buffer, size_t capacity, size_t *size);
