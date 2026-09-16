@@ -3,6 +3,8 @@
 更新：2026-09-16。状态：已接入实现并完成当前 host 回归，默认关闭，仍保持 Draft；
 尚未完成本功能的目标产物、上板和产品验收。初始 PR 仅有文档，后续实现与证据见
 [host 收尾记录](EJIT_CODE_REUSE_HOST_CLOSEOUT.md)及[实现跟踪](EJIT_CODE_REUSE_IMPLEMENTATION.md)。
+已提供[6号核 worker / 16号核 owner 上板用例](EJIT_CODE_REUSE_BOARD.md)，
+覆盖6 cell x 20入口、异值分组及借用栅栏后的更新复用；提供用例不等于上板通过。
 
 目标分支：`dongjianqiang2/llvm-project:ejit_dev_spec5`。
 个人开发分支：`ChenRuan/llvm-project:codex/ejit-spec5-code-reuse`。
@@ -45,10 +47,13 @@ wrapper 仍从原来的 inline-cache 槽取最终函数指针直接调用，不�
 
 ## 2. 基线与现状证据
 
-本PR已rebase到spec5的 `3f0e190dd54752f9c1dcb4bcd1fcb5d6349ae59c`。
+按2026-09-16用户要求，本PR已rebase到PR233的
+`812f6474b706e0bb8f0cd1b93e9b0413bd5457cf`，包含229与233修复。
+此前基线是spec5的 `3f0e190dd54752f9c1dcb4bcd1fcb5d6349ae59c`。
 原创建基线为 `1265b885456811ca33b525eac903a4e8be56f0a9`，
 它是在 `a6cbc831b2ec9122788b8b522424ce7e7b073486` 上加入209/219移植；
-当前基线另外加入223移植，已有提交不重写。此选择继续
+此前基线另外加入223移植；本次重排只重写230的提交，旧head已备份，
+不改写spec5或233历史。此选择继续
 保留旧池布局、发布、初始化和PGO调度；没有带入194/201/203/212。
 因此统一near分配域是本方案的目标，也与当前spec5方向一致；不能误称该基线已有17池。
 

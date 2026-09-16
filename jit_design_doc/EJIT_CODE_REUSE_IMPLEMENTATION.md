@@ -5,6 +5,13 @@ reserved for coordinator review. The experimental feature remains default off.
 
 ## Latest Closeout - 2026-09-16
 
+PR230 is now rebased onto PR233 `812f6474b706e0bb8f0cd1b93e9b0413bd5457cf`.
+The optimizer conflict preserves both bound-pointer facts and load-only
+preserved-dimension evaluation. The board-shaped round-robin/update regression
+and the [single-C board example](EJIT_CODE_REUSE_BOARD.md) are added; neither
+this rebase nor the example claims board acceptance. See the rebase addendum
+in the host closeout for current-source test results.
+
 The production-lock repair has independent read-only review. Final shared-pool
 suites pass NRC205/205 and token187/187; corrected concurrent stress passes
 1000/1000 NRC and100/100 token independent processes without relaxing quota64.
