@@ -175,11 +175,13 @@ ejit_status_t ejit_init_pgo(const ejit_config_t *config);
 /// config struct keeps its layout, so an old caller is never over-read):
 /// Config::enableRepresentativeSharing is forced on together with
 /// Config::enablePgo, which is what the V1 admission policy requires (Async +
-/// normal online PGO). The default product path stays OFF: only a caller of
+/// normal online PGO). EJIT_SRE_PGO_BRANCH_AUDIT diagnostics may stay enabled;
+/// audit-only means PGO is off, not that diagnostics are on.
+/// The default product path stays OFF: only a caller of
 /// THIS entry point opts in. A configuration that cannot satisfy the policy
 /// (Sync/Off mode, audit-only) is rejected by the group admission gate before
-/// any group, queue or sampling side effect, and the runtime keeps the ordinary
-/// per-request PGO behavior.
+/// any group, queue or sampling side effect. Failed initialization does not
+/// silently fall back to ordinary per-request PGO.
 ejit_status_t ejit_init_representative(const ejit_config_t *config);
 void ejit_shutdown(void);
 

@@ -4,6 +4,33 @@ Status: host implementation and the latest legacy concurrency follow-up are
 published for review. The feature remains OFF by default and the PR
 remains Draft. This is not product, board, or whole-specification acceptance.
 
+## Audit-Enabled Initialization Repair
+
+The board's `representative sharing requires Async + normal online PGO`
+initialization failure was reproduced on the published source with
+`EJIT_SRE_PGO_BRANCH_AUDIT` and `EJIT_DIAG_ENABLE` enabled. Both the early
+constructor guard and driver group admission incorrectly treated the audit
+diagnostic flag as audit-only mode, even though the compile pipeline defines
+audit-only as `!enablePgo`.
+
+Both gates now accept Async online PGO with audit diagnostics still enabled.
+PGO-off (with or without audit), Sync/Off and zero-timeout configurations remain
+rejected before registration consumption or worker creation. No public ABI,
+build-option default, board example, sampling quota or product sharing default
+changes. Keep the board's audit option ON and keep using
+`ejit_init_representative`; do not substitute ordinary `ejit_init_pgo`.
+
+Fresh audit-enabled generated-code runtime suites pass 6/6 for NRC and 6/6 for
+VP+NRC; a separate audit-disabled NRC compatibility control also passes 6/6.
+These cover explicit initialization/group activation, real 64-dispatch
+T1 sampling, frozen profiles and shared T2, 120-identity equal/unequal cases,
+borrow-fenced renewal, failure controls, and ordinary-init sharing remaining
+off. Logs retain both branch-audit and mayconst-audit output with 64 observed
+entries/hits. The original failing executable/logs are retained separately.
+Evidence: `reports/audit-init-fix-20260916/` under the PR230 control root.
+This is Windows x86-64 execution of generated code with fresh EJIT translation
+units and retained non-EJIT LLVM libraries, not SRE board acceptance.
+
 ## Rebase Onto PR233
 
 On user request, all eleven published PR230 commits were replayed onto PR233

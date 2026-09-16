@@ -13,6 +13,11 @@ The companion `ejit_reuse_host_check.c` is a host-only mock, NOT a board source.
 - Runtime: async shared taskpool, fixed worker core 6, shared code pointers,
   normal online PGO, `EJIT_STATS_ENABLE`, and diagnostic/dump support enabled.
   Keep the representative quota at its current 64-dispatch setting.
+- Keep `EJIT_SRE_PGO_BRANCH_AUDIT` enabled. Online PGO plus audit diagnostics
+  is supported; it is not audit-only mode. Rebuild the runtime with the PR230
+  audit-admission fix if initialization rejects this valid combination with
+  `representative sharing requires Async + normal online PGO`. No example or
+  public config layout change is needed for this fix.
 - This example opts in through `ejit_init_representative`, not `ejit_init_pgo`.
   It does not change the product's default-off policy. Do not initialize EJIT
   elsewhere before running this example.

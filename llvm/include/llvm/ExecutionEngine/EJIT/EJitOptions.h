@@ -52,8 +52,8 @@ struct Config {
   /// AOT fallback until the group's immutable profile bundle is published, and
   /// lets a member reuse the group's physical Tier-2 only after the emitter's
   /// exact final-identity compare. Requires enablePgo (Async + normal online
-  /// PGO); a build with PGO off rejects the opt-in before any group/queue side
-  /// effect and keeps the unchanged product behavior.
+  /// PGO). Profile audit diagnostics may remain enabled alongside PGO; with
+  /// PGO off, the opt-in is rejected before any group/queue side effect.
   bool enableRepresentativeSharing = false;
   /// No-progress bound in ejit_taskpool_trace_now units (host nanoseconds,
   /// SRE cycle counter ticks). Deployments must configure their clock scale.
@@ -65,6 +65,7 @@ struct Config {
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   /// Build-option-gated runtime sampling. This reuses the temporary
   /// instrumented tier but does not require profile-guided optimization.
+  /// With enablePgo, diagnostics accompany normal PGOUse, not audit-only mode.
   bool enableProfileAudit = true;
 #else
   bool enableProfileAudit = false;
