@@ -83,6 +83,7 @@ set(EJIT_SOURCES
   EJitRuntime.cpp
   EJitDiag.cpp
   EJitOrcEngine.cpp
+  EJitPreparedCode.cpp
   EJitLinkDiagPlugin.cpp
   EJitLinkOptimizationPlugin.cpp
   EJitLibcallStubs.cpp

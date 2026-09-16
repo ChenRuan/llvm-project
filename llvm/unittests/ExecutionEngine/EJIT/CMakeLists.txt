@@ -21,6 +21,7 @@ add_llvm_unittest(EJITTests
   EJitLocalFreeDimTest.cpp
   EJitPhiWitnessTest.cpp
   EJitPreservedDimsTest.cpp
+  EJitPreparedCodeTest.cpp
   EJitLinkOptimizationPluginTest.cpp
   EJitPgoTest.cpp
   EJitVpMergeTest.cpp
