@@ -1521,6 +1521,109 @@ TEST_F(EJitRepresentativeRuntimeTest,
   EXPECT_EQ(Pool->pendingCount(), 0u);
 }
 
+// Board-shaped scheduling: one producer continuously services all identities,
+// including already-admitted representatives, while later entries defer.
+TEST_F(EJitRepresentativeRuntimeTest,
+       RoundRobinTwentyEntriesRejoinSharedTier2AfterBorrowFence) {
+  ejit_representative_stats_t Before{};
+  if (ejit_representative_get_stats(&Before) != EJIT_OK || !Before.active) {
+    ejit_config_t Cfg{};
+    Cfg.compileMode = EJIT_COMPILE_ASYNC;
+    ASSERT_EQ(ejit_init_representative(&Cfg), EJIT_OK);
+  }
+  ASSERT_EQ(ejit_representative_test_timeout(5000000000ULL, 2), EJIT_OK);
+  auto *Pool = static_cast<EJitSharedTaskPool *>(ejit_representative_test_pool());
+  ASSERT_NE(Pool, nullptr);
+  auto &Rows = RepresentativeRuntime::pressureRows();
+  const auto &Indices = RepresentativeRuntime::pressureFuncIndices();
+  auto DeactivateAndDrain = [](uint32_t Cell) {
+    ejit_borrow_fence_t Fence{};
+    if (ejit_representative_deactivate_begin("cell", Cell, &Fence) != EJIT_OK)
+      return false;
+    for (unsigned I = 0; I != 4000; ++I) {
+      auto S = ejit_representative_borrow_status(&Fence);
+      if (S == EJIT_OK) return true;
+      if (S != EJIT_PENDING) return false;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+  };
+  for (uint32_t Cell = 0; Cell < kPressureCells; ++Cell) {
+    ASSERT_TRUE(DeactivateAndDrain(Cell));
+    for (uint32_t Entry = 0; Entry < kPressureEntries; ++Entry)
+      Rows[Entry * kCells + Cell].gain =
+          Entry == 0 && Cell == 5 ? 201u : 40u + Entry;
+    ASSERT_EQ(ejit_activate("cell", Cell), EJIT_OK);
+  }
+  ASSERT_EQ(ejit_activate("trp", 1), EJIT_OK);
+  ASSERT_EQ(ejit_representative_get_stats(&Before), EJIT_OK);
+  using Matrix = std::array<std::array<void *, kPressureCells>, kPressureEntries>;
+  Matrix Initial{}, Updated{};
+  void *UnequalT1 = nullptr;
+  auto Drive = [&](Matrix &Pointers, bool Rejoined) {
+    unsigned Stable = 0;
+    for (unsigned Round = 0; Round != 8000; ++Round) {
+      bool Complete = true;
+      for (uint32_t Entry = 0; Entry < kPressureEntries; ++Entry) {
+        for (uint32_t Cell = 0; Cell < kPressureCells; ++Cell) {
+          void *Fn = nullptr;
+          uint32_t Bucket = 0;
+          const auto S = entryCallFor(Indices[Entry], Cell, 1, &Fn, &Bucket);
+          // Never take a T1 admission just to inspect the pointer: execute
+          // every granted function before releasing its exact read token.
+          if (S == EJIT_OK && Fn)
+            executeAndCheckRows(&Rows[Entry * kCells], Fn, Cell, 1,
+                                Round % 63u + 1u);
+          releaseIfHeld(S, Bucket);
+          if (S != EJIT_OK && S != EJIT_PENDING && S != EJIT_ERR_QUEUE_FULL)
+            return false;
+          if (S == EJIT_OK && !Fn) return false;
+          Complete &= S == EJIT_OK;
+          Pointers[Entry][Cell] = Fn;
+          if (!Rejoined && Entry == 0 && Cell == 5 && Fn && !UnequalT1)
+            UnequalT1 = Fn;
+        }
+        for (uint32_t Cell = 1; Cell < kPressureCells; ++Cell) {
+          if (!Rejoined && Entry == 0 && Cell == 5)
+            Complete &= Pointers[Entry][Cell] &&
+                        Pointers[Entry][Cell] != Pointers[Entry][0] &&
+                        Pointers[Entry][Cell] != UnequalT1;
+          else
+            Complete &= Pointers[Entry][Cell] == Pointers[Entry][0];
+        }
+        if (Rejoined)
+          for (uint32_t Cell = 0; Cell < kPressureCells; ++Cell)
+            Complete &= Pointers[Entry][Cell] == Initial[Entry][0];
+      }
+      Complete &= Pool->pendingCount() == 0 && Pool->liveRequestAttemptCount() == 0;
+      Stable = Complete ? Stable + 1 : 0;
+      if (Stable == 4) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+  };
+  ASSERT_TRUE(Drive(Initial, false));
+  ejit_representative_stats_t After{};
+  ASSERT_EQ(ejit_representative_get_stats(&After), EJIT_OK);
+  EXPECT_EQ(After.representativesElected - Before.representativesElected, 21u);
+  EXPECT_EQ(After.representativeDispatches - Before.representativeDispatches,
+            21u * kQuota);
+  EXPECT_EQ(After.bundlePublications - Before.bundlePublications, 21u);
+  EXPECT_EQ(After.physicalCodeObjects - Before.physicalCodeObjects, 21u);
+  EXPECT_EQ(After.sharedPhysicalReuses - Before.sharedPhysicalReuses, 99u);
+  ASSERT_TRUE(DeactivateAndDrain(5));
+  Rows[5].gain = 40;
+  ASSERT_EQ(ejit_activate("cell", 5), EJIT_OK);
+  ASSERT_TRUE(Drive(Updated, true));
+  ejit_representative_stats_t Final{};
+  ASSERT_EQ(ejit_representative_get_stats(&Final), EJIT_OK);
+  EXPECT_EQ(Final.physicalCodeObjects, After.physicalCodeObjects);
+  EXPECT_EQ(Final.representativeDispatches, After.representativeDispatches);
+  EXPECT_EQ(Final.sharedPhysicalReuses - After.sharedPhysicalReuses, 20u);
+  EXPECT_EQ(Pool->pendingCount(), 0u);
+  EXPECT_EQ(Pool->liveRequestAttemptCount(), 0u);
+}
+
 /// The default-off policy on the REAL runtime: an ordinary initialization never
 /// creates a representative group (no opt-in, no group, no publication).
 TEST_F(EJitRepresentativeRuntimeTest,
