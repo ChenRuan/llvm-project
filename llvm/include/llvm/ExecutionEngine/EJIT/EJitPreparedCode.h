@@ -12,15 +12,18 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/Support/Error.h"
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace llvm {
+class Module;
 namespace orc {
 class LLJIT;
 }
@@ -44,6 +47,64 @@ struct EJitCodeIdentityScope {
   std::string compilerPolicy;
   uint64_t bindingGeneration = 0;
   bool operator==(const EJitCodeIdentityScope &Other) const;
+};
+
+struct EJitCandidateLimits {
+  uint32_t maxGroups = 128;
+  uint64_t maxIdentityBytes = 16 * 1024 * 1024;
+  uint64_t maxModuleBytes = 1024 * 1024;
+};
+struct EJitCandidateResult {
+  uint64_t groupId = 0;
+  bool existing = false;
+};
+
+class EJitCandidateDirectory {
+public:
+  using BucketHash = uint64_t (*)(ArrayRef<uint8_t>);
+  explicit EJitCandidateDirectory(EJitCandidateLimits Limits = {},
+                                  BucketHash Hash = nullptr);
+  ~EJitCandidateDirectory();
+  Expected<EJitCandidateResult> classify(const Module &CommonPrefix,
+                                         EJitCodeIdentityScope Scope,
+                                         ArrayRef<EJitCodeBinding> Bindings,
+                                         ArrayRef<PgoFunctionSchema> Schema);
+  uint32_t groupCount() const;
+  uint64_t identityBytes() const;
+
+private:
+  friend class EJitCandidateCapture;
+  Expected<EJitCandidateResult>
+  classifyCanonical(std::string CanonicalIR, EJitCodeIdentityScope Scope,
+                    ArrayRef<EJitCodeBinding> Bindings,
+                    ArrayRef<PgoFunctionSchema> Schema);
+  struct Impl;
+  std::unique_ptr<Impl> P;
+};
+
+class EJitCandidateCapture {
+public:
+  EJitCandidateCapture(EJitCandidateDirectory &Directory,
+                       EJitCodeIdentityScope Scope,
+                       ArrayRef<EJitCodeBinding> Bindings);
+  ~EJitCandidateCapture();
+  /// Serialize the real optimized prefix before any PGO instrumentation.
+  void capturePrefix(const Module &CommonPrefix);
+  /// Add schema extracted from this same module after IR instrumentation.
+  void complete(ArrayRef<PgoFunctionSchema> Schema);
+  bool prefixCaptured() const { return PrefixCaptured; }
+  bool completed() const { return Completed; }
+  Expected<EJitCandidateResult> takeResult();
+
+private:
+  EJitCandidateDirectory &Directory;
+  EJitCodeIdentityScope Scope;
+  std::vector<EJitCodeBinding> Bindings;
+  std::string CanonicalIR;
+  std::optional<EJitCandidateResult> Result;
+  Error Failure = Error::success();
+  bool PrefixCaptured = false;
+  bool Completed = false;
 };
 
 struct EJitPreparedCodeLimits {

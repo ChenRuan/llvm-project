@@ -273,6 +273,9 @@ EJit::EJit(const Config &config) : config_(config) {
   compileDriver_->registerSymbol(
       "ejit_vp_record_scalar",
       reinterpret_cast<void *>(&ejit_vp_record_scalar));
+  compileDriver_->registerSymbol(
+      "ejit_vp_record_scalar_session",
+      reinterpret_cast<void *>(&ejit_vp_record_scalar_session));
 #endif
 
   // Freeze registration before starting the shared worker. Off neither attaches
