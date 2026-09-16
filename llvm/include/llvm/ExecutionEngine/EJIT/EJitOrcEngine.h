@@ -30,6 +30,7 @@ namespace llvm {
 class Module;
 
 namespace ejit {
+class EJitCandidateCapture;
 
 #ifdef EJIT_SRE_CODE_POOL
 struct EJitTieredCodePoolStats {
@@ -107,6 +108,15 @@ struct SpecializationContext {
   OptimizationLevel optLevel = OptimizationLevel::L2;
   /// PGO tier (Baseline when PGO is disabled or for the first compile).
   CompileTier tier = CompileTier::Baseline;
+  /// Sampling identity is distinct from request-attempt and cache identities.
+  /// It is zero for Baseline and legacy callers that have not joined a group.
+  uint64_t samplingSessionId = 0;
+  /// Optional owner-only capture at the real pre-instrumentation prefix.
+  EJitCandidateCapture *candidateCapture = nullptr;
+  /// Frozen representative profile retained through the whole Tier-2 transform.
+  /// profileData/scalarValueSites below are compatibility views copied from it.
+  EJitFrozenProfileBundle profileBundle;
+  bool valueProfileSnapshotComplete = false;
   /// Tier-2 indexed profile buffer (synthesized from Tier-1 counters by
   /// EJitProfileMerge before loadBitcode). Empty for Baseline/Instrumented.
   /// Owned by the context; lives through the JIT transform that consumes it.

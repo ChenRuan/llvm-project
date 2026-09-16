@@ -108,7 +108,13 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// v18: the old inline payload is replaced by a fixed table of borrowed
 /// raw bound-pointer descriptors; no pointee bytes or ownership cross the
 /// shared queue.
-constexpr uint32_t kEJitSharedAbiVersion = 18u;
+/// v19: compile requests carry a non-reusable attempt token. The shared state
+/// adds a bounded live-attempt table and an independently bounded completion
+/// history, and in-flight dedup slots hold the exact attempt claim.
+/// v20: each cache slot records the exact request-attempt token that published
+/// it, allowing Tier-2 admission and cancellation to validate one full
+/// identity.
+constexpr uint32_t kEJitSharedAbiVersion = 20u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

@@ -8,6 +8,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitPreparedCode.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 #include "llvm/ExecutionEngine/EJIT/EJitValueProfile.h"
@@ -244,6 +245,8 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     // Gen/Use prefix (identical to Tier-2) so the CFG - and thus the PGO
     // hash - matches. No mainFPM_: Tier-1 is temporary, lightly optimized.
     runLightOptPipeline(M);
+    if (ctx.candidateCapture)
+      ctx.candidateCapture->capturePrefix(M);
     ModulePassManager GenMPM;
     GenMPM.addPass(PGOInstrumentationGen(PGOInstrumentationType::FDO));
     // Tier-1 machine code is SHARED and executed concurrently by multiple cores
@@ -269,13 +272,66 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     if (EnableValueProfile) {
       for (Function &F : M.functions())
         if (!F.isDeclaration())
-          runValueProfileOnFunction(F, FAM_, EJitValueProfileMode::Instrument,
-                                    [this](StringRef name, uint32_t count) {
-                                      recordScalarSiteCount(name, count);
-                                    });
+          runValueProfileOnFunction(
+              F, FAM_, EJitValueProfileMode::Instrument,
+              [this](StringRef name, uint32_t count) {
+                recordScalarSiteCount(name, count);
+              },
+              ctx.samplingSessionId);
     }
 #endif
     captureCounterGlobals(M);
+    // Complete the candidate only after extracting the schema produced by
+    // this exact prefix. This is still IR-only work; the caller can skip ORC
+    // emission when the result joins an existing representative group.
+    if (ctx.candidateCapture) {
+      std::vector<PgoFunctionSchema> Schema;
+      for (StringRef PgoName : lastCounterNames_) {
+        std::string ProfcName = ("__profc_" + PgoName).str();
+        std::string ProfdName = ("__profd_" + PgoName).str();
+        auto *Profc = M.getGlobalVariable(ProfcName, true);
+        auto *Profd = M.getGlobalVariable(ProfdName, true);
+        auto *Counters = Profc ? dyn_cast<ArrayType>(Profc->getValueType())
+                               : nullptr;
+        auto *Data = Profd
+                         ? dyn_cast_or_null<ConstantStruct>(
+                               Profd->getInitializer())
+                         : nullptr;
+        if (!Counters || !Data || Data->getNumOperands() < 8) {
+          Schema.clear();
+          break;
+        }
+        auto *NameHash = dyn_cast<ConstantInt>(Data->getOperand(0));
+        auto *FuncHash = dyn_cast<ConstantInt>(Data->getOperand(1));
+        auto *ValueSites = dyn_cast<Constant>(Data->getOperand(7));
+        auto *IcSites = ValueSites
+                            ? dyn_cast_or_null<ConstantInt>(
+                                  ValueSites->getAggregateElement(0u))
+                            : nullptr;
+        auto *MemSites = ValueSites
+                             ? dyn_cast_or_null<ConstantInt>(
+                                   ValueSites->getAggregateElement(1u))
+                             : nullptr;
+        if (!NameHash || !FuncHash || !IcSites || !MemSites) {
+          Schema.clear();
+          break;
+        }
+        PgoFunctionSchema S;
+        S.pgoName = PgoName.str();
+        S.funcHash = FuncHash->getZExtValue();
+        S.pgoNameHash = NameHash->getZExtValue();
+        S.numCounters = static_cast<uint32_t>(Counters->getNumElements());
+        S.numIcSites = static_cast<uint32_t>(IcSites->getZExtValue());
+        S.numMemSites = static_cast<uint32_t>(MemSites->getZExtValue());
+        for (const EJitVpFunctionInfo &Info : lastVpFunctions_)
+          if (Info.pgoHash == S.pgoNameHash) {
+            S.numScalarSites = Info.numScalarSites;
+            break;
+          }
+        Schema.push_back(std::move(S));
+      }
+      ctx.candidateCapture->complete(Schema);
+    }
     EJIT_DIAG_VERBOSE(
         "pipeline done (Tier-1) func=%s key=0x%016lx counters=%zu",
         ctx.fnName.c_str(), ctx.cacheKey, lastCounterNames_.size());

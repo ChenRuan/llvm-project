@@ -14,6 +14,8 @@
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ObjectTransformLayer.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/SHA256.h"
@@ -61,6 +63,230 @@ prepare(StringRef IR, EJitCodeIdentityScope Scope = scope(),
 }
 
 const char *Simple = "define i32 @f(i32 %x) { %y = add i32 %x, 7 ret i32 %y }";
+
+static std::unique_ptr<Module> makeCandidateCellPgoModule(LLVMContext &Ctx) {
+  auto M = std::make_unique<Module>("candidate_cell_pgo", Ctx);
+  M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+
+  auto *I32 = Type::getInt32Ty(Ctx);
+  auto *CellTy = StructType::create(Ctx, "struct.CandidateCell");
+  CellTy->setBody({I32, I32});
+  auto *CellsTy = ArrayType::get(CellTy, 10);
+  auto *Cells =
+      new GlobalVariable(*M, CellsTy, false, GlobalValue::InternalLinkage,
+                         ConstantAggregateZero::get(CellsTy),
+                         "g_candidate_cells");
+  Metadata *PeriodOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+                           MDString::get(Ctx, "cell"),
+                           ConstantAsMetadata::get(ConstantInt::get(I32, 10))};
+  Metadata *FieldOps[] = {MDString::get(Ctx, TAG_EJIT_MAY_CONST_FIELD),
+                          ConstantAsMetadata::get(ConstantInt::get(I32, 0))};
+  Cells->setMetadata(MD_EJIT_METADATA,
+                     MDNode::get(Ctx, {MDNode::get(Ctx, PeriodOps),
+                                       MDNode::get(Ctx, FieldOps)}));
+
+  auto *SinkTy = FunctionType::get(Type::getVoidTy(Ctx), {I32, I32}, false);
+  FunctionCallee Even = M->getOrInsertFunction("candidate_sink_even", SinkTy);
+  FunctionCallee Odd = M->getOrInsertFunction("candidate_sink_odd", SinkTy);
+  auto *F =
+      Function::Create(FunctionType::get(I32, {I32, I32, I32}, false),
+                       Function::ExternalLinkage, "candidate_cell_pgo", M.get());
+  Argument *Cell = F->getArg(0);
+  Argument *Slot = F->getArg(1);
+  Argument *Live = F->getArg(2);
+  Cell->setName("cell");
+  Slot->setName("slot");
+  Live->setName("live");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  BasicBlock *EvenBB = BasicBlock::Create(Ctx, "even", F);
+  BasicBlock *OddBB = BasicBlock::Create(Ctx, "odd", F);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", F);
+  IRBuilder<> B(Entry);
+  Value *Elem =
+      B.CreateInBoundsGEP(CellsTy, Cells, {B.getInt32(0), Cell}, "element");
+  Value *FrozenPtr = B.CreateStructGEP(CellTy, Elem, 0, "frozen.ptr");
+  Value *DynamicPtr = B.CreateStructGEP(CellTy, Elem, 1, "dynamic.ptr");
+  auto *Frozen = B.CreateLoad(I32, FrozenPtr, "frozen");
+  Frozen->setMetadata(MD_EJIT_MAY_CONST, MDNode::get(Ctx, {}));
+  Value *Dynamic = B.CreateLoad(I32, DynamicPtr, "dynamic");
+  B.CreateStore(Live, DynamicPtr);
+  Value *IsOdd =
+      B.CreateICmpNE(B.CreateAnd(Dynamic, B.getInt32(1)), B.getInt32(0));
+  B.CreateCondBr(IsOdd, OddBB, EvenBB);
+  B.SetInsertPoint(EvenBB);
+  B.CreateCall(Even, {Slot, Live});
+  B.CreateBr(Exit);
+  B.SetInsertPoint(OddBB);
+  B.CreateCall(Odd, {Slot, Live});
+  B.CreateBr(Exit);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(B.CreateAdd(Frozen, Dynamic));
+
+  Metadata *DimOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_ARR_IND),
+                        MDString::get(Ctx, "cell"),
+                        ConstantAsMetadata::get(ConstantInt::get(I32, 0))};
+  F->setMetadata(
+      MD_EJIT_METADATA,
+      MDNode::getDistinct(
+          Ctx, {MDNode::get(Ctx, {MDString::get(Ctx, TAG_EJIT_ENTRY)}),
+                MDNode::get(Ctx, DimOps)}));
+  return M;
+}
+
+uint64_t collideCandidateHash(ArrayRef<uint8_t>) { return 1; }
+
+EJitCandidateResult captureCandidate(EJitCandidateDirectory &Directory,
+                                     StringRef IR,
+                                     ArrayRef<EJitCodeBinding> Bindings) {
+  auto TSM = parse(IR);
+  EJitCandidateCapture Capture(Directory, scope(), Bindings);
+  TSM.withModuleDo([&](Module &M) {
+    Function *Entry = M.getFunction("f");
+    ASSERT_NE(Entry, nullptr);
+    LLVMContext &C = M.getContext();
+    MDNode *Tag = MDNode::get(C, {MDString::get(C, TAG_EJIT_ENTRY)});
+    Entry->setMetadata(MD_EJIT_METADATA, MDNode::get(C, {Tag}));
+    PeriodArrayRegistry Registry;
+    EJitOptimizer Optimizer(Registry, /*PreserveDimensions=*/true);
+    SpecializationContext Ctx;
+    Ctx.fnName = "f";
+    Ctx.tier = CompileTier::Instrumented;
+    Ctx.candidateCapture = &Capture;
+    Optimizer.runPipeline(M, Ctx);
+    EXPECT_FALSE(Optimizer.getLastCounterNames().empty());
+  });
+  EXPECT_TRUE(Capture.prefixCaptured());
+  EXPECT_TRUE(Capture.completed());
+  auto R = Capture.takeResult();
+  EXPECT_TRUE(static_cast<bool>(R));
+  return R ? *R : EJitCandidateResult{};
+}
+
+TEST(EJitCandidateDirectory, RealOptimizerPrefixGroupsExactly) {
+  const char *SameA = "define i32 @f(i32 %x) { %r = add i32 %x, 7 ret i32 %r }";
+  const char *SameB =
+      "source_filename=\"cell2.c\" define i32 @f(i32 %cell) { entry: "
+      "%named = add i32 %cell, 7 ret i32 %named }";
+  const char *Different =
+      "define i32 @f(i32 %x) { %r = add i32 %x, 9 ret i32 %r }";
+  EJitCandidateDirectory Directory({}, collideCandidateHash);
+  auto A = captureCandidate(Directory, SameA, {});
+  auto B = captureCandidate(Directory, SameB, {});
+  auto C = captureCandidate(Directory, Different, {});
+  EXPECT_EQ(A.groupId, B.groupId);
+  EXPECT_TRUE(B.existing);
+  EXPECT_NE(A.groupId, C.groupId);
+  EXPECT_FALSE(C.existing);
+}
+
+TEST(EJitCandidateDirectory, BindingsSchemaCollisionAndBudgetsAreExact) {
+  auto TSM = parse("declare i32 @ext() define i32 @f() { %r=call i32 @ext() "
+                   "ret i32 %r }");
+  PgoFunctionSchema S{"f", 1, 2, 1, 0, 0, 0};
+  EJitCandidateLimits Limits;
+  Limits.maxGroups = 3;
+  EJitCandidateDirectory D(Limits, collideCandidateHash);
+  EJitCandidateResult A, B;
+  TSM.withModuleDo([&](Module &M) {
+    A = cantFail(D.classify(M, scope(), {{"ext", 4096, true}}, {S}));
+    B = cantFail(D.classify(M, scope(), {{"ext", 8192, true}}, {S}));
+    auto S2 = S;
+    ++S2.funcHash;
+    auto C = cantFail(D.classify(M, scope(), {{"ext", 4096, true}}, {S2}));
+    EXPECT_NE(A.groupId, C.groupId);
+    auto Other = parse("declare i32 @ext() define i32 @f() { "
+                       "%r=call i32 @ext() %x=add i32 %r, 1 ret i32 %x }");
+    Other.withModuleDo([&](Module &OtherM) {
+      auto Full = D.classify(OtherM, scope(), {{"ext", 4096, true}}, {S2});
+      ASSERT_FALSE(static_cast<bool>(Full));
+      EXPECT_EQ(errorToErrorCode(Full.takeError()),
+                std::make_error_code(std::errc::no_buffer_space));
+    });
+  });
+  EXPECT_NE(A.groupId, B.groupId);
+  EXPECT_EQ(D.groupCount(), 3u);
+
+  TSM.withModuleDo([&](Module &M) {
+    EJitCandidateDirectory Validate;
+    auto MissingBinding = Validate.classify(M, scope(), {}, {S});
+    ASSERT_FALSE(static_cast<bool>(MissingBinding));
+    EXPECT_EQ(errorToErrorCode(MissingBinding.takeError()),
+              std::make_error_code(std::errc::invalid_argument));
+    auto WrongKind =
+        Validate.classify(M, scope(), {{"ext", 4096, false}}, {S});
+    ASSERT_FALSE(static_cast<bool>(WrongKind));
+    EXPECT_EQ(errorToErrorCode(WrongKind.takeError()),
+              std::make_error_code(std::errc::invalid_argument));
+    auto MissingEntry = Validate.classify(
+        M, scope("missing"), {{"ext", 4096, true}}, {S});
+    ASSERT_FALSE(static_cast<bool>(MissingEntry));
+    EXPECT_EQ(errorToErrorCode(MissingEntry.takeError()),
+              std::make_error_code(std::errc::invalid_argument));
+    EXPECT_EQ(Validate.groupCount(), 0u);
+  });
+
+  EJitCandidateLimits Tiny;
+  Tiny.maxIdentityBytes = 1;
+  EJitCandidateDirectory ByteBounded(Tiny);
+  TSM.withModuleDo([&](Module &M) {
+    auto Full = ByteBounded.classify(M, scope(), {{"ext", 4096, true}}, {S});
+    ASSERT_FALSE(static_cast<bool>(Full));
+    EXPECT_EQ(errorToErrorCode(Full.takeError()),
+              std::make_error_code(std::errc::no_buffer_space));
+  });
+  EXPECT_EQ(ByteBounded.groupCount(), 0u);
+  EXPECT_EQ(ByteBounded.identityBytes(), 0u);
+}
+
+TEST(EJitCandidateDirectory, RealPreservedCellPrefixRetainsDynamicSemantics) {
+  struct CellData {
+    int32_t frozen;
+    int32_t dynamic;
+  } Data[10];
+  for (unsigned I = 0; I != 10; ++I)
+    Data[I] = {100, static_cast<int32_t>(I)};
+  Data[1].frozen = 200;
+  Data[2].frozen = 200;
+  Data[3].frozen = 300;
+  std::vector<EJitCodeBinding> Bindings = {{"candidate_sink_even", 4096, true},
+                                           {"candidate_sink_odd", 8192, true}};
+  EJitCandidateDirectory D({}, collideCandidateHash);
+  auto Run = [&](unsigned Cell) {
+    LLVMContext C;
+    auto M = makeCandidateCellPgoModule(C);
+    PeriodArrayRegistry R;
+    R.registerArray("cell", "g_candidate_cells", Data, 10);
+    EJitOptimizer O(R, true);
+    EJitCandidateCapture Capture(D, scope("candidate_cell_pgo"), Bindings);
+    SpecializationContext X;
+    X.fnName = "candidate_cell_pgo";
+    X.dimensions.push_back({"cell", static_cast<uint8_t>(Cell)});
+    X.tier = CompileTier::Instrumented;
+    X.candidateCapture = &Capture;
+    O.runPipeline(*M, X);
+    bool HasLoad = false, HasStore = false, HasSinkCall = false;
+    for (Function &F : *M)
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB) {
+          HasLoad |= isa<LoadInst>(I);
+          HasStore |= isa<StoreInst>(I);
+          if (auto *CB = dyn_cast<CallBase>(&I))
+            if (Function *Callee = CB->getCalledFunction())
+              HasSinkCall |= Callee->getName().starts_with("candidate_sink_");
+        }
+    EXPECT_TRUE(HasLoad);
+    EXPECT_TRUE(HasStore);
+    EXPECT_TRUE(HasSinkCall);
+    return cantFail(Capture.takeResult());
+  };
+  auto A = Run(1);
+  auto B = Run(2);
+  auto C = Run(3);
+  EXPECT_EQ(A.groupId, B.groupId);
+  EXPECT_NE(A.groupId, C.groupId);
+}
 
 TEST(EJitFinalCodeIdentity, NormalizesOnlyDisplayNamesAndModulePaths) {
   auto A = prepare(Simple);

@@ -65,6 +65,58 @@ uint64_t defaultBucketHash(ArrayRef<uint8_t> Digest) {
   return Value;
 }
 
+Error canonicalizeIdentityIR(const Module &M, std::string &Out,
+                             uint64_t MaxBytes) {
+  std::unique_ptr<Module> Comparison = CloneModule(M);
+  StripDebugInfo(*Comparison);
+  Comparison->setModuleIdentifier("");
+  Comparison->setSourceFileName("");
+  for (Function &F : *Comparison) {
+    for (Argument &A : F.args())
+      A.setName("");
+    for (BasicBlock &BB : F) {
+      BB.setName("");
+      for (Instruction &I : BB)
+        if (!I.getType()->isVoidTy())
+          I.setName("");
+    }
+  }
+  BoundedIRStream OS(Out, MaxBytes);
+  Comparison->print(OS, nullptr);
+  if (OS.exceeded())
+    return exhausted("canonical IR budget exceeded");
+  return Error::success();
+}
+
+Error checkCandidateModule(const Module &M,
+                           const EJitCodeIdentityScope &Scope,
+                           ArrayRef<EJitCodeBinding> Bindings) {
+  const Function *Entry = M.getFunction(Scope.entry);
+  if (!Entry || Entry->isDeclarationForLinker())
+    return reject("candidate entry definition missing");
+  auto HasBinding = [&](const GlobalValue &GV, bool Callable) {
+    return llvm::any_of(Bindings, [&](const EJitCodeBinding &B) {
+      return B.name == GV.getName() && B.callable == Callable;
+    });
+  };
+  for (const EJitCodeBinding &B : Bindings)
+    if (const GlobalValue *GV = M.getNamedValue(B.name)) {
+      const auto *F = dyn_cast<Function>(GV);
+      if (static_cast<bool>(F) != B.callable)
+        return reject("candidate binding kind mismatch");
+      if (!GV->isDeclaration())
+        return reject("candidate binding shadows a definition");
+    }
+  for (const GlobalVariable &GV : M.globals())
+    if (GV.isDeclaration() && !GV.use_empty() && !HasBinding(GV, false))
+      return reject("candidate missing external data binding");
+  for (const Function &F : M.functions())
+    if (F.isDeclaration() && !F.isIntrinsic() && !F.use_empty() &&
+        !HasBinding(F, true))
+      return reject("candidate missing external function binding");
+  return Error::success();
+}
+
 Error checkModule(const Module &M, StringRef Entry,
                   ArrayRef<EJitCodeBinding> Bindings,
                   const EJitPreparedCodeLimits &Limits) {
@@ -212,24 +264,9 @@ Expected<std::unique_ptr<EJitPreparedCode>> EJitPreparedCode::create(
     Function *Root = M.getFunction(ID.scope_.entry);
     if (Root->hasLocalLinkage())
       Root->setLinkage(GlobalValue::ExternalLinkage);
-    std::unique_ptr<Module> Comparison = CloneModule(M);
-    StripDebugInfo(*Comparison);
-    Comparison->setModuleIdentifier("");
-    Comparison->setSourceFileName("");
-    for (Function &F : *Comparison) {
-      for (Argument &A : F.args())
-        A.setName("");
-      for (BasicBlock &BB : F) {
-        BB.setName("");
-        for (Instruction &I : BB)
-          if (!I.getType()->isVoidTy())
-            I.setName("");
-      }
-    }
-    BoundedIRStream OS(ID.ir_, std::min(Limits.maxModuleBytes, Remaining));
-    Comparison->print(OS, nullptr);
-    if (OS.exceeded())
-      return exhausted("canonical IR budget exceeded");
+    if (Error E = canonicalizeIdentityIR(
+            M, ID.ir_, std::min(Limits.maxModuleBytes, Remaining)))
+      return E;
     ID.digest_ = SHA256::hash(arrayRefFromStringRef(ID.ir_));
     return Error::success();
   });
@@ -341,4 +378,206 @@ EJitPreparedCodeEmitter::link(std::unique_ptr<EJitPreparedCode> Prepared) {
 
 EJitPreparedCodeEmitter::Stats EJitPreparedCodeEmitter::stats() const {
   return P->stats;
+}
+
+namespace {
+struct CandidateIdentity {
+  EJitCodeIdentityScope scope;
+  std::vector<EJitCodeBinding> bindings;
+  std::vector<PgoFunctionSchema> schema;
+  std::string ir;
+  std::array<uint8_t, 32> digest{};
+  uint64_t bytes() const {
+    uint64_t N = sizeof(*this) + ir.size() + scope.entry.size() +
+                 scope.compilerPolicy.size();
+    for (const auto &B : bindings)
+      N += sizeof(B) + B.name.size();
+    for (const auto &S : schema)
+      N += sizeof(S) + S.pgoName.size();
+    return N;
+  }
+};
+bool sameSchema(const PgoFunctionSchema &A, const PgoFunctionSchema &B) {
+  return A.pgoName == B.pgoName && A.funcHash == B.funcHash &&
+         A.pgoNameHash == B.pgoNameHash && A.numCounters == B.numCounters &&
+         A.numIcSites == B.numIcSites && A.numMemSites == B.numMemSites &&
+         A.numScalarSites == B.numScalarSites;
+}
+bool sameCandidate(const CandidateIdentity &A, const CandidateIdentity &B) {
+  return A.scope == B.scope && A.bindings == B.bindings &&
+         A.schema.size() == B.schema.size() &&
+         llvm::equal(A.schema, B.schema, sameSchema) && A.ir == B.ir;
+}
+bool candidateInputFits(uint64_t Limit, const EJitCodeIdentityScope &Scope,
+                        ArrayRef<EJitCodeBinding> Bindings,
+                        ArrayRef<PgoFunctionSchema> Schema,
+                        StringRef CanonicalIR = {}) {
+  uint64_t Bytes = sizeof(CandidateIdentity);
+  auto Add = [&](uint64_t N) {
+    if (Bytes > Limit || N > Limit - Bytes)
+      return false;
+    Bytes += N;
+    return true;
+  };
+  if (!Add(Scope.entry.size()) || !Add(Scope.compilerPolicy.size()) ||
+      !Add(CanonicalIR.size()))
+    return false;
+  for (const auto &B : Bindings)
+    if (!Add(sizeof(B)) || !Add(B.name.size()))
+      return false;
+  for (const auto &S : Schema)
+    if (!Add(sizeof(S)) || !Add(S.pgoName.size()))
+      return false;
+  return true;
+}
+Expected<CandidateIdentity>
+makeCandidate(std::string CanonicalIR, EJitCodeIdentityScope Scope,
+              ArrayRef<EJitCodeBinding> Bindings,
+              ArrayRef<PgoFunctionSchema> Schema) {
+  bool HasSource = false;
+  for (uint8_t B : Scope.source)
+    HasSource |= B != 0;
+  if (!HasSource || Scope.entry.empty() || Scope.compilerPolicy.empty() ||
+      Scope.bindingGeneration == 0 || CanonicalIR.empty())
+    return reject("candidate missing scope or prefix IR");
+  CandidateIdentity ID;
+  ID.scope = std::move(Scope);
+  ID.bindings.assign(Bindings.begin(), Bindings.end());
+  llvm::sort(ID.bindings,
+             [](const auto &A, const auto &B) { return A.name < B.name; });
+  for (size_t I = 0; I < ID.bindings.size(); ++I)
+    if (ID.bindings[I].name.empty() || !ID.bindings[I].address ||
+        (I && ID.bindings[I - 1].name == ID.bindings[I].name))
+      return reject("candidate invalid binding");
+  if (Schema.empty())
+    return reject("candidate missing PGO schema");
+  ID.schema.assign(Schema.begin(), Schema.end());
+  llvm::sort(ID.schema, [](const auto &A, const auto &B) {
+    return A.pgoName < B.pgoName;
+  });
+  for (size_t I = 0; I < ID.schema.size(); ++I)
+    if (ID.schema[I].pgoName.empty() || !ID.schema[I].numCounters ||
+        (I && ID.schema[I - 1].pgoName == ID.schema[I].pgoName))
+      return reject("candidate invalid schema");
+  ID.ir = std::move(CanonicalIR);
+  ID.digest = SHA256::hash(arrayRefFromStringRef(ID.ir));
+  return ID;
+}
+} // namespace
+struct EJitCandidateDirectory::Impl {
+  EJitCandidateLimits limits;
+  BucketHash hash;
+  uint64_t bytes = 0, nextGroup = 1;
+  uint32_t count = 0;
+  DenseMap<uint64_t, std::vector<std::pair<uint64_t, CandidateIdentity>>>
+      groups;
+  Impl(EJitCandidateLimits L, BucketHash H)
+      : limits(L), hash(H ? H : defaultBucketHash) {}
+};
+EJitCandidateDirectory::EJitCandidateDirectory(EJitCandidateLimits L,
+                                               BucketHash H)
+    : P(std::make_unique<Impl>(L, H)) {}
+EJitCandidateDirectory::~EJitCandidateDirectory() = default;
+Expected<EJitCandidateResult>
+EJitCandidateDirectory::classify(const Module &M, EJitCodeIdentityScope Scope,
+                                 ArrayRef<EJitCodeBinding> Bindings,
+                                 ArrayRef<PgoFunctionSchema> Schema) {
+  if (Error E = checkCandidateModule(M, Scope, Bindings))
+    return std::move(E);
+  std::string CanonicalIR;
+  if (Error E =
+          canonicalizeIdentityIR(M, CanonicalIR, P->limits.maxModuleBytes))
+    return std::move(E);
+  return classifyCanonical(std::move(CanonicalIR), std::move(Scope), Bindings,
+                           Schema);
+}
+Expected<EJitCandidateResult> EJitCandidateDirectory::classifyCanonical(
+    std::string CanonicalIR, EJitCodeIdentityScope Scope,
+    ArrayRef<EJitCodeBinding> Bindings, ArrayRef<PgoFunctionSchema> Schema) {
+  if (!candidateInputFits(P->limits.maxIdentityBytes, Scope, Bindings, Schema,
+                          CanonicalIR))
+    return exhausted("candidate identity budget exceeded");
+  auto Made = makeCandidate(std::move(CanonicalIR), std::move(Scope), Bindings,
+                            Schema);
+  if (!Made)
+    return Made.takeError();
+  CandidateIdentity ID = std::move(*Made);
+  const uint64_t IdentityBytes = ID.bytes();
+  const uint64_t Hash = P->hash(ID.digest);
+  auto It = P->groups.find(Hash);
+  if (It != P->groups.end())
+    for (const auto &E : It->second)
+      if (sameCandidate(E.second, ID))
+        return EJitCandidateResult{E.first, true};
+  if (P->count >= P->limits.maxGroups ||
+      P->bytes > P->limits.maxIdentityBytes ||
+      IdentityBytes > P->limits.maxIdentityBytes - P->bytes)
+    return exhausted("candidate directory budget exceeded");
+  uint64_t G = P->nextGroup++;
+  P->bytes += IdentityBytes;
+  ++P->count;
+  P->groups[Hash].push_back({G, std::move(ID)});
+  return EJitCandidateResult{G, false};
+}
+uint32_t EJitCandidateDirectory::groupCount() const {
+  return P->count;
+}
+uint64_t EJitCandidateDirectory::identityBytes() const {
+  return P->bytes;
+}
+EJitCandidateCapture::EJitCandidateCapture(EJitCandidateDirectory &D,
+                                           EJitCodeIdentityScope S,
+                                           ArrayRef<EJitCodeBinding> B)
+    : Directory(D), Scope(std::move(S)) {
+  if (!candidateInputFits(Directory.P->limits.maxIdentityBytes, Scope, B, {})) {
+    Failure = exhausted("candidate identity budget exceeded");
+    return;
+  }
+  Bindings.assign(B.begin(), B.end());
+}
+EJitCandidateCapture::~EJitCandidateCapture() {
+  consumeError(std::move(Failure));
+}
+void EJitCandidateCapture::capturePrefix(const Module &M) {
+  if (PrefixCaptured || Completed)
+    return;
+  PrefixCaptured = true;
+  if (Failure)
+    return;
+  if (Error E = checkCandidateModule(M, Scope, Bindings)) {
+    Failure = std::move(E);
+    return;
+  }
+  if (Error E = canonicalizeIdentityIR(
+          M, CanonicalIR,
+          std::min(Directory.P->limits.maxModuleBytes,
+                   Directory.P->limits.maxIdentityBytes)))
+    Failure = std::move(E);
+}
+void EJitCandidateCapture::complete(ArrayRef<PgoFunctionSchema> Schema) {
+  if (Completed)
+    return;
+  Completed = true;
+  if (!PrefixCaptured) {
+    if (!Failure)
+      Failure = reject("candidate prefix not reached");
+    return;
+  }
+  if (Failure)
+    return;
+  auto R = Directory.classifyCanonical(std::move(CanonicalIR), std::move(Scope),
+                                       Bindings, Schema);
+  if (R)
+    Result = *R;
+  else
+    Failure = R.takeError();
+}
+Expected<EJitCandidateResult> EJitCandidateCapture::takeResult() {
+  if (!Completed)
+    return reject("candidate schema not reached");
+  if (Failure)
+    return std::move(Failure);
+  if (!Result)
+    return reject("candidate classification missing");
+  return *Result;
 }

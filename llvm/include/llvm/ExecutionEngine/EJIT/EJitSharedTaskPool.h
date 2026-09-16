@@ -329,6 +329,9 @@ public:
                                    void **outFn);
   using PublishCallback = void (*)(void *ctx, const EJitCompileRequest &req,
                                    bool published);
+  /// Owner notification for a terminal queued Tier-2 lifecycle drop.
+  using PgoLifecycleDropCallback = void (*)(void *ctx,
+                                            const EJitCompileRequest &req);
   /// Owner-private physical-code release callback for an overwritten/retired
   /// pointer. Optional; a purely logical drop happens when unset.
   using ReleaseCallback = void (*)(void *ctx, void *oldFn);
@@ -459,6 +462,16 @@ public:
     /// mapping or the C ABI.
     bool fastPathTerminal = false;
   };
+
+  struct RequestAttemptSnapshot {
+    uint64_t token = 0;
+    uint32_t generation = 0;
+    uint32_t funcIndex = 0;
+    uint32_t flags = 0;
+    EJitRequestAttemptReason terminalReason = EJitRequestAttemptReason::None;
+    bool live = false;
+    bool retained = false;
+  };
   static_assert(kEJitSharedCacheBuckets < 255,
                 "bucketIndex is a uint8_t: the bucket count and its sentinel "
                 "must fit in a byte");
@@ -512,6 +525,10 @@ public:
   void setPublishCallback(PublishCallback fn, void *ctx) {
     publishFn_ = fn;
     publishCtx_ = ctx;
+  }
+  void setPgoLifecycleDropCallback(PgoLifecycleDropCallback fn, void *ctx) {
+    pgoLifecycleDropFn_ = fn;
+    pgoLifecycleDropCtx_ = ctx;
   }
   void setMayConstRankingCallback(MayConstRankingCallback fn, void *ctx) {
     mayConstRankingFn_ = fn;
@@ -715,6 +732,15 @@ public:
   /// I/D-cache coherent for cross-core execution (spec §11 fnPtr
   /// prerequisites).
   void setCodeSharingEnabled(bool enabled) { codeSharingEnabled_ = enabled; }
+  /// Enable the experimental request-attempt protocol before init. The shared
+  /// value is immutable while Ready so peers cannot observe a mixed policy.
+  bool setRequestAttemptsEnabled(bool enabled) {
+    if (state_ && state_->initState.loadAcquire() ==
+                      static_cast<uint32_t>(EJitSharedInitState::Ready))
+      return false;
+    requestAttemptsEnabled_ = enabled;
+    return true;
+  }
   /// Owner-only PRE-INIT configuration: the mode the owner publishes into the
   /// shared state during init(). After the blob is Ready this only stages the
   /// desired mode; use setSharedMode() to change the live cross-core mode.
@@ -725,9 +751,19 @@ public:
   /// slot's hitCount; the hit that crosses \p threshold arms a one-shot
   /// Tier-2 (PGOUse) lazy recompile via enqueue. \p threshold 0 disables
   /// the trigger (hits are still counted).
+  uint32_t tier2Threshold() const {
+    return state_ ? state_->tier2Threshold.loadAcquire()
+                  : tier2Threshold_.loadRelaxed();
+  }
+
   void setPgoEnabled(
       bool enable, uint32_t threshold,
       uint32_t maxConcurrentProfiles = EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES) {
+    if (state_ &&
+        state_->initState.loadAcquire() ==
+            static_cast<uint32_t>(EJitSharedInitState::Ready) &&
+        state_->requestAttemptsEnabled.loadAcquire() != 0)
+      return;
     maxConcurrentProfiles = std::max(
         1u, std::min(maxConcurrentProfiles, kEJitSharedMaxConcurrentProfiles));
     pgoEnabled_.storeRelaxed(enable ? 1 : 0);
@@ -772,7 +808,8 @@ public:
   /// Return true when this miss may start a staged PGO function. Only one
   /// specialization of a funcIndex may own admission at a time; later versions
   /// stay on AOT until the current Tier-2 finishes.
-  bool admitPgoFunction(uint32_t funcIndex, bool &newlyAdmitted);
+  bool admitPgoFunction(uint32_t funcIndex, bool &newlyAdmitted,
+                        uint64_t attemptToken = 0);
 
   //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
   /// Publish the compile/taskpool mode as cross-core shared runtime state.
@@ -787,6 +824,11 @@ public:
   ///   * If the blob is not yet initialized, only stage configuredMode_ so the
   ///     owner publishes the desired mode during init().
   void setSharedMode(EJitCompileMode mode) {
+    if (state_ &&
+        state_->initState.loadAcquire() ==
+            static_cast<uint32_t>(EJitSharedInitState::Ready) &&
+        state_->requestAttemptsEnabled.loadAcquire() != 0)
+      return;
     configuredMode_ = mode;
     if (state_ && state_->initState.loadAcquire() ==
                       static_cast<uint32_t>(EJitSharedInitState::Ready))
@@ -798,6 +840,8 @@ public:
   /// caller learns the switch did not take. Returns false without writing then.
   bool publishSharedMode(EJitCompileMode mode, uint32_t gen) {
     if (!state_)
+      return false;
+    if (state_->requestAttemptsEnabled.loadAcquire() != 0)
       return false;
     if (state_->initState.loadAcquire() !=
             static_cast<uint32_t>(EJitSharedInitState::Ready) ||
@@ -875,7 +919,8 @@ public:
   CompileOrGetResult compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
                                   uint32_t numDims, void *fallback,
                                   const EJitBoundPtrDescriptor *boundPointers,
-                                  uint32_t boundCount);
+                                  uint32_t boundCount,
+                                  uint64_t *outAttemptToken = nullptr);
 
   /// Source-compatible single-pointer entry point. A zero size means no bound
   /// pointer; a nonzero size borrows the pointed-to object through compilation.
@@ -930,6 +975,15 @@ public:
                                    uint32_t inst2, uint32_t dim3,
                                    uint32_t inst3);
   void releaseRead(uint32_t bucketIndex);
+
+  /// Cold request-lifecycle controls. They are connected to the same records
+  /// carried by real queue entries; no separate test-only state machine exists.
+  bool cancelRequestAttempt(
+      uint64_t token,
+      EJitRequestAttemptReason reason = EJitRequestAttemptReason::Cancelled);
+  bool requestAttemptStatus(uint64_t token, RequestAttemptSnapshot &out) const;
+  uint32_t liveRequestAttemptCount() const;
+  uint32_t retainedRequestAttemptCount() const;
   /// Drive one end of a period-value mutation window for a lifecycle instance.
   ///
   /// The shared `enabled` bit is the JIT compile gate and is CAS'd, so only the
@@ -1182,6 +1236,12 @@ private:
     /// The matching hit crossed the Tier-2 threshold. The caller decides
     /// whether to enqueue immediately or attach bound descriptors first.
     bool tier2Arm = false;
+    /// Exact slot coordinates and originating attempt observed while the
+    /// bucket snapshot was valid. The cold enqueue path reacquires the bucket
+    /// lock and validates all identity fields before claiming Tier-2.
+    uint32_t tier2BucketIndex = 0;
+    uint32_t tier2SlotIndex = 0;
+    uint64_t tier2AttemptToken = 0;
   };
 
   // shared cache helpers (POD table in the shared blob)
@@ -1241,18 +1301,12 @@ private:
   /// by cacheLookup() and all fixed-dimension specializations.
   SharedLookup resolveMatchedSlot(EJitSharedCacheBucket &bucket,
                                   uint32_t bucketIndex, uint32_t slotIndex);
-  /// Submit Tier-2 from an identity/version-validated slot while its bucket
-  /// read lock is held. This preserves the exact slot snapshot without
-  /// enlarging the 16-byte CompileOrGetResult hot-path return value.
+  /// Reacquire the arming slot's bucket, validate its complete identity and
+  /// originating attempt as one snapshot, then claim Tier-2 on the cold path.
   void
-  enqueueTier2FromSlot(const EJitSharedCacheSlot &slot,
-                       const EJitBoundPtrDescriptor *boundPointers = nullptr,
-                       uint32_t boundCount = 0);
-  void
-  enqueueTier2ForIdentity(uint32_t funcIndex, const EJitDimPair *dims,
-                          uint32_t numDims,
-                          const EJitBoundPtrDescriptor *boundPointers = nullptr,
-                          uint32_t boundCount = 0);
+  enqueueTier2FromLookup(const SharedLookup &lookup,
+                         const EJitBoundPtrDescriptor *boundPointers = nullptr,
+                         uint32_t boundCount = 0);
   /// Cold non-owner first-touch execute-permission preparation for a matched
   /// slot, with the bucket read lock HELD on entry (this function releases it).
   /// Snapshots the slot, drops the lock for the per-core platform seal, then
@@ -1331,12 +1385,30 @@ private:
   // queue/dedup helpers
   bool queuePush(const EJitCompileRequest &req);
   bool queuePop(EJitCompileRequest &out);
-  /// Claim the in-flight slot for \p funcIndex at generation \p gen: CAS
-  /// 0->gen.
-  EJitDedupResult dedupMark(uint32_t funcIndex, uint32_t gen);
-  /// Release the in-flight slot ONLY if it still holds \p gen: CAS gen->0. A
-  /// stale worker (older gen) therefore cannot clear a newer generation's bit.
-  void dedupClear(uint32_t funcIndex, uint32_t gen);
+  /// Claim the in-flight slot for \p funcIndex with \p claim: CAS 0->claim.
+  /// The claim is the exact attempt token when request attempts are enabled,
+  /// otherwise it is the owner generation.
+  EJitDedupResult dedupMark(uint32_t funcIndex, uint64_t claim);
+  /// Release the in-flight slot only when it still holds \p claim. An old
+  /// worker or callback therefore cannot clear a newer attempt's claim.
+  void dedupClear(uint32_t funcIndex, uint64_t claim);
+
+  uint64_t beginRequestAttempt(const EJitCompileRequest &req,
+                               bool samplingPending);
+  bool markRequestAttemptQueued(uint64_t token);
+  bool beginRequestAttemptCompile(uint64_t token);
+  void endRequestAttemptCompile(uint64_t token, bool finalRead);
+  void settleRequestAttemptSampling(uint64_t token,
+                                    EJitRequestAttemptReason reason);
+  void settleRequestAttemptPublication(uint64_t token, bool published,
+                                       EJitRequestAttemptReason reason);
+  void markRequestAttemptWaitingProfile(uint64_t token);
+  void acknowledgeRequestAttemptQueueDrop(uint64_t token,
+                                          EJitRequestAttemptReason reason);
+  void cancelAttemptsForInstance(uint32_t dimType, uint32_t instanceId);
+  void cancelAllRequestAttempts(uint32_t generation,
+                                EJitRequestAttemptReason reason);
+  bool requestAttemptCanPublish(uint64_t token) const;
 
   /// Compile one dequeued request through the two version checkpoints and the
   /// commit-gated publish. The Tier-2 aarch64 exclusive-monitor workaround
@@ -1356,7 +1428,8 @@ private:
   /// completion and terminal worker failures call this; transient queue-full
   /// leaves ownership intact so the next hit can retry.
   void finishPgoFunction(uint32_t funcIndex, bool completed,
-                         const char *reason = nullptr);
+                         const char *reason = nullptr,
+                         uint64_t attemptToken = 0);
 
   /// Owner-only: snapshot the owner-core code-pool stats via the registered
   /// provider and storeRelaxed them into the shared mirror. Called after every
@@ -1369,6 +1442,8 @@ private:
   void *compileCtx_ = nullptr;
   PublishCallback publishFn_ = nullptr;
   void *publishCtx_ = nullptr;
+  PgoLifecycleDropCallback pgoLifecycleDropFn_ = nullptr;
+  void *pgoLifecycleDropCtx_ = nullptr;
   ReleaseCallback releaseFn_ = nullptr;
   void *releaseCtx_ = nullptr;
   PrepareCodeCallback prepareCodeFn_ = nullptr;
@@ -1405,6 +1480,7 @@ private:
   uint64_t regFingerprint_ = 0;
   EJitCompileMode configuredMode_ = EJitCompileMode::Async;
   bool codeSharingEnabled_ = false;
+  bool requestAttemptsEnabled_ = false;
   bool isOwner_ = false;
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   IcacheFillMidpointHook icacheFillMidpointHook_ = nullptr;
