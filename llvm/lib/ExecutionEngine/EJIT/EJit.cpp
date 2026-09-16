@@ -63,9 +63,10 @@ EJit::EJit(const Config &config) : config_(config) {
                     config.maxCacheSize, (unsigned)config.maxCacheEntries);
 
   // Reject unsupported representative policy before consuming registrations,
-  // constructing a driver/collector, or starting a worker.
+  // constructing a driver/collector, or starting a worker. Audit diagnostics
+  // may accompany online PGO; audit-only means enablePgo is false.
   if (config_.enableRepresentativeSharing &&
-      (!config_.enablePgo || config_.enableProfileAudit ||
+      (!config_.enablePgo ||
        config_.representativeIdleTimeoutTicks == 0 ||
        config_.compileMode != CompileMode::Async)) {
     recordInitError(EJIT_ERR_INVALID_PARAM,

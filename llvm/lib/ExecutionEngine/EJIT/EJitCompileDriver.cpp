@@ -300,7 +300,8 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
     EJitGroupAdmissionPolicy Policy;
     Policy.pgoEnabled = config_.enablePgo;
     Policy.asyncService = config_.compileMode == CompileMode::Async;
-    Policy.normalOnlinePgo = config_.enablePgo && !config_.enableProfileAudit;
+    // Match ctx.profileAuditOnly below: diagnostics do not disable online PGO.
+    Policy.normalOnlinePgo = config_.enablePgo;
     Policy.modeChangeInFlight = false;
     Policy.dispatchQuota = kEJitRepresentativeDispatchQuota;
     Policy.poolGeneration = 0;
