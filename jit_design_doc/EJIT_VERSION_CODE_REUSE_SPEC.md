@@ -662,6 +662,9 @@ ABI在这里指各核共同解释的共享内存结构布局：字段的偏移�
 | 共享ON + audit-only | 明确拒绝，不把诊断采样当成正常PGO组生命周期 |
 | 运行中切换共享策略，或把活跃共享模式切成上述不支持组合 | 拒绝并保留原状态，不原地迁移在途组 |
 
+`EJIT_SRE_PGO_BRANCH_AUDIT` 可常开：`enablePgo=true` 时审计诊断随正常PGO运行，
+不得因 `enableProfileAudit=true` 拒绝共享；audit-only 指 `enablePgo=false` 的诊断采样。
+
 检查必须早于queue/waiter/admission副作用，错误通过明确接口结果/诊断反馈；
 不能靠CodeKey分开就假设每种模式都能推进。改变策略需在安全shutdown/drain后
 重新初始化。VP种类因构建选项未启用可在正常PGO中明确标记disabled，不等于

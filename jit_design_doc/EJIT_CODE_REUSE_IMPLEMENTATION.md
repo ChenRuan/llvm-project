@@ -72,6 +72,11 @@ construct real PGO-off/audit-only rejected instances, and verify real ordinary
 initialization leaves sharing inactive. A live Sync switch is rejected before
 controller/cache-epoch changes. All features remain opt-in.
 
+Audit diagnostics (`EJIT_SRE_PGO_BRANCH_AUDIT` / `enableProfileAudit`) may
+accompany normal online PGO. Both the early initialization check and driver
+group admission use `enablePgo`, matching `ctx.profileAuditOnly = !enablePgo`;
+enabling diagnostics must not reject representative sharing or disable PGOUse.
+
 ### Cold representative timeout
 
 Owner maintenance checks unfinished representative sessions before consuming new

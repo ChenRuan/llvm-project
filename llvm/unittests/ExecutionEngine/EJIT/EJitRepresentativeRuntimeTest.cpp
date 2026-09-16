@@ -450,8 +450,22 @@ TEST_F(EJitRepresentativeRuntimeTest,
     Config C;
     C.enableRepresentativeSharing = true;
     C.compileMode = CompileMode::Async;
-    C.enablePgo = Audit;
+    C.enablePgo = false;
     C.enableProfileAudit = Audit;
+    EJit Rejected(C);
+    EXPECT_TRUE(Rejected.initFailed());
+    EXPECT_EQ(Rejected.initError().code, EJIT_ERR_INVALID_PARAM);
+    EXPECT_EQ(Rejected.compileDriver(), nullptr);
+  }
+  for (CompileMode Mode : {CompileMode::Off, CompileMode::Sync,
+                           CompileMode::Async}) {
+    Config C;
+    C.enableRepresentativeSharing = true;
+    C.compileMode = Mode;
+    C.enablePgo = true;
+    C.enableProfileAudit = true;
+    if (Mode == CompileMode::Async)
+      C.representativeIdleTimeoutTicks = 0;
     EJit Rejected(C);
     EXPECT_TRUE(Rejected.initFailed());
     EXPECT_EQ(Rejected.initError().code, EJIT_ERR_INVALID_PARAM);
@@ -484,6 +498,26 @@ TEST_F(EJitRepresentativeRuntimeTest,
   Policy.dispatchQuota = 0;
   EXPECT_EQ(EJitRepresentativeGroupRegistry::admissionReject(Policy),
             EJitGroupAdmitReject::ZeroQuota);
+}
+
+TEST_F(EJitRepresentativeRuntimeTest,
+       InitAllowsOnlinePgoWithBuildDefaultAuditDiagnostics) {
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  EXPECT_TRUE(Config{}.enableProfileAudit);
+#else
+  EXPECT_FALSE(Config{}.enableProfileAudit);
+#endif
+  ejit_config_t Cfg{};
+  Cfg.compileMode = EJIT_COMPILE_ASYNC;
+  ASSERT_EQ(ejit_init_representative(&Cfg), EJIT_OK);
+  ejit_representative_stats_t Stats{};
+  ASSERT_EQ(ejit_representative_get_stats(&Stats), EJIT_OK);
+  EXPECT_EQ(Stats.active, 1u);
+  EXPECT_EQ(Stats.groups, 0u);
+  auto *Pool = static_cast<EJitSharedTaskPool *>(ejit_representative_test_pool());
+  ASSERT_NE(Pool, nullptr);
+  EXPECT_EQ(Pool->pendingCount(), 0u);
+  // Keep the one staged registration set for the generated-code tests below.
 }
 
 namespace {
