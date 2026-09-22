@@ -37,6 +37,7 @@
 #include <cstdio>
 #endif
 #include <cstddef>
+#include <cstring>
 #include <type_traits>
 
 using namespace llvm;

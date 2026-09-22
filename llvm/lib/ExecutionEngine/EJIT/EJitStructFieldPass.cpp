@@ -1907,6 +1907,7 @@ static bool emitVerifyCheck(const Function &F, LoadInst *LI, Constant *Baked,
 
   // Insert after the load so the comparison observes the value it produced.
   IRBuilder<> B(LI->getNextNode());
+  B.SetCurrentDebugLocation(LI->getDebugLoc());
 
   Value *Actual = widenToI64(B, LI);
   Value *Frozen = Actual ? widenToI64(B, Baked) : nullptr;
@@ -1941,10 +1942,15 @@ static bool emitVerifyCheck(const Function &F, LoadInst *LI, Constant *Baked,
       Identity.size() + 1 > kVerifySiteIdentityMax
           ? allocateVerifyIdentity()
           : 0;
+  // A token is the complete runtime identity for an oversized structural key.
+  // Keep the full text in the compiler diagnostic above, but do not embed an
+  // otherwise-unused potentially huge private string in the JIT object.
+  Constant *IdentityString =
+      IdentityId != 0 ? Constant::getNullValue(PtrTy)
+                      : getSiteString(M, Identity, IdentityCache);
   B.CreateCall(Check,
                {getSiteString(M, Display, DisplayCache),
-                getSiteString(M, Identity, IdentityCache),
-                B.getInt64(IdentityId), Frozen, Actual});
+                IdentityString, B.getInt64(IdentityId), Frozen, Actual});
   LI->setMetadata(MD_EJIT_VERIFIED, MDNode::get(Ctx, {}));
   ejitVerifyNoteSite();
   return true;
