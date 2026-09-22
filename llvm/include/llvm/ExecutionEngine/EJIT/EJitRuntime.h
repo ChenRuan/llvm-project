@@ -160,20 +160,24 @@ typedef struct {
   char funcName[128];
 } ejit_error_t;
 
-/// Substitution-verifier counters (ejit_init_verify). A non-zero `mismatches`
-/// means at least one ejit_may_const field changed after the JIT read it —
-/// that field is not safe to freeze.
+/// Substitution-verifier counters (ejit_init_verify). `sites` counts emitted
+/// instrumented sites since the last reset; `checks` and `mismatches` count
+/// executions since that reset. A non-zero `mismatches` proves frozen/live
+/// disagreement, but does not by itself classify the cause as an invalid
+/// annotation.
 typedef struct {
-  uint64_t sites;      ///< instrumented may_const load sites emitted
-  uint64_t checks;     ///< instrumented loads executed
-  uint64_t mismatches; ///< executions where memory != the frozen value
+  uint64_t sites;      ///< emitted sites since reset
+  uint64_t checks;     ///< executed checks since reset
+  uint64_t mismatches; ///< frozen/live disagreements since reset
 } ejit_verify_stats_t;
 
 /// Longest site name kept per record, including the terminator. Must match
 /// llvm::ejit::kVerifySiteNameMax.
 #define EJIT_VERIFY_SITE_NAME_MAX 64
 
-/// One instrumented may_const access, named "<func>:<global>+<byteOffset>".
+/// One instrumented may_const access. `site` is a bounded display name of the
+/// form "<func>:<global>+<byteOffset>". Record identity is kept separately by
+/// the runtime, so callers must not use a truncated display prefix as a key.
 /// The totals say something diverged; this says which field did — and without
 /// EJIT_DIAG_ENABLE it is the only form that says so.
 typedef struct {

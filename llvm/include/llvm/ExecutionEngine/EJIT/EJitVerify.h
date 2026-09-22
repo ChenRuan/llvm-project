@@ -17,9 +17,12 @@
 //
 // Under verifySubstitution the pass keeps the load and emits a call to
 // __ejit_verify_check comparing the value actually in memory against the one
-// it WOULD have frozen. Every divergence reported is a field that must not
-// carry ejit_may_const. Running a real workload this way classifies the marked
-// fields by measurement rather than by inspection.
+// it WOULD have frozen. Every divergence proves frozen/live disagreement for
+// the recorded access. It is evidence to investigate, not by itself proof
+// that the annotation is invalid: core-private data, registration/address
+// resolution, and publication/visibility can produce the same observation.
+// Running a real workload this way classifies marked fields by measurement
+// rather than by inspection.
 //
 // The comparison covers more than value stability. The load reads through the
 // address the source computes, from the AOT global; the frozen value comes
@@ -52,18 +55,30 @@
 namespace llvm {
 namespace ejit {
 
-/// Counters accumulated by the substitution verifier. Relaxed atomics: these
-/// are diagnostic totals, never a control input.
+/// Counters accumulated by the substitution verifier. The `sites` value is
+/// the number of instrumented sites emitted since the last reset; `checks` and
+/// `mismatches` are executions since that reset. All three are snapshots of a
+/// diagnostic-only shared store, never a control input.
 struct VerifyStats {
-  uint64_t sites;      ///< instrumented load sites emitted by the pass
-  uint64_t checks;     ///< instrumented loads executed
-  uint64_t mismatches; ///< executions where memory != the frozen value
+  uint64_t sites;      ///< emitted instrumented load sites since reset
+  uint64_t checks;     ///< instrumented loads executed since reset
+  uint64_t mismatches; ///< executions where memory != frozen since reset
 };
 
 /// Longest site name retained per record, including the terminator. Names are
-/// "<func>:<global>+<byteOffset>"; anything longer is truncated rather than
-/// dropped, since the leading text is what locates the field.
+/// "<func>:<global>+<byteOffset>"; anything longer is truncated for display,
+/// while the separate structural identity remains the record key.
 constexpr size_t kVerifySiteNameMax = 64;
+
+/// Maximum structural identity retained for a record. This is deliberately
+/// separate from kVerifySiteNameMax: the latter is a bounded display field,
+/// while identity comparison must not use a truncated display prefix.
+constexpr size_t kVerifySiteIdentityMax = 512;
+
+// An identity longer than kVerifySiteIdentityMax receives a compiler-issued
+// non-hash token for that emitted version. Such versions remain distinct and
+// are not aggregated across recompilations; identities that fit are compared
+// by their complete structural text and can aggregate across executions.
 
 /// Number of distinct sites the runtime can account for individually. A
 /// fixed table: verify mode runs on targets where a diagnostic must not
@@ -85,9 +100,10 @@ struct VerifySite {
 /// Snapshot the counters. \p out must be non-null.
 void ejitVerifyGetStats(VerifyStats *out);
 
-/// Number of per-site records held, i.e. distinct sites that have executed.
-/// Records are appended in order of first execution and never move, so an
-/// index below this bound stays valid until the next reset.
+/// Number of per-site records held, i.e. distinct identities that have
+/// executed. Records are appended in order of first execution and never move
+/// within an epoch. Queries and checks are synchronized with reset, so a
+/// caller never observes a row being cleared while it is in use.
 size_t ejitVerifySiteCount();
 
 /// Copy record \p index into \p out. False when the index is out of range or
@@ -95,8 +111,10 @@ size_t ejitVerifySiteCount();
 /// a batch copy would need a table-sized buffer on the caller's stack.
 bool ejitVerifyGetSite(size_t index, VerifySite *out);
 
-/// Zero the counters and drop every per-site record. Intended for tests
-/// bracketing a workload.
+/// Zero the counters and drop every per-site record. Reset is a synchronized
+/// epoch boundary: in-flight checks, emission notes, and queries complete
+/// before rows are retired. A check that starts after the boundary belongs to
+/// the new epoch.
 void ejitVerifyResetStats();
 
 /// Record that the pass emitted one instrumented site.
@@ -106,10 +124,15 @@ void ejitVerifyNoteSite();
 } // namespace llvm
 
 /// Called from JIT-compiled code, once per execution of an instrumented
-/// may_const load. \p site names the access as "<func>:<global>+<byteOffset>".
-/// \p baked is the value PASS6 would have frozen; \p actual is what the load
-/// just returned. Values are zero-extended (floats bitcast) to 64 bits.
-extern "C" void __ejit_verify_check(const char *site, uint64_t baked,
+/// may_const load. `site` is a bounded display name. `identity` is the full
+/// structural root/offset key when it fits; otherwise identityId is a unique
+/// non-hash token allocated by the compiler for that emitted version. This
+/// keeps long names and distinct absolute/indirect roots out of
+/// truncated-prefix equality. `baked` is the value PASS6 would have frozen;
+/// `actual` is what the load just returned. Values are zero-extended (floats
+/// bitcast) to 64 bits.
+extern "C" void __ejit_verify_check(const char *site, const char *identity,
+                                    uint64_t identityId, uint64_t baked,
                                     uint64_t actual);
 
 #endif // EJIT_VERIFY_SUBSTITUTION

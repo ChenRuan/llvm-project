@@ -244,8 +244,19 @@ int main(int argc, char **argv) {
           (unsigned long long)moving->lastActual);
     }
 
-    //===-- E: reset ------------------------------------------------------===//
-    printf("\n--- E: counter reset ---\n");
+    //===-- E: emitted-since-reset semantics on a warm cache -------------===//
+    printf("\n--- E: warm cache after reset (no new emission) ---\n");
+
+    ejit_verify_reset_stats();
+    r = probe(ci);
+    snapshot(&st);
+    T(r == 407, "warm cached probe = %u (expected 407)", r);
+    T(st.sites == 0 && st.checks > 0,
+      "warm cache has checks=%llu with no new emitted sites=%llu",
+      (unsigned long long)st.checks, (unsigned long long)st.sites);
+
+    //===-- F: reset ------------------------------------------------------===//
+    printf("\n--- F: counter reset ---\n");
 
     ejit_verify_reset_stats();
     snapshot(&st);
@@ -256,8 +267,8 @@ int main(int argc, char **argv) {
     nsites = ejit_verify_get_sites(sites, MAX_SITES);
     T(nsites == 0, "site records cleared (%zu)", nsites);
 
-    //===-- F: the emitted IR ---------------------------------------------===//
-    printf("\n--- F: instrumented IR ---\n");
+    //===-- G: the emitted IR ---------------------------------------------===//
+    printf("\n--- G: instrumented IR ---\n");
 
     T(opt_ir_has(dumpDir, "call void @__ejit_verify_check("),
       "post-pipeline IR calls __ejit_verify_check");

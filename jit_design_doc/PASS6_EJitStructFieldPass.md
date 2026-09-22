@@ -867,10 +867,13 @@ CMake 开关 OFF 时，插桩代码、per-site 表、运行时 helper 都不进 
 ; 验证模式（保留 + 比对）
 %2 = load i32, ptr @g_cfg, !ejit.may_const !18, !ejit.verified !18
 %3 = zext i32 %2 to i64
-call void @__ejit_verify_check(ptr @.ejit.verify.site, i64 4, i64 %3)
+call void @__ejit_verify_check(ptr @.ejit.verify.site,
+                                ptr @.ejit.verify.identity,
+                                i64 0, i64 4, i64 %3)
 ```
 
-- **site 命名**: `"<函数名>:<全局变量>+<字节偏移>"`，例如 `probe:g_cfg+4`。间接指针模式没有可达的根全局变量，退化为 `"<函数名>:<indirect>+<解引用后的偏移>"`，仍能区分同一结构体的不同字段。名字在模块内按字符串去重，一个热函数对同一字段的多次访问只生成一个字符串常量。
+- **site 命名**: `"<函数名>:<全局变量>+<字节偏移>"`，例如 `probe:g_cfg+4`。间接指针模式没有可达的根全局变量，显示名退化为 `"<函数名>:<indirect>+<解引用后的偏移>"`；独立的 identity 还保留完整根表达式，因此相同偏移的绝对/间接/bound 根不会因显示名截断而合并。显示名仅用于报告，不能作为记录 key。名字和 identity 在模块内分别按字符串去重。
+- **长 identity**: 能放入固定 identity 缓冲区的访问按完整结构文本跨执行聚合；更长的访问使用编译器为该 emitted version 分配的非 hash token，保证版本不碰撞但不跨 recompilation 聚合。
 - **类型**: 整数/浮点/指针统一 zext 到 i64 后传给 helper。浮点走同宽 bitcast —— 比的是 bit 相等，NaN payload 和 ±0 必须保留。宽度 > 64 位的类型不插桩，与 `createConstantFromMemory` 无法materialize 的集合一致。
 - **重复插桩防护**: 插桩过的 load 打上 `!ejit.verified`。`runPipeline` 会跑两次本 Pass（阶段 1c / 1f），而验证模式下 load 不被消耗，没有这个标记第二次就会重复插桩并让所有计数翻倍。
 - **`dso_local` 清除**: 验证模式保留了 load，特化代码因此仍要在运行时够到 AOT 全局。`dso_local` 声明走直接寻址（AArch64 上 ADRP+LDR），只在 JIT 代码池落在程序数据的 PC 相对范围内才可解析；超出时**整个编译失败**，验证器一条结论都给不出来。故验证模式清除外部全局的 `dso_local`，访问改走 JITLink 就近生成的 GOT 表项。诊断模式每个全局多一次 load，替换模式不受影响（它的 load 已经没了）。

@@ -20,12 +20,15 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <string>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -1799,6 +1802,19 @@ static Constant *getSiteString(Module &M, StringRef S,
   return GV;
 }
 
+/// Identity text is deliberately richer than the display name. For a global
+/// root the global name and byte offset are the useful stable field identity;
+/// for an indirect, absolute, or bound root the pointer expression itself is
+/// required because several roots can have the same GEP offset.
+static std::string printPointerExpression(const Value *Ptr) {
+  std::string Text;
+  raw_string_ostream OS(Text);
+  if (Ptr)
+    Ptr->print(OS);
+  OS.flush();
+  return Text;
+}
+
 /// Sum the constant byte offsets along the GEP chain feeding \p Ptr, whatever
 /// the chain is rooted at. accumulateFullOffset() insists on reaching a global
 /// and gives up otherwise — which is precisely the indirect-pointer case, where
@@ -1843,15 +1859,51 @@ static std::string makeSiteName(const Function &F, const LoadInst *LI,
   return Out;
 }
 
+static std::string makeSiteIdentity(const Function &F, const LoadInst *LI,
+                                    const DataLayout &DL,
+                                    const AssumedArgMap &Assumed) {
+  const Value *Ptr = LI->getPointerOperand();
+  std::string Out = F.getName().str() + ":";
+  if (const GlobalVariable *GV = findRootGV(Ptr)) {
+    Out += "global=" + GV->getName().str();
+    if (auto Off = accumulateFullOffset(DL, Ptr, Assumed))
+      Out += "+" + std::to_string(*Off);
+    return Out;
+  }
+
+  // Keep the full root expression, not only the summed offset. This is what
+  // separates two absolute inttoptr addresses and two indirect/bound roots
+  // that happen to use the same field offset.
+  Out += "root=" + printPointerExpression(Ptr);
+  if (auto Off = sumGEPChain(Ptr, DL, Assumed))
+    Out += ";offset=" + std::to_string(*Off);
+  return Out;
+}
+
+// Only identities that cannot fit the fixed structural-key buffer need a
+// token. The token is unique within the compiler process and is compared as a
+// value, not as a hash, so oversized names cannot collapse on a prefix.
+static std::atomic<uint64_t> gNextVerifyIdentity{1};
+
+static uint64_t allocateVerifyIdentity() {
+  uint64_t ID = gNextVerifyIdentity.fetch_add(1, std::memory_order_relaxed);
+  if (ID == 0)
+    ID = gNextVerifyIdentity.fetch_add(1, std::memory_order_relaxed);
+  return ID;
+}
+
 /// Keep \p LI and append a call comparing what it loads against \p Baked, the
 /// value substitution would have frozen. Returns false when the type cannot be
 /// widened, leaving the load untouched.
 static bool emitVerifyCheck(const Function &F, LoadInst *LI, Constant *Baked,
                             const AssumedArgMap &Assumed,
                             const DataLayout &DL,
-                            StringMap<Constant *> &SiteCache) {
+                            StringMap<Constant *> &DisplayCache,
+                            StringMap<Constant *> &IdentityCache) {
   Module &M = *LI->getModule();
   LLVMContext &Ctx = M.getContext();
+  const std::string Display = makeSiteName(F, LI, DL, Assumed);
+  const std::string Identity = makeSiteIdentity(F, LI, DL, Assumed);
 
   // Insert after the load so the comparison observes the value it produced.
   IRBuilder<> B(LI->getNextNode());
@@ -1863,20 +1915,36 @@ static bool emitVerifyCheck(const Function &F, LoadInst *LI, Constant *Baked,
     // coverage rather than a clean result. Say so: silence here would read as
     // "this field never diverged".
     EJIT_DIAG("verify SKIP site=%s: type not checkable (>64-bit or vector)",
-              makeSiteName(F, LI, DL, Assumed).c_str());
+              Display.c_str());
     return false;
   }
+
+  // Keep the worker-side candidate visible for board correlation. This is the
+  // value the pass is about to compare, not proof of the resolved target
+  // address or of shared backing storage.
+  std::string FrozenText;
+  raw_string_ostream FrozenOS(FrozenText);
+  Baked->print(FrozenOS);
+  FrozenOS.flush();
+  EJIT_DIAG("verify emit site=%s identity=%s frozen=%s", Display.c_str(),
+            Identity.c_str(), FrozenText.c_str());
 
   Type *PtrTy = PointerType::getUnqual(Ctx);
   FunctionCallee Check = M.getOrInsertFunction(
       "__ejit_verify_check",
       FunctionType::get(Type::getVoidTy(Ctx),
-                        {PtrTy, B.getInt64Ty(), B.getInt64Ty()},
+                        {PtrTy, PtrTy, B.getInt64Ty(), B.getInt64Ty(),
+                         B.getInt64Ty()},
                         /*isVarArg=*/false));
 
-  B.CreateCall(Check, {getSiteString(M, makeSiteName(F, LI, DL, Assumed),
-                                    SiteCache),
-                       Frozen, Actual});
+  const uint64_t IdentityId =
+      Identity.size() + 1 > kVerifySiteIdentityMax
+          ? allocateVerifyIdentity()
+          : 0;
+  B.CreateCall(Check,
+               {getSiteString(M, Display, DisplayCache),
+                getSiteString(M, Identity, IdentityCache),
+                B.getInt64(IdentityId), Frozen, Actual});
   LI->setMetadata(MD_EJIT_VERIFIED, MDNode::get(Ctx, {}));
   ejitVerifyNoteSite();
   return true;
@@ -2060,7 +2128,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   bool changed = false;
 #ifdef EJIT_VERIFY_SUBSTITUTION
   if (verify_) {
-    StringMap<Constant *> siteCache;
+    StringMap<Constant *> displayCache;
+    StringMap<Constant *> identityCache;
     size_t verifyCandidates = 0, verifyInstrumented = 0;
     for (auto &R : replacements) {
       // A period pointer base is an address root, not a marked field, so it
@@ -2074,7 +2143,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
         continue;
       }
       ++verifyCandidates;
-      if (emitVerifyCheck(F, R.LI, R.ConstVal, freeDimArgs_, DL, siteCache)) {
+      if (emitVerifyCheck(F, R.LI, R.ConstVal, freeDimArgs_, DL, displayCache,
+                          identityCache)) {
         ++verifyInstrumented;
         changed = true;
       }
