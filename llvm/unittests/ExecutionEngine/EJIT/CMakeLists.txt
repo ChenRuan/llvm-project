@@ -1,6 +1,8 @@
 set(LLVM_LINK_COMPONENTS
   Analysis
+  AsmPrinter
   AsmParser
+  CodeGen
   Core
   EmbeddedJIT
   EJIT
@@ -21,12 +23,17 @@ add_llvm_unittest(EJITTests
   EJitPreparedCodeTest.cpp
   EJitLinkOptimizationPluginTest.cpp
   EJitPgoTest.cpp
+  EJitSreHostPlatformTest.cpp
   EJitVpMergeTest.cpp
   EJitVpScalarSpecTest.cpp
   EJitVpPipelineTest.cpp
 
   PARTIAL_SOURCES_INTENDED
   )
+
+# Keep the public C++ registration-phase regression observable without adding
+# a production accessor or changing the runtime ABI.
+target_compile_definitions(EJITTests PRIVATE EJIT_SRE_TASKPOOL_TESTING)
 
 # The value-profile test sources are #ifdef EJIT_SRE_PGO_VALUE_PROFILE-gated,
 # matching the LLVMEJIT build; without these definitions they compile to empty
@@ -48,15 +55,21 @@ if(EJIT_SRE_PGO_BRANCH_AUDIT)
   target_compile_definitions(EJITTests PRIVATE EJIT_SRE_PGO_BRANCH_AUDIT)
 endif()
 
-# EJit.cpp calls InitializeAllAsmParsers(); a target's AsmParser lib is only
-# referenced at runtime (no CMake dependency edge), so when listed via
-# LLVM_LINK_COMPONENTS it can be ordered BEFORE LLVMEJIT on the static link
-# line and its LLVMInitialize<T>AsmParser symbol is dropped. Append each built
-# target's AsmParser lib AFTER the target so the reference resolves.
+if(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  target_compile_definitions(EJITTests PRIVATE EJIT_CODE_POOL_BATCHED_PUBLISH)
+endif()
+
+# EJit.cpp calls InitializeAllAsmParsers(); native parser/printer/codegen
+# symbols are referenced through static-library edges. Keep the generic
+# components in LLVM_LINK_COMPONENTS and append each built target's native
+# parser/printer/codegen libraries after the executable so those references
+# remain live on the static link line.
 foreach(ejit_target ${LLVM_TARGETS_TO_BUILD})
-  if(TARGET LLVM${ejit_target}AsmParser)
-    target_link_libraries(EJITTests PRIVATE LLVM${ejit_target}AsmParser)
-  endif()
+  foreach(ejit_component AsmParser AsmPrinter CodeGen)
+    if(TARGET LLVM${ejit_target}${ejit_component})
+      target_link_libraries(EJITTests PRIVATE LLVM${ejit_target}${ejit_component})
+    endif()
+  endforeach()
 endforeach()
 
 # SRE code pool tests live in their own executable so they build and run
@@ -245,7 +258,9 @@ add_custom_target(check-ejit-shared-taskpool
 set(EJIT_REPGROUP_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
 set(LLVM_LINK_COMPONENTS
   Analysis
+  AsmPrinter
   AsmParser
+  CodeGen
   Core
   ExecutionEngine
   Instrumentation
@@ -277,10 +292,12 @@ add_llvm_unittest(EJitRepresentativeGroupTests
   )
 set(LLVM_LINK_COMPONENTS "${EJIT_REPGROUP_LINK_COMPONENTS_SAVED}")
 foreach(ejit_target ${LLVM_TARGETS_TO_BUILD})
-  if(TARGET LLVM${ejit_target}AsmParser)
-    target_link_libraries(EJitRepresentativeGroupTests PRIVATE
-      LLVM${ejit_target}AsmParser)
-  endif()
+  foreach(ejit_component AsmParser AsmPrinter CodeGen)
+    if(TARGET LLVM${ejit_target}${ejit_component})
+      target_link_libraries(EJitRepresentativeGroupTests PRIVATE
+        LLVM${ejit_target}${ejit_component})
+    endif()
+  endforeach()
 endforeach()
 
 # Same icache geometry/feature macros as the production LLVMEJIT (the EJIT
@@ -309,6 +326,125 @@ add_custom_target(check-ejit-representative-group
   COMMAND $<TARGET_FILE:EJitRepresentativeGroupTests>
   DEPENDS EJitRepresentativeGroupTests
   COMMENT "Running EmbeddedJIT representative-PGO group integration tests"
+  USES_TERMINAL
+  )
+
+# Representative-PGO production runtime and cross-core routing integration.
+# This target deliberately compiles the current EJIT sources directly instead
+# of linking an LLVMEJIT archive, so the formal test cannot silently exercise a
+# stale shared-taskpool ABI or a different audit macro set. The test source
+# contains the existing real runtime pressure/borrow coverage plus the
+# independent-driver attach, 64-dispatch, equal-share, and unequal-share
+# cases. Host execution validates deterministic lifecycle and routing only;
+# board worker scheduling and executable-memory permissions remain platform
+# acceptance gates.
+set(EJIT_REPRUNTIME_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
+set(LLVM_LINK_COMPONENTS
+  Analysis
+  AsmPrinter
+  AsmParser
+  CodeGen
+  Core
+  ExecutionEngine
+  Instrumentation
+  JITLink
+  OrcJIT
+  OrcShared
+  Passes
+  ProfileData
+  Support
+  TargetParser
+  )
+add_llvm_unittest(EJITRepresentativeRuntimeTests
+  EJitRepresentativeRuntimeTest.cpp
+  EJitSreHostPlatformTest.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJit.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitRuntime.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitRuntimeState.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitRegistrationStore.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitModuleLoader.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitCompileDriver.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitRepresentativeGroup.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitOrcEngine.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitOptimizer.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitStructFieldPass.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitPreparedCode.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitProfileMerge.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitBranchProfile.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitValueProfile.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitVpCollector.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitCodePool.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitTaskPool.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSreQueue.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSrePlatform.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSreTask_host.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitWorker.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLinkDiagPlugin.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLinkOptimizationPlugin.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitIpcLock.cpp
+
+  PARTIAL_SOURCES_INTENDED
+  )
+set(LLVM_LINK_COMPONENTS "${EJIT_REPRUNTIME_LINK_COMPONENTS_SAVED}")
+add_dependencies(EJITRepresentativeRuntimeTests ejit_version_header)
+target_include_directories(EJITRepresentativeRuntimeTests PRIVATE
+  ${LLVM_BINARY_DIR}/lib/ExecutionEngine/EJIT)
+foreach(ejit_target ${LLVM_TARGETS_TO_BUILD})
+  foreach(ejit_component AsmParser AsmPrinter CodeGen)
+    if(TARGET LLVM${ejit_target}${ejit_component})
+      target_link_libraries(EJITRepresentativeRuntimeTests PRIVATE
+        LLVM${ejit_target}${ejit_component})
+    endif()
+  endforeach()
+endforeach()
+
+target_compile_definitions(EJITRepresentativeRuntimeTests PRIVATE
+  EJIT_SRE_TASKPOOL
+  EJIT_SRE_SHARED_TASKPOOL
+  EJIT_SRE_TASKPOOL_TESTING
+  EJIT_STATS_ENABLE
+  EJIT_DIAG_ENABLE
+  EJIT_SRE_PGO_BRANCH_AUDIT
+  EJIT_SRE_SHARED_CODE_POINTERS
+  EJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS}
+  EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}
+  EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}
+  EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}
+  EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS}
+  EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}
+  EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=3
+  EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=100
+  )
+if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
+  target_compile_definitions(EJITRepresentativeRuntimeTests PRIVATE
+    EJIT_CODE_POOL_4K_SEAL)
+endif()
+if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL AND
+   EJIT_CODE_POOL_BATCHED_PUBLISH)
+  target_compile_definitions(EJITRepresentativeRuntimeTests PRIVATE
+    EJIT_CODE_POOL_BATCHED_PUBLISH)
+endif()
+if(EJIT_SRE_PGO_VALUE_PROFILE)
+  target_compile_definitions(EJITRepresentativeRuntimeTests PRIVATE
+    EJIT_SRE_PGO_VALUE_PROFILE
+    EJIT_SRE_VP_K=${EJIT_SRE_VP_K}
+    EJIT_SRE_VP_SITES_PER_CORE=${EJIT_SRE_VP_SITES_PER_CORE}
+    EJIT_SRE_VP_MAX_CORES=${EJIT_SRE_VP_MAX_CORES}
+    EJIT_SRE_VP_TOP_N=${EJIT_SRE_VP_TOP_N}
+    EJIT_SRE_VP_DRAIN_TICKS=${EJIT_SRE_VP_DRAIN_TICKS}
+    EJIT_SRE_VP_MIN_SAMPLES=${EJIT_SRE_VP_MIN_SAMPLES}
+    EJIT_SRE_VP_MIN_CONF_PERCENT=${EJIT_SRE_VP_MIN_CONF_PERCENT}
+    )
+endif()
+
+add_custom_target(check-ejit-representative-runtime
+  COMMAND $<TARGET_FILE:EJITRepresentativeRuntimeTests>
+  DEPENDS EJITRepresentativeRuntimeTests
+  COMMENT "Running formal representative-PGO runtime and cross-core tests"
   USES_TERMINAL
   )
 

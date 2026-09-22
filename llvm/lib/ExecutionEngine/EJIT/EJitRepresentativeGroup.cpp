@@ -44,16 +44,30 @@ struct GroupState {
   bool hasPhysical = false;
   uint64_t physicalCodeId = 0;
   void *physicalFn = nullptr;
-  std::vector<uint64_t> retiredAttempts;
+  uint64_t retainedBundleBytes = 0;
   std::vector<MemberRecord> members;
 };
 
+uint64_t saturatingAdd(uint64_t A, uint64_t B) {
+  return B > UINT64_MAX - A ? UINT64_MAX : A + B;
+}
+
 uint64_t retainedBytesOf(const EJitProfileBundle &B) {
   uint64_t Bytes = B.indexedProfile.size();
-  Bytes += B.scalarSites.size() * sizeof(PgoScalarSite);
-  Bytes += B.verifiedTargets.size() * sizeof(EJitProfileBundle::VerifiedTarget);
+  const uint64_t ScalarBytes =
+      B.scalarSites.size() > UINT64_MAX / sizeof(PgoScalarSite)
+          ? UINT64_MAX
+          : B.scalarSites.size() * sizeof(PgoScalarSite);
+  const uint64_t TargetBytes =
+      B.verifiedTargets.size() >
+              UINT64_MAX / sizeof(EJitProfileBundle::VerifiedTarget)
+          ? UINT64_MAX
+          : B.verifiedTargets.size() * sizeof(EJitProfileBundle::VerifiedTarget);
+  Bytes = saturatingAdd(Bytes, ScalarBytes);
+  Bytes = saturatingAdd(Bytes, TargetBytes);
   for (const PgoFunctionSchema &S : B.schema)
-    Bytes += sizeof(PgoFunctionSchema) + S.pgoName.size();
+    Bytes = saturatingAdd(Bytes, saturatingAdd(sizeof(PgoFunctionSchema),
+                                               S.pgoName.size()));
   return Bytes;
 }
 
@@ -68,6 +82,36 @@ struct EJitRepresentativeGroupRegistry::Impl {
   uint64_t nextSamplingSessionId = 1;
   uint64_t nextWaiterToken = 1;
   EJitGroupDiagnostics diag;
+
+  struct RetainedBundle {
+    EJitFrozenProfileBundle bundle;
+    uint64_t bytes = 0;
+  };
+  // A retired bundle remains budgeted while a worker still holds a shared_ptr
+  // returned by bundleFor(). This prevents a late consumer from observing a
+  // freed budget reservation while a new generation reuses the capacity.
+  std::vector<RetainedBundle> retiredBundles;
+
+  void reapRetiredBundles() {
+    for (auto It = retiredBundles.begin(); It != retiredBundles.end();) {
+      if (It->bundle.use_count() != 1) {
+        ++It;
+        continue;
+      }
+      diag.retainedBundleBytes =
+          diag.retainedBundleBytes >= It->bytes
+              ? diag.retainedBundleBytes - It->bytes
+              : 0;
+      It = retiredBundles.erase(It);
+    }
+  }
+
+  void retireBundle(GroupState &G) {
+    if (!G.bundle)
+      return;
+    retiredBundles.push_back({std::move(G.bundle), G.retainedBundleBytes});
+    G.retainedBundleBytes = 0;
+  }
 
   GroupState *find(uint64_t groupId, uint64_t generation) {
     for (GroupState &G : groups)
@@ -93,9 +137,12 @@ struct EJitRepresentativeGroupRegistry::Impl {
         return &M;
     return nullptr;
   }
-  bool isRetired(const GroupState &G, uint64_t attemptToken) const {
-    return std::find(G.retiredAttempts.begin(), G.retiredAttempts.end(),
-                     attemptToken) != G.retiredAttempts.end();
+  void reclaimGenerationMetadata(GroupState &G) {
+    if (G.rep.valid() || !G.members.empty())
+      ++diag.retiredGenerationMetadataReclaims;
+    diag.memberRecordsReclaimed = saturatingAdd(
+        diag.memberRecordsReclaimed, static_cast<uint64_t>(G.members.size()));
+    std::vector<MemberRecord>().swap(G.members);
   }
 };
 
@@ -144,6 +191,7 @@ EJitRepresentativeGroupRegistry::openGroup(uint64_t CandidateGroupId,
   }
   if (P->groups.size() >= P->limits.maxGroups) {
     ++P->diag.rejectedAdmissions;
+    ++P->diag.groupCapacityDefers;
     return make_error<StringError>(
         "representative group table is full",
         std::make_error_code(std::errc::no_buffer_space));
@@ -228,10 +276,12 @@ EJitRepresentativeGroupRegistry::joinWaiter(const EJitGroupHandle &Handle,
     return make_error<StringError>(
         "waiter must be an active cell of the group",
         std::make_error_code(std::errc::invalid_argument));
-  if (G->members.size() >= P->limits.maxMembersPerGroup)
+  if (G->members.size() >= P->limits.maxMembersPerGroup) {
+    ++P->diag.memberCapacityDefers;
     return make_error<StringError>(
         "group member table is full",
         std::make_error_code(std::errc::no_buffer_space));
+  }
 
   MemberRecord R;
   R.logicalKey = M.logicalKey;
@@ -255,7 +305,7 @@ EJitDispatchOutcome EJitRepresentativeGroupRegistry::recordRepresentativeDispatc
   // Exact ownership: the session must be this generation's current session.
   if (!G->rep.valid() || G->rep.attemptToken != S.attemptToken ||
       G->rep.samplingSessionId != S.samplingSessionId) {
-    if (P->isRetired(*G, S.attemptToken) || S.attemptToken != G->rep.attemptToken) {
+    if (!G->rep.valid() || S.attemptToken != G->rep.attemptToken) {
       ++P->diag.staleSettlements;
       return EJitDispatchOutcome::Stale;
     }
@@ -314,7 +364,16 @@ EJitPublishOutcome EJitRepresentativeGroupRegistry::publishBundle(
   if (Bundle.freezeCompletedAt == 0)
     Bundle.freezeCompletedAt = G->rep.quotaEnd;
 
-  P->diag.retainedBundleBytes += retainedBytesOf(Bundle);
+  P->reapRetiredBundles();
+  const uint64_t BundleBytes = retainedBytesOf(Bundle);
+  if (BundleBytes > P->limits.maxRetainedBundleBytes ||
+      P->diag.retainedBundleBytes >
+          P->limits.maxRetainedBundleBytes - BundleBytes) {
+    ++P->diag.retainedBundleBudgetRejects;
+    return EJitPublishOutcome::RetainedBundleBudget;
+  }
+  P->diag.retainedBundleBytes =
+      saturatingAdd(P->diag.retainedBundleBytes, BundleBytes);
   switch (Bundle.quality) {
   case ProfileSnapshotQuality::Complete:
     ++P->diag.completeProfiles;
@@ -331,6 +390,7 @@ EJitPublishOutcome EJitRepresentativeGroupRegistry::publishBundle(
   }
   ++P->diag.bundlePublications;
   G->bundleAttemptToken = G->rep.attemptToken;
+  G->retainedBundleBytes = BundleBytes;
   G->bundle = std::make_shared<const EJitProfileBundle>(std::move(Bundle));
   return EJitPublishOutcome::Published;
 }
@@ -504,9 +564,8 @@ Expected<EJitGroupHandle> EJitRepresentativeGroupRegistry::invalidateRepresentat
         std::make_error_code(std::errc::invalid_argument));
   // Retire the exact session: its late callbacks can only settle as Stale, and
   // every waiter of the retired generation must re-join the new one.
-  G->retiredAttempts.push_back(G->rep.attemptToken);
   G->rep = EJitRepresentativeSession();
-  G->bundle.reset();
+  P->retireBundle(*G);
   G->bundleAttemptToken = 0;
   G->hasPhysical = false;
   G->physicalCodeId = 0;
@@ -520,6 +579,7 @@ Expected<EJitGroupHandle> EJitRepresentativeGroupRegistry::invalidateRepresentat
       ++P->diag.waitersCancelled;
     }
   }
+  P->reclaimGenerationMetadata(*G);
   ++G->generation;
   ++P->diag.representativeReElections;
   return EJitGroupHandle{G->groupId, G->generation};
@@ -542,9 +602,8 @@ bool EJitRepresentativeGroupRegistry::cancelRepresentative(
   GroupState *G = P->find(Handle.groupId, Handle.generation);
   if (!G || !G->rep.valid() || G->rep.attemptToken != S.attemptToken)
     return false;
-  G->retiredAttempts.push_back(G->rep.attemptToken);
   G->rep = EJitRepresentativeSession();
-  G->bundle.reset();
+  P->retireBundle(*G);
   G->bundleAttemptToken = 0;
   G->hasPhysical = false;
   G->physicalCodeId = 0;
@@ -555,6 +614,7 @@ bool EJitRepresentativeGroupRegistry::cancelRepresentative(
       ++P->diag.waitersCancelled;
     }
   }
+  P->reclaimGenerationMetadata(*G);
   ++G->generation;
   ++P->diag.representativeReElections;
   return true;

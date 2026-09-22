@@ -139,10 +139,10 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, bool PreserveDimensions)
 }
 
 void EJitOptimizer::clearAnalyses() {
+  MAM_.clear();
+  CGAM_.clear();
   FAM_.clear();
   LAM_.clear();
-  CGAM_.clear();
-  MAM_.clear();
 }
 
 void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {

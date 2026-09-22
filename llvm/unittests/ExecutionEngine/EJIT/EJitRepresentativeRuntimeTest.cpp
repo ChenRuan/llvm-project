@@ -28,9 +28,12 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLibcallStubs.h"
+#include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRepresentativeGroup.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "llvm/IR/BasicBlock.h"
@@ -433,10 +436,65 @@ void initRuntimeOnce() {
 class EJitRepresentativeRuntimeTest : public ::testing::Test {
 protected:
   void SetUp() override {
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
     initRuntimeOnce();
   }
 };
+
+// The cross-core tests below use the production host worker entry.  CoreId is
+// thread_local, so the worker establishes its own identity; this reset only
+// prevents a test's caller identity from leaking into the next test.
+struct CrossCoreReset {
+  ~CrossCoreReset() { EJitCoreId::resetForTest(); }
+};
+
+struct CrossCoreOwnerShutdown {
+  EJitSharedTaskPool *Pool = nullptr;
+  ~CrossCoreOwnerShutdown() {
+    if (Pool)
+      Pool->ownerShutdown();
+  }
+};
+
+bool crossCoreHostCodeAlreadyExecutable(void *, const void *) { return true; }
+
+bool crossCoreRoutingStatus(EJitCompileOrGetStatus Status) {
+  return Status == EJitCompileOrGetStatus::EnqueuedPending ||
+         Status == EJitCompileOrGetStatus::AlreadyPending ||
+         Status == EJitCompileOrGetStatus::PgoAdmissionDeferred ||
+         Status == EJitCompileOrGetStatus::CacheHit;
+}
+
+void registerCrossCoreOwnerSymbols(EJitCompileDriver &Owner) {
+  Owner.registerSymbol("cfg", RepresentativeRuntime::rows());
+  Owner.registerSymbol("rep_runtime_pause",
+                       reinterpret_cast<void *>(&rep_runtime_pause));
+  // This symbol is deliberately not referenced by the registered bitcode.
+  // It exercises the real owner symbol table without entering the effective
+  // binding set, so an unrelated registration cannot split an equal group.
+  static uint32_t UnrelatedRegisteredSymbol = 0;
+  Owner.registerSymbol("rep_runtime_unrelated_registered_symbol",
+                       &UnrelatedRegisteredSymbol);
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  using InstrumentTargetFn = void (*)(uint64_t, void *, uint32_t);
+  Owner.registerSymbol("rep_runtime_target",
+                       reinterpret_cast<void *>(&rep_runtime_target));
+  Owner.registerSymbol("rep_runtime_slot", &RuntimeTarget);
+  Owner.registerSymbol(
+      "__llvm_profile_instrument_target",
+      reinterpret_cast<void *>(static_cast<InstrumentTargetFn>(
+          &__llvm_profile_instrument_target)));
+  Owner.registerSymbol(
+      "__llvm_profile_instrument_memop",
+      reinterpret_cast<void *>(&__llvm_profile_instrument_memop));
+  Owner.registerSymbol("ejit_vp_record_scalar",
+                       reinterpret_cast<void *>(&ejit_vp_record_scalar));
+  Owner.registerSymbol(
+      "ejit_vp_record_scalar_session",
+      reinterpret_cast<void *>(&ejit_vp_record_scalar_session));
+#endif
+  Owner.registerSymbol("__llvm_profile_runtime",
+                       &RepresentativeRuntime::profileRuntime());
+}
 
 /// The V1 gate: the opt-in is accepted only for Async + normal online PGO.
 TEST_F(EJitRepresentativeRuntimeTest,
@@ -498,6 +556,47 @@ TEST_F(EJitRepresentativeRuntimeTest,
   Policy.dispatchQuota = 0;
   EXPECT_EQ(EJitRepresentativeGroupRegistry::admissionReject(Policy),
             EJitGroupAdmitReject::ZeroQuota);
+}
+
+TEST_F(EJitRepresentativeRuntimeTest,
+       TypedRepresentativeDiagnosticsKeepOutcomeAndReasonDistinct) {
+  EXPECT_EQ(EJitCompileDriver::candidateDiagReasonForTest(
+                "candidate directory budget exhausted"),
+            EJitRepresentativeDiagReason::GroupBudget);
+  EXPECT_EQ(EJitCompileDriver::candidateDiagOutcomeForTest(
+                "candidate directory budget exhausted"),
+            EJitRepresentativeDiagOutcome::Deferred);
+
+  EXPECT_EQ(EJitCompileDriver::candidateDiagReasonForTest(
+                "external binding is missing"),
+            EJitRepresentativeDiagReason::Binding);
+  EXPECT_EQ(EJitCompileDriver::candidateDiagOutcomeForTest(
+                "external binding is missing"),
+            EJitRepresentativeDiagOutcome::Failure);
+
+  EXPECT_EQ(EJitCompileDriver::candidateDiagReasonForTest(
+                "TLS cannot be shared by absolute binding"),
+            EJitRepresentativeDiagReason::TLS);
+  EXPECT_EQ(EJitCompileDriver::candidateDiagOutcomeForTest(
+                "TLS cannot be shared by absolute binding"),
+            EJitRepresentativeDiagOutcome::Independent);
+
+  EXPECT_EQ(EJitCompileDriver::candidateDiagReasonForTest(
+                "module contains address-observable private state"),
+            EJitRepresentativeDiagReason::PrivateState);
+  EXPECT_EQ(EJitCompileDriver::candidateDiagOutcomeForTest(
+                "module contains address-observable private state"),
+            EJitRepresentativeDiagOutcome::Independent);
+
+  EXPECT_EQ(EJitCompileDriver::publishDiagOutcomeForTest(
+                EJitPublishOutcome::AlreadyPublished),
+            EJitRepresentativeDiagOutcome::Pending);
+  EXPECT_EQ(EJitCompileDriver::publishDiagOutcomeForTest(
+                EJitPublishOutcome::RetainedBundleBudget),
+            EJitRepresentativeDiagOutcome::Deferred);
+  EXPECT_EQ(EJitCompileDriver::publishDiagOutcomeForTest(
+                EJitPublishOutcome::InvalidBundle),
+            EJitRepresentativeDiagOutcome::Failure);
 }
 
 TEST_F(EJitRepresentativeRuntimeTest,
@@ -580,9 +679,9 @@ TEST_F(EJitRepresentativeRuntimeTest,
   Cfg.compileMode = EJIT_COMPILE_ASYNC;
   ASSERT_EQ(ejit_init_representative(&Cfg), EJIT_OK)
       << "ejit_init_representative must accept Async + normal online PGO";
-  // Diagnostics on: this test is the runtime-path evidence, so the production
-  // group/bundle/publish lines must be visible in its log.
-  ejit_set_log_level(EJIT_LOG_VERBOSE);
+  // INFO retains group/bundle/audit events without serializing every dispatch
+  // through stdout during the following concurrent pressure tests.
+  ejit_set_log_level(EJIT_LOG_INFO);
 
   auto *ModePool = static_cast<EJitSharedTaskPool *>(ejit_representative_test_pool());
   ASSERT_NE(ModePool, nullptr);
@@ -687,7 +786,12 @@ TEST_F(EJitRepresentativeRuntimeTest,
            "Tier-1 object";
     if (I == kQuota - 1) {
       PauseLast.store(true, std::memory_order_release);
-      std::thread Last([&] { executeAndCheck(DispatchFn, 1, 1, 3); });
+      std::thread Last([&] {
+        // CoreId is thread_local on the host; generated-code execution must
+        // declare the owner context instead of inheriting the caller's id.
+        EJitCoreId::setCurrentForTest(6);
+        executeAndCheck(DispatchFn, 1, 1, 3);
+      });
       const auto Deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
       while (!LastEntered.load(std::memory_order_acquire) &&
              std::chrono::steady_clock::now() < Deadline)
@@ -1020,7 +1124,10 @@ TEST_F(EJitRepresentativeRuntimeTest,
   PauseLast.store(true, std::memory_order_release);
   LastEntered.store(false, std::memory_order_release);
   ResumeLast.store(false, std::memory_order_release);
-  std::thread OldExecution([&] { executeAndCheck(CancelledT1, 8, 1, 27); });
+  std::thread OldExecution([&] {
+    EJitCoreId::setCurrentForTest(6);
+    executeAndCheck(CancelledT1, 8, 1, 27);
+  });
   const auto CancelDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (!LastEntered.load(std::memory_order_acquire) &&
          std::chrono::steady_clock::now() < CancelDeadline)
@@ -1029,6 +1136,7 @@ TEST_F(EJitRepresentativeRuntimeTest,
   std::atomic<bool> CancelDone{false};
   bool CancelSucceeded = false;
   std::thread CancelWorker([&] {
+    EJitCoreId::setCurrentForTest(16);
     CancelSucceeded = Pool->cancelRequestAttempt(CancelToken, EJitRequestAttemptReason::Cancelled);
     CancelDone.store(true, std::memory_order_release);
   });
@@ -1353,6 +1461,11 @@ TEST_F(EJitRepresentativeRuntimeTest,
   auto *Pool =
       static_cast<EJitSharedTaskPool *>(ejit_representative_test_pool());
   ASSERT_NE(Pool, nullptr);
+#ifndef EJIT_SRE_CODE_POOL
+  // Host ORC memory is already executable process-wide. Simulated peer cores
+  // still require the same host adapter as the cross-core runtime tests.
+  Pool->setPrepareCodeCallback(&crossCoreHostCodeAlreadyExecutable, nullptr);
+#endif
 
   for (uint32_t Cell = 0; Cell < kPressureCells; ++Cell)
     ASSERT_EQ(ejit_activate("cell", Cell), EJIT_OK);
@@ -1424,6 +1537,8 @@ TEST_F(EJitRepresentativeRuntimeTest,
       break;
     }
     Samplers.emplace_back([&, Entry] {
+      // std::thread does not inherit the fixture thread's simulated core.
+      EJitCoreId::setCurrentForTest(6);
       // The setup call above is sample zero; complete the remaining quota here.
       for (uint32_t Sample = 1; Sample < kQuota; ++Sample) {
         bool Executed = false;
@@ -1445,9 +1560,11 @@ TEST_F(EJitRepresentativeRuntimeTest,
           if (!Executed)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        if (!Executed)
+        if (!Executed) {
           recordError("entry " + std::to_string(Entry) +
                       " representative sample did not resolve");
+          break;
+        }
       }
     });
   }
@@ -1535,6 +1652,12 @@ TEST_F(EJitRepresentativeRuntimeTest,
   ASSERT_NE(UnequalT2, nullptr);
   EXPECT_NE(UnequalT2, SharedT2[0]);
   EXPECT_NE(UnequalT2, UnequalT1);
+
+  // A published pointer may become visible before the worker retires its
+  // exact source request. Observe bounded quiescence before checking leaks.
+  for (unsigned Try = 0; Try != 4000 &&
+       (Pool->liveRequestAttemptCount() || Pool->pendingCount()); ++Try)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
   ejit_representative_stats_t After{};
   ASSERT_EQ(ejit_representative_get_stats(&After), EJIT_OK);
@@ -1674,6 +1797,768 @@ TEST_F(EJitRepresentativeRuntimeTest,
   EXPECT_EQ(ejit_taskpool_pending_count(), 0u);
   ejit_shutdown();
 
+}
+
+TEST(EJitCrossCoreRuntime, ReadyPoolAcceptsMatchingPeerProtocol) {
+  CrossCoreReset Reset;
+  auto State = std::make_unique<EJitSharedTaskPoolState>();
+  EJitSharedTaskPool Owner, Peer;
+  CrossCoreOwnerShutdown Shutdown{&Owner};
+
+  EJitCoreId::setCurrentForTest(6);
+  Owner.bind(State.get());
+  Owner.setCodeSharingEnabled(true);
+  Owner.setPgoEnabled(true, kQuota);
+  ASSERT_TRUE(Owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EJitCoreId::setCurrentForTest(16);
+  Peer.bind(State.get());
+  Peer.setCodeSharingEnabled(true);
+  EXPECT_TRUE(Peer.setRequestAttemptsEnabled(true));
+  EXPECT_FALSE(Peer.setRequestAttemptsEnabled(false));
+  EXPECT_EQ(State->requestAttemptsEnabled.loadAcquire(), 1u);
+  EXPECT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+}
+
+TEST(EJitCrossCoreRuntime, ReadyPoolRejectsRepresentativePolicyMismatch) {
+  CrossCoreReset Reset;
+  auto State = std::make_unique<EJitSharedTaskPoolState>();
+  EJitSharedTaskPool Owner, Peer;
+  CrossCoreOwnerShutdown Shutdown{&Owner};
+
+  EJitCoreId::setCurrentForTest(6);
+  Owner.bind(State.get());
+  Owner.setRepresentativeSharingEnabled(true);
+  ASSERT_TRUE(Owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EJitCoreId::setCurrentForTest(16);
+  Peer.bind(State.get());
+  Peer.setRepresentativeSharingEnabled(false);
+  ASSERT_TRUE(Peer.setRequestAttemptsEnabled(true));
+  EXPECT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::PolicyMismatch);
+  EXPECT_EQ(State->representativeSharingEnabled.loadAcquire(), 1u);
+}
+
+TEST(EJitCrossCoreRuntime, IndependentRuntimePeerKeepsRepresentativeSharing) {
+  CrossCoreReset Reset;
+  initRuntimeOnce();
+
+  Config C;
+  C.compileMode = CompileMode::Async;
+  C.optLevel = OptimizationLevel::L2;
+  C.enablePgo = true;
+  C.enableRepresentativeSharing = true;
+  ASSERT_TRUE(C.enableProfileAudit);
+
+  EJitCoreId::setCurrentForTest(6);
+  auto Owner = std::make_unique<EJit>(C);
+  ASSERT_FALSE(Owner->initFailed());
+  ASSERT_TRUE(Owner->compileDriver()->representativeSharingActive());
+  ASSERT_EQ(Owner->sharedTaskPool()->state()->ownerCoreId.loadAcquire(), 6u);
+  ASSERT_EQ(Owner->sharedTaskPool()->state()->requestAttemptsEnabled.loadAcquire(),
+            1u);
+
+  EJitCoreId::setCurrentForTest(16);
+  auto Peer = std::make_unique<EJit>(C);
+  ASSERT_FALSE(Peer->initFailed());
+  ASSERT_EQ(Peer->sharedTaskPool()->state(), Owner->sharedTaskPool()->state());
+  EXPECT_TRUE(Peer->compileDriver()->representativeSharingActive());
+}
+
+TEST(EJitCrossCoreRuntime, IndependentPeerExecutes64T1AndConsumesOwnerTier2) {
+  CrossCoreReset Reset;
+  initRuntimeOnce();
+  RepresentativeRuntime::rows()[0].gain = 7;
+  RepresentativeRuntime::rows()[0].live[0] = 0;
+  RepresentativeRuntime::rows()[0].live[1] = 0;
+
+  Config C;
+  C.compileMode = CompileMode::Async;
+  C.optLevel = OptimizationLevel::L2;
+  C.enablePgo = true;
+  C.enableRepresentativeSharing = true;
+  ASSERT_TRUE(C.enableProfileAudit);
+
+  EJitRuntimeState OwnerState, PeerState;
+  EJitModuleLoader OwnerLoader, PeerLoader;
+  const auto &BC = RepresentativeRuntime::bitcode();
+  ASSERT_TRUE(OwnerLoader.registerBitcode(
+      RepresentativeRuntime::entryName(),
+      reinterpret_cast<const uint8_t *>(BC.data()), BC.size()));
+  OwnerState.getRegistry().registerArray("cell", "cfg",
+                                         RepresentativeRuntime::rows(), kCells);
+  EJitCompileDriver Owner(C, OwnerState, OwnerLoader);
+  EJitCompileDriver Peer(C, PeerState, PeerLoader);
+  registerCrossCoreOwnerSymbols(Owner);
+
+  auto *OP = Owner.sharedTaskPool();
+  auto *PP = Peer.sharedTaskPool();
+  OP->setCodeSharingEnabled(true);
+  PP->setCodeSharingEnabled(true);
+  OP->setPrepareCodeCallback(&crossCoreHostCodeAlreadyExecutable, nullptr);
+  PP->setPrepareCodeCallback(&crossCoreHostCodeAlreadyExecutable, nullptr);
+  OP->setPgoEnabled(true, kQuota);
+
+  EJitCoreId::setCurrentForTest(6);
+  ASSERT_TRUE(Owner.startSharedTaskPool());
+  ASSERT_TRUE(OP->setInstanceEnabled(RepresentativeRuntime::cellSlot(), 0,
+                                     true));
+  ASSERT_TRUE(OP->setInstanceEnabled(RepresentativeRuntime::trpSlot(), 1,
+                                     true));
+
+  EJitCoreId::setCurrentForTest(16);
+  ASSERT_TRUE(Peer.startSharedTaskPool());
+  ASSERT_TRUE(Owner.representativeSharingActive());
+  ASSERT_TRUE(Peer.representativeSharingActive());
+  ASSERT_EQ(OP->state(), PP->state());
+  CrossCoreOwnerShutdown Shutdown{OP};
+
+  const EJitDimPair Dims[] = {{RepresentativeRuntime::cellSlot(), 0},
+                              {RepresentativeRuntime::trpSlot(), 1}};
+  using Entry = uint32_t (*)(uint64_t, uint64_t, uint32_t);
+  void *T1 = nullptr;
+  unsigned ExecutedT1 = 0;
+  for (unsigned Try = 0; Try != 8192 && ExecutedT1 != kQuota; ++Try) {
+    EJitCoreId::setCurrentForTest(16);
+    auto R = PP->compileOrGet(RepresentativeRuntime::funcIndex(), Dims, 2,
+                              nullptr);
+    ASSERT_TRUE(crossCoreRoutingStatus(R.status));
+    if (R.fnPtr) {
+      if (!T1)
+        T1 = R.fnPtr;
+      ASSERT_EQ(R.fnPtr, T1)
+          << "Tier-2 appeared before the exact peer quota";
+      ASSERT_EQ(R.status, EJitCompileOrGetStatus::CacheHit);
+      executeAndCheckRows(RepresentativeRuntime::rows(), R.fnPtr, 0, 1,
+                          ExecutedT1 + 1);
+      ++ExecutedT1;
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (R.hasReadToken)
+      PP->releaseRead(R.bucketIndex);
+  }
+  ASSERT_NE(T1, nullptr);
+  ASSERT_EQ(ExecutedT1, kQuota);
+
+  void *T2 = nullptr;
+  for (unsigned Try = 0; Try != 8192 && !T2; ++Try) {
+    EJitCoreId::setCurrentForTest(16);
+    auto R = PP->compileOrGet(RepresentativeRuntime::funcIndex(), Dims, 2,
+                              nullptr);
+    ASSERT_TRUE(crossCoreRoutingStatus(R.status));
+    if (R.fnPtr && R.fnPtr != T1) {
+      T2 = R.fnPtr;
+      ASSERT_EQ(R.status, EJitCompileOrGetStatus::CacheHit);
+      executeAndCheckRows(RepresentativeRuntime::rows(), T2, 0, 1, 65);
+    } else if (!T2) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (R.hasReadToken)
+      PP->releaseRead(R.bucketIndex);
+  }
+  ASSERT_NE(T2, nullptr);
+  EXPECT_NE(T1, T2);
+
+  EJitGroupDiagnostics D;
+  EJitGroupSnapshot S;
+  EJitFrozenProfileBundle B;
+  size_t Groups = 0;
+  ASSERT_TRUE(Owner.representativeSnapshot(D, S, Groups, B));
+  EXPECT_EQ(Groups, 1u);
+  EXPECT_EQ(D.representativeSessions, 1u);
+  EXPECT_EQ(D.representativeDispatches, kQuota);
+  ASSERT_TRUE(S.valid);
+  EXPECT_TRUE(S.hasBundle);
+  EXPECT_EQ(S.bundleDispatchCount, kQuota);
+  EXPECT_TRUE(S.hasPhysical);
+  EXPECT_EQ(S.physicalFn, T2);
+  ASSERT_TRUE(B);
+  EXPECT_EQ(B->actualDispatchCount, kQuota);
+}
+
+TEST(EJitCrossCoreRuntime,
+     IndependentDriversExecute64T1AndPublishDistinctTier2PerMember) {
+  CrossCoreReset Reset;
+  initRuntimeOnce();
+  auto *Rows = RepresentativeRuntime::rows();
+  Rows[0].gain = 7;
+  Rows[0].live[0] = Rows[0].live[1] = 0;
+  Rows[6].gain = 13;
+  Rows[6].live[0] = Rows[6].live[1] = 0;
+
+  Config C;
+  C.compileMode = CompileMode::Async;
+  C.optLevel = OptimizationLevel::L2;
+  C.enablePgo = true;
+  C.enableRepresentativeSharing = true;
+  ASSERT_TRUE(C.enableProfileAudit);
+
+  EJitRuntimeState OwnerState, PeerState;
+  EJitModuleLoader OwnerLoader, PeerLoader;
+  const auto &BC = RepresentativeRuntime::bitcode();
+  ASSERT_TRUE(OwnerLoader.registerBitcode(
+      RepresentativeRuntime::entryName(),
+      reinterpret_cast<const uint8_t *>(BC.data()), BC.size()));
+  OwnerState.getRegistry().registerArray("cell", "cfg", Rows, kCells);
+  EJitCompileDriver Owner(C, OwnerState, OwnerLoader);
+  EJitCompileDriver Peer(C, PeerState, PeerLoader);
+  registerCrossCoreOwnerSymbols(Owner);
+
+  auto *OP = Owner.sharedTaskPool();
+  auto *PP = Peer.sharedTaskPool();
+  OP->setCodeSharingEnabled(true);
+  PP->setCodeSharingEnabled(true);
+  OP->setPrepareCodeCallback(&crossCoreHostCodeAlreadyExecutable, nullptr);
+  PP->setPrepareCodeCallback(&crossCoreHostCodeAlreadyExecutable, nullptr);
+  OP->setPgoEnabled(true, kQuota);
+
+  EJitCoreId::setCurrentForTest(6);
+  ASSERT_TRUE(Owner.startSharedTaskPool());
+  ASSERT_TRUE(OP->setInstanceEnabled(RepresentativeRuntime::cellSlot(), 0,
+                                     true));
+  ASSERT_TRUE(OP->setInstanceEnabled(RepresentativeRuntime::cellSlot(), 6,
+                                     true));
+  ASSERT_TRUE(OP->setInstanceEnabled(RepresentativeRuntime::trpSlot(), 1,
+                                     true));
+  EJitCoreId::setCurrentForTest(16);
+  ASSERT_TRUE(Peer.startSharedTaskPool());
+  ASSERT_TRUE(Owner.representativeSharingActive());
+  ASSERT_TRUE(Peer.representativeSharingActive());
+  ASSERT_EQ(OP->state(), PP->state());
+  CrossCoreOwnerShutdown Shutdown{OP};
+
+  struct Path {
+    void *T1 = nullptr;
+    void *T2 = nullptr;
+    unsigned Executed = 0;
+  };
+
+  auto RunMember = [&](uint32_t Cell, uint32_t Gain) {
+    Path P;
+    const EJitDimPair Dims[] = {{RepresentativeRuntime::cellSlot(), Cell},
+                                {RepresentativeRuntime::trpSlot(), 1}};
+    for (unsigned Try = 0; Try != 16384 && P.Executed != kQuota; ++Try) {
+      EJitCoreId::setCurrentForTest(16);
+      auto R = PP->compileOrGet(RepresentativeRuntime::funcIndex(), Dims, 2,
+                                nullptr);
+      EXPECT_TRUE(crossCoreRoutingStatus(R.status));
+      if (R.fnPtr) {
+        if (!P.T1)
+          P.T1 = R.fnPtr;
+        if (R.fnPtr == P.T1) {
+          EXPECT_EQ(R.status, EJitCompileOrGetStatus::CacheHit);
+          executeAndCheckRows(Rows, R.fnPtr, Cell, 1, P.Executed + 1);
+          ++P.Executed;
+        } else {
+          ADD_FAILURE() << "member cell " << Cell
+                        << " changed physical code before quota closure";
+        }
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      if (R.hasReadToken)
+        PP->releaseRead(R.bucketIndex);
+    }
+    EXPECT_EQ(P.Executed, kQuota)
+        << "peer did not execute the full quota for cell " << Cell;
+
+    for (unsigned Try = 0; Try != 16384 && !P.T2; ++Try) {
+      EJitCoreId::setCurrentForTest(16);
+      auto R = PP->compileOrGet(RepresentativeRuntime::funcIndex(), Dims, 2,
+                                nullptr);
+      EXPECT_TRUE(crossCoreRoutingStatus(R.status));
+      if (R.fnPtr && R.fnPtr != P.T1) {
+        P.T2 = R.fnPtr;
+        EXPECT_EQ(R.status, EJitCompileOrGetStatus::CacheHit);
+        executeAndCheckRows(Rows, P.T2, Cell, 1, 65);
+      } else if (!P.T2) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      if (R.hasReadToken)
+        PP->releaseRead(R.bucketIndex);
+    }
+    EXPECT_NE(P.T1, nullptr);
+    EXPECT_NE(P.T2, nullptr)
+        << "peer did not consume the owner Tier-2 for cell " << Cell;
+    EXPECT_NE(P.T1, P.T2);
+    EXPECT_EQ(Rows[Cell].gain, Gain);
+    return P;
+  };
+
+  Path Cell0 = RunMember(0, 7);
+  Path Cell6 = RunMember(6, 13);
+  ASSERT_NE(Cell0.T1, nullptr);
+  ASSERT_NE(Cell0.T2, nullptr);
+  ASSERT_NE(Cell6.T1, nullptr);
+  ASSERT_NE(Cell6.T2, nullptr);
+  EXPECT_NE(Cell0.T1, Cell6.T1);
+  EXPECT_NE(Cell0.T2, Cell6.T2);
+  EXPECT_NE(Cell0.T2, Cell6.T1);
+  EXPECT_NE(Cell6.T2, Cell0.T1);
+
+  EJitGroupDiagnostics BeforeReentryD;
+  EJitGroupSnapshot BeforeReentryS;
+  EJitFrozenProfileBundle BeforeReentryB;
+  size_t BeforeReentryGroups = 0;
+  ASSERT_TRUE(Owner.representativeSnapshot(
+      BeforeReentryD, BeforeReentryS, BeforeReentryGroups, BeforeReentryB));
+
+  // Re-entry proves the old generation's Tier-2 is not reused and that the
+  // updated binding reaches a new logical Tier-1 generation/output. The
+  // instrumented Tier-1 pointer itself may be physically reused by the
+  // non-reclaiming code pool, so physical T1 pointer inequality is not a
+  // lifecycle contract. This intentionally stops at the new T1 boundary; it
+  // does not claim a second post-update Tier-2 lifecycle.
+  EJitCoreId::setCurrentForTest(6);
+  ASSERT_TRUE(OP->setInstanceEnabled(RepresentativeRuntime::cellSlot(), 0,
+                                     false));
+  Rows[0].gain = 11;
+  ASSERT_TRUE(OP->setInstanceEnabled(RepresentativeRuntime::cellSlot(), 0,
+                                     true));
+  const EJitDimPair ReboundDims[] = {{RepresentativeRuntime::cellSlot(), 0},
+                                     {RepresentativeRuntime::trpSlot(), 1}};
+  void *Rebound = nullptr;
+  for (unsigned Try = 0; Try != 16384 && !Rebound; ++Try) {
+    EJitCoreId::setCurrentForTest(16);
+    auto R = PP->compileOrGet(RepresentativeRuntime::funcIndex(), ReboundDims,
+                              2, nullptr);
+    EXPECT_TRUE(crossCoreRoutingStatus(R.status));
+    if (R.fnPtr) {
+      Rebound = R.fnPtr;
+      EXPECT_NE(Rebound, Cell0.T2);
+      executeAndCheckRows(Rows, Rebound, 0, 1, 3);
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (R.hasReadToken)
+      PP->releaseRead(R.bucketIndex);
+  }
+  EXPECT_NE(Rebound, nullptr);
+
+  EJitGroupDiagnostics D;
+  EJitGroupSnapshot S;
+  EJitFrozenProfileBundle B;
+  size_t Groups = 0;
+  ASSERT_TRUE(Owner.representativeSnapshot(D, S, Groups, B));
+  EXPECT_GT(D.representativeSessions, BeforeReentryD.representativeSessions);
+  EXPECT_GT(Groups, BeforeReentryGroups);
+  std::printf("[FORMAL-ROUTING-UNEQUAL64] peer-drivers=2 cell0-t1=%p "
+              "cell0-t2=%p cell6-t1=%p cell6-t2=%p t1=64/64 groups=%zu "
+              "rebound-t1=%p\n",
+              Cell0.T1, Cell0.T2, Cell6.T1, Cell6.T2, Groups, Rebound);
+}
+
+void checkCandidateAotFallback(EJitCandidateLimits Limits,
+                               bool MissingBinding = false) {
+  CrossCoreReset Reset;
+  initRuntimeOnce();
+  auto *Rows = RepresentativeRuntime::rows();
+  Rows[0].gain = 7;
+  Rows[0].live[0] = Rows[0].live[1] = 0;
+
+  Config C;
+  C.compileMode = CompileMode::Async;
+  C.optLevel = OptimizationLevel::L2;
+  C.enablePgo = true;
+  C.enableRepresentativeSharing = true;
+  ASSERT_TRUE(C.enableProfileAudit);
+
+  EJitRuntimeState OwnerState, PeerState;
+  EJitModuleLoader OwnerLoader, PeerLoader;
+  const auto &BC = RepresentativeRuntime::bitcode();
+  ASSERT_TRUE(OwnerLoader.registerBitcode(
+      RepresentativeRuntime::entryName(),
+      reinterpret_cast<const uint8_t *>(BC.data()), BC.size()));
+  OwnerState.getRegistry().registerArray("cell", "cfg", Rows, kCells);
+  EJitCompileDriver Owner(C, OwnerState, OwnerLoader);
+  EJitCompileDriver Peer(C, PeerState, PeerLoader);
+  if (MissingBinding) {
+    Owner.registerSymbol("cfg", Rows);
+    Owner.registerSymbol("__llvm_profile_runtime",
+                         &RepresentativeRuntime::profileRuntime());
+  } else {
+    registerCrossCoreOwnerSymbols(Owner);
+  }
+  Owner.setCandidateLimitsForTest(Limits);
+
+  auto *OP = Owner.sharedTaskPool();
+  auto *PP = Peer.sharedTaskPool();
+  OP->setCodeSharingEnabled(true);
+  PP->setCodeSharingEnabled(true);
+  OP->setPrepareCodeCallback(&crossCoreHostCodeAlreadyExecutable, nullptr);
+  PP->setPrepareCodeCallback(&crossCoreHostCodeAlreadyExecutable, nullptr);
+  OP->setPgoEnabled(true, kQuota);
+
+  EJitCoreId::setCurrentForTest(6);
+  ASSERT_TRUE(Owner.startSharedTaskPool());
+  ASSERT_TRUE(OP->setInstanceEnabled(RepresentativeRuntime::cellSlot(), 0,
+                                     true));
+  ASSERT_TRUE(OP->setInstanceEnabled(RepresentativeRuntime::trpSlot(), 1,
+                                     true));
+  EJitCoreId::setCurrentForTest(16);
+  ASSERT_TRUE(Peer.startSharedTaskPool());
+  CrossCoreOwnerShutdown Shutdown{OP};
+
+  const EJitDimPair Dims[] = {{RepresentativeRuntime::cellSlot(), 0},
+                              {RepresentativeRuntime::trpSlot(), 1}};
+  EJitCoreId::setCurrentForTest(16);
+  auto Budget = PP->compileOrGet(RepresentativeRuntime::funcIndex(), Dims, 2,
+                                 nullptr);
+  EXPECT_EQ(Budget.status, EJitCompileOrGetStatus::PgoAdmissionDeferred)
+      << "candidate rejection must be a real AOT fallback, not a "
+         "private Tier-1 grant";
+  EXPECT_EQ(Budget.fnPtr, nullptr);
+  EXPECT_FALSE(Budget.hasReadToken);
+  if (Budget.hasReadToken)
+    PP->releaseRead(Budget.bucketIndex);
+
+  auto OwnerMeta = Owner.representativeDriverMetadataForTest();
+  if (MissingBinding)
+    EXPECT_EQ(OwnerMeta.candidateBudgetDefers, 0u);
+  else
+    EXPECT_GE(OwnerMeta.candidateBudgetDefers, 1u);
+  EXPECT_EQ(OwnerMeta.pendingCandidateBorrows, 0u);
+  EXPECT_EQ(OwnerMeta.candidateBindings, 0u);
+  EXPECT_EQ(OP->liveRequestAttemptCount(), 0u);
+  EXPECT_EQ(OP->pendingCount(), 0u);
+  if (MissingBinding)
+    return;
+
+  // A bound-pointer request is a conservative independent route. The first
+  // call performs the real owner classification; the next one must be allowed
+  // ordinary PGO admission even though the candidate directory is exhausted.
+  uint32_t BoundValue = 19;
+  auto Bound = PP->compileOrGet(RepresentativeRuntime::funcIndex(), Dims, 2,
+                                nullptr, &BoundValue, sizeof(BoundValue), 0);
+  EXPECT_NE(Bound.status, EJitCompileOrGetStatus::PgoAdmissionDeferred);
+  EXPECT_NE(Bound.status, EJitCompileOrGetStatus::InvalidParam);
+  if (Bound.hasReadToken)
+    PP->releaseRead(Bound.bucketIndex);
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  auto BoundAdmission =
+      PP->compileOrGet(RepresentativeRuntime::funcIndex(), Dims, 2, nullptr,
+                       &BoundValue, sizeof(BoundValue), 0);
+  EXPECT_NE(BoundAdmission.status, EJitCompileOrGetStatus::PgoAdmissionDeferred);
+  EXPECT_NE(BoundAdmission.status, EJitCompileOrGetStatus::InvalidParam);
+  if (BoundAdmission.hasReadToken)
+    PP->releaseRead(BoundAdmission.bucketIndex);
+}
+
+TEST(EJitCrossCoreRuntime,
+     CandidateBudgetUsesAotAdmissionAndBoundPointerStaysIndependent) {
+  EJitCandidateLimits Limits;
+  Limits.maxGroups = 0;
+  checkCandidateAotFallback(Limits);
+}
+
+TEST(EJitCrossCoreRuntime, CandidateIdentityBudgetUsesAotAdmission) {
+  EJitCandidateLimits Limits;
+  Limits.maxIdentityBytes = 0;
+  checkCandidateAotFallback(Limits);
+}
+
+TEST(EJitCrossCoreRuntime, CandidateMissingBindingUsesFailureAotFallback) {
+  checkCandidateAotFallback(EJitCandidateLimits{}, true);
+}
+
+TEST(EJitCrossCoreRuntime,
+     DriverRetiresAllWaiterBorrowsBeforeSameKeyReclassification) {
+  CrossCoreReset Reset;
+  initRuntimeOnce();
+  auto *Rows = RepresentativeRuntime::rows();
+  Rows[0].gain = Rows[1].gain = Rows[2].gain = Rows[3].gain = 7;
+  for (uint32_t Cell : {0u, 1u, 2u, 3u})
+    Rows[Cell].live[0] = Rows[Cell].live[1] = 0;
+
+  Config C;
+  C.compileMode = CompileMode::Async;
+  C.optLevel = OptimizationLevel::L2;
+  C.enablePgo = true;
+  C.enableRepresentativeSharing = true;
+  ASSERT_TRUE(C.enableProfileAudit);
+
+  EJitRuntimeState OwnerState, PeerState;
+  EJitModuleLoader OwnerLoader, PeerLoader;
+  const auto &BC = RepresentativeRuntime::bitcode();
+  ASSERT_TRUE(OwnerLoader.registerBitcode(
+      RepresentativeRuntime::entryName(),
+      reinterpret_cast<const uint8_t *>(BC.data()), BC.size()));
+  OwnerState.getRegistry().registerArray("cell", "cfg", Rows, kCells);
+  EJitCompileDriver Owner(C, OwnerState, OwnerLoader);
+  EJitCompileDriver Peer(C, PeerState, PeerLoader);
+  registerCrossCoreOwnerSymbols(Owner);
+
+  auto *OP = Owner.sharedTaskPool();
+  auto *PP = Peer.sharedTaskPool();
+  OP->setCodeSharingEnabled(true);
+  PP->setCodeSharingEnabled(true);
+  OP->setPrepareCodeCallback(&crossCoreHostCodeAlreadyExecutable, nullptr);
+  PP->setPrepareCodeCallback(&crossCoreHostCodeAlreadyExecutable, nullptr);
+  OP->setPgoEnabled(true, kQuota);
+
+  EJitCoreId::setCurrentForTest(6);
+  ASSERT_TRUE(Owner.startSharedTaskPool());
+  for (uint32_t Cell : {0u, 1u, 2u, 3u})
+    ASSERT_TRUE(OP->setInstanceEnabled(RepresentativeRuntime::cellSlot(),
+                                       Cell, true));
+  ASSERT_TRUE(OP->setInstanceEnabled(RepresentativeRuntime::trpSlot(), 1,
+                                     true));
+  EJitCoreId::setCurrentForTest(16);
+  ASSERT_TRUE(Peer.startSharedTaskPool());
+  CrossCoreOwnerShutdown Shutdown{OP};
+
+  const EJitDimPair RepDims[] = {{RepresentativeRuntime::cellSlot(), 0},
+                                 {RepresentativeRuntime::trpSlot(), 1}};
+  void *OldT1 = nullptr;
+  uint32_t HeldBucket = kEJitSharedCacheBuckets;
+  for (unsigned Try = 0; Try != 4096 && !OldT1; ++Try) {
+    EJitCoreId::setCurrentForTest(16);
+    auto R = PP->compileOrGet(RepresentativeRuntime::funcIndex(), RepDims, 2,
+                              nullptr);
+    if (R.fnPtr) {
+      OldT1 = R.fnPtr;
+      HeldBucket = R.bucketIndex;
+      // Keep this exact read token while cancellation races the owner slot.
+      ASSERT_TRUE(R.hasReadToken);
+    } else if (R.hasReadToken) {
+      PP->releaseRead(R.bucketIndex);
+    }
+    if (!OldT1)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_NE(OldT1, nullptr);
+
+  const EJitDimPair WaiterDims[] = {{RepresentativeRuntime::cellSlot(), 1},
+                                    {RepresentativeRuntime::trpSlot(), 1}};
+  const EJitDimPair WaiterDims2[] = {{RepresentativeRuntime::cellSlot(), 2},
+                                     {RepresentativeRuntime::trpSlot(), 1}};
+  const EJitDimPair WaiterDims3[] = {{RepresentativeRuntime::cellSlot(), 3},
+                                     {RepresentativeRuntime::trpSlot(), 1}};
+  uint32_t ExpectedWaiters = 0;
+  for (const auto *Dims : {WaiterDims, WaiterDims2, WaiterDims3}) {
+    ++ExpectedWaiters;
+    for (unsigned Try = 0; Try != 4096; ++Try) {
+      EJitCoreId::setCurrentForTest(16);
+      auto R = PP->compileOrGet(RepresentativeRuntime::funcIndex(), Dims, 2,
+                                nullptr);
+      if (R.hasReadToken)
+        PP->releaseRead(R.bucketIndex);
+      auto M = Owner.representativeDriverMetadataForTest();
+      if (M.waiters >= ExpectedWaiters)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  auto Before = Owner.representativeDriverMetadataForTest();
+  ASSERT_GE(Before.waiters, 3u);
+  ASSERT_GE(Before.pendingCandidateBorrows, 3u);
+  EJitGroupDiagnostics BeforeD;
+  EJitGroupSnapshot BeforeS;
+  EJitFrozenProfileBundle BeforeB;
+  size_t BeforeGroups = 0;
+  ASSERT_TRUE(Owner.representativeSnapshot(BeforeD, BeforeS, BeforeGroups,
+                                           BeforeB));
+  ASSERT_TRUE(BeforeS.hasRepresentative);
+  uint64_t OldAttempt = 0;
+  ASSERT_LT(HeldBucket, kEJitSharedCacheBuckets);
+  for (const auto &Slot : OP->state()->buckets[HeldBucket].slots)
+    if (Slot.fnPtr.loadAcquire() == reinterpret_cast<uintptr_t>(OldT1)) {
+      OldAttempt = Slot.attemptToken;
+      break;
+    }
+  ASSERT_NE(OldAttempt, 0u);
+  const uint32_t OldPoolGeneration = OP->state()->generation.loadAcquire();
+
+  std::atomic<bool> CancelDone{false};
+  bool Cancelled = false;
+  std::thread Canceller([&] {
+    EJitCoreId::setCurrentForTest(16);
+    Cancelled = OP->cancelRequestAttempt(
+        OldAttempt, EJitRequestAttemptReason::Cancelled);
+    CancelDone.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  PP->releaseRead(HeldBucket);
+  Canceller.join();
+  EXPECT_TRUE(CancelDone.load(std::memory_order_acquire));
+  EXPECT_TRUE(Cancelled);
+
+  EJitSharedTaskPool::RequestAttemptSnapshot OldStatus;
+  ASSERT_TRUE(OP->requestAttemptStatus(OldAttempt, OldStatus));
+  EXPECT_EQ(OldStatus.flags & EJitAttemptBorrowPending, 0u);
+
+  // A stale observation from the retired session must not charge the new
+  // generation. It travels through the same peer mailbox as a real observer.
+  EJitSharedTaskPool::DispatchObservation Late;
+  Late.funcIndex = RepresentativeRuntime::funcIndex();
+  Late.attemptToken = OldAttempt;
+  Late.generation = OldPoolGeneration;
+  Late.count = 1;
+  Late.limit = kQuota;
+  EJitCoreId::setCurrentForTest(16);
+  EXPECT_FALSE(PP->submitRepresentativeDispatch(Late));
+
+  // The next same-group waiter forces owner refresh/re-election. Reclassify
+  // cell 1 immediately; its new attempt must not inherit cell 1's old token.
+  const EJitDimPair ReentryDims[] = {
+      {RepresentativeRuntime::cellSlot(), 1},
+      {RepresentativeRuntime::trpSlot(), 1}};
+  void *NewT1 = nullptr;
+  for (unsigned Try = 0; Try != 8192 && !NewT1; ++Try) {
+    EJitCoreId::setCurrentForTest(16);
+    auto R = PP->compileOrGet(RepresentativeRuntime::funcIndex(), ReentryDims,
+                              2, nullptr);
+    if (R.fnPtr) {
+      NewT1 = R.fnPtr;
+      if (R.hasReadToken)
+        PP->releaseRead(R.bucketIndex);
+    } else if (R.hasReadToken) {
+      PP->releaseRead(R.bucketIndex);
+    }
+    if (!NewT1) {
+      // Maintenance may elect any surviving waiter; retrying cell 1 must not
+      // require that cell to win the next election.
+      EJitGroupDiagnostics D;
+      EJitGroupSnapshot S;
+      EJitFrozenProfileBundle B;
+      size_t Groups = 0;
+      if (Owner.representativeSnapshot(D, S, Groups, B) && S.hasRepresentative &&
+          S.representative.generation > BeforeS.representative.generation) {
+        const EJitDimPair ElectedDims[] = {
+            {RepresentativeRuntime::cellSlot(),
+             static_cast<uint32_t>(S.representative.logicalKey & 255)},
+            {RepresentativeRuntime::trpSlot(), 1}};
+        auto Elected = PP->compileOrGet(RepresentativeRuntime::funcIndex(),
+                                        ElectedDims, 2, nullptr);
+        NewT1 = Elected.fnPtr;
+        if (Elected.hasReadToken)
+          PP->releaseRead(Elected.bucketIndex);
+      }
+    }
+    if (!NewT1)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_NE(NewT1, nullptr);
+
+  EJitGroupDiagnostics AfterD;
+  EJitGroupSnapshot AfterS;
+  EJitFrozenProfileBundle AfterB;
+  size_t AfterGroups = 0;
+  ASSERT_TRUE(Owner.representativeSnapshot(AfterD, AfterS, AfterGroups,
+                                           AfterB));
+  auto After = Owner.representativeDriverMetadataForTest();
+  EXPECT_GE(AfterD.waitersCancelled, BeforeD.waitersCancelled + 3u);
+  // Old waiters may be retried automatically. New-generation borrows are
+  // legitimate; retaining either old token is not. Check identity, not only
+  // the aggregate number of pending members.
+  for (uint64_t Token : Before.pendingCandidateAttempts) {
+    EJitSharedTaskPool::RequestAttemptSnapshot Status;
+    if (OP->requestAttemptStatus(Token, Status))
+      EXPECT_EQ(Status.flags & EJitAttemptBorrowPending, 0u);
+    EXPECT_FALSE(OP->completeRequestBorrow(Token));
+    EXPECT_EQ(std::count(After.pendingCandidateAttempts.begin(),
+                         After.pendingCandidateAttempts.end(), Token), 0);
+  }
+  EXPECT_LE(After.pendingCandidateBorrows, 3u);
+  EXPECT_LE(After.waiters, 2u);
+  EXPECT_LE(After.tier1Bindings, 1u);
+  EXPECT_LE(After.sessions, 1u);
+  EXPECT_LE(After.candidateBindings, 3u);
+  ASSERT_TRUE(AfterS.hasRepresentative);
+  EXPECT_NE(AfterS.representative.attemptToken, OldAttempt);
+  EXPECT_GT(AfterS.representative.generation,
+            BeforeS.representative.generation);
+
+  // Reuse the same owner and logical keys across many generations. Resetting
+  // the runtime between rounds would hide accumulation in owner-private maps.
+  for (unsigned Round = 0; Round != 128; ++Round) {
+    SCOPED_TRACE(Round);
+    EJitGroupDiagnostics D;
+    EJitGroupSnapshot S;
+    EJitFrozenProfileBundle B;
+    size_t Groups = 0;
+    ASSERT_TRUE(Owner.representativeSnapshot(D, S, Groups, B));
+    ASSERT_TRUE(S.hasRepresentative);
+    const uint32_t Cell = static_cast<uint32_t>(S.representative.logicalKey & 255);
+    const uint64_t OldGeneration = S.representative.generation;
+    const EJitDimPair CurrentDims[] = {
+        {RepresentativeRuntime::cellSlot(), Cell},
+        {RepresentativeRuntime::trpSlot(), 1}};
+    auto Current = PP->compileOrGet(RepresentativeRuntime::funcIndex(),
+                                     CurrentDims, 2, nullptr);
+    uint64_t Token = 0;
+    if (Current.hasReadToken) {
+      for (const auto &Slot : OP->state()->buckets[Current.bucketIndex].slots)
+        if (Slot.fnPtr.loadAcquire() == reinterpret_cast<uintptr_t>(Current.fnPtr))
+          Token = Slot.attemptToken;
+      PP->releaseRead(Current.bucketIndex);
+    }
+    ASSERT_NE(Token, 0u);
+    for (uint32_t Other : {0u, 1u, 2u, 3u}) {
+      if (Other == Cell)
+        continue;
+      const EJitDimPair Dims[] = {{RepresentativeRuntime::cellSlot(), Other},
+                                  {RepresentativeRuntime::trpSlot(), 1}};
+      for (unsigned Try = 0; Try != 512; ++Try) {
+        auto R = PP->compileOrGet(RepresentativeRuntime::funcIndex(), Dims, 2,
+                                   nullptr);
+        if (R.hasReadToken)
+          PP->releaseRead(R.bucketIndex);
+        ASSERT_EQ(R.fnPtr, nullptr);
+        if (R.status == EJitCompileOrGetStatus::PgoAdmissionDeferred)
+          break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    const auto Old = Owner.representativeDriverMetadataForTest();
+    ASSERT_GE(Old.waiters, 3u);
+    ASSERT_TRUE(OP->cancelRequestAttempt(Token, EJitRequestAttemptReason::Cancelled));
+    // Re-enter the cancelled key before maintenance finishes the other keys.
+    auto Retry = PP->compileOrGet(RepresentativeRuntime::funcIndex(),
+                                   CurrentDims, 2, nullptr);
+    if (Retry.hasReadToken)
+      PP->releaseRead(Retry.bucketIndex);
+    bool Ready = false;
+    for (unsigned Try = 0; Try != 2048 && !Ready; ++Try) {
+      ASSERT_TRUE(Owner.representativeSnapshot(D, S, Groups, B));
+      if (S.hasRepresentative && S.representative.generation > OldGeneration) {
+        const EJitDimPair Dims[] = {
+            {RepresentativeRuntime::cellSlot(),
+             static_cast<uint32_t>(S.representative.logicalKey & 255)},
+            {RepresentativeRuntime::trpSlot(), 1}};
+        auto R = PP->compileOrGet(RepresentativeRuntime::funcIndex(), Dims, 2,
+                                   nullptr);
+        Ready = R.fnPtr != nullptr;
+        if (R.hasReadToken)
+          PP->releaseRead(R.bucketIndex);
+      }
+      if (!Ready)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(Ready);
+    for (uint64_t OldToken : Old.pendingCandidateAttempts) {
+      EJitSharedTaskPool::RequestAttemptSnapshot Status;
+      if (OP->requestAttemptStatus(OldToken, Status))
+        EXPECT_EQ(Status.flags & EJitAttemptBorrowPending, 0u);
+      EXPECT_FALSE(OP->completeRequestBorrow(OldToken));
+    }
+    Late.attemptToken = Token;
+    EXPECT_FALSE(PP->submitRepresentativeDispatch(Late));
+    const auto M = Owner.representativeDriverMetadataForTest();
+    EXPECT_LE(M.waiters, 3u);
+    EXPECT_LE(M.tier1Bindings, 1u);
+    EXPECT_LE(M.sessions, 1u);
+    EXPECT_LE(M.candidateBindings, 4u);
+    EXPECT_LE(M.pendingCandidateBorrows, 4u);
+    EXPECT_LE(M.groupHandles, 1u);
+    EXPECT_LE(M.timeoutCounts, 1u);
+    EXPECT_LE(M.retiringGroups, 1u);
+    EXPECT_LE(M.failedGroups, 1u);
+    EXPECT_LE(OP->liveRequestAttemptCount(), 6u);
+  }
 }
 
 } // namespace

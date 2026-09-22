@@ -352,6 +352,25 @@ TEST(EJitFinalCodeIdentity, BindingOrderIsNormalizedButAddressesAreNot) {
   EXPECT_FALSE(A->identity().equals(C->identity()));
 }
 
+TEST(EJitBindingGeneration, IsStableForExactBindingsAndChangesOnMeaningfulEdit) {
+  std::vector<EJitCodeBinding> A = {{"data", 0x1000, false},
+                                    {"callee", 0x2000, true}};
+  std::vector<EJitCodeBinding> Reordered = {A[1], A[0]};
+  EXPECT_EQ(EJitBindingGeneration(A), EJitBindingGeneration(Reordered));
+
+  auto AddressChanged = A;
+  AddressChanged[0].address = 0x1004;
+  EXPECT_NE(EJitBindingGeneration(A), EJitBindingGeneration(AddressChanged));
+
+  auto KindChanged = A;
+  KindChanged[1].callable = false;
+  EXPECT_NE(EJitBindingGeneration(A), EJitBindingGeneration(KindChanged));
+
+  auto BindingAdded = A;
+  BindingAdded.push_back({"other", 0x3000, true});
+  EXPECT_NE(EJitBindingGeneration(A), EJitBindingGeneration(BindingAdded));
+}
+
 TEST(EJitFinalCodeIdentity, SourcePolicyGenerationAndTargetRemainInIdentity) {
   auto Original = prepare(Simple);
   ASSERT_TRUE(Original);

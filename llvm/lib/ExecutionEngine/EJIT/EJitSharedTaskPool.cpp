@@ -210,16 +210,14 @@ void bucketWriteRelease(EJitSharedCacheBucket &b) {
   b.writeFlag.storeRelease(0);
 }
 
-#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
 //===----------------------------------------------------------------------===//
-// Observation exclusion for the observed Tier-1 dispatch contract (ABI v22).
+// Observation exclusion for the observed Tier-1 dispatch contract (ABI v25).
 //
-// A NO_RECLAIM lookup holds no read token, so the bucket writer lock cannot
-// serialize the admission commit: taking it sets writeFlag and bumps
-// publishSeq, which is exactly the state a concurrent load-only reader uses to
-// discard its read (R1R-1). observationLock is a separate word that reader
-// never reads, so an admitted dispatch invalidates no lookup. It serializes the
-// observation identity of one bucket:
+// The bucket writer lock cannot serialize the admission commit: taking it sets
+// writeFlag (and, in NO_RECLAIM, bumps publishSeq), which either drains readers
+// or invalidates a load-only lookup. observationLock is a separate word that
+// seqlock readers never read, so an admitted dispatch invalidates no lookup. It
+// serializes the observation identity of one bucket:
 //
 //   * admission (admitObservedT1Dispatch): identity re-check + count CAS +
 //     quotaEnd freeze as ONE critical section;
@@ -230,11 +228,10 @@ void bucketWriteRelease(EJitSharedCacheBucket &b) {
 //   * enqueueTier2FromLookup: the coherent count/quotaEnd read.
 //
 // Lock order: bucket writeFlag -> observationLock. observationLock is a LEAF: a
-// holder performs bounded atomic field work only and never acquires another
-// lock, so a waiter spins for a bounded duration and admission cannot deadlock
-// against a publish/cancel that holds writeFlag. The default token build never
-// takes it (the committed lookup holds the bucket read token and publish/cancel
-// drain readers), so the word stays 0 there.
+// holder performs only the bounded dispatch/reply handshake and never acquires
+// another lock, so a waiter cannot deadlock against a publish/cancel that holds
+// writeFlag. Token readers additionally hold their bucket read lease, which
+// keeps slot identity stable while the reply is in flight.
 //===----------------------------------------------------------------------===//
 void bucketObservationLock(EJitSharedCacheBucket &b) {
   uint32_t expected = 0;
@@ -246,7 +243,6 @@ void bucketObservationLock(EJitSharedCacheBucket &b) {
 void bucketObservationUnlock(EJitSharedCacheBucket &b) {
   b.observationLock.storeRelease(0);
 }
-#endif
 
 constexpr uint32_t kReady = static_cast<uint32_t>(EJitSharedInitState::Ready);
 
@@ -1117,6 +1113,469 @@ void EJitSharedTaskPool::dedupClear(uint32_t funcIndex, uint64_t claim) {
   state_->inFlight[funcIndex].compareExchange(expected, uint64_t{0});
 }
 
+EJitSharedRepresentativeCommand *
+EJitSharedTaskPool::claimRepresentativeCommand(
+    EJitSharedRepresentativeCommandKind Kind) {
+  if (!state_ || isOwner_ ||
+      state_->initState.loadAcquire() !=
+          static_cast<uint32_t>(EJitSharedInitState::Ready) ||
+      state_->representativeSharingEnabled.loadAcquire() == 0)
+    return nullptr;
+  for (EJitSharedRepresentativeCommand &Command :
+       state_->representativeCommands) {
+    uint32_t Expected = static_cast<uint32_t>(
+        EJitSharedRepresentativeCommandState::Free);
+    if (!Command.state.compareExchange(
+            Expected,
+            static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Filling)))
+      continue;
+    uint64_t NextIncarnation = state_->representativeCommandEpoch.loadRelaxed();
+    for (;;) {
+      if (NextIncarnation >= kEJitRepresentativeCommandIncarnationMask) {
+        Command.state.storeRelease(
+            static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Failed));
+        return nullptr;
+      }
+      if (state_->representativeCommandEpoch.compareExchange(
+              NextIncarnation, NextIncarnation + 1))
+        break;
+    }
+    Command.abandoned.storeRelaxed(0);
+    Command.requesterReleased.storeRelaxed(0);
+    Command.kind = static_cast<uint32_t>(Kind);
+    Command.generation = state_->generation.loadAcquire();
+    Command.requesterCore = EJitCoreId::current();
+    Command.funcIndex = 0;
+    Command.numDims = 0;
+    Command.boundCount = 0;
+    Command.incarnation.storeRelaxed(NextIncarnation + 1);
+    Command.recycleLease.storeRelaxed(NextIncarnation + 1);
+    for (uint32_t I = 0; I < kEJitSharedMaxDims; ++I) {
+      Command.dims[I] = {};
+      Command.versions[I] = 0;
+      Command.resultVersions[I] = 0;
+    }
+    Command.attemptToken = 0;
+    Command.dispatchCount = 0;
+    Command.dispatchLimit = 0;
+    Command.dispatchQuotaEnd = 0;
+    Command.dispatchClosedQuota = 0;
+    Command.dispatchBucketIndex = kEJitSharedCacheBuckets;
+    Command.dispatchSlotIndex = kEJitSharedCacheSlots;
+    Command.reserved = 0;
+    Command.resultCode = 0;
+    Command.resultGeneration = 0;
+    Command.resultT1DispatchCount = 0;
+    Command.resultT1QuotaEnd = 0;
+    Command.resultT1DispatchLimit = 0;
+    return &Command;
+  }
+  return nullptr;
+}
+
+bool EJitSharedTaskPool::waitRepresentativeCommand(
+    EJitSharedRepresentativeCommand &Command, uint64_t Incarnation) {
+  if (Command.incarnation.loadAcquire() != Incarnation)
+    return false;
+  uint32_t Expected = static_cast<uint32_t>(
+      EJitSharedRepresentativeCommandState::Filling);
+  if (!Command.state.compareExchange(
+          Expected,
+          static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Pending)))
+    return false;
+
+  constexpr uint32_t MaxSpins = 1u << 20;
+  for (uint32_t Spin = 0; Spin < MaxSpins; ++Spin) {
+    if (Command.incarnation.loadAcquire() != Incarnation)
+      return false;
+    const uint32_t State = Command.state.loadAcquire();
+    if (State == static_cast<uint32_t>(
+                     EJitSharedRepresentativeCommandState::Complete) ||
+        State == static_cast<uint32_t>(
+                     EJitSharedRepresentativeCommandState::Failed))
+      return State == static_cast<uint32_t>(
+                         EJitSharedRepresentativeCommandState::Complete);
+    if (State == static_cast<uint32_t>(
+                     EJitSharedRepresentativeCommandState::Cancelled))
+      return false;
+    if (!state_ || state_->generation.loadAcquire() != Command.generation ||
+        state_->initState.loadAcquire() !=
+            static_cast<uint32_t>(EJitSharedInitState::Ready))
+      break;
+    workerIdle(1);
+  }
+
+  uint32_t ExpectedPending = static_cast<uint32_t>(
+      EJitSharedRepresentativeCommandState::Pending);
+  if (Command.state.compareExchange(
+          ExpectedPending,
+          static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Cancelled))) {
+    return false;
+  }
+  // If the owner already picked it up, let the owner release the mailbox after
+  // its callback returns. The requester fails closed without touching any
+  // owner-private state.
+  Command.abandoned.storeRelease(1);
+  return false;
+}
+
+bool EJitSharedTaskPool::recycleRepresentativeCommand(
+    EJitSharedRepresentativeCommand &Command, uint64_t Incarnation) {
+  if (!Incarnation || Incarnation > kEJitRepresentativeCommandIncarnationMask)
+    return false;
+  const uint32_t State = Command.state.loadAcquire();
+  if (State != static_cast<uint32_t>(
+                   EJitSharedRepresentativeCommandState::Complete) &&
+      State != static_cast<uint32_t>(
+                   EJitSharedRepresentativeCommandState::Failed) &&
+      State != static_cast<uint32_t>(
+                   EJitSharedRepresentativeCommandState::Cancelled))
+    return false;
+  uint64_t ExpectedLease =
+      Incarnation | kEJitRepresentativeCommandRecycleReleased;
+  if (!Command.recycleLease.compareExchange(
+          ExpectedLease,
+              Incarnation | kEJitRepresentativeCommandRecycleReleased |
+              kEJitRepresentativeCommandRecycleClaimed))
+    return false;
+  uint32_t ExpectedState = State;
+  return Command.state.compareExchange(
+      ExpectedState,
+      static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Free));
+}
+
+void EJitSharedTaskPool::releaseRepresentativeCommand(
+    EJitSharedRepresentativeCommand &Command, uint64_t Incarnation) {
+  if (Command.incarnation.loadAcquire() != Incarnation)
+    return;
+  Command.requesterReleased.storeRelease(1);
+  uint64_t ExpectedLease = Incarnation;
+  if (!Command.recycleLease.compareExchange(
+          ExpectedLease,
+          Incarnation | kEJitRepresentativeCommandRecycleReleased))
+    return;
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  if (representativeReleasePauseHook_)
+    representativeReleasePauseHook_(representativeReleasePauseHookCtx_);
+#endif
+  (void)recycleRepresentativeCommand(Command, Incarnation);
+}
+
+bool EJitSharedTaskPool::reserveRepresentativeDispatch(uint32_t &Index,
+                                                        uint64_t &Incarnation) {
+  Index = kEJitSharedRepresentativeCommandCapacity;
+  Incarnation = 0;
+  auto *Command = claimRepresentativeCommand(
+      EJitSharedRepresentativeCommandKind::DispatchObservation);
+  if (!Command)
+    return false;
+  Index = static_cast<uint32_t>(
+      Command - state_->representativeCommands);
+  Incarnation = Command->incarnation.loadAcquire();
+  return true;
+}
+
+void EJitSharedTaskPool::cancelRepresentativeDispatch(uint32_t Index,
+                                                       uint64_t Incarnation) {
+  if (!state_ || Index >= kEJitSharedRepresentativeCommandCapacity ||
+      !Incarnation)
+    return;
+  auto &Command = state_->representativeCommands[Index];
+  if (Command.incarnation.loadAcquire() != Incarnation)
+    return;
+  uint32_t Expected = static_cast<uint32_t>(
+      EJitSharedRepresentativeCommandState::Filling);
+  (void)Command.state.compareExchange(
+      Expected,
+      static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Cancelled));
+  releaseRepresentativeCommand(Command, Incarnation);
+}
+
+bool EJitSharedTaskPool::representativeCommandsDrained() const {
+  if (!state_)
+    return true;
+  for (const auto &Command : state_->representativeCommands)
+    if (Command.state.loadAcquire() !=
+        static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Free))
+      return false;
+  return true;
+}
+
+bool EJitSharedTaskPool::requestRepresentativeCandidate(
+    const EJitCompileRequest &Req, bool &Classified) {
+  Classified = false;
+  auto *Command = claimRepresentativeCommand(
+      EJitSharedRepresentativeCommandKind::CandidateClassify);
+  if (!Command)
+    return false;
+  const uint64_t Incarnation = Command->incarnation.loadAcquire();
+  Command->funcIndex = stripReqTier(Req.funcIndex);
+  Command->numDims = Req.numDims;
+  Command->boundCount = Req.boundCount;
+  Command->attemptToken = Req.attemptToken;
+  for (uint32_t I = 0; I < kEJitSharedMaxDims; ++I) {
+    Command->dims[I] = I < Req.numDims ? Req.dims[I] : EJitDimPair{};
+    Command->versions[I] = I < Req.numDims ? Req.versions[I] : 0;
+  }
+  const bool Done = waitRepresentativeCommand(*Command, Incarnation);
+  if (Done)
+    Classified = Command->resultCode != 0;
+  releaseRepresentativeCommand(*Command, Incarnation);
+  return Done;
+}
+
+EJitSharedTaskPool::SamplingAdmission
+EJitSharedTaskPool::requestRepresentativeAdmission(
+    uint32_t FuncIndex, const EJitDimPair *Dims, uint32_t NumDims,
+    uint32_t BoundCount, uint64_t AttemptToken) {
+  auto *Command = claimRepresentativeCommand(
+      EJitSharedRepresentativeCommandKind::SamplingAdmission);
+  if (!Command)
+    return SamplingAdmission::Deny;
+  const uint64_t Incarnation = Command->incarnation.loadAcquire();
+  Command->funcIndex = FuncIndex;
+  Command->numDims = NumDims;
+  Command->boundCount = BoundCount;
+  Command->attemptToken = AttemptToken;
+  for (uint32_t I = 0; I < kEJitSharedMaxDims; ++I)
+    if (I < NumDims && Dims) {
+      Command->dims[I] = Dims[I];
+      Command->versions[I] = instanceVersion(Dims[I].dimType,
+                                              Dims[I].instanceId);
+    }
+  const bool Done = waitRepresentativeCommand(*Command, Incarnation);
+  const SamplingAdmission Result =
+      Done ? static_cast<SamplingAdmission>(Command->resultCode)
+           : SamplingAdmission::Deny;
+  releaseRepresentativeCommand(*Command, Incarnation);
+  return Result;
+}
+
+bool EJitSharedTaskPool::requestRepresentativeWake(
+    uint32_t FuncIndex, const EJitDimPair *Dims, uint32_t NumDims,
+    EJitCompileRequest &Out) {
+  Out = {};
+  auto *Command = claimRepresentativeCommand(
+      EJitSharedRepresentativeCommandKind::RepresentativeWake);
+  if (!Command)
+    return false;
+  const uint64_t Incarnation = Command->incarnation.loadAcquire();
+  Command->funcIndex = FuncIndex;
+  Command->numDims = NumDims;
+  for (uint32_t I = 0; I < kEJitSharedMaxDims; ++I)
+    if (I < NumDims && Dims) {
+      Command->dims[I] = Dims[I];
+      Command->versions[I] = instanceVersion(Dims[I].dimType,
+                                              Dims[I].instanceId);
+    }
+  const bool Done = waitRepresentativeCommand(*Command, Incarnation);
+  if (Done && Command->resultCode != 0) {
+    Out.funcIndex = encodeReqTier(FuncIndex, kEJitTierPgoUse);
+    Out.numDims = NumDims;
+    Out.generation = Command->resultGeneration;
+    for (uint32_t I = 0; I < NumDims && I < kEJitSharedMaxDims; ++I) {
+      Out.dims[I] = Command->dims[I];
+      Out.versions[I] = Command->resultVersions[I];
+    }
+    Out.t1DispatchCount = Command->resultT1DispatchCount;
+    Out.t1QuotaEnd = Command->resultT1QuotaEnd;
+    Out.t1DispatchLimit = Command->resultT1DispatchLimit;
+  }
+  const bool Result = Done && Command->resultCode != 0;
+  releaseRepresentativeCommand(*Command, Incarnation);
+  return Result;
+}
+
+bool EJitSharedTaskPool::submitRepresentativeDispatch(
+    const DispatchObservation &Obs) {
+  EJitSharedRepresentativeCommand *Command = nullptr;
+  uint64_t Incarnation = Obs.mailboxIncarnation;
+  if (Obs.mailboxIndex < kEJitSharedRepresentativeCommandCapacity &&
+      Incarnation != 0) {
+    if (!state_)
+      return false;
+    Command = &state_->representativeCommands[Obs.mailboxIndex];
+    if (Command->incarnation.loadAcquire() != Incarnation ||
+        Command->kind != static_cast<uint32_t>(
+                              EJitSharedRepresentativeCommandKind::DispatchObservation) ||
+        Command->state.loadAcquire() != static_cast<uint32_t>(
+                                             EJitSharedRepresentativeCommandState::Filling))
+      return false;
+  } else {
+    Command = claimRepresentativeCommand(
+        EJitSharedRepresentativeCommandKind::DispatchObservation);
+    if (!Command)
+      return false;
+    Incarnation = Command->incarnation.loadAcquire();
+  }
+  Command->funcIndex = Obs.funcIndex;
+  Command->generation = Obs.generation;
+  Command->attemptToken = Obs.attemptToken;
+  Command->dispatchCount = Obs.count;
+  Command->dispatchLimit = Obs.limit;
+  Command->dispatchQuotaEnd = Obs.quotaEnd;
+  Command->dispatchClosedQuota = Obs.closedQuota ? 1u : 0u;
+  Command->dispatchBucketIndex = Obs.bucketIndex;
+  Command->dispatchSlotIndex = Obs.slotIndex;
+  const bool Done = waitRepresentativeCommand(*Command, Incarnation);
+  const bool Result = Done && Command->resultCode != 0;
+  releaseRepresentativeCommand(*Command, Incarnation);
+  return Result;
+}
+
+bool EJitSharedTaskPool::serviceRepresentativeCommand() {
+  if (!state_ || !isOwner_ ||
+      state_->representativeSharingEnabled.loadAcquire() == 0)
+    return false;
+  for (EJitSharedRepresentativeCommand &Command :
+       state_->representativeCommands) {
+    uint32_t Expected = static_cast<uint32_t>(
+        EJitSharedRepresentativeCommandState::Pending);
+    if (!Command.state.compareExchange(
+            Expected,
+            static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Running)))
+      continue;
+
+    const uint64_t Incarnation = Command.incarnation.loadAcquire();
+    bool Ok = false;
+    const auto Kind = static_cast<EJitSharedRepresentativeCommandKind>(
+        Command.kind);
+    auto ClassifyOnOwner = [&](const EJitCompileRequest &Req,
+                               bool ContinueAttempt) {
+      if (!candidateClassifyFn_ ||
+          !beginRequestAttemptCompile(Req.attemptToken))
+        return false;
+      const bool Classified = candidateClassifyFn_(candidateClassifyCtx_, Req);
+      // A requester timeout/cancel may race the real owner read. This clears
+      // CompileActive only after the callback returns, so cancellation cannot
+      // retire the borrowed configuration while classifyCandidate is using it.
+      if (ContinueAttempt)
+        endRequestAttemptCompile(Req.attemptToken, /*finalRead=*/false);
+      else
+        finishCandidateClassification(Req.attemptToken);
+      return Classified;
+    };
+    if (Kind == EJitSharedRepresentativeCommandKind::CandidateClassify) {
+      EJitCompileRequest Req{};
+      Req.funcIndex = encodeReqTier(Command.funcIndex, kEJitTierCandidate);
+      Req.numDims = Command.numDims;
+      Req.generation = Command.generation;
+      Req.attemptToken = Command.attemptToken;
+      Req.boundCount = Command.boundCount;
+      for (uint32_t I = 0; I < Command.numDims; ++I) {
+        Req.dims[I] = Command.dims[I];
+        Req.versions[I] = Command.versions[I];
+      }
+      Ok = ClassifyOnOwner(Req, /*continueAttempt=*/false);
+      Command.resultCode = Ok ? 1u : 0u;
+    } else if (Kind == EJitSharedRepresentativeCommandKind::SamplingAdmission) {
+      SamplingAdmission Admission = SamplingAdmission::Deny;
+      if (samplingAdmissionFn_)
+        Admission = samplingAdmissionFn_(samplingAdmissionCtx_,
+                                         Command.funcIndex, Command.dims,
+                                         Command.numDims, Command.boundCount,
+                                         Command.attemptToken);
+      // A peer can ask before the candidate queue has been consumed. Perform
+      // the real prefix classification on this worker, then retry admission
+      // once, so a response never depends on a peer-local candidate map.
+      if (Admission == SamplingAdmission::Classify && candidateClassifyFn_) {
+        EJitCompileRequest Req{};
+        Req.funcIndex = encodeReqTier(Command.funcIndex, kEJitTierCandidate);
+        Req.numDims = Command.numDims;
+        Req.generation = Command.generation;
+        Req.attemptToken = Command.attemptToken;
+        Req.boundCount = Command.boundCount;
+        for (uint32_t I = 0; I < Command.numDims; ++I) {
+          Req.dims[I] = Command.dims[I];
+          Req.versions[I] = Command.versions[I];
+        }
+        if (ClassifyOnOwner(Req, /*continueAttempt=*/true) &&
+            samplingAdmissionFn_)
+          Admission = samplingAdmissionFn_(samplingAdmissionCtx_,
+                                           Command.funcIndex, Command.dims,
+                                           Command.numDims,
+                                           Command.boundCount,
+                                           Command.attemptToken);
+      }
+      Command.resultCode = static_cast<uint32_t>(Admission);
+      Ok = true;
+    } else if (Kind == EJitSharedRepresentativeCommandKind::RepresentativeWake) {
+      EJitCompileRequest Wake{};
+      Ok = representativeWakeFn_ && representativeWakeFn_(
+                                         representativeWakeCtx_,
+                                         Command.funcIndex, Command.dims,
+                                         Command.numDims, Wake);
+      if (Ok) {
+        Command.resultGeneration = Wake.generation;
+        for (uint32_t I = 0; I < Command.numDims; ++I)
+          Command.resultVersions[I] = Wake.versions[I];
+        Command.resultT1DispatchCount = Wake.t1DispatchCount;
+        Command.resultT1QuotaEnd = Wake.t1QuotaEnd;
+        Command.resultT1DispatchLimit = Wake.t1DispatchLimit;
+      }
+      Command.resultCode = Ok ? 1u : 0u;
+    } else if (Kind == EJitSharedRepresentativeCommandKind::DispatchObservation) {
+      DispatchObservation Obs{};
+      Obs.funcIndex = Command.funcIndex;
+      Obs.attemptToken = Command.attemptToken;
+      Obs.generation = Command.generation;
+      Obs.count = Command.dispatchCount;
+      Obs.limit = Command.dispatchLimit;
+      Obs.quotaEnd = Command.dispatchQuotaEnd;
+      Obs.closedQuota = Command.dispatchClosedQuota != 0;
+      Obs.bucketIndex = Command.dispatchBucketIndex;
+      Obs.slotIndex = Command.dispatchSlotIndex;
+      if (dispatchObserverFn_)
+        Ok = dispatchObserverFn_(dispatchObserverCtx_, Obs);
+      Command.resultCode = Ok ? 1u : 0u;
+    }
+    Command.state.storeRelease(
+        static_cast<uint32_t>(Ok
+                                  ? EJitSharedRepresentativeCommandState::Complete
+                                  : EJitSharedRepresentativeCommandState::Failed));
+    // A timed-out requester may have published release while this callback
+    // was running. Only the incarnation-bound recycle lease may free it.
+    (void)recycleRepresentativeCommand(Command, Incarnation);
+    return true;
+  }
+  return false;
+}
+
+void EJitSharedTaskPool::cancelRepresentativeCommands() {
+  if (!state_)
+    return;
+  for (EJitSharedRepresentativeCommand &Command :
+       state_->representativeCommands) {
+    uint32_t Expected = static_cast<uint32_t>(
+        EJitSharedRepresentativeCommandState::Filling);
+    if (Command.state.compareExchange(
+            Expected,
+            static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Failed))) {
+      (void)recycleRepresentativeCommand(
+          Command, Command.incarnation.loadAcquire());
+      continue;
+    }
+    Expected = static_cast<uint32_t>(
+        EJitSharedRepresentativeCommandState::Pending);
+    if (Command.state.compareExchange(
+            Expected,
+            static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Failed)))
+      (void)recycleRepresentativeCommand(
+          Command, Command.incarnation.loadAcquire());
+    if (Command.state.loadAcquire() == static_cast<uint32_t>(
+                                           EJitSharedRepresentativeCommandState::Running))
+      Command.abandoned.storeRelease(1);
+    else if (Command.state.loadAcquire() == static_cast<uint32_t>(
+                                                EJitSharedRepresentativeCommandState::Complete) ||
+             Command.state.loadAcquire() == static_cast<uint32_t>(
+                                                EJitSharedRepresentativeCommandState::Failed) ||
+             Command.state.loadAcquire() == static_cast<uint32_t>(
+                                                EJitSharedRepresentativeCommandState::Cancelled))
+      (void)recycleRepresentativeCommand(
+          Command, Command.incarnation.loadAcquire());
+  }
+}
+
 namespace {
 constexpr uint32_t kAttemptPendingEvents = EJitAttemptSamplingPending |
                                            EJitAttemptBorrowPending |
@@ -1326,11 +1785,15 @@ bool EJitSharedTaskPool::beginRequestAttemptCompile(uint64_t Token) {
   requestAttemptLock(state_);
   EJitSharedRequestAttempt *A = findAttemptLocked(state_, Token);
   if (!A) {
+    EJIT_DIAG("shared worker compile drop: attempt=%llu no longer live",
+              static_cast<unsigned long long>(Token));
     requestAttemptUnlock(state_);
     return false;
   }
   uint32_t Flags = A->flags.loadRelaxed() & ~EJitAttemptQueueOwned;
   if (Flags & EJitAttemptCancelRequested) {
+    EJIT_DIAG("shared worker compile drop: attempt=%llu cancelled flags=0x%x",
+              static_cast<unsigned long long>(Token), Flags);
     Flags &= ~EJitAttemptBorrowPending;
     A->flags.storeRelaxed(Flags);
     maybeRetireAttemptLocked(state_, *A);
@@ -3692,7 +4155,9 @@ namespace {
 void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
                        uint32_t pgoEnabled, uint32_t tier2Threshold,
                        uint32_t pgoMaxConcurrentProfiles,
-                       bool requestAttemptsEnabled, uint64_t nextAttemptToken) {
+                       bool requestAttemptsEnabled,
+                       bool representativeSharingEnabled,
+                       uint64_t nextAttemptToken) {
   for (uint32_t d = 0; d < kEJitSharedDimTypes; ++d)
     for (uint32_t i = 0; i < kEJitSharedInstances; ++i) {
       st->enabled[d][i].storeRelaxed(0);
@@ -3701,6 +4166,8 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   st->mode.storeRelaxed(mode);
   st->tier2Threshold.storeRelaxed(pgoEnabled ? tier2Threshold : 0);
   st->pgoEnabled.storeRelaxed(pgoEnabled ? 1 : 0);
+  st->representativeSharingEnabled.storeRelaxed(
+      representativeSharingEnabled ? 1u : 0u);
   st->pgoAdmissionLock.storeRelaxed(0);
   st->pgoMaxActiveFunctions.storeRelaxed(pgoMaxConcurrentProfiles);
   st->pgoActiveFunctionCount.storeRelaxed(0);
@@ -3784,6 +4251,43 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
     H.generation.storeRelaxed(0);
     H.funcIndex.storeRelaxed(0);
     H.terminalReason.storeRelaxed(0);
+  }
+  for (uint32_t I = 0;
+       I < kEJitSharedRepresentativeCommandCapacity; ++I) {
+    EJitSharedRepresentativeCommand &C = st->representativeCommands[I];
+    C.state.storeRelaxed(
+        static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Free));
+    C.abandoned.storeRelaxed(0);
+    C.requesterReleased.storeRelaxed(1);
+    C.kind = 0;
+    C.generation = 0;
+    C.requesterCore = kEJitInvalidCoreId;
+    C.funcIndex = 0;
+    C.numDims = 0;
+    C.boundCount = 0;
+    // The command epoch is deliberately not reset. A stale requester from a
+    // previous generation must never acquire the same slot incarnation after
+    // owner re-initialization.
+    C.incarnation.storeRelaxed(0);
+    C.recycleLease.storeRelaxed(0);
+    for (uint32_t D = 0; D < kEJitSharedMaxDims; ++D) {
+      C.dims[D] = {};
+      C.versions[D] = 0;
+      C.resultVersions[D] = 0;
+    }
+    C.attemptToken = 0;
+    C.dispatchCount = 0;
+    C.dispatchLimit = 0;
+    C.dispatchQuotaEnd = 0;
+    C.dispatchClosedQuota = 0;
+    C.dispatchBucketIndex = kEJitSharedCacheBuckets;
+    C.dispatchSlotIndex = kEJitSharedCacheSlots;
+    C.reserved = 0;
+    C.resultCode = 0;
+    C.resultGeneration = 0;
+    C.resultT1DispatchCount = 0;
+    C.resultT1QuotaEnd = 0;
+    C.resultT1DispatchLimit = 0;
   }
   for (uint32_t i = 0; i < kEJitSharedQueueSlots; ++i) {
     st->ring[i].sequence.storeRelaxed(i); // Vyukov initial sequence = index
@@ -3951,9 +4455,33 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
               static_cast<uint32_t>(EJitSharedInitState::Initializing)))
         break; // lost the race; re-observe.
 
+
       // We are the owner. Build the whole blob, then publish Ready LAST.
       uint32_t self = EJitCoreId::current();
       uint32_t nextGen = state_->generation.loadRelaxed() + 1;
+      // A previous owner may have stopped while a peer still held a mailbox
+      // lease. Cancel those commands, then wait for their requesters to
+      // release them before touching the command array or any other shared
+      // generation state. Failure is explicit; reinitialization never writes
+      // over a live Filling/Running command.
+      if (state_->magic == kEJitSharedAbiMagic &&
+          state_->abiVersion == kEJitSharedAbiVersion &&
+          state_->structSize == sizeof(EJitSharedTaskPoolState)) {
+        cancelRepresentativeCommands();
+        for (uint32_t Wait = 0; Wait < kMaxSpins &&
+                                      !representativeCommandsDrained(); ++Wait)
+          workerIdle(1);
+        if (!representativeCommandsDrained()) {
+          state_->lastInitError.storeRelease(static_cast<uint32_t>(
+              EJitSharedInitError::RepresentativeCommandDrainFailed));
+          state_->initState.storeRelease(
+              static_cast<uint32_t>(EJitSharedInitState::Failed));
+          EJIT_DIAG("shared taskpool owner=%u init FAILED: representative "
+                    "command drain did not complete",
+                    self);
+          return InitResult::OwnerFailed;
+        }
+      }
       // Owner-private batch state must never cross a generation boundary.
       pendingBatchCompiles_.clear();
       pendingPublishes_.clear();
@@ -3967,7 +4495,8 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
                         pgoEnabled_.loadRelaxed(),
                         tier2Threshold_.loadRelaxed(),
                         pgoMaxConcurrentProfiles_.loadRelaxed(),
-                        requestAttemptsEnabled_, NextAttemptToken);
+                        requestAttemptsEnabled_, representativeSharingEnabled_,
+                        NextAttemptToken);
       // Empty the shared cell table for the new generation: after a re-init
       // that skipped ownerShutdown the cells hold pointers into the previous
       // generation's code, and a cell carries no epoch to invalidate against.
@@ -4067,6 +4596,14 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
                   static_cast<unsigned long long>(regFingerprint_));
         return InitResult::FingerprintMismatch;
       }
+      if (state_->representativeSharingEnabled.loadAcquire() !=
+          (representativeSharingEnabled_ ? 1u : 0u)) {
+        EJIT_DIAG("shared taskpool attach REJECTED: representative policy "
+                  "mismatch (owner=%u self=%u)",
+                  state_->representativeSharingEnabled.loadAcquire(),
+                  representativeSharingEnabled_ ? 1u : 0u);
+        return InitResult::PolicyMismatch;
+      }
       EJIT_DIAG("shared taskpool attached ready (owner=%u)",
                 state_->ownerCoreId.loadAcquire());
       return InitResult::AttachedReady;
@@ -4112,6 +4649,10 @@ void EJitSharedTaskPool::ownerShutdown() {
   // Uninitialized so no worker can touch owner-private state afterwards.
   state_->initState.storeRelease(
       static_cast<uint32_t>(EJitSharedInitState::Stopping));
+  // Wake any peer waiting for an owner decision before the worker is joined.
+  // A command already running is marked abandoned and is released by the
+  // worker after its owner-private callback returns.
+  cancelRepresentativeCommands();
   if (workerStop_)
     workerStop_(workerCtx_); // soft-stop + JOIN (no use-after-free).
   // The join acknowledges that no queued or active compiler callback from this
@@ -4192,38 +4733,36 @@ bool EJitSharedTaskPool::captureT1Observation(const EJitSharedCacheSlot &Slot,
 }
 
 EJitSharedTaskPool::T1DispatchOutcome
-EJitSharedTaskPool::admitObservedT1Dispatch(const SharedLookup &Hit) {
+EJitSharedTaskPool::admitObservedT1Dispatch(const SharedLookup &Hit,
+                                            uint64_t *AdmittedCount) {
+  if (AdmittedCount)
+    *AdmittedCount = 0;
   if (!Hit.t1Observation || !Hit.slot)
     return T1DispatchOutcome::NotApplicable;
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-  // No read token exists in this build, so take the bucket observationLock: the
-  // identity re-check, the admission CAS and the freeze below cannot be
-  // interleaved by a cancel/republish of the same slot address, and unlike the
+  // No read token exists in this build. The caller holds the bucket
+  // observationLock, so the identity re-check, admission CAS and freeze cannot
+  // interleave with a cancel/republish of the same slot address. Unlike the
   // writer lock this leaves writeFlag/publishSeq untouched, so a concurrent
-  // load-only lookup is never invalidated by a granted dispatch (R1R-1). The
-  // observation snapshot always carries the exact coordinates of the publish it
-  // was captured from (resolveMatchedSlot/peerPrepareSlot); a hit without them
-  // cannot be committed safely and is reported as a changed identity, so the
-  // pointer is still returned but nothing is attributed.
+  // load-only lookup is not invalidated (R1R-1). The observation snapshot always
+  // carries the exact coordinates of the publish it was captured from; a hit
+  // without them cannot be committed safely.
   if (Hit.tier2BucketIndex >= kEJitSharedCacheBuckets ||
       Hit.tier2SlotIndex >= kEJitSharedCacheSlots)
     return T1DispatchOutcome::IdentityChanged;
-  EJitSharedCacheBucket &Bucket = state_->buckets[Hit.tier2BucketIndex];
-  bucketObservationLock(Bucket);
+#endif
   const T1DispatchOutcome Outcome = admitObservedT1DispatchLocked(Hit);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
   if (samplingAdmissionFn_ &&
       (Outcome == T1DispatchOutcome::Admitted ||
        Outcome == T1DispatchOutcome::FinalAdmitted))
-    Bucket.readers.fetchAdd(1);
-  // The increment precedes unlock: a concurrent quota-closed request cannot
-  // enqueue a freeze which observes zero before the final writer is pinned.
-  bucketObservationUnlock(Bucket);
-  return Outcome;
-#else
-  // The committed lookup holds the bucket read token across this call, and a
-  // publish/cancel drains readers, so the identity is already exact here.
-  return admitObservedT1DispatchLocked(Hit);
+    state_->buckets[Hit.tier2BucketIndex].readers.fetchAdd(1);
 #endif
+  if (AdmittedCount &&
+      (Outcome == T1DispatchOutcome::Admitted ||
+       Outcome == T1DispatchOutcome::FinalAdmitted))
+    *AdmittedCount = Hit.slot->t1DispatchCount.loadAcquire();
+  return Outcome;
 }
 
 EJitSharedTaskPool::T1DispatchOutcome
@@ -4303,10 +4842,93 @@ EJitSharedTaskPool::admitObservedT1DispatchLocked(const SharedLookup &Hit) {
 }
 
 __attribute__((always_inline)) EJitSharedTaskPool::CompileOrGetResult
-EJitSharedTaskPool::classifyHit(const SharedLookup &Hit,
-                                const EJitBoundPtrDescriptor *boundPointers,
-                                uint32_t boundCount) {
+EJitSharedTaskPool::classifyHit(SharedLookup Hit,
+                                 const EJitBoundPtrDescriptor *boundPointers,
+                                 uint32_t boundCount) {
   CompileOrGetResult R;
+  struct ObservationScope {
+    EJitSharedCacheBucket *Bucket = nullptr;
+    ~ObservationScope() {
+      if (Bucket)
+        bucketObservationUnlock(*Bucket);
+    }
+    void acquire(EJitSharedCacheBucket &B) {
+      bucketObservationLock(B);
+      Bucket = &B;
+    }
+    void release() {
+      if (Bucket) {
+        bucketObservationUnlock(*Bucket);
+        Bucket = nullptr;
+      }
+    }
+  } Observation;
+  uint32_t DispatchMailboxIndex = kEJitSharedRepresentativeCommandCapacity;
+  uint64_t DispatchMailboxIncarnation = 0;
+  auto CancelDispatchReservation = [&] {
+    if (DispatchMailboxIndex < kEJitSharedRepresentativeCommandCapacity)
+      cancelRepresentativeDispatch(DispatchMailboxIndex,
+                                    DispatchMailboxIncarnation);
+    DispatchMailboxIndex = kEJitSharedRepresentativeCommandCapacity;
+    DispatchMailboxIncarnation = 0;
+  };
+  auto DeliverDispatchObservation = [&](bool ClosedQuota) {
+    if (!Hit.slot)
+      return false;
+    // The local/unit-test owner has no cross-core observer to acknowledge.
+    // That is still a successful local admission; only an installed observer
+    // can reject the mailbox handshake and require an exact quota rollback.
+    if (!dispatchObserverFn_)
+      return true;
+    DispatchObservation Obs;
+    Obs.funcIndex = Hit.slot->funcIndex;
+    Obs.attemptToken = Hit.t1SlotAttemptToken;
+    Obs.generation = Hit.t1SlotGeneration;
+    Obs.count = Hit.slot->t1DispatchCount.loadAcquire();
+    Obs.limit = Hit.t1DispatchLimit;
+    Obs.quotaEnd = ClosedQuota ? Hit.slot->t1QuotaEnd.loadAcquire() : 0;
+    Obs.closedQuota = ClosedQuota;
+    Obs.bucketIndex = Hit.tier2BucketIndex;
+    Obs.slotIndex = Hit.tier2SlotIndex;
+    Obs.mailboxIndex = DispatchMailboxIndex;
+    Obs.mailboxIncarnation = DispatchMailboxIncarnation;
+    const bool Delivered =
+        dispatchObserverFn_(dispatchObserverCtx_, Obs);
+    // Production observers consume the reserved lease synchronously. A custom
+    // observer that declines it must not strand this mailbox slot.
+    CancelDispatchReservation();
+    return Delivered;
+  };
+  auto RollbackDispatchAdmission = [&](uint64_t AdmittedCount,
+                                       bool ClosedQuota) {
+    if (!AdmittedCount || !Hit.slot)
+      return false;
+    uint64_t Expected = AdmittedCount;
+    if (!Hit.slot->t1DispatchCount.compareExchange(Expected,
+                                                    AdmittedCount - 1)) {
+      EJIT_DIAG("representative dispatch reply failed after count advanced "
+                "attempt=%llu observed=%llu current=%llu",
+                static_cast<unsigned long long>(Hit.t1SlotAttemptToken),
+                static_cast<unsigned long long>(AdmittedCount),
+                static_cast<unsigned long long>(Expected));
+      return false;
+    }
+    if (ClosedQuota)
+      Hit.slot->t1QuotaEnd.storeRelease(0);
+    return true;
+  };
+  // Peer admission is backpressured before the shared count CAS. With every
+  // mailbox legitimately held in Filling, no T1 pointer is granted and the
+  // caller retries after the slot owners release their leases.
+  if (Hit.fnPtr && Hit.t1Observation && dispatchObserverFn_ && !isOwner_ &&
+      !reserveRepresentativeDispatch(DispatchMailboxIndex,
+                                     DispatchMailboxIncarnation)) {
+    if (Hit.hasReadToken)
+      releaseRead(Hit.bucketIndex);
+    R.status = EJitCompileOrGetStatus::AlreadyPending;
+    R.fastPathTerminal = true;
+    return R;
+  }
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
   bool SamplingToken = false;
 #endif
@@ -4314,7 +4936,18 @@ EJitSharedTaskPool::classifyHit(const SharedLookup &Hit,
   // real dispatch before any pointer is handed back. A lookup whose quota is
   // already closed falls back to AOT instead of executing more Tier-1 code.
   if (Hit.fnPtr && Hit.t1Observation) {
-    const auto Outcome = admitObservedT1Dispatch(Hit);
+    if (Hit.tier2BucketIndex >= kEJitSharedCacheBuckets ||
+        Hit.tier2SlotIndex >= kEJitSharedCacheSlots) {
+      if (Hit.hasReadToken)
+        releaseRead(Hit.bucketIndex);
+      CancelDispatchReservation();
+      R.status = EJitCompileOrGetStatus::AlreadyPending;
+      R.fastPathTerminal = true;
+      return R;
+    }
+    Observation.acquire(state_->buckets[Hit.tier2BucketIndex]);
+    uint64_t AdmittedCount = 0;
+    const auto Outcome = admitObservedT1Dispatch(Hit, &AdmittedCount);
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
     SamplingToken = samplingAdmissionFn_ &&
                    (Outcome == T1DispatchOutcome::Admitted ||
@@ -4331,44 +4964,43 @@ EJitSharedTaskPool::classifyHit(const SharedLookup &Hit,
       // may predate the frozen boundary timestamp.
       if (Hit.hasReadToken)
         releaseRead(Hit.bucketIndex);
+      CancelDispatchReservation();
       R.status = EJitCompileOrGetStatus::AlreadyPending;
       R.fastPathTerminal = true;
       return R;
     case T1DispatchOutcome::FinalAdmitted:
+      // Deliver the final high-water mark before Tier-2 can be serviced by the
+      // owner. Otherwise it could publish a count N-1 bundle while the peer is
+      // still waiting to submit the closing observation.
+      if (!DeliverDispatchObservation(true)) {
+        (void)RollbackDispatchAdmission(AdmittedCount, true);
+        Observation.release();
+        if (Hit.hasReadToken)
+          releaseRead(Hit.bucketIndex);
+        R.status = EJitCompileOrGetStatus::AlreadyPending;
+        R.fastPathTerminal = true;
+        return R;
+      }
+      Observation.release();
       // The last allowed dispatch freezes the boundary AND claims Tier-2.
       enqueueTier2FromLookup(Hit, boundPointers, boundCount);
-      // The dispatch that closed the quota: the observer sees the frozen
-      // boundary the same way the Tier-2 request does.
-      if (dispatchObserverFn_ && Hit.slot) {
-        DispatchObservation Obs;
-        Obs.funcIndex = Hit.slot->funcIndex;
-        Obs.attemptToken = Hit.t1SlotAttemptToken;
-        Obs.generation = Hit.t1SlotGeneration;
-        Obs.count = Hit.slot->t1DispatchCount.loadAcquire();
-        Obs.limit = Hit.t1DispatchLimit;
-        Obs.quotaEnd = Hit.slot->t1QuotaEnd.loadAcquire();
-        Obs.closedQuota = true;
-        Obs.bucketIndex = Hit.tier2BucketIndex;
-        Obs.slotIndex = Hit.tier2SlotIndex;
-        dispatchObserverFn_(dispatchObserverCtx_, Obs);
-      }
       break;
     case T1DispatchOutcome::NotApplicable:
     case T1DispatchOutcome::Admitted:
       // A real granted dispatch below the limit.
-      if (dispatchObserverFn_ && Hit.slot) {
-        DispatchObservation Obs;
-        Obs.funcIndex = Hit.slot->funcIndex;
-        Obs.attemptToken = Hit.t1SlotAttemptToken;
-        Obs.generation = Hit.t1SlotGeneration;
-        Obs.count = Hit.slot->t1DispatchCount.loadAcquire();
-        Obs.limit = Hit.t1DispatchLimit;
-        Obs.bucketIndex = Hit.tier2BucketIndex;
-        Obs.slotIndex = Hit.tier2SlotIndex;
-        dispatchObserverFn_(dispatchObserverCtx_, Obs);
+      if (!DeliverDispatchObservation(false)) {
+        (void)RollbackDispatchAdmission(AdmittedCount, false);
+        Observation.release();
+        if (Hit.hasReadToken)
+          releaseRead(Hit.bucketIndex);
+        R.status = EJitCompileOrGetStatus::AlreadyPending;
+        R.fastPathTerminal = true;
+        return R;
       }
+      Observation.release();
       break;
     case T1DispatchOutcome::IdentityChanged:
+      CancelDispatchReservation();
       if (samplingAdmissionFn_) {
         if (Hit.hasReadToken)
           releaseRead(Hit.bucketIndex);
@@ -4644,7 +5276,8 @@ EJitSharedTaskPool::CompileOrGetResult EJitSharedTaskPool::compileOrGet(
     // Tier-1 must still be recorded as a waiter of the group generation (its
     // later wake-up is what turns it into a shared-code consumer).
     if (state_->pgoEnabled.loadAcquire() != 0 && samplingAdmissionFn_ &&
-        samplingAdmissionFn_(samplingAdmissionCtx_, funcIndex, dims, numDims) ==
+        samplingAdmissionFn_(samplingAdmissionCtx_, funcIndex, dims, numDims,
+                             boundCount, 0) ==
             SamplingAdmission::WakeTier2) {
       // The member's group already published: enqueue its Tier-2 rather than
       // reporting a coalesced Tier-1 it must not run.
@@ -4829,7 +5462,8 @@ EJitSharedTaskPool::CompileOrGetResult EJitSharedTaskPool::compileOrGet(
   // legacy path.
   if (pgoForRequest && samplingAdmissionFn_) {
     const SamplingAdmission Admission =
-        samplingAdmissionFn_(samplingAdmissionCtx_, funcIndex, dims, numDims);
+        samplingAdmissionFn_(samplingAdmissionCtx_, funcIndex, dims, numDims,
+                             boundCount, Req.attemptToken);
     if (Admission == SamplingAdmission::Classify) {
       Req.funcIndex = encodeReqTier(funcIndex, kEJitTierCandidate);
       if (candidateClassifyFn_ && versionsCurrent(Req) && queuePush(Req)) {
@@ -4899,6 +5533,17 @@ EJitSharedTaskPool::CompileOrGetResult EJitSharedTaskPool::compileOrGet(
         "shared taskpool async bound request drop func=%u: lifecycle changed",
         funcIndex);
     R.status = EJitCompileOrGetStatus::CompileFailed;
+    return R;
+  }
+  // Inline owner classification temporarily clears QueueOwned while it borrows
+  // the candidate configuration. Re-acquire that shared ownership before the
+  // real Tier-1 request becomes visible to the owner worker; a cancellation or
+  // re-init cannot retire the borrow in the enqueue window.
+  if (Req.attemptToken && !markRequestAttemptQueued(Req.attemptToken)) {
+    dedupClear(funcIndex, Claim);
+    acknowledgeRequestAttemptQueueDrop(
+        Req.attemptToken, EJitRequestAttemptReason::Cancelled);
+    R.status = EJitCompileOrGetStatus::PgoAdmissionDeferred;
     return R;
   }
   if (!queuePush(Req)) {
@@ -5613,6 +6258,11 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
   switch (static_cast<EJitSharedInitState>(st)) {
   case EJitSharedInitState::Ready:
     workerConsumeLoops_.fetchAdd(1);
+    // Peer representative callbacks are synchronous identity/decision
+    // handshakes. Service one before maintenance and queue work so a peer
+    // never waits behind a continuously replenished compile queue.
+    if (serviceRepresentativeCommand())
+      return EJitWorkerStep::Consumed;
     // A replenished compile queue must not starve cold-session cancellation.
     if (ownerMaintenanceFn_ && ownerMaintenanceFn_(ownerMaintenanceCtx_))
       return EJitWorkerStep::Consumed;
@@ -5685,7 +6335,15 @@ void EJitSharedTaskPool::workerThrottle() {
 }
 
 void EJitSharedTaskPool::workerEntryThunk(void *ctx) {
-  static_cast<EJitSharedTaskPool *>(ctx)->runWorkerLoop();
+  auto *Pool = static_cast<EJitSharedTaskPool *>(ctx);
+#ifndef EJIT_SRE_SHARED_TASKPOOL_PLATFORM
+  // Host worker threads do not inherit the caller's simulated core id. Set it
+  // from the elected owner in the test seam so owner-only code-pool callbacks
+  // and routing assertions observe the real worker identity.
+  if (Pool->state_)
+    EJitCoreId::setCurrentForTest(Pool->state_->ownerCoreId.loadAcquire());
+#endif
+  Pool->runWorkerLoop();
 }
 
 //===----------------------------------------------------------------------===//

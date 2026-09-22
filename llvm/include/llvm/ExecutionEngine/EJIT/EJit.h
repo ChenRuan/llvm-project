@@ -88,6 +88,8 @@ public:
 
   /// Register a user-defined external symbol for JIT resolution.
   /// Required for bare-metal where dlsym is unavailable.
+  /// In a taskpool build this is accepted only before registration freezes;
+  /// post-init calls are rejected without mutating the worker's map.
   void registerSymbol(const std::string &name, void *addr);
 
   /// Manual registration of bitcode / period arrays / static vars.

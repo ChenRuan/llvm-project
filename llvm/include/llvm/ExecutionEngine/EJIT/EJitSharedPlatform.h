@@ -124,7 +124,14 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// admission commit against every publish/cancel/reset of a slot's observation
 /// identity. The NO_RECLAIM load-only seqlock reader never reads it, so an
 /// admitted dispatch no longer sets writeFlag or bumps publishSeq.
-constexpr uint32_t kEJitSharedAbiVersion = 22u;
+/// v23: peer representative-PGO callbacks use a fixed-layout owner-command
+/// mailbox array; private group registries and optimizer state never cross the
+/// core boundary. v24: mailbox commands carry an incarnation and a requester
+/// release handshake; a timed-out requester cannot recycle a slot while the
+/// owner or a stale caller may still hold its command reference. v25: the
+/// release handshake carries an incarnation-bound, single-winner recycle
+/// lease, so a late requester cannot state-only CAS a reused command to Free.
+constexpr uint32_t kEJitSharedAbiVersion = 25u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

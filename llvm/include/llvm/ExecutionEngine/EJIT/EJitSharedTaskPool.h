@@ -349,7 +349,8 @@ public:
     Classify, ///< worker prefix/schema work, without sampling admission.
   };
   using SamplingAdmissionCallback = SamplingAdmission (*)(
-      void *ctx, uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims);
+      void *ctx, uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+      uint32_t boundCount, uint64_t attemptToken);
   void setSamplingAdmissionCallback(SamplingAdmissionCallback fn, void *ctx) {
     samplingAdmissionFn_ = fn;
     samplingAdmissionCtx_ = ctx;
@@ -401,12 +402,28 @@ public:
     /// sentinel values mean the build carries no bucket index).
     uint32_t bucketIndex = kEJitSharedCacheBuckets;
     uint32_t slotIndex = kEJitSharedCacheSlots;
+    /// A peer fills these with the pre-granted owner mailbox lease. They are
+    /// local protocol metadata, never a pointer or an owner-private object.
+    uint32_t mailboxIndex = kEJitSharedRepresentativeCommandCapacity;
+    uint64_t mailboxIncarnation = 0;
   };
-  using DispatchObserver = void (*)(void *ctx, const DispatchObservation &obs);
+  using DispatchObserver = bool (*)(void *ctx,
+                                    const DispatchObservation &obs);
   void setDispatchObserver(DispatchObserver fn, void *ctx) {
     dispatchObserverFn_ = fn;
     dispatchObserverCtx_ = ctx;
   }
+  /// Peer-side representative callbacks use fixed-layout owner mailboxes.
+  /// The elected worker executes owner-private callbacks and returns only POD
+  /// decisions/observations to the requester.
+  bool requestRepresentativeCandidate(const EJitCompileRequest &req,
+                                       bool &classified);
+  SamplingAdmission requestRepresentativeAdmission(
+      uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+      uint32_t boundCount, uint64_t attemptToken);
+  bool requestRepresentativeWake(uint32_t funcIndex, const EJitDimPair *dims,
+                                 uint32_t numDims, EJitCompileRequest &out);
+  bool submitRepresentativeDispatch(const DispatchObservation &obs);
   /// Owner-private physical-code release callback for an overwritten/retired
   /// pointer. Optional; a purely logical drop happens when unset.
   using ReleaseCallback = void (*)(void *ctx, void *oldFn);
@@ -488,9 +505,9 @@ public:
   /// Owner-private diagnostic callback. It runs only on the owner worker and
   /// may access owner-local optimizer state.
   using MayConstRankingCallback = bool (*)(void *ctx);
-#ifdef EJIT_SRE_TASKPOOL_TESTING
   using TestHookFn = void (*)(void *ctx);
-#endif
+  using IcacheFillMidpointHook = void (*)(void *ctx);
+  using SeqRetryHook = void (*)(void *ctx, uint32_t bucketIndex);
 
   enum class InitResult : uint32_t {
     BecameOwner =
@@ -505,6 +522,7 @@ public:
     AbiMismatch,    ///< magic/version/size mismatch — refuse to use the blob.
     FingerprintMismatch, ///< owner/peer registration mapping differs — clean
                          ///< fail.
+    PolicyMismatch, ///< representative/request-attempt strategy differs.
     NoState,             ///< bind() not called.
   };
 
@@ -817,6 +835,15 @@ public:
   /// core with a different mapping never submits requests against the wrong
   /// indices (spec §11). 0 means "unknown / not checked".
   void setRegistrationFingerprint(uint64_t fp) { regFingerprint_ = fp; }
+  /// Set the representative-PGO policy before init. Ready peers must match the
+  /// owner's published policy; the registry is never silently dropped.
+  void setRepresentativeSharingEnabled(bool enabled) {
+    representativeSharingEnabled_ = enabled;
+  }
+  bool representativeSharingEnabled() const {
+    return state_ ? state_->representativeSharingEnabled.loadAcquire() != 0
+                  : representativeSharingEnabled_;
+  }
   /// Platform capability: may a NON-owner core read a cache fnPtr? Only true
   /// when the code pool is mapped at the same VA on every core, sealed, and
   /// I/D-cache coherent for cross-core execution (spec §11 fnPtr
@@ -826,8 +853,17 @@ public:
   /// value is immutable while Ready so peers cannot observe a mixed policy.
   bool setRequestAttemptsEnabled(bool enabled) {
     if (state_ && state_->initState.loadAcquire() ==
-                      static_cast<uint32_t>(EJitSharedInitState::Ready))
-      return false;
+                      static_cast<uint32_t>(EJitSharedInitState::Ready)) {
+      // Validate the old header before reading the v20+ policy field. A peer
+      // attached to an older blob must fail explicitly, never interpret a
+      // coincident word as a compatible live policy.
+      if (state_->magic != kEJitSharedAbiMagic ||
+          state_->abiVersion != kEJitSharedAbiVersion ||
+          state_->structSize != sizeof(EJitSharedTaskPoolState))
+        return false;
+      return state_->requestAttemptsEnabled.loadAcquire() ==
+             (enabled ? 1u : 0u);
+    }
     requestAttemptsEnabled_ = enabled;
     return true;
   }
@@ -885,6 +921,13 @@ public:
   void setPgoAdmissionTestHook(TestHookFn fn, void *ctx) {
     pgoAdmissionTestHook_ = fn;
     pgoAdmissionTestHookCtx_ = ctx;
+  }
+  /// Pause a peer immediately after it publishes its incarnation-bound
+  /// representative release lease and before it attempts final recycle.
+  /// Testing only: this creates the deterministic late-release/reuse window.
+  void setRepresentativeReleasePauseHook(TestHookFn fn, void *ctx) {
+    representativeReleasePauseHook_ = fn;
+    representativeReleasePauseHookCtx_ = ctx;
   }
 #endif
 
@@ -1230,7 +1273,6 @@ public:
   /// drain exactly where a preempting peer core would - the only way to reach
   /// the retract deterministically (the pre-store checks decline a token that
   /// is already stale when icacheFill is entered).
-  using IcacheFillMidpointHook = void (*)(void *ctx);
   void setIcacheFillMidpointForTest(IcacheFillMidpointHook fn, void *ctx) {
     icacheFillMidpointHook_ = fn;
     icacheFillMidpointCtx_ = ctx;
@@ -1243,7 +1285,6 @@ public:
   /// single-threaded test can force exactly one retry where a racing publish
   /// would (used to prove an abandoned retry consumes no observed dispatch).
   /// Receives the bucket index.
-  using SeqRetryHook = void (*)(void *ctx, uint32_t bucketIndex);
   void setSeqlockRetryHookForTest(SeqRetryHook fn, void *ctx) {
     seqlockRetryHook_ = fn;
     seqlockRetryHookCtx_ = ctx;
@@ -1496,7 +1537,7 @@ private:
   /// this commit. \p boundPointers/\p boundCount are attached when a deferred
   /// Tier-2 claim has to be made.
   CompileOrGetResult
-  classifyHit(const SharedLookup &Hit,
+  classifyHit(SharedLookup Hit,
               const EJitBoundPtrDescriptor *boundPointers = nullptr,
               uint32_t boundCount = 0);
 
@@ -1515,15 +1556,15 @@ private:
   /// the diagnostic progress quarter. Never fabricates a count for a rejected
   /// lookup: only the committed-return path calls this.
   ///
-  /// Exclusion: the identity re-check, the CAS and the freeze run as one
-  /// critical section against cachePublish()/cancelRequestAttempt(). The token
-  /// build relies on the bucket read token the committed lookup already holds;
-  /// NO_RECLAIM takes the separate leaf bucket observationLock (ABI v22), which
-  /// does not set writeFlag or bump publishSeq, so a granted dispatch never
-  /// invalidates a concurrent load-only lookup. The lock is released before the
+  /// Exclusion: the identity re-check, the CAS, the owner reply and the freeze
+  /// run as one critical section against cachePublish()/cancelRequestAttempt().
+  /// Both token and NO_RECLAIM builds use the separate leaf bucket
+  /// observationLock (ABI v24); the token build also holds its read token, while
+  /// NO_RECLAIM leaves publishSeq untouched. The lock is released before the
   /// Tier-2 enqueue (which takes the bucket writeFlag and then the
   /// observationLock again, in that fixed order).
-  T1DispatchOutcome admitObservedT1Dispatch(const SharedLookup &Hit);
+  T1DispatchOutcome admitObservedT1Dispatch(const SharedLookup &Hit,
+                                             uint64_t *AdmittedCount = nullptr);
 
   /// Body of admitObservedT1Dispatch() executed under the observation exclusion
   /// of the build (caller guarantees no republish can interleave).
@@ -1639,6 +1680,22 @@ private:
   /// worker or callback therefore cannot clear a newer attempt's claim.
   void dedupClear(uint32_t funcIndex, uint64_t claim);
 
+  EJitSharedRepresentativeCommand *claimRepresentativeCommand(
+      EJitSharedRepresentativeCommandKind kind);
+  bool waitRepresentativeCommand(EJitSharedRepresentativeCommand &command,
+                                 uint64_t incarnation);
+  void releaseRepresentativeCommand(EJitSharedRepresentativeCommand &command,
+                                     uint64_t incarnation);
+  bool recycleRepresentativeCommand(EJitSharedRepresentativeCommand &command,
+                                     uint64_t incarnation);
+  bool reserveRepresentativeDispatch(uint32_t &index,
+                                     uint64_t &incarnation);
+  void cancelRepresentativeDispatch(uint32_t index, uint64_t incarnation);
+  bool representativeCommandsDrained() const;
+  /// Consume one owner-command mailbox. Runs only on the elected worker.
+  bool serviceRepresentativeCommand();
+  void cancelRepresentativeCommands();
+
   uint64_t beginRequestAttempt(const EJitCompileRequest &req,
                                bool samplingPending);
   bool markRequestAttemptQueued(uint64_t token);
@@ -1727,13 +1784,16 @@ private:
   void *ownerMaintenanceCtx_ = nullptr;
   TraceClockFn traceClockFn_ = nullptr;
   void *traceClockCtx_ = nullptr;
-#ifdef EJIT_SRE_TASKPOOL_TESTING
+  // Keep test-hook storage in every build so EJitSharedTaskPool has one class
+  // layout across LLVMEJIT and test translation units. The test-only APIs and
+  // behavior remain guarded by EJIT_SRE_TASKPOOL_TESTING.
   EJitAtomicU32 failTier2QueuePush_{0};
   TestHookFn pgoAdmissionTestHook_ = nullptr;
   void *pgoAdmissionTestHookCtx_ = nullptr;
+  TestHookFn representativeReleasePauseHook_ = nullptr;
+  void *representativeReleasePauseHookCtx_ = nullptr;
   SeqRetryHook seqlockRetryHook_ = nullptr;
   void *seqlockRetryHookCtx_ = nullptr;
-#endif
   OwnerElectedFn ownerElected_ = nullptr;
   void *ownerElectedCtx_ = nullptr;
   OwnerReleasedFn ownerReleased_ = nullptr;
@@ -1741,12 +1801,11 @@ private:
   uint64_t regFingerprint_ = 0;
   EJitCompileMode configuredMode_ = EJitCompileMode::Async;
   bool codeSharingEnabled_ = false;
+  bool representativeSharingEnabled_ = false;
   bool requestAttemptsEnabled_ = false;
   bool isOwner_ = false;
-#ifdef EJIT_SRE_TASKPOOL_TESTING
   IcacheFillMidpointHook icacheFillMidpointHook_ = nullptr;
   void *icacheFillMidpointCtx_ = nullptr;
-#endif
   struct PendingPublish {
     EJitCompileRequest req{};
     void *fn = nullptr;

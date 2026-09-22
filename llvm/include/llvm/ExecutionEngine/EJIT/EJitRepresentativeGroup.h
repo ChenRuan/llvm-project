@@ -33,6 +33,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ExecutionEngine/EJIT/EJitPreparedCode.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRepresentativeDiagnostics.h"
 #include "llvm/Support/Error.h"
 #include <cstdint>
 #include <memory>
@@ -147,6 +148,9 @@ enum class EJitPublishOutcome : uint8_t {
   /// The bundle is not a real profile (no edge profile, no schema, or no
   /// trustworthy observation): publishing it would fabricate a shared path.
   InvalidBundle,
+  /// The frozen bundle would exceed the registry's retained-byte budget. The
+  /// generation remains unpublished and the caller must stay on AOT.
+  RetainedBundleBudget,
 };
 
 /// Physical-code decision for one member of a group generation.
@@ -206,6 +210,11 @@ struct EJitGroupDiagnostics {
   uint64_t logicalRequests = 0;
   uint64_t admittedGroups = 0;
   uint64_t rejectedAdmissions = 0;
+  /// Resource failures are separate from policy rejections so a capacity
+  /// fallback is observable as AOT deferral, not as a private sampling grant.
+  uint64_t groupCapacityDefers = 0;
+  uint64_t memberCapacityDefers = 0;
+  uint64_t retainedBundleBudgetRejects = 0;
   uint64_t representativeSessions = 0;
   uint64_t representativeReElections = 0;
   uint64_t representativeDispatches = 0;
@@ -223,6 +232,10 @@ struct EJitGroupDiagnostics {
   uint64_t independentPhysicalObjects = 0;
   uint64_t schemaRejections = 0;
   uint64_t staleSettlements = 0;
+  /// Retired generation metadata is released after its generation-stamped
+  /// callbacks can no longer address the live generation.
+  uint64_t retiredGenerationMetadataReclaims = 0;
+  uint64_t memberRecordsReclaimed = 0;
 };
 
 /// One group's cold-path lifecycle owner. Not thread-safe: the compile owner

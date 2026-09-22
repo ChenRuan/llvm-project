@@ -448,6 +448,16 @@ void ejit_register_symbol(const char *name, void *addr) {
   EJIT_DIAG_VERBOSE("register_symbol name=%s addr=%p", name ? name : "<null>",
                     addr);
   if (gEJIT) {
+#ifdef EJIT_SRE_TASKPOOL
+    if (gEJIT->registrationFrozen()) {
+      EJitRegistrationStore::instance().recordError(
+          EJIT_ERR_INVALID_PARAM, "runtime symbol registration rejected",
+          name ? name : "");
+      EJIT_DIAG("register_symbol FAIL name=%s: registration frozen",
+                name ? name : "<null>");
+      return;
+    }
+#endif
     gEJIT->registerSymbol(name, addr);
   } else {
     // Constructor-phase call (before ejit_init): stage for later consumption.

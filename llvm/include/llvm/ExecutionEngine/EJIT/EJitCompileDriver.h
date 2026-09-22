@@ -9,6 +9,7 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITCOMPILEDRIVER_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITCOMPILEDRIVER_H
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
@@ -104,6 +105,13 @@ public:
   /// instead of the per-instance taskPool_.
   EJitSharedTaskPool *sharedTaskPool() { return &sharedPool_; }
 #ifdef EJIT_SRE_TASKPOOL_TESTING
+  static EJitRepresentativeDiagReason
+  candidateDiagReasonForTest(StringRef Detail);
+  static EJitRepresentativeDiagOutcome
+  candidateDiagOutcomeForTest(StringRef Detail);
+  static EJitRepresentativeDiagOutcome
+  publishDiagOutcomeForTest(EJitPublishOutcome Outcome);
+
   void failMemberTier2ForTest(uint32_t Count) { failMemberT2_.storeRelease(Count); }
   uint32_t candidateGateForTest(uint32_t Command) {
     if (Command == 1)
@@ -117,6 +125,25 @@ public:
     repMaxReelections_.storeRelease(MaxReelections);
     repTimeoutTicks_.storeRelease(Ticks);
   }
+  struct RepresentativeDriverMetadataForTest {
+    size_t waiters = 0;
+    size_t tier1Bindings = 0;
+    size_t sessions = 0;
+    size_t candidateBindings = 0;
+    size_t pendingCandidateBorrows = 0;
+    uint64_t candidateBudgetDefers = 0;
+    std::vector<uint64_t> pendingCandidateAttempts;
+    size_t groupHandles = 0;
+    size_t timeoutCounts = 0;
+    size_t retiringGroups = 0;
+    size_t failedGroups = 0;
+  };
+  RepresentativeDriverMetadataForTest
+  representativeDriverMetadataForTest() const;
+  /// Install deliberately small candidate limits before a test starts its
+  /// shared worker. This exercises the production Classify -> Admission route
+  /// without adding a product configuration or ABI field.
+  void setCandidateLimitsForTest(EJitCandidateLimits Limits);
 #endif
   const EJitSharedTaskPool *sharedTaskPool() const { return &sharedPool_; }
 
@@ -183,6 +210,14 @@ public:
   /// engine long after registration is over and must still see every symbol.
   void registerSymbol(const std::string &name, void *addr);
 
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  /// Test-only visibility into the durable staged-symbol list. This does not
+  /// expose the list or add a production ABI surface; it lets the public EJit
+  /// registration test prove both the legacy Open phase and taskpool Frozen
+  /// rejection without relying on an ORC lookup side effect.
+  size_t stagedUserSymbolCountForTest() const { return userSymbols_.size(); }
+#endif
+
 private:
   const Config &config_;
   EJitRuntimeState &runtimeState_;
@@ -222,12 +257,13 @@ private:
   /// owns its ONE representative sampling session.
   static EJitSharedTaskPool::SamplingAdmission
   samplingAdmissionThunk(void *ctx, uint32_t funcIndex,
-                         const EJitDimPair *dims, uint32_t numDims);
+                         const EJitDimPair *dims, uint32_t numDims,
+                         uint32_t boundCount, uint64_t attemptToken);
   /// Pool hook: ONE real granted Tier-1 dispatch. Routes the exact publish
   /// identity into the group registry so the group quota is owned by the real
   /// runtime dispatch, never by a test-side call.
-  static void dispatchObserverThunk(void *ctx,
-                                    const EJitSharedTaskPool::DispatchObservation &Obs);
+  static bool dispatchObserverThunk(
+      void *ctx, const EJitSharedTaskPool::DispatchObservation &Obs);
   /// Pool hook: build the Tier-2 request of a represented member that owns no
   /// sampling session of its own. Returns false (and leaves \p Out untouched)
   /// while the group has no published bundle, so the member stays on AOT.
@@ -270,7 +306,7 @@ private:
   bool classifyRepresentativeRequest(const EJitCompileRequest &Req);
   EJitSharedTaskPool::SamplingAdmission
   admitSamplingRequest(uint32_t funcIndex, const EJitDimPair *dims,
-                       uint32_t numDims);
+                       uint32_t numDims, uint64_t attemptToken);
   /// The live group handle of an identity, or an invalid handle when this
   /// identity never formed a group. Never creates one: the cold compile path
   /// must not invent a group for a request the admission gate never grouped.
@@ -351,6 +387,8 @@ private:
   bool serviceRepresentativeTimeouts();
   bool serviceRepresentativeWaiters();
   void completeCandidateBorrow(uint64_t LogicalKey, const EJitCompileRequest *Request = nullptr);
+  void completeCandidateBorrowForAttempt(uint64_t LogicalKey,
+                                         uint64_t AttemptToken);
   EJitAtomicU64 repTimeoutTicks_{0};
   EJitAtomicU32 repMaxReelections_{0};
   std::unordered_map<uint64_t, uint32_t> repTimeoutCounts_;
@@ -375,6 +413,11 @@ private:
   /// dispatches (the pool's committed-return hook). It never guards a stable
   /// published-Tier-2 wrapper hit - those return AOT/terminal results without
   /// entering any of this.
+  enum class CandidateAdmissionRoute : uint8_t {
+    Group,
+    Independent,
+    AotFallback,
+  };
   struct CandidateBinding {
     uint64_t groupId = 0;
     EJitCompileRequest request{};
@@ -382,9 +425,16 @@ private:
     bool finalFailed = false;
     uint32_t finalFailures = 0;
     uint64_t finalReadyAt = 0;
+    CandidateAdmissionRoute route = CandidateAdmissionRoute::Group;
+    bool needsReclassification = false;
+    EJitRepresentativeDiagOutcome outcome = EJitRepresentativeDiagOutcome::Pending;
+    EJitRepresentativeDiagReason reason = EJitRepresentativeDiagReason::Unclassified;
   };
   std::unique_ptr<EJitCandidateDirectory> candidateDirectory_;
   std::unordered_map<uint64_t, CandidateBinding> candidateBindings_;
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  EJitAtomicU64 candidateBudgetDefers_{0};
+#endif
   mutable EJitAtomicU32 repGroupLock_{0};
   void lockRepGroups() const {
     uint32_t Expected = 0;
@@ -392,6 +442,11 @@ private:
       Expected = 0;
   }
   void unlockRepGroups() const { repGroupLock_.storeRelease(0); }
+  void retireDriverGenerationMetadataLocked(
+      uint64_t GroupId, uint64_t RetiredGeneration,
+      uint64_t RetiredRepresentativeLogicalKey,
+      SmallVectorImpl<uint64_t> &RetiredBorrows);
+  void removeDriverWaiterLocked(const EJitWaiterToken &Token);
   /// The candidate-group key of each group id, so the compact key and the
   /// identity-bearing group id stay distinguishable in diagnostics.
   struct RepGroupIdentity {

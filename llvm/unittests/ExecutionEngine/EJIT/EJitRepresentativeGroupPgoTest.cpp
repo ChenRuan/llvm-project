@@ -928,3 +928,272 @@ TEST(EJitRepresentativeGroupPgo, AdmissionGatesAndLifecycleSettleExactlyOnce) {
   EXPECT_NE(NewSession->attemptToken, S.attemptToken);
   EXPECT_EQ(Reg.bundleFor(*Next), nullptr);
 }
+
+TEST(EJitRepresentativeGroupPgo, CapacityDefersAndRetainedBundleBudgetIsHard) {
+  EJitGroupAdmissionPolicy P;
+  P.pgoEnabled = true;
+  P.asyncService = true;
+  P.normalOnlinePgo = true;
+  P.dispatchQuota = 1;
+
+  EJitRepresentativeGroupRegistry::Limits Capacity;
+  Capacity.maxGroups = 1;
+  Capacity.maxMembersPerGroup = 1;
+  EJitRepresentativeGroupRegistry Reg(Capacity);
+  auto G = Reg.openGroup(1, P);
+  ASSERT_TRUE(static_cast<bool>(G));
+  auto FullGroup = Reg.openGroup(2, P);
+  ASSERT_FALSE(static_cast<bool>(FullGroup));
+  EXPECT_EQ(errorToErrorCode(FullGroup.takeError()),
+            std::make_error_code(std::errc::no_buffer_space));
+  auto S = Reg.electRepresentative(*G, {{1, 7, true, false}}, 0);
+  ASSERT_TRUE(static_cast<bool>(S));
+  auto W = Reg.joinWaiter(*G, {2, 7, true, false});
+  ASSERT_TRUE(static_cast<bool>(W));
+  auto FullMember = Reg.joinWaiter(*G, {3, 7, true, false});
+  ASSERT_FALSE(static_cast<bool>(FullMember));
+  EXPECT_EQ(errorToErrorCode(FullMember.takeError()),
+            std::make_error_code(std::errc::no_buffer_space));
+  auto CapacityDiag = Reg.diagnostics();
+  EXPECT_EQ(CapacityDiag.groupCapacityDefers, 1u);
+  EXPECT_EQ(CapacityDiag.memberCapacityDefers, 1u);
+
+  EJitRepresentativeGroupRegistry::Limits Tiny;
+  Tiny.maxRetainedBundleBytes = 1;
+  EJitRepresentativeGroupRegistry Budgeted(Tiny);
+  auto BG = Budgeted.openGroup(3, P);
+  ASSERT_TRUE(static_cast<bool>(BG));
+  auto BS = Budgeted.electRepresentative(*BG, {{4, 8, true, false}}, 0);
+  ASSERT_TRUE(static_cast<bool>(BS));
+  EXPECT_EQ(Budgeted.recordRepresentativeDispatch(*BG, *BS, 1),
+            EJitDispatchOutcome::CountedAndClosed);
+  EJitProfileBundle TooLarge;
+  TooLarge.hasEdgeProfile = true;
+  TooLarge.indexedProfile = "profile";
+  TooLarge.schema = {PgoFunctionSchema{"f", 1, 2, 1, 0, 0, 0}};
+  TooLarge.dispatchQuality = T1DispatchObservationQuality::FrozenAtQuota;
+  EXPECT_EQ(Budgeted.publishBundle(*BG, *BS, std::move(TooLarge)),
+            EJitPublishOutcome::RetainedBundleBudget);
+  EXPECT_EQ(Budgeted.bundleFor(*BG), nullptr);
+  EXPECT_EQ(Budgeted.diagnostics().retainedBundleBytes, 0u);
+  EXPECT_EQ(Budgeted.diagnostics().retainedBundleBudgetRejects, 1u);
+}
+
+TEST(EJitRepresentativeGroupPgo,
+     RetainedBundleBorrowKeepsBudgetAcrossGenerationReplacement) {
+  EJitGroupAdmissionPolicy P;
+  P.pgoEnabled = true;
+  P.asyncService = true;
+  P.normalOnlinePgo = true;
+  P.dispatchQuota = 1;
+
+  EJitRepresentativeGroupRegistry::Limits Limits;
+  Limits.maxRetainedBundleBytes = 4096;
+  EJitRepresentativeGroupRegistry Reg(Limits);
+  const std::string Profile(4000, 'p');
+  auto G = Reg.openGroup(11, P);
+  ASSERT_TRUE(static_cast<bool>(G));
+  auto S = Reg.electRepresentative(*G, {{1, 9, true, false}}, 0);
+  ASSERT_TRUE(static_cast<bool>(S));
+  EXPECT_EQ(Reg.recordRepresentativeDispatch(*G, *S, 9),
+            EJitDispatchOutcome::CountedAndClosed);
+
+  EJitProfileBundle First;
+  First.hasEdgeProfile = true;
+  First.indexedProfile = Profile;
+  First.schema = {PgoFunctionSchema{"f", 1, 2, 1, 0, 0, 0}};
+  First.dispatchQuality = T1DispatchObservationQuality::FrozenAtQuota;
+  EXPECT_EQ(Reg.publishBundle(*G, *S, std::move(First)),
+            EJitPublishOutcome::Published);
+  auto Held = Reg.bundleFor(*G);
+  ASSERT_TRUE(Held != nullptr);
+  const uint64_t RetainedBytes = Reg.diagnostics().retainedBundleBytes;
+  ASSERT_GT(RetainedBytes, 0u);
+  ASSERT_LT(RetainedBytes, Limits.maxRetainedBundleBytes);
+
+  auto Next = Reg.invalidateRepresentative(*G, *S, "borrowed old bundle");
+  ASSERT_TRUE(static_cast<bool>(Next));
+  auto NextS = Reg.electRepresentative(*Next, {{1, 9, true, false}}, 0);
+  ASSERT_TRUE(static_cast<bool>(NextS));
+  EXPECT_EQ(Reg.recordRepresentativeDispatch(*Next, *NextS, 10),
+            EJitDispatchOutcome::CountedAndClosed);
+
+  EJitProfileBundle Second;
+  Second.hasEdgeProfile = true;
+  Second.indexedProfile = Profile;
+  Second.schema = {PgoFunctionSchema{"f", 1, 2, 1, 0, 0, 0}};
+  Second.dispatchQuality = T1DispatchObservationQuality::FrozenAtQuota;
+  EXPECT_EQ(Reg.publishBundle(*Next, *NextS, std::move(Second)),
+            EJitPublishOutcome::RetainedBundleBudget);
+  EXPECT_EQ(Reg.bundleFor(*Next), nullptr);
+  EXPECT_EQ(Reg.diagnostics().retainedBundleBytes, RetainedBytes);
+
+  Held.reset();
+  EJitProfileBundle Retry;
+  Retry.hasEdgeProfile = true;
+  Retry.indexedProfile = Profile;
+  Retry.schema = {PgoFunctionSchema{"f", 1, 2, 1, 0, 0, 0}};
+  Retry.dispatchQuality = T1DispatchObservationQuality::FrozenAtQuota;
+  EXPECT_EQ(Reg.publishBundle(*Next, *NextS, std::move(Retry)),
+            EJitPublishOutcome::Published);
+  EXPECT_EQ(Reg.diagnostics().retainedBundleBytes, RetainedBytes);
+  EXPECT_EQ(Reg.diagnostics().retainedBundleBudgetRejects, 1u);
+}
+
+TEST(EJitRepresentativeGroupPgo,
+     RetiredGenerationMetadataIsBoundedAndOldCallbacksCannotSettleNewMembers) {
+  EJitGroupAdmissionPolicy P;
+  P.pgoEnabled = true;
+  P.asyncService = true;
+  P.normalOnlinePgo = true;
+  P.dispatchQuota = 1;
+
+  EJitRepresentativeGroupRegistry::Limits Limits;
+  Limits.maxMembersPerGroup = 1;
+  EJitRepresentativeGroupRegistry Reg(Limits);
+  auto Opened = Reg.openGroup(0xD00D, P);
+  ASSERT_TRUE(static_cast<bool>(Opened));
+  EJitGroupHandle Current = *Opened;
+  const EJitGroupMember Representative{1, 17, true, false};
+  const EJitGroupMember Member{2, 17, true, false};
+  EJitWaiterToken OldWaiter;
+
+  // Alternate cancel and invalidate so both retirement paths reclaim the old
+  // vector before the next generation tries to consume its one slot.
+  constexpr unsigned Rounds = 24;
+  for (unsigned I = 0; I < Rounds; ++I) {
+    auto Session = Reg.electRepresentative(Current, {Representative}, 0);
+    ASSERT_TRUE(static_cast<bool>(Session)) << toString(Session.takeError());
+    auto Waiter = Reg.joinWaiter(Current, Member);
+    ASSERT_TRUE(static_cast<bool>(Waiter)) << toString(Waiter.takeError());
+    OldWaiter = *Waiter;
+    const EJitGroupHandle Retired = Current;
+    if ((I & 1u) == 0) {
+      EXPECT_TRUE(Reg.cancelRepresentative(Current, *Session));
+      ++Current.generation; // mirrors the driver's handle update
+    } else {
+      auto Next = Reg.invalidateRepresentative(Current, *Session, "bounded");
+      ASSERT_TRUE(static_cast<bool>(Next)) << toString(Next.takeError());
+      Current = *Next;
+    }
+
+    EXPECT_EQ(Reg.snapshot(Current).members, 0u);
+    EXPECT_FALSE(Reg.completeMember(OldWaiter, 10 + I,
+                                    reinterpret_cast<void *>(0x1000 + I), true));
+    EXPECT_FALSE(Reg.cancelWaiter(OldWaiter));
+    EXPECT_EQ(Reg.snapshot(Retired).valid, false);
+  }
+
+  const EJitGroupDiagnostics AfterRetire = Reg.diagnostics();
+  EXPECT_EQ(AfterRetire.retiredGenerationMetadataReclaims, Rounds);
+  EXPECT_EQ(AfterRetire.memberRecordsReclaimed, Rounds);
+
+  // A current-generation member can settle once, while the immediately
+  // preceding generation's token remains permanently unable to settle it.
+  auto Session = Reg.electRepresentative(Current, {Representative}, 0);
+  ASSERT_TRUE(static_cast<bool>(Session));
+  auto NewWaiter = Reg.joinWaiter(Current, Member);
+  ASSERT_TRUE(static_cast<bool>(NewWaiter));
+  EXPECT_FALSE(Reg.completeMember(OldWaiter, 99,
+                                  reinterpret_cast<void *>(0x2000), true));
+  EXPECT_TRUE(Reg.completeMember(*NewWaiter, 100,
+                                 reinterpret_cast<void *>(0x3000), true));
+  EXPECT_FALSE(Reg.completeMember(*NewWaiter, 101,
+                                  reinterpret_cast<void *>(0x4000), true));
+  EXPECT_TRUE(Reg.memberSettled(*NewWaiter));
+
+  auto Final = Reg.invalidateRepresentative(Current, *Session, "cleanup");
+  ASSERT_TRUE(static_cast<bool>(Final));
+  EXPECT_EQ(Reg.snapshot(*Final).members, 0u);
+  EXPECT_EQ(Reg.diagnostics().memberRecordsReclaimed, Rounds + 1);
+}
+
+TEST(EJitRepresentativeGroupPgo,
+     RetainedBundleBudgetAcceptsExactFitAndRejectsOneByteOver) {
+  EJitGroupAdmissionPolicy P;
+  P.pgoEnabled = true;
+  P.asyncService = true;
+  P.normalOnlinePgo = true;
+  P.dispatchQuota = 1;
+
+  auto publish = [&](uint64_t Limit, uint64_t GroupId,
+                     uint64_t *ObservedBytes) {
+    EJitRepresentativeGroupRegistry::Limits Limits;
+    Limits.maxRetainedBundleBytes = Limit;
+    EJitRepresentativeGroupRegistry Reg(Limits);
+    auto G = Reg.openGroup(GroupId, P);
+    EXPECT_TRUE(static_cast<bool>(G));
+    if (!G)
+      return EJitPublishOutcome::InvalidBundle;
+    auto S = Reg.electRepresentative(*G, {{1, 23, true, false}}, 0);
+    EXPECT_TRUE(static_cast<bool>(S));
+    if (!S)
+      return EJitPublishOutcome::InvalidBundle;
+    EXPECT_EQ(Reg.recordRepresentativeDispatch(*G, *S, 7),
+              EJitDispatchOutcome::CountedAndClosed);
+    EJitProfileBundle B;
+    B.hasEdgeProfile = true;
+    B.indexedProfile = std::string(128, 'b');
+    B.schema = {PgoFunctionSchema{"exact", 7, 8, 1, 0, 0, 0}};
+    B.dispatchQuality = T1DispatchObservationQuality::FrozenAtQuota;
+    const EJitPublishOutcome Outcome =
+        Reg.publishBundle(*G, *S, std::move(B));
+    if (ObservedBytes)
+      *ObservedBytes = Reg.diagnostics().retainedBundleBytes;
+    return Outcome;
+  };
+
+  uint64_t ExactBytes = 0;
+  EXPECT_EQ(publish(UINT64_MAX, 31, &ExactBytes),
+            EJitPublishOutcome::Published);
+  ASSERT_GT(ExactBytes, 1u);
+  EXPECT_EQ(publish(ExactBytes, 32, nullptr),
+            EJitPublishOutcome::Published);
+  EXPECT_EQ(publish(ExactBytes - 1, 33, nullptr),
+            EJitPublishOutcome::RetainedBundleBudget);
+}
+
+TEST(EJitRepresentativeGroupPgo, DiagnosticVocabularyIsStableAndPointerFree) {
+  EXPECT_STREQ(
+      ejitRepresentativeDiagStageToken(
+          EJitRepresentativeDiagStage::FinalCompare),
+      "FINAL_COMPARE");
+  EXPECT_STREQ(
+      ejitRepresentativeDiagOutcomeToken(
+          EJitRepresentativeDiagOutcome::SharedReuse),
+      "SHARED_REUSE");
+  EXPECT_STREQ(
+      ejitRepresentativeDiagOutcomeToken(
+          EJitRepresentativeDiagOutcome::Deferred),
+      "DEFER");
+  EXPECT_STREQ(
+      ejitRepresentativeDiagReasonToken(
+          EJitRepresentativeDiagReason::FunctionPointerTable),
+      "FN_PTR_TABLE");
+  EXPECT_STREQ(
+      ejitRepresentativeDiagReasonToken(
+          EJitRepresentativeDiagReason::CandidateMatch),
+      "CANDIDATE_MATCH");
+  EXPECT_STREQ(
+      ejitRepresentativeDiagReasonToken(
+          EJitRepresentativeDiagReason::DuplicatePublish),
+      "DUPLICATE_PUBLISH");
+  EXPECT_EQ(kEJitRepresentativeDiagReasonCount, 45u);
+
+  EJitRepresentativeDiagRecord Record;
+  Record.identity.funcIndex = 7;
+  Record.identity.numDims = 1;
+  Record.identity.dims[0] = {2, 5};
+  Record.identity.versions[0] = 3;
+  Record.identity.generation = 4;
+  Record.identity.attemptToken = 9;
+  Record.identity.samplingSessionId = 10;
+  Record.identity.groupId = 11;
+  Record.identity.groupGeneration = 12;
+  Record.stage = static_cast<uint32_t>(EJitRepresentativeDiagStage::Candidate);
+  Record.outcome = static_cast<uint32_t>(EJitRepresentativeDiagOutcome::Pending);
+  Record.reasonCode =
+      static_cast<uint32_t>(EJitRepresentativeDiagReason::NewGroup);
+  EXPECT_EQ(Record.identity.dims[0].instanceId, 5u);
+  EXPECT_EQ(Record.codeId, 0u);
+}

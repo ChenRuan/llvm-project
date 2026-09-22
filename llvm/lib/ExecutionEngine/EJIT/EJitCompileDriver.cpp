@@ -63,6 +63,135 @@ private:
 
 #ifdef EJIT_SRE_TASKPOOL
 namespace {
+EJitRepresentativeDiagReason diagReasonForMember(EJitMemberShare Kind) {
+  switch (Kind) {
+  case EJitMemberShare::Reuse:
+    return EJitRepresentativeDiagReason::IdentityEqual;
+  case EJitMemberShare::Emit:
+    return EJitRepresentativeDiagReason::LateSplit;
+  case EJitMemberShare::NotReady:
+    return EJitRepresentativeDiagReason::NotReady;
+  case EJitMemberShare::Stale:
+    return EJitRepresentativeDiagReason::GenerationChanged;
+  case EJitMemberShare::Cancelled:
+    return EJitRepresentativeDiagReason::Cancelled;
+  case EJitMemberShare::SchemaRejected:
+    return EJitRepresentativeDiagReason::Schema;
+  }
+  return EJitRepresentativeDiagReason::Unclassified;
+}
+
+EJitRepresentativeDiagReason diagReasonForPublish(EJitPublishOutcome Outcome) {
+  switch (Outcome) {
+  case EJitPublishOutcome::Published:
+    return EJitRepresentativeDiagReason::Publish;
+  case EJitPublishOutcome::AlreadyPublished:
+    return EJitRepresentativeDiagReason::DuplicatePublish;
+  case EJitPublishOutcome::Stale:
+    return EJitRepresentativeDiagReason::GenerationChanged;
+  case EJitPublishOutcome::InvalidBundle:
+    return EJitRepresentativeDiagReason::ProfileUnavailable;
+  case EJitPublishOutcome::RetainedBundleBudget:
+    return EJitRepresentativeDiagReason::ProfileBudget;
+  }
+  return EJitRepresentativeDiagReason::Unclassified;
+}
+
+EJitRepresentativeDiagOutcome
+diagOutcomeForPublish(EJitPublishOutcome Outcome) {
+  switch (Outcome) {
+  case EJitPublishOutcome::Published:
+  case EJitPublishOutcome::AlreadyPublished:
+  case EJitPublishOutcome::Stale:
+    // Publication is only a pending lifecycle event. Final success is emitted
+    // by the later exact compare/link path, never by this callback.
+    return EJitRepresentativeDiagOutcome::Pending;
+  case EJitPublishOutcome::RetainedBundleBudget:
+    return EJitRepresentativeDiagOutcome::Deferred;
+  case EJitPublishOutcome::InvalidBundle:
+    return EJitRepresentativeDiagOutcome::Failure;
+  }
+  return EJitRepresentativeDiagOutcome::Failure;
+}
+
+EJitRepresentativeDiagReason diagReasonForCandidateError(StringRef Detail) {
+  if (Detail.contains("directory budget"))
+    return EJitRepresentativeDiagReason::GroupBudget;
+  if (Detail.contains("identity budget") || Detail.contains("metadata budget"))
+    return EJitRepresentativeDiagReason::IdentityBudget;
+  if (Detail.contains("IR budget") || Detail.contains("canonical IR") ||
+      Detail.contains("defined data budget") || Detail.contains("IR node"))
+    return EJitRepresentativeDiagReason::IRBudget;
+  if (Detail.contains("schema"))
+    return EJitRepresentativeDiagReason::Schema;
+  if (Detail.contains("prefix"))
+    return EJitRepresentativeDiagReason::PrefixIR;
+  if (Detail.contains("module asm") || Detail.contains("alias") ||
+      Detail.contains("ifunc"))
+    return EJitRepresentativeDiagReason::AliasIFunc;
+  if (Detail.contains("TLS"))
+    return EJitRepresentativeDiagReason::TLS;
+  if (Detail.contains("address space"))
+    return EJitRepresentativeDiagReason::AddressSpace;
+  if (Detail.contains("inline asm"))
+    return EJitRepresentativeDiagReason::InlineAsm;
+  if (Detail.contains("blockaddress"))
+    return EJitRepresentativeDiagReason::BlockAddress;
+  if (Detail.contains("private state") ||
+      Detail.contains("address-observable"))
+    return EJitRepresentativeDiagReason::PrivateState;
+  if (Detail.contains("binding") || Detail.contains("external"))
+    return EJitRepresentativeDiagReason::Binding;
+  if (Detail.contains("bitcode"))
+    return EJitRepresentativeDiagReason::BitcodeMissing;
+  if (Detail.contains("LLJIT") ||
+      Detail.contains("specialization context"))
+    return EJitRepresentativeDiagReason::OwnerUnavailable;
+  if (Detail.contains("empty") || Detail.contains("invalid") ||
+      Detail.contains("missing"))
+    return EJitRepresentativeDiagReason::InvalidInput;
+  return EJitRepresentativeDiagReason::Unclassified;
+}
+
+EJitRepresentativeDiagOutcome
+diagOutcomeForCandidateError(EJitRepresentativeDiagReason Reason) {
+  switch (Reason) {
+  case EJitRepresentativeDiagReason::GroupBudget:
+  case EJitRepresentativeDiagReason::MemberBudget:
+  case EJitRepresentativeDiagReason::DiagnosticBudget:
+  case EJitRepresentativeDiagReason::IRBudget:
+  case EJitRepresentativeDiagReason::IdentityBudget:
+  case EJitRepresentativeDiagReason::ProfileBudget:
+  case EJitRepresentativeDiagReason::CodeBudget:
+    return EJitRepresentativeDiagOutcome::Deferred;
+  case EJitRepresentativeDiagReason::AliasIFunc:
+  case EJitRepresentativeDiagReason::PrivateState:
+  case EJitRepresentativeDiagReason::TLS:
+  case EJitRepresentativeDiagReason::AddressSpace:
+  case EJitRepresentativeDiagReason::InlineAsm:
+  case EJitRepresentativeDiagReason::BlockAddress:
+    return EJitRepresentativeDiagOutcome::Independent;
+  default:
+    return EJitRepresentativeDiagOutcome::Failure;
+  }
+}
+
+EJitRepresentativeDiagOutcome diagOutcomeForMember(EJitMemberShare Kind) {
+  switch (Kind) {
+  case EJitMemberShare::Reuse:
+    return EJitRepresentativeDiagOutcome::SharedReuse;
+  case EJitMemberShare::Emit:
+    return EJitRepresentativeDiagOutcome::Independent;
+  case EJitMemberShare::Cancelled:
+    return EJitRepresentativeDiagOutcome::Cancelled;
+  case EJitMemberShare::NotReady:
+  case EJitMemberShare::Stale:
+  case EJitMemberShare::SchemaRejected:
+    return EJitRepresentativeDiagOutcome::Pending;
+  }
+  return EJitRepresentativeDiagOutcome::Failure;
+}
+
 /// Adapter so the taskpool can call back into the driver's cold compile path
 /// through a plain function pointer (never std::function). The produced JIT
 /// pointer still comes from the OrcJIT engine (SRE code pool when enabled).
@@ -243,6 +372,53 @@ bool sharedMayConstRankingThunk(void *ctx) {
 #endif
 
 #ifdef EJIT_SRE_SHARED_TASKPOOL
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+EJitRepresentativeDiagReason
+EJitCompileDriver::candidateDiagReasonForTest(StringRef Detail) {
+  return diagReasonForCandidateError(Detail);
+}
+
+EJitRepresentativeDiagOutcome
+EJitCompileDriver::candidateDiagOutcomeForTest(StringRef Detail) {
+  return diagOutcomeForCandidateError(diagReasonForCandidateError(Detail));
+}
+
+EJitRepresentativeDiagOutcome
+EJitCompileDriver::publishDiagOutcomeForTest(EJitPublishOutcome Outcome) {
+  return diagOutcomeForPublish(Outcome);
+}
+
+EJitCompileDriver::RepresentativeDriverMetadataForTest
+EJitCompileDriver::representativeDriverMetadataForTest() const {
+  RepresentativeDriverMetadataForTest Snapshot;
+  lockRepGroups();
+  Snapshot.waiters = repWaiters_.size();
+  Snapshot.tier1Bindings = repTier1Bindings_.size();
+  Snapshot.sessions = repSessions_.size();
+  Snapshot.candidateBindings = candidateBindings_.size();
+  Snapshot.groupHandles = repGroupHandles_.size();
+  Snapshot.timeoutCounts = repTimeoutCounts_.size();
+  Snapshot.retiringGroups = repRetiringGroups_.size();
+  Snapshot.failedGroups = repFailedGroups_.size();
+  for (const auto &Entry : candidateBindings_)
+    if (Entry.second.finalReadPending) {
+      ++Snapshot.pendingCandidateBorrows;
+      Snapshot.pendingCandidateAttempts.push_back(Entry.second.request.attemptToken);
+    }
+  Snapshot.candidateBudgetDefers = candidateBudgetDefers_.loadAcquire();
+  unlockRepGroups();
+  return Snapshot;
+}
+
+void EJitCompileDriver::setCandidateLimitsForTest(EJitCandidateLimits Limits) {
+  lockRepGroups();
+  candidateDirectory_ = std::make_unique<EJitCandidateDirectory>(Limits);
+  unlockRepGroups();
+}
+#endif
+#endif
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
 namespace {
 // The single process-global shared taskpool state. Placed in the cross-core
 // shared section (an empty attribute on host, where one address space already
@@ -325,6 +501,9 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   } else {
     EJIT_DIAG_VERBOSE("representative sharing not enabled by config");
   }
+  // Publish the policy bit only when the driver later initializes the shared
+  // blob. Every attached facade must make the same opt-in decision.
+  sharedPool_.setRepresentativeSharingEnabled(repGroups_ != nullptr);
   sharedPool_.setMayConstRankingCallback(&sharedMayConstRankingThunk, this);
   sharedPool_.setWorkerHooks(&EJitCompileDriver::sharedWorkerStart,
                              &EJitCompileDriver::sharedWorkerStop, this);
@@ -484,13 +663,102 @@ uint64_t EJitCompileDriver::requestLogicalKey(uint32_t funcIndex,
          (static_cast<uint64_t>(InstanceIds[3]) << 24);
 }
 
+void EJitCompileDriver::removeDriverWaiterLocked(
+    const EJitWaiterToken &Token) {
+  for (auto It = repWaiters_.begin(); It != repWaiters_.end(); ++It) {
+    if (It->groupId == Token.groupId && It->generation == Token.generation &&
+        It->token == Token.token) {
+      repWaiters_.erase(It);
+      return;
+    }
+  }
+}
+
+void EJitCompileDriver::retireDriverGenerationMetadataLocked(
+    uint64_t GroupId, uint64_t RetiredGeneration,
+    uint64_t RetiredRepresentativeLogicalKey,
+    SmallVectorImpl<uint64_t> &RetiredBorrows) {
+  // The registry has already cancelled and reclaimed its member records. Drop
+  // the driver's waiter/session tokens in the same critical section, before a
+  // replacement classification can overwrite a logical key. Pending
+  // candidate identities may be retried by maintenance, but their old source
+  // borrows must end before a new generation acquires fresh request tokens.
+  for (auto It = repWaiters_.begin(); It != repWaiters_.end();) {
+    if (It->groupId != GroupId || It->generation != RetiredGeneration) {
+      ++It;
+      continue;
+    }
+    (void)repGroups_->cancelWaiter(*It);
+    It = repWaiters_.erase(It);
+  }
+
+  for (auto It = repTier1Bindings_.begin(); It != repTier1Bindings_.end();) {
+    if (It->group.groupId != GroupId ||
+        It->group.generation != RetiredGeneration) {
+      ++It;
+      continue;
+    }
+    if (It->session.attemptToken)
+      repSessions_.erase(It->session.attemptToken);
+    It = repTier1Bindings_.erase(It);
+  }
+  for (auto It = repSessions_.begin(); It != repSessions_.end();) {
+    if (It->second.groupId == GroupId &&
+        It->second.generation == RetiredGeneration)
+      It = repSessions_.erase(It);
+    else
+      ++It;
+  }
+
+  const bool Failed = repFailedGroups_[GroupId];
+  for (auto It = candidateBindings_.begin(); It != candidateBindings_.end();) {
+    if (It->second.groupId != GroupId) {
+      ++It;
+      continue;
+    }
+    const bool WasPending = It->second.finalReadPending ||
+                            It->second.needsReclassification;
+    if (It->second.finalReadPending)
+      RetiredBorrows.push_back(It->second.request.attemptToken);
+    It->second.finalReadPending = false;
+    It->second.needsReclassification = false;
+    if (Failed) {
+      // A terminal group retains only a per-logical-key AOT decision, never a
+      // borrowed source or a trigger for another sampling session.
+      It->second.finalFailed = true;
+      ++It;
+      continue;
+    }
+    if (WasPending && It->first != RetiredRepresentativeLogicalKey) {
+      It->second.needsReclassification = true;
+      It->second.finalFailed = false;
+      It->second.finalFailures = 0;
+      It->second.finalReadyAt = 0;
+      ++It;
+      continue;
+    }
+    It = candidateBindings_.erase(It);
+  }
+}
+
 bool EJitCompileDriver::candidateClassifyThunk(void *Ctx,
                                               const EJitCompileRequest &Req) {
-  return static_cast<EJitCompileDriver *>(Ctx)->classifyRepresentativeRequest(Req);
+  auto *Driver = static_cast<EJitCompileDriver *>(Ctx);
+  if (Driver->sharedPool_.isOwner())
+    return Driver->classifyRepresentativeRequest(Req);
+  bool Classified = false;
+  return Driver->sharedPool_.requestRepresentativeCandidate(Req, Classified) &&
+         Classified;
 }
 
 bool EJitCompileDriver::classifyRepresentativeRequest(const EJitCompileRequest &Req) {
-  if (!repGroups_ || !candidateDirectory_ || !jitEngine_) return false;
+  if (!repGroups_ || !candidateDirectory_ || !jitEngine_) {
+    EJIT_DIAG(
+        "ejit_diag stage=CANDIDATE outcome=FAILURE reason=OWNER_UNAVAILABLE "
+        "attempt=%llu detail=classifier-unavailable",
+        static_cast<unsigned long long>(Req.attemptToken));
+    return false;
+  }
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   uint32_t Armed = 1;
   if (candidateGate_.compareExchange(Armed, 2)) {
@@ -498,13 +766,31 @@ bool EJitCompileDriver::classifyRepresentativeRequest(const EJitCompileRequest &
     candidateGate_.storeRelease(0);
   }
 #endif
-  if (Req.numDims > kEJitMaxRequestDims) return false;
+  if (Req.numDims > kEJitMaxRequestDims) {
+    EJIT_DIAG("ejit_diag stage=CANDIDATE outcome=FAILURE reason=INVALID_INPUT "
+              "attempt=%llu detail=numDims=%u",
+              static_cast<unsigned long long>(Req.attemptToken), Req.numDims);
+    return false;
+  }
   for (unsigned I = 0; I < Req.numDims; ++I)
-    if (Req.dims[I].instanceId > 255u) return false;
+    if (Req.dims[I].instanceId > 255u) {
+      EJIT_DIAG("ejit_diag stage=CANDIDATE outcome=FAILURE reason=INVALID_INPUT "
+                "attempt=%llu detail=dim[%u]-instance=%u",
+                static_cast<unsigned long long>(Req.attemptToken), I,
+                Req.dims[I].instanceId);
+      return false;
+    }
   const uint32_t F = stripReqTier(Req.funcIndex);
   const uint64_t LogicalKey = requestLogicalKey(F, Req.dims, Req.numDims);
   auto BC = loader_.getBitcodeByFuncIdx(F);
-  if (!BC) { consumeError(BC.takeError()); return false; }
+  if (!BC) {
+    const std::string Reason = toString(BC.takeError());
+    EJIT_DIAG("ejit_diag stage=CANDIDATE outcome=FAILURE reason=BITCODE_MISSING "
+              "func=%u attempt=%llu detail=%s",
+              F, static_cast<unsigned long long>(Req.attemptToken),
+              Reason.c_str());
+    return false;
+  }
   const auto &Meta = loader_.getOrCacheFuncMeta(F);
   SpecializationContext Ctx;
   Ctx.fnName = loader_.getFuncNameByFuncIdx(F);
@@ -520,16 +806,49 @@ bool EJitCompileDriver::classifyRepresentativeRequest(const EJitCompileRequest &
   Scope.entry = Ctx.fnName;
   Scope.compilerPolicy = "ejit/prefix/preserved/opt" +
                          std::to_string(static_cast<int>(config_.optLevel));
-  Scope.bindingGeneration = userSymbols_.size() + 1;
+  // The ORC classifier replaces this seed with a fingerprint of the exact
+  // effective bindings referenced by the module. Registration count is not an
+  // identity component: unrelated symbols must not split a candidate group.
+  Scope.bindingGeneration = 1;
   // Bound-pointer identity needs descriptor-aware admission. Until that path
   // is classified exactly, keep those requests on independent compilation.
   uint64_t Group = UINT64_MAX;
+  bool ExistingCandidate = false;
+  EJitRepresentativeDiagReason CandidateReason =
+      EJitRepresentativeDiagReason::Unclassified;
+  EJitRepresentativeDiagOutcome CandidateOutcome =
+      EJitRepresentativeDiagOutcome::Pending;
+  std::string CandidateDetail;
+  bool CandidateEvent = false;
+  CandidateAdmissionRoute Route = CandidateAdmissionRoute::Group;
   if (Req.boundCount == 0 && Meta.boundPointerArgIndices.empty()) {
     auto Candidate = jitEngine_->classifyCandidate(*BC, Ctx, *candidateDirectory_, Scope);
-    if (Candidate) Group = Candidate->groupId;
-    else EJIT_DIAG("candidate independent func=%u: %s", F,
-                   toString(Candidate.takeError()).c_str());
+    if (Candidate) {
+      Group = Candidate->groupId;
+      ExistingCandidate = Candidate->existing;
+    } else {
+      CandidateDetail = toString(Candidate.takeError());
+      CandidateReason = diagReasonForCandidateError(CandidateDetail);
+      CandidateOutcome = diagOutcomeForCandidateError(CandidateReason);
+      CandidateEvent = true;
+      Route = CandidateOutcome == EJitRepresentativeDiagOutcome::Independent
+                  ? CandidateAdmissionRoute::Independent
+                  : CandidateAdmissionRoute::AotFallback;
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+      if (CandidateOutcome == EJitRepresentativeDiagOutcome::Deferred)
+        candidateBudgetDefers_.fetchAdd(1);
+#endif
+    }
+  } else {
+    // Bound-pointer requests remain on the conservative independent route;
+    // this is an intentional policy result, not a classifier failure.
+    CandidateReason = EJitRepresentativeDiagReason::Binding;
+    CandidateOutcome = EJitRepresentativeDiagOutcome::Independent;
+    CandidateDetail = "bound-pointer identity uses independent fallback";
+    CandidateEvent = true;
+    Route = CandidateAdmissionRoute::Independent;
   }
+  uint64_t SupersededBorrow = 0;
   lockRepGroups();
   bool Current = sharedPool_.state() &&
                 Req.generation == sharedPool_.state()->generation.loadAcquire();
@@ -537,6 +856,11 @@ bool EJitCompileDriver::classifyRepresentativeRequest(const EJitCompileRequest &
     Current = Req.versions[I] == sharedPool_.instanceVersionPublic(
         Req.dims[I].dimType, Req.dims[I].instanceId);
   if (Current) {
+    auto Existing = candidateBindings_.find(LogicalKey);
+    if (Existing != candidateBindings_.end() &&
+        Existing->second.finalReadPending &&
+        Existing->second.request.attemptToken != Req.attemptToken)
+      SupersededBorrow = Existing->second.request.attemptToken;
     // A newly classified lifecycle must acquire a fresh waiter token, even if
     // its may_const prefix still matches the previously published group.
     for (auto W = repWaiters_.begin(); W != repWaiters_.end();) {
@@ -547,21 +871,50 @@ bool EJitCompileDriver::classifyRepresentativeRequest(const EJitCompileRequest &
         ++W;
       }
     }
-    const bool NeedsFinalRead = Group != UINT64_MAX && !repFailedGroups_[Group];
-    candidateBindings_[LogicalKey] = CandidateBinding{Group, Req, NeedsFinalRead};
+    const bool NeedsFinalRead =
+        Route == CandidateAdmissionRoute::AotFallback ||
+        (Route == CandidateAdmissionRoute::Group && Group != UINT64_MAX &&
+         !repFailedGroups_[Group]);
+    candidateBindings_[LogicalKey] =
+        CandidateBinding{Group, Req, NeedsFinalRead, false, 0, 0, Route};
+    candidateBindings_[LogicalKey].outcome = CandidateOutcome;
+    candidateBindings_[LogicalKey].reason = CandidateReason;
   }
   const bool KeepBorrow = Current && candidateBindings_[LogicalKey].finalReadPending;
   unlockRepGroups();
+  if (SupersededBorrow && SupersededBorrow != Req.attemptToken)
+    sharedPool_.completeRequestBorrow(SupersededBorrow);
   if (Current && !KeepBorrow) sharedPool_.completeRequestBorrow(Req.attemptToken);
-  EJIT_DIAG("candidate classified key=0x%016lx group=%llu current=%u no emit/no sampling",
-            LogicalKey, static_cast<unsigned long long>(Group), Current);
+  if (!CandidateEvent) {
+    CandidateReason =
+        Group == UINT64_MAX
+            ? EJitRepresentativeDiagReason::Unclassified
+            : (ExistingCandidate ? EJitRepresentativeDiagReason::CandidateMatch
+                                  : EJitRepresentativeDiagReason::NewGroup);
+    CandidateOutcome = EJitRepresentativeDiagOutcome::Pending;
+  }
+  EJIT_DIAG(
+    "ejit_diag stage=%s outcome=%s reason=%s entry=%s func=%u generation=%u "
+      "attempt=%llu group=%llu key=0x%016lx current=%u no_emit=1 detail=%s",
+      ejitRepresentativeDiagStageToken(EJitRepresentativeDiagStage::Candidate),
+      ejitRepresentativeDiagOutcomeToken(CandidateOutcome),
+      ejitRepresentativeDiagReasonToken(CandidateReason), Ctx.fnName.c_str(), F,
+      Req.generation, static_cast<unsigned long long>(Req.attemptToken),
+      static_cast<unsigned long long>(Group), LogicalKey, Current,
+      CandidateDetail.empty() ? (CandidateEvent ? "classifier-error" :
+                                                    "candidate-ready")
+                              : CandidateDetail.c_str());
   return Current;
 }
 
 EJitSharedTaskPool::SamplingAdmission EJitCompileDriver::samplingAdmissionThunk(
-    void *ctx, uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims) {
+    void *ctx, uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+    uint32_t boundCount, uint64_t attemptToken) {
   auto *drv = static_cast<EJitCompileDriver *>(ctx);
-  return drv->admitSamplingRequest(funcIndex, dims, numDims);
+  if (!drv->sharedPool_.isOwner())
+    return drv->sharedPool_.requestRepresentativeAdmission(
+        funcIndex, dims, numDims, boundCount, attemptToken);
+  return drv->admitSamplingRequest(funcIndex, dims, numDims, attemptToken);
 }
 
 bool EJitCompileDriver::representativeMaintenanceThunk(void *Ctx) {
@@ -574,21 +927,53 @@ void EJitCompileDriver::completeCandidateBorrow(uint64_t Key,
   uint64_t Token = 0;
   lockRepGroups();
   auto It = candidateBindings_.find(Key);
-  if (It != candidateBindings_.end() && It->second.finalReadPending) {
+  if (It != candidateBindings_.end() &&
+      (It->second.finalReadPending || It->second.needsReclassification)) {
     const auto &Original = It->second.request;
     bool Same = !Request || (Original.generation == Request->generation &&
                              Original.numDims == Request->numDims);
+    if (Same && Request && decodeReqTier(Request->funcIndex) == kEJitTierCandidate)
+      Same = Original.attemptToken == Request->attemptToken;
     for (uint32_t I = 0; Same && Request && I < Original.numDims; ++I)
       Same = Original.dims[I].dimType == Request->dims[I].dimType &&
              Original.dims[I].instanceId == Request->dims[I].instanceId &&
              Original.versions[I] == Request->versions[I];
     if (Same) {
-      Token = Original.attemptToken;
+      Token = It->second.finalReadPending ? Original.attemptToken : 0;
       It->second.finalReadPending = false;
+      It->second.needsReclassification = false;
+      if (!It->second.finalFailed) {
+        for (auto W = repWaiters_.begin(); W != repWaiters_.end();) {
+          if (W->groupId == It->second.groupId && W->logicalKey == Key)
+            W = repWaiters_.erase(W);
+          else
+            ++W;
+        }
+        candidateBindings_.erase(It);
+      }
     }
   }
   unlockRepGroups();
   if (Token) sharedPool_.completeRequestBorrow(Token);
+}
+
+void EJitCompileDriver::completeCandidateBorrowForAttempt(
+    uint64_t Key, uint64_t AttemptToken) {
+  if (!AttemptToken)
+    return;
+  uint64_t Token = 0;
+  lockRepGroups();
+  auto It = candidateBindings_.find(Key);
+  if (It != candidateBindings_.end() && It->second.finalReadPending &&
+      It->second.request.attemptToken == AttemptToken) {
+    Token = It->second.request.attemptToken;
+    It->second.finalReadPending = false;
+    if (!It->second.finalFailed)
+      candidateBindings_.erase(It);
+  }
+  unlockRepGroups();
+  if (Token)
+    sharedPool_.completeRequestBorrow(Token);
 }
 
 bool EJitCompileDriver::serviceRepresentativeWaiters() {
@@ -598,14 +983,16 @@ bool EJitCompileDriver::serviceRepresentativeWaiters() {
   bool Found = false;
   lockRepGroups();
   for (auto &C : candidateBindings_) {
-    if (!C.second.finalReadPending || C.second.groupId == UINT64_MAX ||
+    if ((!C.second.finalReadPending && !C.second.needsReclassification) ||
+        C.second.groupId == UINT64_MAX ||
         repFailedGroups_[C.second.groupId] || repRetiringGroups_[C.second.groupId]) continue;
     auto G = repGroupHandles_.find(C.second.groupId);
     if (G == repGroupHandles_.end()) continue;
     const bool HasBundle = repGroups_->bundleFor(G->second) != nullptr;
     // A cancelled/cold representative need not call again to unblock waiters.
     // Elect one existing legal member; only actual business calls sample it.
-    if (HasBundle || !repGroups_->currentRepresentative(G->second)) {
+    if (C.second.needsReclassification || HasBundle ||
+        !repGroups_->currentRepresentative(G->second)) {
       if (HasBundle && !C.second.finalReadyAt)
         C.second.finalReadyAt = ejit_taskpool_trace_now();
       Work = C.second;
@@ -655,6 +1042,7 @@ bool EJitCompileDriver::serviceRepresentativeTimeouts() {
   const uint64_t Timeout = repTimeoutTicks_.loadAcquire();
   RepTier1Binding Expired;
   uint64_t Key = 0;
+  SmallVector<uint64_t, 8> RetiredBorrows;
   lockRepGroups();
   for (const auto &H : repGroupHandles_) {
     if (repGroups_->bundleFor(H.second) ||
@@ -683,27 +1071,24 @@ bool EJitCompileDriver::serviceRepresentativeTimeouts() {
   lockRepGroups();
   auto H = repGroupHandles_.find(Key);
   if (Cancelled && H != repGroupHandles_.end()) {
+    const uint64_t RetiredGeneration = H->second.generation;
     if (H->second.generation == Expired.group.generation &&
-        repGroups_->cancelRepresentative(H->second, Expired.session))
+        repGroups_->cancelRepresentative(H->second, Expired.session)) {
+      const uint32_t Count = ++repTimeoutCounts_[Key];
+      repFailedGroups_[Key] = Count > repMaxReelections_.loadAcquire();
       ++H->second.generation;
-    const uint32_t Count = ++repTimeoutCounts_[Key];
-    repFailedGroups_[Key] = Count > repMaxReelections_.loadAcquire();
+      retireDriverGenerationMetadataLocked(
+          Key, RetiredGeneration, Expired.logicalKey,
+          RetiredBorrows);
+    }
+    const uint32_t Count = repTimeoutCounts_[Key];
     EJIT_DIAG("representative timeout group=%llu rounds=%u fallback=%u",
               static_cast<unsigned long long>(H->second.groupId), Count,
               static_cast<unsigned>(repFailedGroups_[Key]));
   }
-  SmallVector<uint64_t, 8> Ended;
-  if (Cancelled) {
-    Ended.push_back(Expired.logicalKey);
-    if (repFailedGroups_[Key])
-      for (const auto &C : candidateBindings_)
-        if (C.second.groupId == Key && C.second.finalReadPending)
-          Ended.push_back(C.first);
-  }
   unlockRepGroups();
-  for (uint64_t LogicalKey : Ended)
-    completeCandidateBorrow(LogicalKey, LogicalKey == Expired.logicalKey
-                                          ? &Expired.requestIdentity : nullptr);
+  for (uint64_t Token : RetiredBorrows)
+    sharedPool_.completeRequestBorrow(Token);
   lockRepGroups();
   repRetiringGroups_[Key] = false;
   unlockRepGroups();
@@ -740,17 +1125,23 @@ void EJitCompileDriver::refreshRepresentativeGroup(uint64_t GroupKey) {
   lockRepGroups();
   It = repGroupHandles_.find(GroupKey);
   bool Changed = false;
+  SmallVector<uint64_t, 8> RetiredBorrows;
   if (!repRetiringGroups_[GroupKey] && It != repGroupHandles_.end() &&
       It->second.generation == Binding.group.generation &&
       !repGroups_->bundleFor(It->second) &&
       repGroups_->cancelRepresentative(It->second, Binding.session)) {
     repRetiringGroups_[GroupKey] = true;
+    const uint64_t RetiredGeneration = It->second.generation;
     ++It->second.generation;
+    retireDriverGenerationMetadataLocked(
+        GroupKey, RetiredGeneration, Binding.logicalKey,
+        RetiredBorrows);
     Changed = true;
   }
   unlockRepGroups();
   if (Changed) {
-    completeCandidateBorrow(Binding.logicalKey, &Binding.requestIdentity);
+    for (uint64_t Token : RetiredBorrows)
+      sharedPool_.completeRequestBorrow(Token);
     lockRepGroups();
     repRetiringGroups_[GroupKey] = false;
     unlockRepGroups();
@@ -760,13 +1151,59 @@ void EJitCompileDriver::refreshRepresentativeGroup(uint64_t GroupKey) {
 EJitSharedTaskPool::SamplingAdmission
 EJitCompileDriver::admitSamplingRequest(uint32_t funcIndex,
                                         const EJitDimPair *dims,
-                                        uint32_t numDims) {
+                                        uint32_t numDims,
+                                        uint64_t attemptToken) {
   using Admission = EJitSharedTaskPool::SamplingAdmission;
   if (!repGroups_)
     return Admission::Grant; // sharing off: legacy per-request admission
+  if (attemptToken) {
+    EJitSharedTaskPool::RequestAttemptSnapshot Attempt;
+    if (!sharedPool_.requestAttemptStatus(attemptToken, Attempt) ||
+        !Attempt.live || (Attempt.flags & EJitAttemptCancelRequested)) {
+      // An inline owner classification may finish after the peer's bounded
+      // mailbox wait has cancelled its attempt. Never admit a group/session
+      // for that late reply or let it read the candidate map again.
+      return Admission::Deny;
+    }
+  }
   const uint64_t GroupKey = candidateGroupKey(funcIndex, dims, numDims);
   if (GroupKey == 0) return Admission::Classify;
-  if (GroupKey == UINT64_MAX) return Admission::Grant;
+  if (GroupKey == UINT64_MAX) {
+    const uint64_t LogicalKey = requestLogicalKey(funcIndex, dims, numDims);
+    uint64_t RetainedToken = 0;
+    bool AotFallback = false;
+    auto Outcome = EJitRepresentativeDiagOutcome::Failure;
+    auto Reason = EJitRepresentativeDiagReason::Unclassified;
+    lockRepGroups();
+    auto Candidate = candidateBindings_.find(LogicalKey);
+    if (Candidate != candidateBindings_.end()) {
+      AotFallback =
+          Candidate->second.route == CandidateAdmissionRoute::AotFallback;
+      Outcome = Candidate->second.outcome;
+      Reason = Candidate->second.reason;
+      if (AotFallback && Candidate->second.finalReadPending)
+        RetainedToken = Candidate->second.request.attemptToken;
+      // Neither independent fallback nor an AOT budget decision owns a
+      // long-lived group entry. Removing it here keeps repeated misses bounded
+      // and forces any later lifecycle to classify its own exact attempt.
+      if (Candidate->second.route != CandidateAdmissionRoute::Group)
+        candidateBindings_.erase(Candidate);
+    }
+    unlockRepGroups();
+    if (AotFallback) {
+      if (RetainedToken && RetainedToken != attemptToken)
+        sharedPool_.completeRequestBorrow(RetainedToken);
+      if (attemptToken)
+        sharedPool_.completeRequestBorrow(attemptToken);
+      EJIT_DIAG("ejit_diag stage=ADMISSION outcome=%s reason=%s "
+                "func=%u attempt=%llu",
+                ejitRepresentativeDiagOutcomeToken(Outcome),
+                ejitRepresentativeDiagReasonToken(Reason),
+                funcIndex, static_cast<unsigned long long>(attemptToken));
+      return Admission::Deny;
+    }
+    return Admission::Grant;
+  }
   refreshRepresentativeGroup(GroupKey);
   lockRepGroups();
   if (repRetiringGroups_[GroupKey] || repFailedGroups_[GroupKey]) {
@@ -786,14 +1223,22 @@ EJitCompileDriver::admitSamplingRequest(uint32_t funcIndex,
   // This request's per-cell logical identity: the exact cacheKey the wrapper
   // dispatched, so one group tracks independent logical members.
   const uint64_t LogicalKey = requestLogicalKey(funcIndex, dims, numDims);
+  auto denyResource = [&]() {
+    unlockRepGroups();
+    // Classification owns the final-read borrow until the exact attempt has
+    // either reached its representative lifecycle or is rejected. A capacity
+    // failure is terminal for this admission, so settle only that attempt;
+    // never release a newer retry with the same logical identity.
+    completeCandidateBorrowForAttempt(LogicalKey, attemptToken);
+    return Admission::Deny;
+  };
 
   auto HandleIt = repGroupHandles_.find(GroupKey);
   if (HandleIt == repGroupHandles_.end()) {
     auto Opened = repGroups_->openGroup(GroupKey, repAdmissionPolicy_);
     if (!Opened) {
       consumeError(Opened.takeError());
-      unlockRepGroups();
-      return Admission::Grant; // a group-table limit must not strand the request
+      return denyResource();
     }
     HandleIt = repGroupHandles_.emplace(GroupKey, *Opened).first;
   }
@@ -828,8 +1273,7 @@ EJitCompileDriver::admitSamplingRequest(uint32_t funcIndex,
       auto W = repGroups_->joinWaiter(G, M);
       if (!W) {
         consumeError(W.takeError());
-        unlockRepGroups();
-        return Admission::Grant;
+        return denyResource();
       }
       repWaiters_.push_back(*W);
       EJIT_DIAG("representative group %llu gen %llu: member cell=%u joins as "
@@ -863,8 +1307,7 @@ EJitCompileDriver::admitSamplingRequest(uint32_t funcIndex,
   auto Elected = repGroups_->electRepresentative(G, Offered, 0);
   if (!Elected) {
     consumeError(Elected.takeError());
-    unlockRepGroups();
-    return Admission::Grant;
+    return denyResource();
   }
   repSessions_.emplace(Elected->attemptToken, *Elected);
   EJIT_DIAG("representative group %llu gen %llu: elected attempt %llu session "
@@ -884,6 +1327,9 @@ bool EJitCompileDriver::representativeWakeThunk(void *ctx, uint32_t funcIndex,
                                                 uint32_t numDims,
                                                 EJitCompileRequest &Out) {
   auto *drv = static_cast<EJitCompileDriver *>(ctx);
+  if (!drv->sharedPool_.isOwner())
+    return drv->sharedPool_.requestRepresentativeWake(funcIndex, dims, numDims,
+                                                       Out);
   if (!drv->repGroups_)
     return false;
   const uint64_t GroupKey = drv->candidateGroupKey(funcIndex, dims, numDims);
@@ -1005,10 +1451,36 @@ bool EJitCompileDriver::bindRepresentativeTier1(
   return true;
 }
 
-void EJitCompileDriver::dispatchObserverThunk(    void *ctx, const EJitSharedTaskPool::DispatchObservation &Obs) {
+bool EJitCompileDriver::dispatchObserverThunk(
+    void *ctx, const EJitSharedTaskPool::DispatchObservation &Obs) {
   auto *drv = static_cast<EJitCompileDriver *>(ctx);
+  if (!drv->sharedPool_.isOwner()) {
+    const bool Delivered = drv->sharedPool_.submitRepresentativeDispatch(Obs);
+    if (!Delivered)
+      EJIT_DIAG("representative dispatch observation could not reach owner "
+                "worker: attempt=%llu generation=%u",
+                static_cast<unsigned long long>(Obs.attemptToken),
+                Obs.generation);
+    return Delivered;
+  }
   if (!drv->repGroups_)
-    return;
+    return false;
+  EJitSharedTaskPool::RequestAttemptSnapshot Attempt;
+  if (!drv->sharedPool_.requestAttemptStatus(Obs.attemptToken, Attempt) ||
+      !Attempt.live || Attempt.retained ||
+      (Attempt.flags & EJitAttemptCancelRequested) ||
+      Attempt.generation != Obs.generation) {
+    // A dispatch observation is a lease on the exact pool attempt, not just
+    // on a group generation. A cancelled/retained attempt must be rejected
+    // before owner-private group state is inspected, so a late reply cannot
+    // charge a re-elected representative.
+    EJIT_DIAG("representative dispatch rejected stale attempt=%llu "
+              "generation=%u",
+              static_cast<unsigned long long>(Obs.attemptToken),
+              Obs.generation);
+    return false;
+  }
+  bool Accepted = false;
   drv->lockRepGroups();
   // Exact-attempt routing: the observation carries the publish identity of the
   // slot the dispatch was granted from, so a retired attempt's late dispatch
@@ -1024,23 +1496,64 @@ void EJitCompileDriver::dispatchObserverThunk(    void *ctx, const EJitSharedTas
     if (!Live || Live->attemptToken != Binding.session.attemptToken ||
         Live->samplingSessionId != Binding.session.samplingSessionId)
       break; // exact pool request belonged to a retired group session
-    const uint64_t Now = Obs.closedQuota ? Obs.quotaEnd : 0;
-    const EJitDispatchOutcome Outcome =
-        drv->repGroups_->recordRepresentativeDispatch(G, *Live, Now);
-    if (Outcome == EJitDispatchOutcome::Counted ||
-        Outcome == EJitDispatchOutcome::CountedAndClosed)
-      Binding.lastProgressAt = ejit_taskpool_trace_now();
-    // A granted dispatch must be counted exactly once: if the registry reports
-    // anything other than a real count, the group and the pool disagree about
-    // the session, which is a lifecycle fault, not a hot-path condition.
-    if (Outcome != EJitDispatchOutcome::Counted &&
-        Outcome != EJitDispatchOutcome::CountedAndClosed)
-      EJIT_DIAG("representative dispatch NOT counted attempt=%llu outcome=%u",
+    // The pool's slot counter is the shared source of truth. Observations may
+    // be delayed, duplicated, or arrive out of order, so reconcile the owner
+    // registry to the monotonic cumulative count instead of treating delivery
+    // as one count. A later high-water mark repairs a missing mailbox event;
+    // an old/duplicate count is a no-op and can never charge a new generation.
+    if (Obs.limit != Live->dispatchLimit || Obs.count == 0 ||
+        Obs.count > Obs.limit) {
+      EJIT_DIAG("representative dispatch rejected count=%llu limit=%llu "
+                "live=%llu attempt=%llu generation=%u",
+                static_cast<unsigned long long>(Obs.count),
+                static_cast<unsigned long long>(Obs.limit),
+                static_cast<unsigned long long>(Live->dispatchCount),
                 static_cast<unsigned long long>(Obs.attemptToken),
-                static_cast<unsigned>(Outcome));
+                Obs.generation);
+      break;
+    }
+    // A delayed duplicate or an older observation is already represented by
+    // the owner high-water mark. It is an accepted no-op, not a failed reply.
+    if (Obs.count <= Live->dispatchCount) {
+      Accepted = true;
+      break;
+    }
+    if (Obs.closedQuota != (Obs.count == Obs.limit)) {
+      EJIT_DIAG("representative dispatch rejected inconsistent quota boundary "
+                "count=%llu limit=%llu closed=%u attempt=%llu",
+                static_cast<unsigned long long>(Obs.count),
+                static_cast<unsigned long long>(Obs.limit),
+                static_cast<unsigned>(Obs.closedQuota),
+                static_cast<unsigned long long>(Obs.attemptToken));
+      break;
+    }
+    bool Advanced = false;
+    while (Live->dispatchCount < Obs.count) {
+      const uint64_t Next = Live->dispatchCount + 1;
+      const uint64_t Now =
+          (Obs.closedQuota && Next == Obs.count) ? Obs.quotaEnd : 0;
+      const EJitDispatchOutcome Outcome =
+          drv->repGroups_->recordRepresentativeDispatch(G, *Live, Now);
+      if (Outcome != EJitDispatchOutcome::Counted &&
+          Outcome != EJitDispatchOutcome::CountedAndClosed)
+        break;
+      Advanced = true;
+    }
+    if (Advanced)
+      Binding.lastProgressAt = ejit_taskpool_trace_now();
+    if (Live->dispatchCount != Obs.count)
+      EJIT_DIAG("representative dispatch high-water mark incomplete "
+                "observed=%llu live=%llu attempt=%llu generation=%u",
+                static_cast<unsigned long long>(Obs.count),
+                static_cast<unsigned long long>(Live->dispatchCount),
+                static_cast<unsigned long long>(Obs.attemptToken),
+                 Obs.generation);
+    else
+      Accepted = true;
     break;
   }
   drv->unlockRepGroups();
+  return Accepted;
 }
 
 void *EJitCompileDriver::sharePhysicalTier2(
@@ -1100,8 +1613,9 @@ void *EJitCompileDriver::sharePhysicalTier2(
   Scope.entry = FuncName;
   Scope.compilerPolicy = "ejit/representative-sharing/pgouse/opt" +
                          std::to_string(static_cast<int>(config_.optLevel));
-  Scope.bindingGeneration =
-      static_cast<uint64_t>(userSymbols_.size()) + 1;
+  // prepareFinalCode replaces this seed with the same exact-binding
+  // fingerprint used by candidate classification.
+  Scope.bindingGeneration = 1;
 
   // The REAL pipeline (same optimizer, same context, same module
   // normalization) WITHOUT linking: the identity below describes this exact
@@ -1179,20 +1693,34 @@ void *EJitCompileDriver::sharePhysicalTier2(
                 static_cast<unsigned long long>(G.generation), CacheKey);
       return nullptr;
     }
-    EJIT_DIAG("representative group %llu gen %llu: member key=0x%016lx reuses "
-              "physical codeId=%llu fn=%p (final identity equal)",
+    EJIT_DIAG("ejit_diag stage=%s outcome=%s reason=%s group=%llu generation=%llu "
+              "attempt=%llu key=0x%016lx code_id=%llu fn=%p",
+              ejitRepresentativeDiagStageToken(
+                  EJitRepresentativeDiagStage::FinalCompare),
+              ejitRepresentativeDiagOutcomeToken(
+                  EJitRepresentativeDiagOutcome::SharedReuse),
+              ejitRepresentativeDiagReasonToken(
+                  EJitRepresentativeDiagReason::IdentityEqual),
               static_cast<unsigned long long>(G.groupId),
-              static_cast<unsigned long long>(G.generation), CacheKey,
+              static_cast<unsigned long long>(G.generation),
+              static_cast<unsigned long long>(Request->attemptToken), CacheKey,
               static_cast<unsigned long long>(Decision.codeId), Decision.fn);
     return Decision.fn;
   }
   if (Decision.kind != EJitMemberShare::Emit) {
     // NotReady / Stale / Cancelled / SchemaRejected: never share, never emit
     // here. The ordinary route (or AOT) is the honest outcome.
-    EJIT_DIAG("representative group %llu gen %llu: member key=0x%016lx not "
-              "shared (kind=%u %s)",
+    EJIT_DIAG("ejit_diag stage=%s outcome=%s reason=%s group=%llu generation=%llu "
+              "attempt=%llu key=0x%016lx kind=%u detail=%s",
+              ejitRepresentativeDiagStageToken(
+                  EJitRepresentativeDiagStage::FinalCompare),
+              ejitRepresentativeDiagOutcomeToken(diagOutcomeForMember(
+                  Decision.kind)),
+              ejitRepresentativeDiagReasonToken(diagReasonForMember(
+                  Decision.kind)),
               static_cast<unsigned long long>(G.groupId),
-              static_cast<unsigned long long>(G.generation), CacheKey,
+              static_cast<unsigned long long>(G.generation),
+              static_cast<unsigned long long>(Request->attemptToken), CacheKey,
               static_cast<unsigned>(Decision.kind), Decision.reason.c_str());
     return nullptr;
   }
@@ -1201,10 +1729,15 @@ void *EJitCompileDriver::sharePhysicalTier2(
   // as an independent logical member record.
   auto Linked = Emitter->link(std::move(*Prepared));
   if (!Linked) {
-    EJIT_DIAG("representative group %llu gen %llu: member key=0x%016lx link "
-              "failed (%s)",
+    EJIT_DIAG("ejit_diag stage=%s outcome=FAILURE reason=%s group=%llu "
+              "generation=%llu attempt=%llu key=0x%016lx detail=%s",
+              ejitRepresentativeDiagStageToken(
+                  EJitRepresentativeDiagStage::FinalCompare),
+              ejitRepresentativeDiagReasonToken(
+                  EJitRepresentativeDiagReason::Link),
               static_cast<unsigned long long>(G.groupId),
-              static_cast<unsigned long long>(G.generation), CacheKey,
+              static_cast<unsigned long long>(G.generation),
+              static_cast<unsigned long long>(Request->attemptToken), CacheKey,
               toString(Linked.takeError()).c_str());
     return nullptr;
   }
@@ -1222,10 +1755,17 @@ void *EJitCompileDriver::sharePhysicalTier2(
               static_cast<unsigned long long>(G.generation), CacheKey);
     return nullptr;
   }
-  EJIT_DIAG("representative group %llu gen %llu: member key=0x%016lx emitted an "
-            "independent physical Tier-2 codeId=%llu fn=%p (%s)",
+  EJIT_DIAG("ejit_diag stage=%s outcome=%s reason=%s group=%llu generation=%llu "
+            "attempt=%llu key=0x%016lx code_id=%llu fn=%p detail=%s",
+            ejitRepresentativeDiagStageToken(
+                EJitRepresentativeDiagStage::FinalCompare),
+            ejitRepresentativeDiagOutcomeToken(
+                EJitRepresentativeDiagOutcome::Independent),
+            ejitRepresentativeDiagReasonToken(
+                EJitRepresentativeDiagReason::LateSplit),
             static_cast<unsigned long long>(G.groupId),
-            static_cast<unsigned long long>(G.generation), CacheKey,
+            static_cast<unsigned long long>(G.generation),
+            static_cast<unsigned long long>(Request->attemptToken), CacheKey,
             static_cast<unsigned long long>(Linked->codeId), Linked->fn,
             Decision.reason.c_str());
   return Linked->fn;
@@ -1245,17 +1785,12 @@ bool EJitCompileDriver::startSharedTaskPool() {
   // the blob is Ready, so it is enabled here, before init() elects the owner.
   if (repGroups_ &&
       !sharedPool_.setRequestAttemptsEnabled(/*enabled=*/true)) {
-    // A peer already published a Ready blob without the contract: representative
-    // sharing cannot be honored on this core, so the opt-in is dropped with no
-    // group created rather than silently falling back to a private T1.
-    repGroups_.reset();
-    repGroupHandles_.clear();
-    repSessions_.clear();
-    repTier1Bindings_.clear();
-    sharedPool_.setSamplingAdmissionCallback(nullptr, nullptr);
-    sharedPool_.setDispatchObserver(nullptr, nullptr);
-    EJIT_DIAG("representative sharing dropped: the live shared pool does not "
-              "carry the request-attempt/observed-dispatch contract");
+    // A peer already published a Ready blob without the contract: reject this
+    // initialization rather than attaching successfully after dropping the
+    // owner-routed representative registry.
+    EJIT_DIAG("shared taskpool init FAILED: representative sharing requires "
+              "the matching live request-attempt contract");
+    return false;
   }
   EJitSharedTaskPool::InitResult r = sharedPool_.init();
   switch (r) {
@@ -1276,6 +1811,9 @@ bool EJitCompileDriver::startSharedTaskPool() {
     return false;
   case EJitSharedTaskPool::InitResult::FingerprintMismatch:
     EJIT_DIAG("shared taskpool init FAILED: registration fingerprint mismatch");
+    return false;
+  case EJitSharedTaskPool::InitResult::PolicyMismatch:
+    EJIT_DIAG("shared taskpool init FAILED: representative policy mismatch");
     return false;
   case EJitSharedTaskPool::InitResult::NoState:
     EJIT_DIAG("shared taskpool init FAILED: no shared state bound");
@@ -1919,10 +2457,18 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
             const EJitPublishOutcome Outcome =
                 repGroups_->publishBundle(PgoGroup, *Live,
                                           std::move(Publishable));
-            EJIT_DIAG("representative group %llu gen %llu: bundle publish "
-                      "outcome=%u (dispatch=%llu/%llu quotaEnd=%llu)",
+            EJIT_DIAG("ejit_diag stage=%s outcome=%s reason=%s group=%llu "
+                      "generation=%llu attempt=%llu publish_outcome=%u "
+                      "dispatch=%llu/%llu quotaEnd=%llu",
+                      ejitRepresentativeDiagStageToken(
+                          EJitRepresentativeDiagStage::ProfilePublish),
+                      ejitRepresentativeDiagOutcomeToken(
+                          diagOutcomeForPublish(Outcome)),
+                      ejitRepresentativeDiagReasonToken(
+                          diagReasonForPublish(Outcome)),
                       static_cast<unsigned long long>(PgoGroup.groupId),
                       static_cast<unsigned long long>(PgoGroup.generation),
+                      static_cast<unsigned long long>(Live->attemptToken),
                       static_cast<unsigned>(Outcome),
                       static_cast<unsigned long long>(
                           Bundle->actualDispatchCount),

@@ -610,6 +610,16 @@ void EJit::invalidateAllByPeriod(const std::string &periodName) {
 }
 
 void EJit::registerSymbol(const std::string &name, void *addr) {
+#ifdef EJIT_SRE_TASKPOOL
+  // The worker reads the ORC user-symbol map without a concurrent-write
+  // protocol. Keep symbol registration under the same frozen contract as the
+  // other runtime registries; the C ABI wrapper records the rejection.
+  if (registrationFrozen()) {
+    EJIT_DIAG("registerSymbol reject name=%s: registration frozen",
+              name.c_str());
+    return;
+  }
+#endif
   if (compileDriver_)
     compileDriver_->registerSymbol(name, addr);
 }

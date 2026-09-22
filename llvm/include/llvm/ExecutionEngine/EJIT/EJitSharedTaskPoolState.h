@@ -133,6 +133,10 @@ constexpr uint64_t kEJitSharedSplitGranule =
     static_cast<uint64_t>(2) * 1024 * 1024;
 /// Highest core id whose per-core readiness can be memoized in a 64-bit mask.
 constexpr uint32_t kEJitSharedMaxMemoCores = 64u;
+/// Fixed number of owner-command mailboxes used by peer representative-PGO
+/// callbacks. A mailbox is held only for the bounded request/response
+/// handshake; it carries identities and decisions, never an owner pointer.
+constexpr uint32_t kEJitSharedRepresentativeCommandCapacity = 64u;
 
 static_assert((kEJitSharedQueueSlots & (kEJitSharedQueueSlots - 1)) == 0 &&
                   kEJitSharedQueueSlots >= 2,
@@ -160,6 +164,9 @@ enum class EJitSharedInitError : uint32_t {
   /// the CAS succeeds; a failure there is an init failure exactly like a failed
   /// worker start, not a silently degraded pool.
   OwnerSetupFailed = 2,
+  /// A previous generation still has an owner-command lease. Re-initializing
+  /// over it would permit a stale requester or callback to touch new state.
+  RepresentativeCommandDrainFailed = 3,
 };
 
 //===----------------------------------------------------------------------===//
@@ -228,6 +235,88 @@ struct EJitSharedRequestAttemptHistory {
   EJitAtomicU32 funcIndex;
   EJitAtomicU32 terminalReason;
 };
+
+//===----------------------------------------------------------------------===//
+// Owner-routed representative-PGO command protocol.
+//
+// Representative groups, candidate directories, LLVM and ORC state remain on
+// the elected worker. A peer callback submits one of these fixed-layout
+// commands and waits for the owner worker to answer. No field below is a
+// pointer, STL object, or allocator-owned object.
+//===----------------------------------------------------------------------===//
+enum class EJitSharedRepresentativeCommandState : uint32_t {
+  Free = 0,
+  Filling = 1,
+  Pending = 2,
+  Running = 3,
+  Complete = 4,
+  Failed = 5,
+  Cancelled = 6,
+};
+
+enum class EJitSharedRepresentativeCommandKind : uint32_t {
+  CandidateClassify = 1,
+  SamplingAdmission = 2,
+  RepresentativeWake = 3,
+  DispatchObservation = 4,
+};
+
+// The command recycle lease is one fixed shared word. The low 62 bits are the
+// command incarnation; the high bits publish requester release and claim the
+// one final recycler. A requester or owner must win that incarnation-bound CAS
+// before touching state, so a stale release cannot free a newer command.
+constexpr uint64_t kEJitRepresentativeCommandRecycleClaimed = uint64_t{1} << 62;
+constexpr uint64_t kEJitRepresentativeCommandRecycleReleased = uint64_t{1} << 63;
+constexpr uint64_t kEJitRepresentativeCommandIncarnationMask =
+    kEJitRepresentativeCommandRecycleClaimed - 1;
+
+struct EJitSharedRepresentativeCommand {
+  EJitAtomicU32 state;
+  EJitAtomicU32 abandoned;
+  EJitAtomicU32 requesterReleased;
+  uint32_t kind;
+  uint32_t generation;
+  uint32_t requesterCore;
+  uint32_t funcIndex;
+  uint32_t numDims;
+  uint32_t boundCount;
+  /// Monotonic slot incarnation. It is assigned before the command is
+  /// published and never reset across owner re-initialization. It is atomic so
+  /// a stale requester release can inspect a reused slot without racing the
+  /// next incarnation writer.
+  EJitAtomicU64 incarnation;
+  /// Incarnation-bound recycle lease: incarnation, plus the released and
+  /// single-winner claimed bits above. It is zero in an initialized empty
+  /// blob; a recycled slot retains its claimed tombstone until its next claim.
+  EJitAtomicU64 recycleLease;
+  EJitDimPair dims[kEJitSharedMaxDims];
+  uint32_t versions[kEJitSharedMaxDims];
+  uint64_t attemptToken;
+
+  // DispatchObservation input. The same fixed words are unused for the other
+  // command kinds and are always initialized before Pending is published.
+  uint64_t dispatchCount;
+  uint64_t dispatchLimit;
+  uint64_t dispatchQuotaEnd;
+  uint32_t dispatchClosedQuota;
+  uint32_t dispatchBucketIndex;
+  uint32_t dispatchSlotIndex;
+  uint32_t reserved;
+
+  // Owner response. Wake uses the identity/version fields plus the frozen
+  // observation below; admission/classification use resultCode only.
+  uint32_t resultCode;
+  uint32_t resultGeneration;
+  uint32_t resultVersions[kEJitSharedMaxDims];
+  uint64_t resultT1DispatchCount;
+  uint64_t resultT1QuotaEnd;
+  uint64_t resultT1DispatchLimit;
+};
+
+static_assert(offsetof(EJitSharedRepresentativeCommand, recycleLease) ==
+                  offsetof(EJitSharedRepresentativeCommand, incarnation) +
+                      sizeof(EJitAtomicU64),
+              "representative recycle lease must remain adjacent to its incarnation");
 
 //===----------------------------------------------------------------------===//
 // EJitSharedWritableRange: one runtime-writable extent of a published code
@@ -616,6 +705,10 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU32 icacheReleasersWired;
   EJitAtomicU32 pgoEnabled;     ///< 1 => shared online-PGO trigger is enabled
   EJitAtomicU32 tier2Threshold; ///< shared hit threshold; 0 disables trigger
+  /// 1 => every attached facade must opt into the same representative-PGO
+  /// owner-command contract. This is a policy bit, not a local capability;
+  /// mismatching peers are rejected before they can enqueue work.
+  EJitAtomicU32 representativeSharingEnabled;
   /// Staged PGO admission. Entries are funcIndex + 1; zero means free.
   EJitAtomicU32 pgoAdmissionLock;
   EJitAtomicU32 pgoMaxActiveFunctions;
@@ -655,6 +748,13 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitSharedRequestAttempt requestAttempts[kEJitSharedRequestAttemptCapacity];
   EJitSharedRequestAttemptHistory
       requestHistory[kEJitSharedRequestHistoryCapacity];
+
+  //--- owner-routed representative-PGO callback commands (ABI v25)
+  alignas(kEJitSharedCacheLine)
+      EJitAtomicU64 representativeCommandEpoch;
+  alignas(kEJitSharedCacheLine)
+      EJitSharedRepresentativeCommand
+          representativeCommands[kEJitSharedRepresentativeCommandCapacity];
 
   //--- MPSC queue: head and tail on SEPARATE cache lines (false-sharing), ring
   //    storage on its own.
@@ -725,6 +825,12 @@ static_assert(
         std::is_trivially_destructible<EJitSharedQueueCell>::value &&
         std::is_trivially_default_constructible<EJitSharedQueueCell>::value,
     "EJitSharedQueueCell must be POD-style");
+static_assert(
+    std::is_standard_layout<EJitSharedRepresentativeCommand>::value &&
+        std::is_trivially_destructible<EJitSharedRepresentativeCommand>::value &&
+        std::is_trivially_default_constructible<
+            EJitSharedRepresentativeCommand>::value,
+    "EJitSharedRepresentativeCommand must be POD-style");
 static_assert(
     std::is_standard_layout<EJitSharedPoolSplit>::value &&
         std::is_trivially_destructible<EJitSharedPoolSplit>::value &&

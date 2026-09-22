@@ -415,6 +415,42 @@ bool mockWorkerStart(void *ctx, EJitSharedTaskPool::WorkerEntryFn /*entry*/,
 }
 void mockWorkerStop(void *ctx) { ++static_cast<WorkerHooks *>(ctx)->stops; }
 
+struct BlockingRepresentativeAdmission {
+  std::atomic<bool> entered{false};
+  std::atomic<bool> allow{false};
+};
+
+EJitSharedTaskPool::SamplingAdmission blockRepresentativeAdmission(
+    void *ctx, uint32_t, const EJitDimPair *, uint32_t, uint64_t) {
+  auto *Block = static_cast<BlockingRepresentativeAdmission *>(ctx);
+  Block->entered.store(true, std::memory_order_release);
+  while (!Block->allow.load(std::memory_order_acquire))
+    std::this_thread::yield();
+  return EJitSharedTaskPool::SamplingAdmission::Grant;
+}
+
+struct RepresentativeReleasePause {
+  std::atomic<uint32_t> calls{0};
+  std::atomic<bool> firstEntered{false};
+  std::atomic<bool> secondEntered{false};
+  std::atomic<bool> resumeFirst{false};
+  std::atomic<bool> resumeSecond{false};
+};
+
+void pauseRepresentativeRelease(void *ctx) {
+  auto *Pause = static_cast<RepresentativeReleasePause *>(ctx);
+  const uint32_t Call = Pause->calls.fetch_add(1, std::memory_order_acq_rel) + 1;
+  if (Call == 1) {
+    Pause->firstEntered.store(true, std::memory_order_release);
+    while (!Pause->resumeFirst.load(std::memory_order_acquire))
+      std::this_thread::yield();
+  } else if (Call == 2) {
+    Pause->secondEntered.store(true, std::memory_order_release);
+    while (!Pause->resumeSecond.load(std::memory_order_acquire))
+      std::this_thread::yield();
+  }
+}
+
 // Stands in for building/releasing the owner's ORC engine, and records what the
 // blob looked like WHILE it ran -- the ordering against the worker start and
 // the Ready publish is the contract, not just that it ran.
@@ -581,6 +617,294 @@ TEST_F(SharedTaskPoolTest, AbiLayoutAndHeader) {
   EXPECT_EQ(state_->magic, kEJitSharedAbiMagic);
   EXPECT_EQ(state_->abiVersion, kEJitSharedAbiVersion);
   EXPECT_EQ(state_->structSize, sizeof(EJitSharedTaskPoolState));
+  EXPECT_EQ(offsetof(EJitSharedRepresentativeCommand, recycleLease),
+            offsetof(EJitSharedRepresentativeCommand, incarnation) +
+                sizeof(EJitAtomicU64));
+  EXPECT_EQ(state_->representativeCommandEpoch.loadAcquire(), 0u);
+  for (const auto &Command : state_->representativeCommands) {
+    EXPECT_EQ(Command.state.loadAcquire(),
+              static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Free));
+    EXPECT_EQ(Command.requesterReleased.loadAcquire(), 1u);
+    EXPECT_EQ(Command.incarnation.loadAcquire(), 0u);
+    EXPECT_EQ(Command.recycleLease.loadAcquire(), 0u);
+  }
+}
+
+// A timed-out requester must not recycle a command while the owner callback is
+// still using it. The requester release is the only path that makes a command
+// reusable, and the owner may finish a Running callback afterwards.
+TEST_F(SharedTaskPoolTest, RepresentativeMailboxTimeoutKeepsRunningLease) {
+  EJitSharedTaskPool Owner;
+  EJitSharedTaskPool Peer;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setRepresentativeSharingEnabled(true);
+  BlockingRepresentativeAdmission Block;
+  Owner.setSamplingAdmissionCallback(&blockRepresentativeAdmission, &Block);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EJitCoreId::setCurrentForTest(1);
+  Peer.bind(state_.get());
+  Peer.setMode(EJitCompileMode::Async);
+  Peer.setRepresentativeSharingEnabled(true);
+  ASSERT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+
+  EJitSharedTaskPool::SamplingAdmission Result =
+      EJitSharedTaskPool::SamplingAdmission::Grant;
+  std::atomic<bool> PeerDone{false};
+  std::thread Producer([&] {
+    EJitCoreId::setCurrentForTest(1);
+    Result = Peer.requestRepresentativeAdmission(7, nullptr, 0, 0);
+    PeerDone.store(true, std::memory_order_release);
+  });
+  std::thread Service([&] {
+    EJitCoreId::setCurrentForTest(0);
+    while (!PeerDone.load(std::memory_order_acquire) &&
+           !Block.entered.load(std::memory_order_acquire)) {
+      (void)Owner.workerPollOnce();
+      std::this_thread::yield();
+    }
+    // If the callback was entered, workerPollOnce() is still inside it here.
+    if (!Block.entered.load(std::memory_order_acquire))
+      (void)Owner.workerPollOnce();
+  });
+
+  bool Entered = false;
+  const auto EnterDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!(Entered = Block.entered.load(std::memory_order_acquire)) &&
+         std::chrono::steady_clock::now() < EnterDeadline)
+    std::this_thread::yield();
+  EXPECT_TRUE(Entered);
+
+  bool Returned = false;
+  const auto ReturnDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!(Returned = PeerDone.load(std::memory_order_acquire)) &&
+         std::chrono::steady_clock::now() < ReturnDeadline)
+    std::this_thread::yield();
+  EXPECT_TRUE(Returned);
+  if (Entered && Returned) {
+    EXPECT_EQ(Result, EJitSharedTaskPool::SamplingAdmission::Deny);
+    uint32_t Running = 0;
+    uint32_t NonFree = 0;
+    for (const auto &Command : state_->representativeCommands) {
+      const uint32_t State = Command.state.loadAcquire();
+      Running += State == static_cast<uint32_t>(
+                             EJitSharedRepresentativeCommandState::Running);
+      NonFree += State != static_cast<uint32_t>(
+                            EJitSharedRepresentativeCommandState::Free);
+    }
+    EXPECT_EQ(Running, 1u);
+    EXPECT_EQ(NonFree, 1u);
+  }
+
+  Block.allow.store(true, std::memory_order_release);
+  Producer.join();
+  Service.join();
+  for (const auto &Command : state_->representativeCommands)
+    EXPECT_EQ(Command.state.loadAcquire(),
+              static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Free));
+  EJitCoreId::setCurrentForTest(0);
+  Owner.ownerShutdown();
+}
+
+// The requester release itself is an asynchronous handoff: after it publishes
+// release, the owner may finish a timed-out callback and recycle the slot
+// before the requester performs its final action. Pause that handoff, force the
+// owner to reuse the same slot, and prove the old requester cannot free the new
+// Complete reply. This is the deterministic ABA window from the cross-core
+// review, not a timeout-probability test.
+TEST_F(SharedTaskPoolTest,
+       RepresentativeReleaseCannotFreeReusedCommandAfterPause) {
+  EJitSharedTaskPool Owner;
+  EJitSharedTaskPool Peer;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setRepresentativeSharingEnabled(true);
+  BlockingRepresentativeAdmission Block;
+  Owner.setSamplingAdmissionCallback(&blockRepresentativeAdmission, &Block);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EJitCoreId::setCurrentForTest(1);
+  Peer.bind(state_.get());
+  Peer.setMode(EJitCompileMode::Async);
+  Peer.setRepresentativeSharingEnabled(true);
+  RepresentativeReleasePause Pause;
+  Peer.setRepresentativeReleasePauseHook(&pauseRepresentativeRelease, &Pause);
+  ASSERT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+
+  EJitSharedTaskPool::SamplingAdmission AResult =
+      EJitSharedTaskPool::SamplingAdmission::Grant;
+  std::atomic<bool> ADone{false};
+  std::thread A([&] {
+    EJitCoreId::setCurrentForTest(1);
+    AResult = Peer.requestRepresentativeAdmission(7, nullptr, 0, 0);
+    ADone.store(true, std::memory_order_release);
+  });
+  std::thread ServiceA([&] {
+    EJitCoreId::setCurrentForTest(0);
+    while (!Block.entered.load(std::memory_order_acquire) &&
+           !ADone.load(std::memory_order_acquire)) {
+      (void)Owner.workerPollOnce();
+      std::this_thread::yield();
+    }
+    (void)Owner.workerPollOnce();
+  });
+
+  auto waitFor = [](const std::atomic<bool> &Flag) {
+    const auto Deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!Flag.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < Deadline)
+      std::this_thread::yield();
+    return Flag.load(std::memory_order_acquire);
+  };
+  const bool AReleaseEntered = waitFor(Pause.firstEntered);
+  EXPECT_TRUE(AReleaseEntered);
+  if (!AReleaseEntered)
+    Pause.resumeFirst.store(true, std::memory_order_release);
+
+  uint32_t AIndex = kEJitSharedRepresentativeCommandCapacity;
+  uint64_t AIncarnation = 0;
+  for (uint32_t I = 0; I < kEJitSharedRepresentativeCommandCapacity; ++I) {
+    auto &Command = state_->representativeCommands[I];
+    if (Command.state.loadAcquire() == static_cast<uint32_t>(
+                                          EJitSharedRepresentativeCommandState::Running)) {
+      AIndex = I;
+      AIncarnation = Command.incarnation.loadAcquire();
+      break;
+    }
+  }
+  EXPECT_NE(AIndex, kEJitSharedRepresentativeCommandCapacity);
+  EXPECT_NE(AIncarnation, 0u);
+
+  Block.allow.store(true, std::memory_order_release);
+  const auto AFreeDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  bool ARecycled = false;
+  while (AIndex < kEJitSharedRepresentativeCommandCapacity &&
+         std::chrono::steady_clock::now() < AFreeDeadline) {
+    ARecycled = state_->representativeCommands[AIndex].state.loadAcquire() ==
+                static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Free);
+    if (ARecycled)
+      break;
+    std::this_thread::yield();
+  }
+  EXPECT_TRUE(ARecycled);
+
+  EJitSharedTaskPool::SamplingAdmission BResult =
+      EJitSharedTaskPool::SamplingAdmission::Deny;
+  std::atomic<bool> BDone{false};
+  std::thread B;
+  std::thread ServiceB;
+  if (ARecycled) {
+    B = std::thread([&] {
+      EJitCoreId::setCurrentForTest(1);
+      BResult = Peer.requestRepresentativeAdmission(8, nullptr, 0, 0);
+      BDone.store(true, std::memory_order_release);
+    });
+    ServiceB = std::thread([&] {
+      EJitCoreId::setCurrentForTest(0);
+      while (!Pause.secondEntered.load(std::memory_order_acquire) &&
+             !BDone.load(std::memory_order_acquire)) {
+        (void)Owner.workerPollOnce();
+        std::this_thread::yield();
+      }
+    });
+  }
+
+  const bool BReleaseEntered = waitFor(Pause.secondEntered);
+  if (ARecycled)
+    EXPECT_TRUE(BReleaseEntered);
+
+  uint32_t BIndex = kEJitSharedRepresentativeCommandCapacity;
+  uint64_t BLease = 0;
+  if (BReleaseEntered) {
+    for (uint32_t I = 0; I < kEJitSharedRepresentativeCommandCapacity; ++I) {
+      auto &Command = state_->representativeCommands[I];
+      const uint64_t Lease = Command.recycleLease.loadAcquire();
+      if (Command.state.loadAcquire() == static_cast<uint32_t>(
+                                            EJitSharedRepresentativeCommandState::Complete) &&
+          (Lease & kEJitRepresentativeCommandRecycleReleased) != 0) {
+        BIndex = I;
+        BLease = Lease;
+        break;
+      }
+    }
+    EXPECT_EQ(BIndex, AIndex);
+    EXPECT_EQ(BLease & kEJitRepresentativeCommandRecycleClaimed, 0u);
+  }
+
+  Pause.resumeFirst.store(true, std::memory_order_release);
+  A.join();
+  ServiceA.join();
+  if (AReleaseEntered)
+    EXPECT_EQ(AResult, EJitSharedTaskPool::SamplingAdmission::Deny);
+  if (BReleaseEntered &&
+      BIndex < kEJitSharedRepresentativeCommandCapacity) {
+    // A resumes after B is Complete. Its lease no longer names the slot, so
+    // the B reply must remain consumable until B performs its own release.
+    EXPECT_EQ(state_->representativeCommands[BIndex].state.loadAcquire(),
+              static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Complete));
+    EXPECT_EQ(state_->representativeCommands[BIndex].recycleLease.loadAcquire(),
+              BLease);
+  }
+
+  Pause.resumeSecond.store(true, std::memory_order_release);
+  if (B.joinable())
+    B.join();
+  if (ServiceB.joinable())
+    ServiceB.join();
+  if (BReleaseEntered)
+    EXPECT_EQ(BResult, EJitSharedTaskPool::SamplingAdmission::Grant);
+  if (BReleaseEntered &&
+      BIndex < kEJitSharedRepresentativeCommandCapacity)
+    EXPECT_EQ(state_->representativeCommands[BIndex].state.loadAcquire(),
+              static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Free));
+  for (const auto &Command : state_->representativeCommands)
+    EXPECT_EQ(Command.state.loadAcquire(),
+              static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Free));
+  EJitCoreId::setCurrentForTest(0);
+  Owner.ownerShutdown();
+}
+
+// Re-initialization must fail closed when an abandoned Filling lease has not
+// received the requester's release. initSharedStorage() must not overwrite it
+// with a new generation.
+TEST_F(SharedTaskPoolTest, ReinitRefusesUnreleasedRepresentativeMailbox) {
+  EJitSharedTaskPool Owner;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setRepresentativeSharingEnabled(true);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  auto &Command = state_->representativeCommands[0];
+  uint32_t Free = static_cast<uint32_t>(
+      EJitSharedRepresentativeCommandState::Free);
+  ASSERT_TRUE(Command.state.compareExchange(
+      Free, static_cast<uint32_t>(
+                EJitSharedRepresentativeCommandState::Filling)));
+  Command.requesterReleased.storeRelease(0);
+  Command.incarnation.storeRelease(17);
+  Command.recycleLease.storeRelease(17);
+
+  Owner.ownerShutdown();
+  EXPECT_EQ(Command.state.loadAcquire(),
+            static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Failed));
+
+  EJitSharedTaskPool Reinit;
+  EJitCoreId::setCurrentForTest(0);
+  Reinit.bind(state_.get());
+  Reinit.setMode(EJitCompileMode::Async);
+  Reinit.setRepresentativeSharingEnabled(true);
+  EXPECT_EQ(Reinit.init(), EJitSharedTaskPool::InitResult::OwnerFailed);
+  EXPECT_EQ(state_->lastInitError.loadAcquire(),
+            static_cast<uint32_t>(EJitSharedInitError::RepresentativeCommandDrainFailed));
+  EXPECT_EQ(Command.state.loadAcquire(),
+            static_cast<uint32_t>(EJitSharedRepresentativeCommandState::Failed));
 }
 
 // A process-global instance of the shared blob must require no C++ dynamic
@@ -3184,7 +3508,7 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // publish/cancel/reset of the same bucket's observation identity. The v22
   // word lives in the bucket header padding, so the blob size and every slot
   // offset stay unchanged.
-  EXPECT_EQ(kEJitSharedAbiVersion, 22u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 25u);
   EXPECT_EQ(offsetof(EJitSharedCacheBucket, observationLock), 12u);
   EXPECT_EQ(offsetof(EJitSharedCacheBucket, slots), 16u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
@@ -5594,6 +5918,13 @@ TEST_F(SharedTaskPoolTest, SharedPgoInlineCacheWaitsForTier2) {
   uintptr_t cell = 0;
   ejitIcacheRegisterSlot(kFunc, &cell, 0);
   pool.setPgoEnabled(true, 1);
+
+  // Under the audit/PGO contract, a test-local or stale Tier-1 pointer is not
+  // a publishable inline-cache value. The guard must reject it without
+  // weakening the normal sentinel/registration contract tested above.
+  pool.icacheFill(kFunc, reinterpret_cast<void *>(0x2000), nullptr, 0,
+                  pool.icacheBeginResolve());
+  EXPECT_EQ(cell, 0u);
 
   // Publish Tier-1. Its first hit crosses the threshold, but the wrapper cell
   // must remain empty so subsequent calls can continue observing the shared
