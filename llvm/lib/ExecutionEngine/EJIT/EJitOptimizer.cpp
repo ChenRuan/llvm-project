@@ -150,10 +150,10 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, bool PreserveDimensions,
 }
 
 void EJitOptimizer::clearAnalyses() {
+  MAM_.clear();
+  CGAM_.clear();
   FAM_.clear();
   LAM_.clear();
-  CGAM_.clear();
-  MAM_.clear();
 }
 
 // Only cache the entry's resolved runtime views. The pass must rediscover

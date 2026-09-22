@@ -991,6 +991,11 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
             }
           }
 #endif // EJIT_DUMP_SUPPORT
+
+          // Analysis results contain pointers into M. Clear them before this
+          // transform returns and ORC is allowed to destroy the module; doing
+          // this at the start of the next transform is already too late.
+          engine->P->optimizer->clearAnalyses();
         });
         // PGO: claim transform-generated __profc_*/__profd_* (Instrumented).
         // Gen creates them inside runPipeline (after addIRModule), so the
@@ -1182,7 +1187,9 @@ Expected<EJitCandidateResult> EJitOrcEngine::classifyCandidate(
   if (!collectEffectiveBindings(M, *P->periodReg, P->userSymbols, Bindings, Missing))
     return make_error<StringError>("candidate binding unavailable: " + Missing,
                                    inconvertibleErrorCode());
-  EJitCandidateCapture Capture(Directory, Scope, Bindings);
+  EJitCodeIdentityScope BindingScope = Scope;
+  BindingScope.bindingGeneration = EJitBindingGeneration(Bindings);
+  EJitCandidateCapture Capture(Directory, BindingScope, Bindings);
   Ctx.candidateCapture = &Capture;
   P->optimizer->clearAnalyses();
   P->optimizer->runPipeline(M, Ctx);
@@ -1235,9 +1242,11 @@ Expected<std::unique_ptr<EJitPreparedCode>> EJitOrcEngine::prepareFinalCode(
     return make_error<StringError>("unresolved effective binding: " + Missing,
                                    inconvertibleErrorCode());
 
+  EJitCodeIdentityScope BindingScope = Scope;
+  BindingScope.bindingGeneration = EJitBindingGeneration(Bindings);
   return EJitPreparedCode::create(
-      orc::ThreadSafeModule(std::move(*ModuleOrErr), std::move(CtxOwner)), Scope,
-      Bindings);
+      orc::ThreadSafeModule(std::move(*ModuleOrErr), std::move(CtxOwner)),
+      BindingScope, Bindings);
 }
 
 EJitPreparedCodeEmitter *EJitOrcEngine::preparedEmitter() {

@@ -194,6 +194,41 @@ bool EJitCodeBinding::operator==(const EJitCodeBinding &Other) const {
          callable == Other.callable;
 }
 
+uint64_t llvm::ejit::EJitBindingGeneration(
+    ArrayRef<EJitCodeBinding> Bindings) {
+  std::vector<const EJitCodeBinding *> Ordered;
+  Ordered.reserve(Bindings.size());
+  for (const EJitCodeBinding &B : Bindings)
+    Ordered.push_back(&B);
+  std::sort(Ordered.begin(), Ordered.end(), [](const EJitCodeBinding *A,
+                                               const EJitCodeBinding *B) {
+    if (A->name != B->name)
+      return A->name < B->name;
+    if (A->callable != B->callable)
+      return A->callable < B->callable;
+    return A->address < B->address;
+  });
+
+  // FNV-1a is sufficient here because the full bindings are still retained
+  // and compared exactly; this value only prevents unrelated registration
+  // growth from creating a different candidate scope.
+  uint64_t Hash = 1469598103934665603ull;
+  auto Mix = [&](uint8_t Byte) {
+    Hash ^= Byte;
+    Hash *= 1099511628211ull;
+  };
+  for (const EJitCodeBinding *B : Ordered) {
+    for (unsigned I = 0; I != sizeof(B->address); ++I)
+      Mix(static_cast<uint8_t>(B->address >> (I * 8)));
+    Mix(B->callable ? 1 : 0);
+    for (unsigned I = 0; I != sizeof(uint64_t); ++I)
+      Mix(static_cast<uint8_t>(B->name.size() >> (I * 8)));
+    for (unsigned char Byte : B->name)
+      Mix(Byte);
+  }
+  return Hash ? Hash : 1;
+}
+
 bool EJitCodeIdentityScope::operator==(
     const EJitCodeIdentityScope &Other) const {
   return source == Other.source && entry == Other.entry &&
@@ -538,6 +573,9 @@ EJitCandidateCapture::EJitCandidateCapture(EJitCandidateDirectory &D,
                                            ArrayRef<EJitCodeBinding> B)
     : Directory(D), Scope(std::move(S)) {
   if (!candidateInputFits(Directory.P->limits.maxIdentityBytes, Scope, B, {})) {
+    // Error move-assignment requires the current value (including Success) to
+    // have been checked before it is replaced.
+    consumeError(std::move(Failure));
     Failure = exhausted("candidate identity budget exceeded");
     return;
   }

@@ -38,6 +38,12 @@ struct EJitCodeBinding {
   bool operator==(const EJitCodeBinding &Other) const;
 };
 
+/// Stable fingerprint of the exact resolved binding set. The result is
+/// independent of registration order and excludes symbols that the module did
+/// not actually reference. It is used as an identity scope component only;
+/// the full binding list remains in the exact identity comparison.
+uint64_t EJitBindingGeneration(ArrayRef<EJitCodeBinding> Bindings);
+
 /// Logical cell/TRP values and lifecycle versions deliberately do not belong
 /// here. Policy must describe the final target/ABI/pipeline settings; source
 /// is the digest of the original bitcode, not just its filename.
