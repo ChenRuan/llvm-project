@@ -8,12 +8,35 @@ For optional mismatch reasons and paired bounded IR excerpts on core 6, see
 call `ejit_reuse_diag_print` on core 6 after testing, without preconfiguration.
 The smoke source need not change.
 
+## Default lightweight mode
+
+The default now uses two functions (`reuse_0`, `reuse_1`), six cells each:
+12 logical T2 entries, three representative groups/physical T2 objects, and
+3 x 64 = 192 T1 dispatches. It still checks same-value sharing, unequal cell 5,
+live loads/stores, borrow fencing and rejoining the original code after update.
+Expected shared reuse after renewal is 11. This is a smoke test, not the old
+20-function pressure test; it does not prove the same capacity coverage.
+
+No extra flags are needed. For the original 20-function/120-entry workload,
+compile this source with `-DREUSE_STRESS=1`. Whole IR/ASM capture and printing
+are now off in BOTH modes; add `-DREUSE_DUMP_IR=1` when needed. Bounded reuse
+difference diagnostics remain available independently via
+`ejit_reuse_diag_print` on core 6. Update the demo object as well as the runtime
+package, then link a fresh board image. Shell arguments do not select the mode.
+
+The PGO quota remains 64; worker throttling, mailbox protocol and sample
+lookup/execute/release/yield discipline are unchanged. Reduced workload and
+omitting full dumps should shorten the run, but no board timing is promised.
+SRE dump-loop throttling applies to bulk dump lines, not every ordinary log.
+The new lipo GC roots must be used during `gc-merge`, before `merge.ld`;
+verify `ejit_reuse_diag_print/config/reset` exist in the final runtime object.
+
 ## Build And Startup
 
 - Use the EJIT Clang and runtime from the current PR230 spec5 branch, including
   the worker fairness fix `5b8288a97`. Stock Clang is rejected. Replace the
   board example with the current source too; a runtime-only rebuild retains
-  the old slow first-sweep scheduling in the application.
+  the old slow first-sweep scheduling or larger workload in the application.
 - Use the existing spec5 AOT annotation/bitcode/static-registration build flow.
   Keep generated wrappers and registration constructors in the linked image.
 - Runtime: async shared taskpool, fixed worker core 6, shared code pointers,
@@ -37,8 +60,8 @@ The smoke source need not change.
   command never replay constructors or reinitialize EJIT.
 - Run after board reset in an otherwise idle test image, from schedulable shell
   tasks. There must be no other callers or configuration writers. Provision
-  cache/code/data capacity for 120 live logical entries, 21 representative T1s,
-  21 physical T2 objects and their retained profiles. Old T1 allocation need
+  cache/code/data capacity for 12 live logical entries, 3 representative T1s,
+  3 physical T2 objects and their retained profiles (stress: 120/21/21). Old T1 allocation need
   not be reclaimed. This is larger than the previous six-version IR sample.
 
 ## Shell Sequence
@@ -49,7 +72,7 @@ core[6]-> test_ejit_period
 core[6]-> core 16
 core[16]-> test_ejit_period
            [REUSE230] SAMPLED entry=0 cell=0 calls=65
-           ... (21 representative identities)
+           ... (3 representative identities; stress mode: 21)
            [REUSE230] PHASE_INITIAL checked ...
            [REUSE230] PHASE_UPDATE checked ...
            [REUSE230] OWNER_DONE ...
@@ -62,7 +85,7 @@ All four optional shell arguments are ignored. There is no Baseline/PGO mode
 argument: this is always representative online PGO. A timeout or failure needs
 a reset before another run; printing partial state is safe after failure.
 
-## What Is Checked
+## Full Stress Mode Details (`REUSE_STRESS=1`)
 
 Twenty entries (`reuse_0` through `reuse_19`) each use six cells, with TRP 1 as
 a second live dimension. Each entry has its own period array. Only `gain` is
@@ -101,7 +124,7 @@ accidentally frozen write address cannot pass just because the gain is equal.
    `post_publish_seen=yes`. No re-election, schema rejection, independent
    fallback object, cancelled waiter, compile or publish failure is expected.
 
-The dump captures only `reuse_0` to limit output. Inspect the final T2 entry and
+When `REUSE_DUMP_IR=1`, the dump captures only `reuse_0`. Inspect the final T2 entry and
 module: the gain load should disappear, but the live load/store and real
 cell/TRP indexing must remain. The recorded module is the latest capture, not
 an archive of all 120 versions; use the cache lines and saved before/after
@@ -116,11 +139,12 @@ change/disable the timeout or increase the sample quota; product timeout tuning
 still requires the platform clock frequency and the business call cadence.
 
 `ejit_reuse_host_check.c` checks arithmetic, startup order, admission retry,
-read-token balance, all 120 identities, mutation fences, failure paths, and
+read-token balance, all selected identities (12 or 120), mutation fences, failure paths, and
 read-only printing with a mock. It also builds against the real public header
 to check the header-free declarations. A deterministic slow-request clock
 shows the old first sweep expiring profiles before their first sample, while
-focused sampling completes with no expiration and exactly 1344 T1 dispatches.
+focused sampling completes with no expiration and exactly 192 T1 dispatches
+(stress mode: 1344).
 These are simulated time units, not a measured SRE cycle frequency. It is not
 an AOT/JIT test.
 

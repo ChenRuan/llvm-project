@@ -104,12 +104,33 @@ extern uint8_t g_ucLocalCoreID;
 #ifndef REUSE_WAIT_ROUNDS
 #define REUSE_WAIT_ROUNDS 30000u
 #endif
+#ifndef REUSE_STRESS
+#define REUSE_STRESS 0
+#endif
+#ifndef REUSE_DUMP_IR
+#define REUSE_DUMP_IR 0
+#endif
+#if REUSE_STRESS
 #define REUSE_ENTRIES 20u
+#else
+#define REUSE_ENTRIES 2u
+#endif
 #define REUSE_CELLS 6u
+#define REUSE_LOGICAL (REUSE_ENTRIES * REUSE_CELLS)
+#define REUSE_GROUPS (REUSE_ENTRIES + 1u)
+#if REUSE_STRESS
+#define REUSE_MODE "stress"
+#else
+#define REUSE_MODE "smoke"
+#endif
 #define REUSE_TRP 1u
+#if REUSE_STRESS
 #define REUSE_EACH(M) \
   M(0) M(1) M(2) M(3) M(4) M(5) M(6) M(7) M(8) M(9) \
   M(10) M(11) M(12) M(13) M(14) M(15) M(16) M(17) M(18) M(19)
+#else
+#define REUSE_EACH(M) M(0) M(1)
+#endif
 
 typedef struct { REUSE_CONST uint32_t gain; uint32_t live[2]; } ReuseCell;
 typedef uint32_t (*ReuseFn)(uint8_t, uint8_t, uint32_t);
@@ -243,7 +264,7 @@ static int reuse_drive(unsigned updated) {
   unsigned stable = 0;
   for (unsigned round = 0; round < REUSE_WAIT_ROUNDS; ++round) {
     int complete = 1;
-    // Profiles are already complete. Visit ALL 120 identities to converge
+    // Profiles are already complete. Visit all selected identities to converge
     // member publication and verify final reuse (also after lifecycle renewal).
     for (unsigned e = 0; e < REUSE_ENTRIES; ++e) {
       for (uint8_t c = 0; c < REUSE_CELLS; ++c) {
@@ -265,7 +286,7 @@ static int reuse_drive(unsigned updated) {
     }
     ejit_taskpool_stats_t s = {0};
     if (reuse_stats(&s)) return -1;
-    complete &= s.readyEntries == 120u && !s.pendingEntries &&
+    complete &= s.readyEntries == REUSE_LOGICAL && !s.pendingEntries &&
                 !s.queueApproxSize && !ejit_taskpool_pending_count();
     stable = complete ? stable + 1u : 0u;
     if (stable >= 4u) {
@@ -273,15 +294,15 @@ static int reuse_drive(unsigned updated) {
       for (unsigned e = 0; e < REUSE_ENTRIES; ++e)
         for (uint8_t c = 0; c < REUSE_CELLS; ++c)
           if (reuse_call(e, c, 23u, 0, 1) < 0) return -1;
-      SRE_printf("[REUSE230] PHASE_%s checked: 120 ready, same-value pointers "
-                 "shared; %s\n", updated ? "UPDATE" : "INITIAL",
+      SRE_printf("[REUSE230] PHASE_%s checked: %u ready, same-value pointers "
+                 "shared; %s\n", updated ? "UPDATE" : "INITIAL", REUSE_LOGICAL,
                  updated ? "updated cell rejoined original T2" :
                            "unequal cell has distinct post-T1 code");
       return 0;
     }
     if (reuse_delay()) return -1;
   }
-  return reuse_fail("T2 convergence timeout; inspect all 120 entries on core 6");
+  return reuse_fail("T2 convergence timeout; inspect entries on core 6");
 }
 
 int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
@@ -326,9 +347,13 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     return reuse_fail("representative runtime initialization failed");
   if (ejit_taskpool_get_worker_core() != 6u) return reuse_fail("worker is not core 6");
   if (g_ucLocalCoreID == 6u) {
+#if REUSE_DUMP_IR
     ejit_dump_func("reuse_0");
+#endif
     __atomic_store_n(&g_reuse_stage, REUSE_READY, __ATOMIC_RELEASE);
-    SRE_printf("[REUSE230] WORKER_READY; core 16: test_ejit_period\n");
+    SRE_printf("[REUSE230] WORKER_READY mode=%s entries=%u groups=%u; "
+               "core 16: test_ejit_period\n",
+               REUSE_MODE, REUSE_LOGICAL, REUSE_GROUPS);
     return 0;
   }
   ejit_taskpool_stats_t s = {0};
@@ -375,8 +400,10 @@ int test_ejit_reuse_print(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   }
   ejit_taskpool_print_stats();
   ejit_taskpool_print_compiled();
+#if REUSE_DUMP_IR
   ejit_print_dumped("reuse_0");
   ejit_print_dumped_module("reuse_0");
+#endif
   ejit_representative_stats_t r = {0};
   ejit_taskpool_stats_t s = {0};
   if (ejit_representative_get_stats(&r) != EJIT_OK ||
@@ -391,19 +418,22 @@ int test_ejit_reuse_print(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
              (unsigned long long)r.independentPhysicalObjects);
   // Stats are owned by the compiler on core 6, not the producer's empty
   // core-local group registry. Pointer equality alone is not codegen evidence.
-  if (stage != REUSE_DONE || !r.active || r.physicalCodeObjects != 21u ||
-      r.representativesElected != 21u || r.representativeDispatches != 1344u ||
-      r.bundlePublications != 21u || r.sharedPhysicalReuses < 99u ||
+  if (stage != REUSE_DONE || !r.active || r.physicalCodeObjects != REUSE_GROUPS ||
+      r.representativesElected != REUSE_GROUPS ||
+      r.representativeDispatches != REUSE_GROUPS * 64u ||
+      r.bundlePublications != REUSE_GROUPS ||
+      r.sharedPhysicalReuses < REUSE_LOGICAL - REUSE_GROUPS ||
       r.independentPhysicalObjects || r.representativeReElections ||
       r.schemaRejections || r.waitersJoined != r.waitersCompleted ||
       r.waitersCancelled || s.compileFailed || s.publishFailed || s.queueFull ||
-      s.readyEntries != 120u || s.pendingEntries ||
+      s.readyEntries != REUSE_LOGICAL || s.pendingEntries ||
       s.queueApproxSize || ejit_taskpool_pending_count()) {
     SRE_printf("[REUSE230] NOT_ACCEPTED: inspect worker diagnostics; "
                "OWNER_DONE alone is not acceptance\n");
     return -1;
   }
-  SRE_printf("[REUSE230] PASS: 120 logical entries, 21 physical T2 objects, "
-             "21 x 64 representative dispatches; unequal/update/live checks passed\n");
+  SRE_printf("[REUSE230] PASS: %u logical entries, %u physical T2 objects, "
+             "%u x 64 representative dispatches; unequal/update/live checks passed\n",
+             REUSE_LOGICAL, REUSE_GROUPS, REUSE_GROUPS);
   return 0;
 }
