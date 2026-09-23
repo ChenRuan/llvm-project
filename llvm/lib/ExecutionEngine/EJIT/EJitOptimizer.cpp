@@ -146,6 +146,10 @@ void EJitOptimizer::clearAnalyses() {
 }
 
 void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
+  if (ctx.candidateCapture) {
+    EJitStructFieldPass::tagFrozenSites(M);
+    ctx.candidateCapture->frozen.captured = true;
+  }
   EJIT_DIAG_VERBOSE("pipeline begin func=%s key=0x%016lx opt=%d dims=%zu "
                     "tier=%d module=%s",
                     ctx.fnName.c_str(), ctx.cacheKey,
@@ -247,6 +251,12 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     runLightOptPipeline(M);
     if (ctx.candidateCapture)
       ctx.candidateCapture->capturePrefix(M);
+    // Provenance has been copied out; do not carry diagnostics into PGO schema
+    // or emitted code. Canonical identity also strips it defensively.
+    for (Function &F : M)
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          I.setMetadata(FrozenSiteMD, nullptr);
     ModulePassManager GenMPM;
     GenMPM.addPass(PGOInstrumentationGen(PGOInstrumentationType::FDO));
     // Tier-1 machine code is SHARED and executed concurrently by multiple cores
@@ -963,6 +973,8 @@ void EJitOptimizer::runStructFieldPass(Module &M,
     }
   }
   EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName);
+  if (ctx.candidateCapture)
+    structField.frozenCapture = &ctx.candidateCapture->frozen;
   if (preserveDimensions_)
     structField.setPreservedDimensions(ctx);
   structField.initFromModule(M);

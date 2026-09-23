@@ -59,6 +59,22 @@ EJitReuseDiagnosticStore &llvm::ejit::reuseDiagnosticStore() {
 }
 
 void llvm::ejit::printReuseDiagnostic(const EJitReuseDiagnostic &R, bool ShowDetails) {
+  if (R.frozen.available || StringRef(R.reason) == "PREFIX_IR_DIFF") {
+    EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu frozen_available=%u frozen_compared=%u frozen_different=%u "
+                  "shown=%u incomplete=%u (recorded substitutions, not verifier)",
+                  (unsigned long long)R.sequence, R.frozen.available ? 1u : 0u,
+                  R.frozen.compared, R.frozen.different,
+                  ShowDetails && R.level >= 2 ? R.frozen.shown : 0,
+                  R.frozen.incomplete ? 1u : 0u);
+    if (ShowDetails && R.level >= 2)
+      for (unsigned I = 0; I < R.frozen.shown; ++I) {
+        const auto &D = R.frozen.differences[I];
+        EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu MAYCONST_VALUE_DIFF site=%llu "
+                      "origin=%s peer_frozen=%s request_frozen=%s",
+                      (unsigned long long)R.sequence,
+                      (unsigned long long)D.site, D.origin, D.peer, D.request);
+      }
+  }
   EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu entry=%s func=%u stage=%s reason=%s "
                 "action=%s generation=%u attempt=%llu group=%llu group_gen=%llu "
                 "peer_group=%llu peer_code=%llu repeats=%llu truncated=%u detail=%s",

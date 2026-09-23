@@ -2032,7 +2032,9 @@ ejit_status_t ejit_reuse_diag_reset(void) {
 
 ejit_status_t ejit_reuse_diag_print(void) {
   if (!reuseDiagOnOwner()) return EJIT_ERR_NOT_ACTIVE;
-  EJitReuseDiagnosticStore::Snapshot S;
+  // The shell task need not have the compiler worker's large stack.
+  auto Storage = std::make_unique<EJitReuseDiagnosticStore::Snapshot>();
+  auto &S = *Storage;
   if (!reuseDiagnosticStore().snapshot(S)) return EJIT_PENDING;
   EJIT_DIAG_RAW("[REUSE_DIAG] retained=%u capacity=%u level=%u filter=%s "
                 "evicted=%llu dropped=%llu (bounded first differences, not full IR)",

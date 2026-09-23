@@ -7,6 +7,49 @@ using namespace llvm;
 using namespace llvm::ejit;
 
 namespace {
+TEST(EJitFrozenValues, MultipleDifferencesAreBoundedAndMatchedBySite) {
+  EJitFrozenSnapshot A, B;
+  A.captured = B.captured = true;
+  for (unsigned I = 1; I <= 6; ++I) A.record(I, "f:row", "i32 3");
+  for (unsigned I = 6; I; --I) B.record(I, "f:row", "i32 17");
+  auto D = compareFrozen(A, B);
+  EXPECT_TRUE(D.available);
+  EXPECT_FALSE(D.incomplete);
+  EXPECT_EQ(D.compared, 6u);
+  EXPECT_EQ(D.different, 6u);
+  EXPECT_EQ(D.shown, 4u);
+  EXPECT_EQ(D.differences[0].site, 1u);
+  EXPECT_STREQ(D.differences[0].peer, "i32 3");
+  EXPECT_STREQ(D.differences[0].request, "i32 17");
+}
+TEST(EJitFrozenValues, MissingClonedAndTruncatedSitesAreNotGuessed) {
+  EJitFrozenSnapshot A, B;
+  A.captured = B.captured = true;
+  A.record(1, "f:g", "i32 1");
+  B.record(1, "f:g", "i32 2");
+  B.record(1, "f:g", "i32 3");
+  A.record(2, "f:g", "i32 1");
+  A.record(3, std::string(80, 'a'), "i32 1");
+  B.record(3, std::string(80, 'a'), "i32 2");
+  auto D = compareFrozen(A, B);
+  EXPECT_TRUE(D.incomplete);
+  EXPECT_EQ(D.compared, 0u);
+  EXPECT_EQ(D.different, 0u);
+  EXPECT_FALSE(compareFrozen(A, EJitFrozenSnapshot{}).available);
+  for (unsigned I = 4; I < 100; ++I) A.record(I, "f:g", "i32 1");
+  EXPECT_EQ(A.count, A.Capacity);
+  EXPECT_GT(A.omitted, 0u);
+}
+TEST(EJitFrozenValues, EqualRecordedValuesDoNotClaimIdenticalIR) {
+  EJitFrozenSnapshot A;
+  A.captured = true;
+  A.record(1, "f:g", "i32 1");
+  auto D = compareFrozen(A, A);
+  EXPECT_TRUE(D.available);
+  EXPECT_EQ(D.compared, 1u);
+  EXPECT_EQ(D.different, 0u);
+  EXPECT_FALSE(D.incomplete);
+}
 EJitReuseDiagnostic event(unsigned Group = 1) {
   EJitReuseDiagnostic R;
   R.identity.groupId = Group;

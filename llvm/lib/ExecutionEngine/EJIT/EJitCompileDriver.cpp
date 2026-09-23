@@ -73,6 +73,7 @@ void logReuseFailure(const EJitCompileRequest &Req, StringRef Entry,
   recordReuseDiagnostic(R);
 }
 void attachReuseDifference(EJitReuseDiagnostic &R, const EJitIdentityDiagnostic &D) {
+  R.frozen = D.frozen;
   StringRef Reason = D.reasonToken();
   if (D.kind == EJitIdentityDiagnostic::Kind::IRMismatch)
     Reason = StringRef(R.stage) == "CANDIDATE" ? "PREFIX_IR_DIFF" : "FINAL_IR_DIFF";

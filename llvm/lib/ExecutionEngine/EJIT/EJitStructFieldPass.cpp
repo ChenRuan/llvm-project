@@ -32,6 +32,33 @@ using namespace llvm::ejit;
 
 #define DEBUG_TYPE "ejit-struct-field"
 
+void EJitStructFieldPass::tagFrozenSites(Module &M) {
+  // Number input loads BEFORE specialization. Never match by the order in
+  // which replacements happen. Clones retain the ID and become ambiguous.
+  uint64_t Site = 0;
+  for (Function &F : M)
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *LI = dyn_cast<LoadInst>(&I)) {
+          LI->setMetadata(FrozenSiteMD, nullptr);
+          if (++Site > 4096) continue;
+          const Value *Root = getUnderlyingObject(LI->getPointerOperand());
+          std::string Origin = F.getName().str();
+          if (Root->hasName()) Origin += ":" + Root->getName().str();
+          else Origin += ":unknown-base";
+          const GlobalVariable *GV = nullptr;
+          if (auto Offset = ejitMayConstFieldOffset(
+                  LI->getPointerOperand(), M.getDataLayout(), GV))
+            Origin += "+field_offset=" + std::to_string(*Offset);
+          // Bounded metadata. Truncation remains explicit in the snapshot.
+          if (Origin.size() > 64) Origin.resize(64);
+          LI->setMetadata(FrozenSiteMD, MDNode::get(M.getContext(), {
+              ConstantAsMetadata::get(ConstantInt::get(
+                  Type::getInt64Ty(M.getContext()), Site)),
+              MDString::get(M.getContext(), Origin)}));
+        }
+}
+
 void EJitStructFieldPass::initFromModule(Module &M) {
   // A pass instance may be reused after the previous module was destroyed.
   // Never preserve keys that point into old IR across a rebuild.
@@ -2298,6 +2325,36 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   // 3. Apply replacements.
   bool changed = false;
   for (auto &R : replacements) {
+    if (frozenCapture) {
+      // Legacy pointer-base substitutions are address plumbing, not mayconst
+      // values. The preserved-dimension path replaces only proven load values.
+      bool IsValue = preserveDimensions_ ||
+          isMayConstLoad(R.LI, mayConstFieldMap_, DL);
+      for (const BoundPointerState &State : boundStates_)
+        IsValue |= isBoundMayConstLoad(R.LI, State.boundArguments,
+                                      State.mayConstFields, DL, freeDimArgs_);
+      if (IsValue) {
+        uint64_t Site = 0;
+        StringRef Origin;
+        if (MDNode *MD = R.LI->getMetadata(FrozenSiteMD))
+          if (MD->getNumOperands() == 2)
+            if (auto *ID = mdconst::dyn_extract<ConstantInt>(MD->getOperand(0)))
+              if (auto *Name = dyn_cast<MDString>(MD->getOperand(1))) {
+                Site = ID->getZExtValue();
+                Origin = Name->getString();
+              }
+        // Scalar constants only: never recursively print an unbounded aggregate.
+        std::string Value;
+        raw_string_ostream OS(Value);
+        if ((isa<ConstantInt>(R.ConstVal) &&
+             R.ConstVal->getType()->getIntegerBitWidth() <= 128) ||
+            isa<ConstantFP>(R.ConstVal) || isa<ConstantPointerNull>(R.ConstVal))
+          R.ConstVal->printAsOperand(OS, true);
+        else
+          Site = 0;
+        frozenCapture->record(Site, Origin, Value);
+      }
+    }
     R.LI->replaceAllUsesWith(R.ConstVal);
     R.LI->eraseFromParent();
     changed = true;
