@@ -1,4 +1,4 @@
-# PR230 Board Smoke Test (On PR233)
+# PR230 Board Smoke Test (spec5)
 
 Source: `examples/ejit_reuse_sre_test.c`, a single header-free C file.
 Replace the previous file defining `test_ejit_period`; do not link both demos.
@@ -6,8 +6,10 @@ The companion `ejit_reuse_host_check.c` is a host-only mock, NOT a board source.
 
 ## Build And Startup
 
-- Use the EJIT Clang and runtime from PR230 rebased on PR233
-  (`812f6474b706e0bb8f0cd1b93e9b0413bd5457cf`). Stock Clang is rejected.
+- Use the EJIT Clang and runtime from the current PR230 spec5 branch, including
+  the worker fairness fix `5b8288a97`. Stock Clang is rejected. Replace the
+  board example with the current source too; a runtime-only rebuild retains
+  the old slow first-sweep scheduling in the application.
 - Use the existing spec5 AOT annotation/bitcode/static-registration build flow.
   Keep generated wrappers and registration constructors in the linked image.
 - Runtime: async shared taskpool, fixed worker core 6, shared code pointers,
@@ -42,6 +44,8 @@ core[6]-> test_ejit_period
           [REUSE230] WORKER_READY
 core[6]-> core 16
 core[16]-> test_ejit_period
+           [REUSE230] SAMPLED entry=0 cell=0 calls=65
+           ... (21 representative identities)
            [REUSE230] PHASE_INITIAL checked ...
            [REUSE230] PHASE_UPDATE checked ...
            [REUSE230] OWNER_DONE ...
@@ -67,12 +71,17 @@ accidentally frozen write address cannot pass just because the gain is equal.
    representative sessions, 21 x 64 = 1344 T1 dispatches, 21 physical T2 objects,
    and 120 logical T2 entries. The unequal cell must NOT share the equal group's
    pointer, and its final pointer must differ from its observed T1 pointer.
-2. The owner continuously polls ALL 120 identities, executing every successful
-   grant immediately and releasing its read token afterwards. It never waits
-   for a batch of four profiles before sampling the representatives already
-   running. Admission deferral is retried; actual queue/compile/publish failures
-   are rejected separately. The same generated wrappers are exercised after
-   convergence. This diagnostic C-API polling is not a hot-path benchmark.
+2. The owner first drives each of the 21 known representative identities to
+   65 successful calls (64 T1 samples followed by a T2 call), one identity at
+   a time. Each call performs a fresh lookup, executes the grant immediately,
+   releases its read token and yields between attempts. Pending calls do not
+   count. It then polls ALL 120 identities to verify final publication/reuse.
+   This avoids leaving a newly published T1 idle while slow cross-core mailbox
+   handshakes and logging process the rest of a 120-identity first sweep.
+   Admission deferral is retried; actual queue/compile/publish failures are
+   rejected separately. The same generated wrappers are exercised after
+   convergence. This diagnostic smoke is neither a hot-path benchmark nor a
+   concurrent-admission stress test. `SAMPLED` is progress, not final acceptance.
 3. The owner stops business calls, deactivates cell 5 and waits for the exact
    compiler-source borrow fence. Only `EJIT_OK` permits changing gain 17 to 3.
    A pending/error/timeout never authorizes mutation. The owner reactivates the
@@ -96,14 +105,24 @@ pointer matrices to compare the whole run.
 
 ## Verification Boundary
 
+The runtime no-progress timeout is expressed in `ejit_taskpool_trace_now()`
+units: nanoseconds on the host, hardware cycles on SRE. The default 5,000,000,000
+must NOT be assumed to mean five seconds on the board. This smoke does not
+change/disable the timeout or increase the sample quota; product timeout tuning
+still requires the platform clock frequency and the business call cadence.
+
 `ejit_reuse_host_check.c` checks arithmetic, startup order, admission retry,
 read-token balance, all 120 identities, mutation fences, failure paths, and
 read-only printing with a mock. It also builds against the real public header
-to check the header-free declarations. It is not an AOT/JIT test.
+to check the header-free declarations. A deterministic slow-request clock
+shows the old first sweep expiring profiles before their first sample, while
+focused sampling completes with no expiration and exactly 1344 T1 dispatches.
+These are simulated time units, not a measured SRE cycle frequency. It is not
+an AOT/JIT test.
 
 The real runtime regression
 `RoundRobinTwentyEntriesRejoinSharedTier2AfterBorrowFence` independently runs
-the same continuous scheduling and renewal pattern through ORC, online PGO,
+the separate continuous round-robin scheduling and renewal pattern through ORC, online PGO,
 the production shared cache and actual generated host code. The native host
 tests do not certify AArch64 BE code generation, SRE mappings/cache maintenance,
 or board execution. Those require the three board commands above and their

@@ -199,13 +199,52 @@ static int reuse_call(unsigned entry, uint8_t cell, uint32_t x, void **seen,
   return 1;
 }
 
+// This smoke test has known representatives: cell 0 of every entry and the
+// unequal cell 5 of entry 0. Keep calling each one while its profile is live.
+// A full 120-identity sweep can take longer than the SRE no-progress timeout
+// (mailbox handshakes, worker throttling and serial logging are not free).
+// 65 successful lookups, each executed and released, include at least one T2
+// dispatch with the required 64-sample quota. Never cache/call a T1 pointer
+// repeatedly outside the lookup/read-token protocol to manufacture samples.
+static int reuse_sample_representative(unsigned entry, uint8_t cell) {
+  unsigned executed = 0;
+  for (unsigned attempt = 0; attempt < REUSE_WAIT_ROUNDS; ++attempt) {
+    void *fn = 0;
+    int rc = reuse_call(entry, cell, attempt % 31u + 1u, &fn, 0);
+    if (rc < 0) return -1;
+    if (rc) {
+      if (entry == 0u && cell == 5u && !reuse_first_unequal)
+        reuse_first_unequal = fn;
+      if (++executed == 65u) {
+        g_reuse_before[entry][cell] = fn;
+        SRE_printf("[REUSE230] SAMPLED entry=%u cell=%u calls=%u\n",
+                   entry, (unsigned)cell, executed);
+        return 0;
+      }
+    }
+    ejit_taskpool_stats_t s = {0};
+    if (reuse_stats(&s)) return -1;
+    // Yield even on a successful T1 call: worker work must still progress.
+    if (reuse_delay()) return -1;
+  }
+  SRE_printf("[REUSE230] sampling stalled entry=%u cell=%u calls=%u\n",
+             entry, (unsigned)cell, executed);
+  return reuse_fail("representative sampling/T2 timeout");
+}
+
 static int reuse_drive(unsigned updated) {
+  if (!updated) {
+    for (unsigned e = 0; e < REUSE_ENTRIES; ++e) {
+      if (reuse_sample_representative(e, 0u)) return -1;
+      if (e == 0u && reuse_sample_representative(0u, 5u)) return -1;
+    }
+  }
   void *(*pointers)[REUSE_CELLS] = updated ? g_reuse_after : g_reuse_before;
   unsigned stable = 0;
   for (unsigned round = 0; round < REUSE_WAIT_ROUNDS; ++round) {
     int complete = 1;
-    // Visit ALL 120 identities on every round. Never wait for a wave of T1s
-    // to become ready before sampling the representatives already admitted.
+    // Profiles are already complete. Visit ALL 120 identities to converge
+    // member publication and verify final reuse (also after lifecycle renewal).
     for (unsigned e = 0; e < REUSE_ENTRIES; ++e) {
       for (uint8_t c = 0; c < REUSE_CELLS; ++c) {
         int rc = reuse_call(e, c, round % 31u + 1u, &pointers[e][c], 0);
@@ -329,7 +368,11 @@ int test_ejit_reuse_print(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   (void)a; (void)b; (void)c; (void)d;
   if (g_ucLocalCoreID != 6u) return -1;
   uint32_t stage = __atomic_load_n(&g_reuse_stage, __ATOMIC_ACQUIRE);
-  if (stage != REUSE_DONE && stage != REUSE_FAILED) return -1;
+  if (stage != REUSE_DONE && stage != REUSE_FAILED) {
+    SRE_printf("[REUSE230] NOT_READY stage=%u; wait for OWNER_DONE or FAIL\n",
+               stage);
+    return -1;
+  }
   ejit_taskpool_print_stats();
   ejit_taskpool_print_compiled();
   ejit_print_dumped("reuse_0");
