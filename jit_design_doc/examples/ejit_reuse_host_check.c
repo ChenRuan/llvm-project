@@ -105,7 +105,7 @@ void ejit_taskpool_release_read(uint32_t b) {
 }
 void ejit_register_funcindex(const char *name, uint32_t *slot) {
   assert(ctor_ready[g_ucLocalCoreID] && !frozen[g_ucLocalCoreID]);
-  for (unsigned e = 0; e < 20; ++e)
+  for (unsigned e = 0; e < REUSE_ENTRIES; ++e)
     if (!strcmp(name, reuse_names[e])) { *slot = e; return; }
   assert(0);
 }
@@ -133,10 +133,10 @@ ejit_status_t ejit_activate(const char *name, uint32_t c) {
 ejit_status_t ejit_representative_deactivate_begin(const char *n, uint32_t c,
                                                   ejit_borrow_fence_t *f) {
   assert(!held && !strcmp(n, "cell") && c == 5 && !active_groups);
-  assert(g_reuse_0[5].gain == 17 && mock_stats.readyEntries == 120);
+  assert(g_reuse_0[5].gain == 17 && mock_stats.readyEntries == REUSE_LOGICAL);
   f->generation = 1; f->dimType = 0; f->instanceId = 5; f->version = 2;
-  for (unsigned e = 0; e < 20; ++e) ready[e][5] = 0;
-  mock_stats.readyEntries -= 20;
+  for (unsigned e = 0; e < REUSE_ENTRIES; ++e) ready[e][5] = 0;
+  mock_stats.readyEntries -= REUSE_ENTRIES;
   return EJIT_OK;
 }
 ejit_status_t ejit_representative_borrow_status(const ejit_borrow_fence_t *f) {
@@ -224,9 +224,10 @@ int main(void) {
   assert(test_ejit_period(0,0,0,0) == -1 && inits[16] == 1);
   assert(grants == releases && !held && g_reuse_deferred > 0);
   assert(ctors[6] == REUSE_RUN_INIT_ARRAY && ctors[16] == REUSE_RUN_INIT_ARRAY);
-  assert(mock_rep.physicalCodeObjects == 21 && mock_rep.representativeDispatches == 1344);
+  assert(mock_rep.physicalCodeObjects == REUSE_GROUPS &&
+         mock_rep.representativeDispatches == REUSE_GROUPS * 64u);
   assert(expirations == 0);
-  assert(mock_rep.sharedPhysicalReuses == 119 && borrow_waits == 3);
+  assert(mock_rep.sharedPhysicalReuses == REUSE_LOGICAL - 1u && borrow_waits == 3);
   g_ucLocalCoreID = 6;
   assert(test_ejit_reuse_print(0,0,0,0) == 0);
   unsigned old_grants = grants;
@@ -248,7 +249,7 @@ int main(void) {
   assert(test_ejit_period(0,0,0,0) == -1 && !updated && g_reuse_0[5].gain == 17);
   reset(); ready_owner(); mock_stats.compileFailed = 1;
   assert(test_ejit_period(0,0,0,0) == -1 && !grants);
-  puts("PASS: mock startup, focused sampling without expiry, 120-identity final sweep, admission deferral, tokens, "
+  puts("PASS: mock startup, focused sampling without expiry, final sweep, admission deferral, tokens, "
        "unequal/update, borrow timeout, errors and read-only print; not JIT acceptance");
   return 0;
 }

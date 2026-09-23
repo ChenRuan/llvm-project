@@ -388,6 +388,7 @@ def doit_gc_merge(args):
         "ejit_print_dumped_module",
         "ejit_print_period_const_ranking", "ejit_print_mayconst_ranking",
         "ejit_vp_get_stats",
+        "ejit_reuse_diag_print", "ejit_reuse_diag_config", "ejit_reuse_diag_reset",
         # Inline-cache: ejit_register_icache_slot is called from
         # ejit_auto_register (AOT) when -ejit-inline-cache is on, not from the
         # runtime, so gc-merge's --gc-sections would discard it without this GC

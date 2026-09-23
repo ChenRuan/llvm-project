@@ -20,6 +20,9 @@ OPTIONAL_APIS = (
     "ejit_print_period_const_ranking",
     "ejit_print_mayconst_ranking",
     "ejit_vp_get_stats",
+    "ejit_reuse_diag_print",
+    "ejit_reuse_diag_config",
+    "ejit_reuse_diag_reset",
 )
 RETIRED_APIS = (
     "ejit_compile_or_get",
@@ -132,7 +135,7 @@ def main():
     clang = find_tool("clang")
     ar = find_tool("llvm-ar", "ar")
     nm = find_tool("llvm-nm", "nm")
-    ld = find_tool("ld.lld")
+    ld = find_tool("ld.lld", "ld.lld-18", "ld.lld-17")
     lipo = load_lipo()
     with tempfile.TemporaryDirectory(prefix="ejit-lipo-roots-") as directory:
         root = Path(directory)
@@ -166,6 +169,9 @@ def main():
                 raise AssertionError("mandatory ejit_init root was discarded")
             if set(OPTIONAL_APIS) & minimal_symbols:
                 raise AssertionError("lipo fabricated missing optional symbols")
+            undefined = run([nm, "-u", output]).stdout
+            if any(symbol in undefined for symbol in OPTIONAL_APIS):
+                raise AssertionError("missing optional API introduced an undefined symbol")
 
     print("lipo GC-root regression: PASS")
 
