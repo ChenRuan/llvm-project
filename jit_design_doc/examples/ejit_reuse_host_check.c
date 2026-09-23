@@ -14,10 +14,15 @@ static unsigned started[21], samples[21], active_groups, ready[20][6];
 static int frozen[17], ctor_ready[17], fail_init, fail_delay, stall, fence_stall;
 static int bad_result, bad_stats, fence_done, updated, borrow_waits;
 static unsigned worker_core = 6;
+// Deterministic slow-mailbox clock: a full sweep outlasts a live profile.
+// Units are simulated, not host nanoseconds or real SRE cycles.
+static unsigned mock_now, last_progress[21], expired[21], expirations;
+static unsigned t2_waited[21];
 
 static uint32_t mock_t1(unsigned e, unsigned g, uint8_t c, uint8_t t, uint32_t x) {
   assert(held == 1 && samples[g] < 64);
   ++samples[g];
+  last_progress[g] = mock_now;
   if (samples[g] == 64) {
     --active_groups;
     ++mock_rep.physicalCodeObjects;
@@ -50,6 +55,15 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t e, const ejit_dim_pair_t *d,
   *out = 0;
   *b = 0;
   if (stall) return EJIT_PENDING;
+  ++mock_now;
+  for (unsigned i = 0; i < 21; ++i)
+    if (started[i] && samples[i] < 64 && !expired[i] &&
+        mock_now - last_progress[i] > 8u) {
+      expired[i] = 1;
+      ++expirations;
+      --active_groups;
+    }
+  if (expired[g]) return EJIT_PENDING;
   if (!started[g]) {
     if (active_groups == 4) return EJIT_ERR_QUEUE_FULL;
     assert(c == 0 || g == 20);
@@ -58,11 +72,16 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t e, const ejit_dim_pair_t *d,
     ++mock_rep.representativesElected;
     ++mock_rep.groups;
     ++mock_stats.asyncCompiles;
+    last_progress[g] = mock_now;
+    // Compilation is asynchronous: the first request cannot execute T1.
+    return EJIT_PENDING;
   }
   if (samples[g] < 64) {
     if (c != 0 && g != 20) return EJIT_PENDING;
     *out = (void *)(g == 20 ? mock_unequal_t1 : mock_t1_entries[e]);
   } else {
+    // Exhausting the quota is not publication: force a pending T2 turn too.
+    if (!t2_waited[g]++) return EJIT_PENDING;
     *out = (void *)(g == 20 ? mock_unequal_t2 : reuse_entries[e]);
     if (!ready[e][c]) {
       ready[e][c] = 1;
@@ -163,6 +182,10 @@ static void reset(void) {
   memset(frozen, 0, sizeof(frozen)); memset(ctor_ready, 0, sizeof(ctor_ready));
   memset(started, 0, sizeof(started)); memset(samples, 0, sizeof(samples));
   memset(ready, 0, sizeof(ready));
+  memset(last_progress, 0, sizeof(last_progress));
+  memset(expired, 0, sizeof(expired));
+  memset(t2_waited, 0, sizeof(t2_waited));
+  mock_now = expirations = 0;
   memset(g_reuse_before, 0, sizeof(g_reuse_before));
   memset(g_reuse_after, 0, sizeof(g_reuse_after));
   g_reuse_checked = g_reuse_deferred = 0; reuse_first_unequal = 0;
@@ -179,6 +202,16 @@ static void ready_owner(void) {
   g_ucLocalCoreID = 16;
 }
 int main(void) {
+  // Negative control: the old first sweep admits profiles but does not return
+  // to them before the no-progress bound. Do not claim this mock proves SRE.
+  reset(); ready_owner();
+  for (unsigned e = 0; e < REUSE_ENTRIES; ++e)
+    for (uint8_t c = 0; c < REUSE_CELLS; ++c) {
+      void *fn = 0;
+      assert(reuse_call(e, c, 1u, &fn, 0) == 0);
+    }
+  assert(expirations > 0 && mock_rep.representativeDispatches == 0);
+  puts("PASS: old sweep expires profiles before first sample (negative control)");
   reset();
   g_ucLocalCoreID = 16;
   assert(test_ejit_period(0,0,0,0) == -1 && !inits[16]);
@@ -192,6 +225,7 @@ int main(void) {
   assert(grants == releases && !held && g_reuse_deferred > 0);
   assert(ctors[6] == REUSE_RUN_INIT_ARRAY && ctors[16] == REUSE_RUN_INIT_ARRAY);
   assert(mock_rep.physicalCodeObjects == 21 && mock_rep.representativeDispatches == 1344);
+  assert(expirations == 0);
   assert(mock_rep.sharedPhysicalReuses == 119 && borrow_waits == 3);
   g_ucLocalCoreID = 6;
   assert(test_ejit_reuse_print(0,0,0,0) == 0);
@@ -214,7 +248,7 @@ int main(void) {
   assert(test_ejit_period(0,0,0,0) == -1 && !updated && g_reuse_0[5].gain == 17);
   reset(); ready_owner(); mock_stats.compileFailed = 1;
   assert(test_ejit_period(0,0,0,0) == -1 && !grants);
-  puts("PASS: mock startup, 120-identity round-robin, admission deferral, tokens, "
+  puts("PASS: mock startup, focused sampling without expiry, 120-identity final sweep, admission deferral, tokens, "
        "unequal/update, borrow timeout, errors and read-only print; not JIT acceptance");
   return 0;
 }
