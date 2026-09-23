@@ -18,14 +18,14 @@ EJitReuseDiagnostic event(unsigned Group = 1) {
   EJitReuseDiagnosticStore::copyText(R.action, "NEW_GROUP");
   return R;
 }
-TEST(EJitReuseDiagnostics, DefaultSummaryDedupsButNewGenerationSurvives) {
+TEST(EJitReuseDiagnostics, DefaultDetailsDedupButNewGenerationSurvives) {
   EJitReuseDiagnosticStore S;
-  EXPECT_EQ(S.levelFor("anything"), 1u);
+  EXPECT_EQ(S.levelFor("anything"), 2u);
   auto R = event();
   R.level = 2;
   EJitReuseDiagnosticStore::copyText(R.left, "private detail");
   EXPECT_TRUE(S.record(R));
-  EXPECT_EQ(R.left[0], 0);
+  EXPECT_STREQ(R.left, "private detail");
   R.identity.attemptToken = 99;
   EXPECT_FALSE(S.record(R));
   R.identity.groupGeneration = 2;
@@ -33,6 +33,8 @@ TEST(EJitReuseDiagnostics, DefaultSummaryDedupsButNewGenerationSurvives) {
   EJitReuseDiagnosticStore::Snapshot Snap;
   ASSERT_TRUE(S.snapshot(Snap));
   ASSERT_EQ(Snap.count, 2u);
+  EXPECT_EQ(Snap.level, 2u);
+  EXPECT_STREQ(Snap.records[0].left, "private detail");
   EXPECT_EQ(Snap.records[0].repeats, 1u);
   EXPECT_LT(Snap.records[0].sequence, Snap.records[1].sequence);
   R.identity.numDims = 1;
@@ -69,6 +71,12 @@ TEST(EJitReuseDiagnostics, FilterLevelResetAndTextLimits) {
   ASSERT_TRUE(S.snapshot(Snap));
   EXPECT_EQ(Snap.count, 0u);
   EXPECT_EQ(S.levelFor("reuse_0"), 2u);
+  ASSERT_TRUE(S.configure("*", 1));
+  EXPECT_TRUE(S.record(R));
+  ASSERT_TRUE(S.snapshot(Snap));
+  EXPECT_EQ(Snap.records[0].level, 1u);
+  EXPECT_EQ(Snap.records[0].left[0], 0);
+  EXPECT_EQ(Snap.records[0].right[0], 0);
   ASSERT_TRUE(S.configure("*", 0));
   EXPECT_FALSE(S.record(R));
 }

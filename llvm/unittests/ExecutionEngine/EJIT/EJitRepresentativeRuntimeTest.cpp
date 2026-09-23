@@ -1691,10 +1691,10 @@ TEST_F(EJitRepresentativeRuntimeTest,
     ASSERT_EQ(ejit_init_representative(&Cfg), EJIT_OK);
   }
   ASSERT_EQ(ejit_representative_test_timeout(5000000000ULL, 2), EJIT_OK);
-  ASSERT_EQ(ejit_reuse_diag_config("entry_rep_pressure_0", 2), EJIT_OK);
-  auto RestoreDiagnostics = make_scope_exit([] {
-    (void)reuseDiagnosticStore().configure("*", 1);
-  });
+  // No preconfiguration: defaults must retain the unequal IR pair for a later
+  // print, including across earlier shutdown/reinitialization in this suite.
+  ASSERT_EQ(reuseDiagnosticStore().levelFor("entry_rep_pressure_0"), 2u);
+  ASSERT_EQ(ejit_reuse_diag_reset(), EJIT_OK);
   const uint32_t OriginalCore = EJitCoreId::current();
   EJitCoreId::setCurrentForTest(OriginalCore + 1);
   EXPECT_EQ(ejit_reuse_diag_config("*", 0), EJIT_ERR_NOT_ACTIVE);
