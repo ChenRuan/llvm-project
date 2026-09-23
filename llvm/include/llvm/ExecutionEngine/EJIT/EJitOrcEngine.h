@@ -50,6 +50,10 @@ struct EJitVpFunctionInfo; // defined in EJitOptimizer.h (value-profile capture)
 enum class CompileTier : uint8_t;
 
 namespace detail {
+/// Validate before changing target metadata. Only the SRE AArch64 BE GNU/ELF
+/// producer to bare-metal ELF transition is allowed beyond exact matches.
+Error normalizeJitModuleTarget(Module &M, const Triple &Target,
+                               const DataLayout &Layout);
 /// Render one function definition without the rest of its specialization
 /// module. Exposed for focused dump-path testing; callers should use the
 /// ejit_dump_* APIs.

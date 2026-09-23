@@ -8,10 +8,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitPreparedCode.h"
+#include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
 #include "llvm/ExecutionEngine/Orc/ObjectTransformLayer.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
@@ -28,6 +30,66 @@ using namespace llvm;
 using namespace llvm::ejit;
 
 namespace {
+TEST(EJitModuleTarget, SreProducerNormalizesBeforeIdentity) {
+  LLVMContext C;
+  Module M("board", C);
+  const Triple Target("aarch64_be-none-elf");
+  const DataLayout Layout("E-m:e-i64:64-i128:128-n32:64-S128");
+  M.setTargetTriple(Triple("aarch64_be-target-linux-gnu"));
+  M.setDataLayout(Layout);
+  EXPECT_FALSE(bool(llvm::ejit::detail::normalizeJitModuleTarget(M, Target, Layout)));
+  EXPECT_EQ(M.getTargetTriple(), Target);
+  EXPECT_EQ(M.getDataLayout(), Layout);
+  EXPECT_FALSE(bool(llvm::ejit::detail::normalizeJitModuleTarget(M, Target, Layout)));
+}
+
+TEST(EJitModuleTarget, RejectsOtherTargetsWithoutMutation) {
+  LLVMContext C;
+  const Triple Target("aarch64_be-none-elf");
+  const DataLayout Layout("E-m:e-i64:64-i128:128-n32:64-S128");
+  for (const char *Name : {"aarch64-target-linux-gnu", "x86_64-linux-gnu",
+                           "aarch64_be-unknown-linux-gnuilp32",
+                           "aarch64_be-unknown-linux-gnu_ilp32",
+                           "aarch64_be-pc-windows-msvc", "aarch64_be-windows-msvc"}) {
+    SCOPED_TRACE(Name);
+    Module M("bad", C);
+    M.setTargetTriple(Triple(Name));
+    M.setDataLayout(Layout);
+    auto Err = llvm::ejit::detail::normalizeJitModuleTarget(M, Target, Layout);
+    ASSERT_TRUE(bool(Err));
+    EXPECT_NE(toString(std::move(Err)).find("module triple="), std::string::npos);
+    EXPECT_EQ(M.getTargetTriple(), Triple(Name));
+  }
+}
+
+TEST(EJitModuleTarget, RejectsLayoutAndSpecialAbi) {
+  LLVMContext C;
+  Module M("bad", C);
+  const Triple Source("aarch64_be-target-linux-gnu"), Target("aarch64_be-none-elf");
+  const DataLayout Layout("E-m:e-i64:64-i128:128-n32:64-S128");
+  M.setTargetTriple(Source);
+  M.setDataLayout("e-m:e-i64:64-i128:128-n32:64-S128");
+  auto Err = llvm::ejit::detail::normalizeJitModuleTarget(M, Target, Layout);
+  ASSERT_TRUE(bool(Err));
+  consumeError(std::move(Err));
+  EXPECT_EQ(M.getTargetTriple(), Source);
+  M.setDataLayout(Layout);
+  auto *F = Function::Create(FunctionType::get(Type::getVoidTy(C), false),
+                            GlobalValue::ExternalLinkage, "f", M);
+  F->setCallingConv(CallingConv::Fast);
+  Err = llvm::ejit::detail::normalizeJitModuleTarget(M, Target, Layout);
+  ASSERT_TRUE(bool(Err));
+  consumeError(std::move(Err));
+  F->setCallingConv(CallingConv::C);
+  auto *G = new GlobalVariable(M, Type::getInt32Ty(C), false,
+                              GlobalValue::ExternalLinkage, nullptr, "tls");
+  G->setThreadLocal(true);
+  Err = llvm::ejit::detail::normalizeJitModuleTarget(M, Target, Layout);
+  ASSERT_TRUE(bool(Err));
+  consumeError(std::move(Err));
+  EXPECT_EQ(M.getTargetTriple(), Source);
+}
+
 EJitCodeIdentityScope scope(StringRef Entry = "f") {
   EJitCodeIdentityScope S;
   S.source = SHA256::hash(arrayRefFromStringRef("original-bitcode-revision"));
@@ -541,6 +603,57 @@ TEST_F(PreparedCodeNative, ExactHitSkipsClaimsTransformsAndCodegen) {
   EXPECT_EQ(Objects, 1u);
   EXPECT_EQ(UnexpectedTransforms, 0u);
   EXPECT_EQ(reinterpret_cast<int (*)(int)>(B.fn)(35), 42);
+}
+
+TEST_F(PreparedCodeNative, SreBigEndianNormalizationLinksAndReuses) {
+  if (!J->getTargetTriple().isAArch64())
+    GTEST_SKIP() << "Requires the native AArch64 backend (BE object is not executed)";
+  auto BoardOrErr = orc::LLJITBuilder()
+      .setJITTargetMachineBuilder(
+          orc::JITTargetMachineBuilder(Triple("aarch64_be-none-elf")))
+      // Cross-endian objects must never register their unwind frames with the
+      // little-endian host unwinder. No execution or EH plugin in this test.
+      .setObjectLinkingLayerCreator(
+          [](orc::ExecutionSession &ES)
+              -> Expected<std::unique_ptr<orc::ObjectLayer>> {
+            return std::make_unique<orc::ObjectLinkingLayer>(ES);
+          })
+      .setPlatformSetUp(orc::setUpInactivePlatform)
+      .create();
+  ASSERT_TRUE(bool(BoardOrErr)) << toString(BoardOrErr.takeError());
+  auto Board = std::move(*BoardOrErr);
+  unsigned BoardObjects = 0;
+  Board->getObjTransformLayer().setTransform(
+      [&](std::unique_ptr<MemoryBuffer> Obj)
+          -> Expected<std::unique_ptr<MemoryBuffer>> {
+        ++BoardObjects;
+        return std::move(Obj);
+      });
+  auto Make = [&](bool Normalize) {
+    auto M = parse(Simple);
+    M.withModuleDo([&](Module &M) {
+      M.setTargetTriple(Triple("aarch64_be-target-linux-gnu"));
+      M.setDataLayout(Board->getDataLayout());
+      if (Normalize)
+        cantFail(llvm::ejit::detail::normalizeJitModuleTarget(
+            M, Board->getTargetTriple(), Board->getDataLayout()));
+    });
+    return cantFail(EJitPreparedCode::create(std::move(M), scope(), {}));
+  };
+  EJitPreparedCodeEmitter E(*Board, 1);
+  auto Old = E.link(Make(false));
+  ASSERT_FALSE(bool(Old));
+  EXPECT_NE(toString(Old.takeError()).find("does not match emitter target"),
+            std::string::npos);
+  EXPECT_EQ(BoardObjects, 0u);
+  auto A = E.link(Make(true));
+  ASSERT_TRUE(bool(A)) << toString(A.takeError());
+  auto B = E.link(Make(true));
+  ASSERT_TRUE(bool(B)) << toString(B.takeError());
+  EXPECT_EQ(A->fn, B->fn);
+  EXPECT_TRUE(B->reused);
+  EXPECT_EQ(BoardObjects, 1u);
+  // Cross-endian host linking only: do NOT execute the BE function here.
 }
 
 TEST_F(PreparedCodeNative, ForcedHashCollisionStillComparesFullIdentity) {

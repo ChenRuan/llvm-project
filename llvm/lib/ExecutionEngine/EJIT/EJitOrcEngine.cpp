@@ -52,6 +52,45 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+Error llvm::ejit::detail::normalizeJitModuleTarget(
+    Module &M, const Triple &Target, const DataLayout &Layout) {
+  const Triple Source = M.getTargetTriple();
+  auto Incompatible = [&]() {
+    return make_error<StringError>(
+        "EJIT target mismatch: module triple=" + Source.str() +
+            " layout=" + M.getDataLayoutStr() + "; jit triple=" +
+            Target.str() + " layout=" + Layout.getStringRepresentation(),
+        inconvertibleErrorCode());
+  };
+  if (!M.getDataLayout().isDefault() && M.getDataLayout() != Layout)
+    return Incompatible();
+  if (!Source.empty() && Source.str() != Target.str()) {
+    // Existing SRE AOT bitcode is produced with a Linux GNU triple, but the
+    // executor uses bare-metal ELF. Do not generalize this to arbitrary OS,
+    // architecture, endianness, ILP32 or calling-convention conversions.
+    const bool SreProducer = Source.getArch() == Triple::aarch64_be &&
+        Target.getArch() == Triple::aarch64_be &&
+        Source.getSubArch() == Target.getSubArch() &&
+        Source.isOSLinux() && Source.getEnvironment() == Triple::GNU &&
+        Source.getEnvironmentName() == "gnu" &&
+        Target.getOS() == Triple::UnknownOS &&
+        Target.getEnvironment() == Triple::UnknownEnvironment &&
+        Source.isOSBinFormatELF() && Target.isOSBinFormatELF() &&
+        !M.getDataLayout().isDefault() && Layout.isBigEndian() &&
+        Layout.getPointerSizeInBits() == 64;
+    if (!SreProducer) return Incompatible();
+    for (const GlobalVariable &GV : M.globals())
+      if (GV.isThreadLocal()) return Incompatible();
+    for (const Function &F : M)
+      if (F.getCallingConv() != CallingConv::C) return Incompatible();
+  }
+  // Do this BEFORE optimization and final identity capture in ALL routes.
+  // The emitter's exact target check remains unchanged.
+  M.setTargetTriple(Target);
+  M.setDataLayout(Layout);
+  return Error::success();
+}
+
 #define DEBUG_TYPE "ejit-orc-engine"
 
 namespace {
@@ -1163,8 +1202,9 @@ Expected<EJitCandidateResult> EJitOrcEngine::classifyCandidate(
   auto Parsed = parseBitcodeFile(Buffer->getMemBufferRef(), *Owner);
   if (!Parsed) return Parsed.takeError();
   Module &M = **Parsed;
-  if (M.getTargetTriple().empty()) M.setTargetTriple(P->J->getTargetTriple());
-  if (M.getDataLayout().isDefault()) M.setDataLayout(P->J->getDataLayout());
+  if (auto Err = detail::normalizeJitModuleTarget(
+          M, P->J->getTargetTriple(), P->J->getDataLayout()))
+    return std::move(Err);
   Ctx.tier = CompileTier::Instrumented;
   Ctx.samplingSessionId = 0; // no runtime collector or private T1 is allocated
   normalizeModuleForJIT(M, Ctx.fnName, &Ctx);
@@ -1205,10 +1245,9 @@ Expected<std::unique_ptr<EJitPreparedCode>> EJitOrcEngine::prepareFinalCode(
   // fills the DataLayout (LLJIT::applyDataLayout) and never the triple, while
   // EJitPreparedCode::create requires both, so pin both explicitly to the
   // engine's target BEFORE the pipeline runs.
-  if (M.getTargetTriple().empty())
-    M.setTargetTriple(P->J->getTargetTriple());
-  if (M.getDataLayout().isDefault())
-    M.setDataLayout(P->J->getDataLayout());
+  if (auto Err = detail::normalizeJitModuleTarget(
+          M, P->J->getTargetTriple(), P->J->getDataLayout()))
+    return std::move(Err);
 
   normalizeModuleForJIT(M, origFnName, Ctx);
 
@@ -1269,6 +1308,10 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: parse bitcode error", cacheKey);
     return ModuleOrErr.takeError();
   }
+
+  if (auto Err = detail::normalizeJitModuleTarget(
+          **ModuleOrErr, P->J->getTargetTriple(), P->J->getDataLayout()))
+    return Err;
 
   // Do this before addIRModule so ORC's materialization-unit symbol claims
   // match the definitions that codegen will actually emit. Shared with the
