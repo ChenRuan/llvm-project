@@ -15,6 +15,7 @@
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
 #include "llvm/ExecutionEngine/Orc/ObjectTransformLayer.h"
+#include <algorithm>
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -198,12 +199,31 @@ static std::unique_ptr<Module> makeCandidateCellPgoModule(LLVMContext &Ctx) {
 }
 
 uint64_t collideCandidateHash(ArrayRef<uint8_t>) { return 1; }
+std::array<uint8_t, 32> CandidateDiagnosticBaseDigest{};
+bool CandidateDiagnosticHaveBase = false;
+bool CandidateDiagnosticSawOtherBucket = false;
+uint64_t splitCandidateDigestBucket(ArrayRef<uint8_t> Digest) {
+  if (!CandidateDiagnosticHaveBase) {
+    std::copy(Digest.begin(), Digest.end(),
+              CandidateDiagnosticBaseDigest.begin());
+    CandidateDiagnosticHaveBase = true;
+    return 1;
+  }
+  if (Digest.size() == CandidateDiagnosticBaseDigest.size() &&
+      std::equal(Digest.begin(), Digest.end(),
+                 CandidateDiagnosticBaseDigest.begin()))
+    return 1;
+  CandidateDiagnosticSawOtherBucket = true;
+  return 2;
+}
 
 EJitCandidateResult captureCandidate(EJitCandidateDirectory &Directory,
                                      StringRef IR,
-                                     ArrayRef<EJitCodeBinding> Bindings) {
+                                     ArrayRef<EJitCodeBinding> Bindings,
+                                     EJitIdentityDiagnosticOptions Diag = {},
+                                     EJitCodeIdentityScope Scope = scope()) {
   auto TSM = parse(IR);
-  EJitCandidateCapture Capture(Directory, scope(), Bindings);
+  EJitCandidateCapture Capture(Directory, std::move(Scope), Bindings, Diag);
   TSM.withModuleDo([&](Module &M) {
     Function *Entry = M.getFunction("f");
     ASSERT_NE(Entry, nullptr);
@@ -243,6 +263,90 @@ TEST(EJitCandidateDirectory, RealOptimizerPrefixGroupsExactly) {
   EXPECT_FALSE(C.existing);
 }
 
+TEST(EJitCandidateDirectory,
+     ExplanationFindsDeterministicPeerAcrossBucketsAndBoundsIR) {
+  const char *First =
+      "define i32 @f(i32 %x) { %r = add i32 %x, 7 ret i32 %r }";
+  const char *Different =
+      "define i32 @f(i32 %x) { %r = add i32 %x, 9007 ret i32 %r }";
+  CandidateDiagnosticHaveBase = false;
+  CandidateDiagnosticSawOtherBucket = false;
+  EJitCandidateDirectory Directory({}, splitCandidateDigestBucket);
+  auto A = captureCandidate(Directory, First, {});
+  EJitIdentityDiagnosticOptions Detailed;
+  Detailed.explain = true;
+  Detailed.excerptBytes = 32;
+  auto B = captureCandidate(Directory, Different, {}, Detailed);
+  ASSERT_FALSE(B.existing);
+  EXPECT_NE(A.groupId, B.groupId);
+  EXPECT_EQ(B.relatedGroupId, A.groupId);
+  ASSERT_TRUE(B.diagnostic);
+  EXPECT_TRUE(CandidateDiagnosticSawOtherBucket);
+  EXPECT_EQ(B.diagnostic->reasonToken(), "PREFIX_IR_DIFF");
+  EXPECT_EQ(B.diagnostic->kind, EJitIdentityDiagnostic::Kind::PrefixIRMismatch);
+  EXPECT_EQ(B.diagnostic->field, "prefix_ir");
+  EXPECT_GT(B.diagnostic->firstDiffLine, 0u);
+  EXPECT_FALSE(B.diagnostic->lhsExcerpt.empty());
+  EXPECT_FALSE(B.diagnostic->rhsExcerpt.empty());
+  EXPECT_LE(B.diagnostic->lhsExcerpt.size(),
+            Detailed.excerptBytes);
+  EXPECT_LE(B.diagnostic->rhsExcerpt.size(),
+            Detailed.excerptBytes);
+  EXPECT_TRUE(B.diagnostic->excerptsTruncated);
+
+  // Candidate equality remains exact and unchanged after enabling explanation.
+  EJitIdentityDiagnosticOptions Small;
+  Small.explain = true;
+  Small.excerptBytes = 32;
+  auto BAgain = captureCandidate(Directory, Different, {}, Small);
+  EXPECT_TRUE(BAgain.existing);
+  EXPECT_EQ(BAgain.groupId, B.groupId);
+  EXPECT_EQ(BAgain.relatedGroupId, 0u);
+  EXPECT_FALSE(BAgain.diagnostic);
+
+  EJitCandidateDirectory PolicyDirectory;
+  auto PolicyBase = captureCandidate(PolicyDirectory, First, {});
+  EJitIdentityDiagnosticOptions PolicyExplain;
+  PolicyExplain.explain = true;
+  auto DifferentPolicy = scope();
+  DifferentPolicy.compilerPolicy += ":diagnostic-policy-test";
+  auto PolicyVariant = captureCandidate(PolicyDirectory, First, {}, PolicyExplain,
+                                        DifferentPolicy);
+  ASSERT_TRUE(PolicyVariant.diagnostic);
+  EXPECT_EQ(PolicyVariant.relatedGroupId, PolicyBase.groupId);
+  EXPECT_EQ(PolicyVariant.diagnostic->reasonToken(), "POLICY_DIFF");
+  EXPECT_EQ(PolicyVariant.diagnostic->field, "scope.compilerPolicy");
+
+  std::string LargeIR1 = "@pad = private constant [1024 x i8] c\"" +
+                         std::string(1024, 'a') +
+                         "\"\ndefine i32 @f() { ret i32 1 }";
+  std::string LargeIR2 = LargeIR1;
+  LargeIR2[LargeIR2.find_last_of('a')] = 'b';
+  EJitCandidateDirectory LargeDirectory;
+  PgoFunctionSchema Schema{"f", 1, 2, 1, 0, 0, 0};
+  auto Large1 = parse(LargeIR1);
+  auto Large2 = parse(LargeIR2);
+  EJitCandidateResult LargeBase;
+  Large1.withModuleDo([&](Module &M) {
+    LargeBase = cantFail(LargeDirectory.classify(M, scope(), {}, {Schema}));
+  });
+  EJitIdentityDiagnosticOptions HardCap;
+  HardCap.explain = true;
+  HardCap.excerptBytes = 4096;
+  EJitCandidateResult LargeDifference;
+  Large2.withModuleDo([&](Module &M) {
+    LargeDifference = cantFail(
+        LargeDirectory.classify(M, scope(), {}, {Schema}, HardCap));
+  });
+  ASSERT_TRUE(LargeDifference.diagnostic);
+  EXPECT_EQ(LargeDifference.diagnostic->reasonToken(), "PREFIX_IR_DIFF");
+  EXPECT_EQ(LargeDifference.diagnostic->lhsExcerpt.size(),
+            EJitIdentityDiagnostic::MaxExcerptBytes);
+  EXPECT_EQ(LargeDifference.diagnostic->rhsExcerpt.size(),
+            EJitIdentityDiagnostic::MaxExcerptBytes);
+  EXPECT_TRUE(LargeDifference.diagnostic->excerptsTruncated);
+}
+
 TEST(EJitCandidateDirectory, BindingsSchemaCollisionAndBudgetsAreExact) {
   auto TSM = parse("declare i32 @ext() define i32 @f() { %r=call i32 @ext() "
                    "ret i32 %r }");
@@ -251,13 +355,28 @@ TEST(EJitCandidateDirectory, BindingsSchemaCollisionAndBudgetsAreExact) {
   Limits.maxGroups = 3;
   EJitCandidateDirectory D(Limits, collideCandidateHash);
   EJitCandidateResult A, B;
+  EJitIdentityDiagnosticOptions Explain;
+  Explain.explain = true;
   TSM.withModuleDo([&](Module &M) {
     A = cantFail(D.classify(M, scope(), {{"ext", 4096, true}}, {S}));
-    B = cantFail(D.classify(M, scope(), {{"ext", 8192, true}}, {S}));
+    B = cantFail(D.classify(M, scope(), {{"ext", 8192, true}}, {S}, Explain));
+    ASSERT_TRUE(B.diagnostic);
+    EXPECT_EQ(B.relatedGroupId, A.groupId);
+    EXPECT_EQ(B.diagnostic->reasonToken(), "BINDING_ADDRESS_DIFF");
+    EXPECT_EQ(B.diagnostic->field, "binding.address");
+    EXPECT_EQ(B.diagnostic->lhsValue, "ext=0x1000");
+    EXPECT_EQ(B.diagnostic->rhsValue, "ext=0x2000");
     auto S2 = S;
     ++S2.funcHash;
-    auto C = cantFail(D.classify(M, scope(), {{"ext", 4096, true}}, {S2}));
+    auto C = cantFail(
+        D.classify(M, scope(), {{"ext", 4096, true}}, {S2}, Explain));
     EXPECT_NE(A.groupId, C.groupId);
+    ASSERT_TRUE(C.diagnostic);
+    EXPECT_EQ(C.relatedGroupId, A.groupId);
+    EXPECT_EQ(C.diagnostic->reasonToken(), "SCHEMA_FUNC_HASH_DIFF");
+    EXPECT_EQ(C.diagnostic->field, "schema.funcHash");
+    EXPECT_EQ(C.diagnostic->lhsValue, "f=1");
+    EXPECT_EQ(C.diagnostic->rhsValue, "f=2");
     auto Other = parse("declare i32 @ext() define i32 @f() { "
                        "%r=call i32 @ext() %x=add i32 %r, 1 ret i32 %x }");
     Other.withModuleDo([&](Module &OtherM) {
@@ -659,14 +778,36 @@ TEST_F(PreparedCodeNative, SreBigEndianNormalizationLinksAndReuses) {
 TEST_F(PreparedCodeNative, ForcedHashCollisionStillComparesFullIdentity) {
   EJitPreparedCodeEmitter E(*J, 1, {},
                             [](ArrayRef<uint8_t>) { return uint64_t(0); });
-  auto A = cantFail(E.link(prepared(Simple)));
-  auto B = cantFail(E.link(
-      prepared("define i32 @f(i32 %x) { %r = add i32 %x, 9 ret i32 %r }")));
+  auto First = prepared(Simple);
+  auto Different = prepared(
+      "define i32 @f(i32 %x) { %r = add i32 %x, 9 ret i32 %r }");
+  auto A = cantFail(E.link(std::move(First)));
+  auto Explain = E.explainLinkedIdentity(A.codeId, Different->identity(), 10000);
+  ASSERT_TRUE(Explain);
+  EXPECT_EQ(Explain->reasonToken(), "FINAL_IR_DIFF");
+  EXPECT_GT(Explain->firstDiffLine, 0u);
+  EXPECT_LE(Explain->lhsExcerpt.size(), EJitIdentityDiagnostic::MaxExcerptBytes);
+  EXPECT_LE(Explain->rhsExcerpt.size(), EJitIdentityDiagnostic::MaxExcerptBytes);
+
+  auto DifferentSourceScope = scope();
+  DifferentSourceScope.source[0] ^= 0xff;
+  auto SourceVariant = prepared(Simple, {}, DifferentSourceScope);
+  auto SourceExplain = E.explainLinkedIdentity(A.codeId, SourceVariant->identity());
+  ASSERT_TRUE(SourceExplain);
+  EXPECT_EQ(SourceExplain->reasonToken(), "SOURCE_DIFF");
+  EXPECT_EQ(SourceExplain->field, "scope.source");
+  EXPECT_EQ(SourceExplain->lhsValue.size(), 64u);
+  EXPECT_EQ(SourceExplain->rhsValue.size(), 64u);
+  auto B = cantFail(E.link(std::move(Different)));
   EXPECT_NE(A.codeId, B.codeId);
   EXPECT_NE(A.fn, B.fn);
   EXPECT_EQ(Objects, 2u);
   EXPECT_EQ(reinterpret_cast<int (*)(int)>(A.fn)(1), 8);
   EXPECT_EQ(reinterpret_cast<int (*)(int)>(B.fn)(1), 10);
+  auto Equal = E.explainLinkedIdentity(A.codeId, prepared(Simple)->identity());
+  ASSERT_TRUE(Equal);
+  EXPECT_EQ(Equal->reasonToken(), "IDENTITY_EQUAL");
+  EXPECT_FALSE(E.explainLinkedIdentity(999999, prepared(Simple)->identity()));
 }
 
 TEST_F(PreparedCodeNative, DifferentBindingsGenerateIndependentCode) {

@@ -55,6 +55,56 @@ struct EJitCodeIdentityScope {
   bool operator==(const EJitCodeIdentityScope &Other) const;
 };
 
+/// A read-only explanation of the first exact-identity difference. This is
+/// computed from identities already retained by the candidate directory or
+/// emitter; it never changes their equality or sharing decisions.
+struct EJitIdentityDiagnostic {
+  enum class Kind : uint8_t {
+    Equal,
+    SourceMismatch,
+    EntryMismatch,
+    PolicyMismatch,
+    BindingNameMismatch,
+    BindingAddressMismatch,
+    BindingCallableMismatch,
+    BindingCountMismatch,
+    BindingGenerationMismatch,
+    SchemaNameMismatch,
+    SchemaFuncHashMismatch,
+    SchemaNameHashMismatch,
+    SchemaCounterCountMismatch,
+    SchemaIcSiteCountMismatch,
+    SchemaMemSiteCountMismatch,
+    SchemaScalarSiteCountMismatch,
+    SchemaCountMismatch,
+    PrefixIRMismatch,
+    IRMismatch,
+  };
+
+  static constexpr uint32_t MaxExcerptBytes = 512;
+  static constexpr uint32_t MaxValueBytes = 128;
+
+  Kind kind = Kind::Equal;
+  std::string field;
+  std::string lhsValue;
+  std::string rhsValue;
+  bool valuesTruncated = false;
+  uint64_t firstDiffOffset = 0;
+  uint64_t firstDiffLine = 0;
+  std::string lhsExcerpt;
+  std::string rhsExcerpt;
+  bool excerptsTruncated = false;
+
+  StringRef reasonToken() const;
+};
+
+/// Explanations are opt-in. Excerpts are centered around the first IR
+/// difference and clamped to MaxExcerptBytes for each side.
+struct EJitIdentityDiagnosticOptions {
+  bool explain = false;
+  uint32_t excerptBytes = 0;
+};
+
 struct EJitCandidateLimits {
   uint32_t maxGroups = 128;
   uint64_t maxIdentityBytes = 16 * 1024 * 1024;
@@ -63,6 +113,8 @@ struct EJitCandidateLimits {
 struct EJitCandidateResult {
   uint64_t groupId = 0;
   bool existing = false;
+  uint64_t relatedGroupId = 0;
+  std::optional<EJitIdentityDiagnostic> diagnostic;
 };
 
 class EJitCandidateDirectory {
@@ -74,7 +126,8 @@ public:
   Expected<EJitCandidateResult> classify(const Module &CommonPrefix,
                                          EJitCodeIdentityScope Scope,
                                          ArrayRef<EJitCodeBinding> Bindings,
-                                         ArrayRef<PgoFunctionSchema> Schema);
+                                         ArrayRef<PgoFunctionSchema> Schema,
+                                         EJitIdentityDiagnosticOptions Diag = {});
   uint32_t groupCount() const;
   uint64_t identityBytes() const;
 
@@ -83,7 +136,8 @@ private:
   Expected<EJitCandidateResult>
   classifyCanonical(std::string CanonicalIR, EJitCodeIdentityScope Scope,
                     ArrayRef<EJitCodeBinding> Bindings,
-                    ArrayRef<PgoFunctionSchema> Schema);
+                    ArrayRef<PgoFunctionSchema> Schema,
+                    EJitIdentityDiagnosticOptions Diag = {});
   struct Impl;
   std::unique_ptr<Impl> P;
 };
@@ -92,7 +146,8 @@ class EJitCandidateCapture {
 public:
   EJitCandidateCapture(EJitCandidateDirectory &Directory,
                        EJitCodeIdentityScope Scope,
-                       ArrayRef<EJitCodeBinding> Bindings);
+                       ArrayRef<EJitCodeBinding> Bindings,
+                       EJitIdentityDiagnosticOptions Diag = {});
   ~EJitCandidateCapture();
   /// Serialize the real optimized prefix before any PGO instrumentation.
   void capturePrefix(const Module &CommonPrefix);
@@ -106,6 +161,7 @@ private:
   EJitCandidateDirectory &Directory;
   EJitCodeIdentityScope Scope;
   std::vector<EJitCodeBinding> Bindings;
+  EJitIdentityDiagnosticOptions Diag;
   std::string CanonicalIR;
   std::optional<EJitCandidateResult> Result;
   Error Failure = Error::success();
@@ -209,6 +265,12 @@ public:
   /// nothing and consumes no budget.
   bool linkedIdentityEquals(uint64_t CodeId,
                             const EJitFinalCodeIdentity &Other) const;
+
+  /// On-demand explanation for a final exact-identity comparison. Unknown
+  /// CodeIds return std::nullopt. The query retains no comparison material.
+  std::optional<EJitIdentityDiagnostic>
+  explainLinkedIdentity(uint64_t CodeId, const EJitFinalCodeIdentity &Other,
+                        uint32_t ExcerptBytes = 0) const;
 
 private:
   struct Impl;
