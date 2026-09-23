@@ -58,7 +58,7 @@ EJitReuseDiagnosticStore &llvm::ejit::reuseDiagnosticStore() {
   return Store;
 }
 
-void llvm::ejit::printReuseDiagnostic(const EJitReuseDiagnostic &R) {
+void llvm::ejit::printReuseDiagnostic(const EJitReuseDiagnostic &R, bool ShowDetails) {
   EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu entry=%s func=%u stage=%s reason=%s "
                 "action=%s generation=%u attempt=%llu group=%llu group_gen=%llu "
                 "peer_group=%llu peer_code=%llu repeats=%llu truncated=%u detail=%s",
@@ -73,7 +73,7 @@ void llvm::ejit::printReuseDiagnostic(const EJitReuseDiagnostic &R) {
     EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu dim=%u instance=%u version=%u",
                   (unsigned long long)R.sequence, R.identity.dims[I].dimType,
                   R.identity.dims[I].instanceId, R.identity.versions[I]);
-  if (R.level >= 2 && (R.left[0] || R.right[0])) {
+  if (ShowDetails && R.level >= 2 && (R.left[0] || R.right[0])) {
     EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu first_diff_line=%u byte=%llu "
                   "left(peer)=%s", (unsigned long long)R.sequence, R.diffLine,
                   (unsigned long long)R.diffOffset, R.left);
@@ -83,7 +83,9 @@ void llvm::ejit::printReuseDiagnostic(const EJitReuseDiagnostic &R) {
 }
 
 void llvm::ejit::recordReuseDiagnostic(EJitReuseDiagnostic R) {
-  if (reuseDiagnosticStore().record(R)) printReuseDiagnostic(R);
+  // Retain details now, but avoid automatically streaming IR to the console.
+  // The explicit print API shows the retained pair without needing a rerun.
+  if (reuseDiagnosticStore().record(R)) printReuseDiagnostic(R, false);
 }
 
 Error llvm::ejit::detail::normalizeJitModuleTarget(

@@ -446,7 +446,8 @@ void ejit_shutdown(void) {
 #endif
   delete gEJIT;
   gEJIT = nullptr;
-  if (WasReuseOwner) (void)reuseDiagnosticStore().configure("*", 1);
+  if (WasReuseOwner)
+    (void)reuseDiagnosticStore().configure("*", EJitReuseDiagnosticStore::DefaultLevel);
   EJIT_DIAG("shutdown complete");
 }
 

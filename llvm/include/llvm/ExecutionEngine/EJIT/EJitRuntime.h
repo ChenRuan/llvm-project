@@ -433,10 +433,12 @@ typedef struct {
 /// off), EJIT_ERR_NOT_ACTIVE otherwise.
 ejit_status_t ejit_representative_get_stats(ejit_representative_stats_t *out);
 
-/// Owner-core-only cold-path reuse diagnostics. Configure AFTER initialization
-/// on ejit_taskpool_get_worker_core(), before starting the workload. No shared
-/// ABI or remote mailbox. level: 0 off, 1 summaries (default *), 2 bounded paired
-/// excerpts; entry is an exact name or "*" (max 95 bytes). Capture/print retains
+/// Owner-core-only cold-path reuse diagnostics. No configuration needed by
+/// default: capture detailed pairs for all entries, automatically log summaries
+/// only, then call print on ejit_taskpool_get_worker_core(). Optional config is
+/// applied after initialization. No shared ABI or remote mailbox.
+/// level: 0 off, 1 summaries, 2 bounded paired excerpts (default, filter "*").
+/// entry is an exact name or "*" (max 95 bytes). Capture/print retains
 /// 16 records, may evict/drop, and never retains a second full IR. Config clears
 /// prior records; reset clears records but preserves config. In-flight events
 /// may straddle a reset. EJIT_PENDING means busy; retry, never spin in a caller.

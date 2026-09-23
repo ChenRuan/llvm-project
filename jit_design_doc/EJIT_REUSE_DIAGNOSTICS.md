@@ -8,14 +8,8 @@ keep `EJIT_SRE_PGO_BRANCH_AUDIT=ON` for validation.
 
 ## Board usage
 
-After `test_ejit_period` initializes the worker on core 6, and BEFORE starting
-the workload on core 16, run on core 6:
-
-```text
-ejit_reuse_diag_config "reuse_0", 2
-```
-
-Then run the existing workload. On core 6, inspect retained records with:
+No runtime preconfiguration is needed: detailed capture defaults to all entries.
+Run the existing workload, then on worker core 6 inspect retained records with:
 
 ```text
 ejit_reuse_diag_print
@@ -28,14 +22,19 @@ core after initialization; a peer call returns `EJIT_ERR_NOT_ACTIVE`, not an
 apparently empty private registry. They do not route through a cross-core
 mailbox. `EJIT_PENDING` means a diagnostic operation was busy: retry later.
 
-Level 0 disables new capture, 1 records summaries (default, filter `*`), and 2
-adds paired first-difference excerpts. The filter is an exact function name or
+Level 0 disables new capture, 1 records summaries, and 2 adds paired
+first-difference excerpts (default, filter `*`). Automatic logs print summaries
+only; the explicit print command also prints retained excerpts. The filter is an exact function name or
 `*`, up to 95 printable ASCII bytes; an empty filter is equivalent to `*`.
 Configuration clears the old capture window. Reset clears records but preserves
 the filter/level. In-flight compilation can straddle config/reset. Turning on
-level 2 after the mismatch happened cannot recover uncaptured historical IR;
-enable it BEFORE a fresh run. A cached existing candidate is not reclassified
+level 2 after explicitly using level 0/1 cannot recover uncaptured historical IR;
+enable it BEFORE a fresh run in that case. A cached existing candidate is not reclassified
 just to populate diagnostics.
+
+If unrelated events evict the record of interest, optionally use
+`ejit_reuse_diag_config "reuse_0", 2` before a focused rerun. It is not required
+for the first test run. Shutdown restores the default all-entry detailed capture.
 
 ## Reading the record
 
@@ -86,7 +85,8 @@ that all requests shared. At most 256 bytes per IR side and 192 bytes of detail
 are retained per record; names/reasons also have fixed limits. Control characters
 are replaced with spaces for one-line logs. Select one function to avoid unrelated
 events evicting the interesting one. Addresses and IR may reveal application
-details: enable detailed diagnostics only where such logs are appropriate.
+details: restrict access to diagnostic output and use level 0/1 where detailed
+capture is inappropriate.
 
 Existing identity material is reused to calculate the difference. No extra full
 module/IR copy is retained, no worker registry pointer escapes, and no shared

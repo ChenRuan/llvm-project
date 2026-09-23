@@ -27,6 +27,7 @@ struct EJitReuseDiagnostic {
 class EJitReuseDiagnosticStore {
 public:
   static constexpr unsigned Capacity = 16;
+  static constexpr unsigned DefaultLevel = 2;
   struct Snapshot {
     EJitReuseDiagnostic records[Capacity];
     uint32_t count = 0, level = 0;
@@ -126,13 +127,13 @@ private:
   EJitAtomicU64 dropped_{0};
   EJitReuseDiagnostic records_[Capacity];
   uint64_t sequence_ = 0, evicted_ = 0;
-  uint32_t count_ = 0, next_ = 0, level_ = 1;
+  uint32_t count_ = 0, next_ = 0, level_ = DefaultLevel;
   char filter_[96] = "*";
 };
 
 // Core-local, not shared ABI. Shell API checks compile-owner core explicitly.
 EJitReuseDiagnosticStore &reuseDiagnosticStore();
-void printReuseDiagnostic(const EJitReuseDiagnostic &R);
+void printReuseDiagnostic(const EJitReuseDiagnostic &R, bool ShowDetails = true);
 void recordReuseDiagnostic(EJitReuseDiagnostic R);
 
 } // namespace ejit
