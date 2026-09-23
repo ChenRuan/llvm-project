@@ -421,7 +421,7 @@ struct BlockingRepresentativeAdmission {
 };
 
 EJitSharedTaskPool::SamplingAdmission blockRepresentativeAdmission(
-    void *ctx, uint32_t, const EJitDimPair *, uint32_t, uint64_t) {
+    void *ctx, uint32_t, const EJitDimPair *, uint32_t, uint32_t, uint64_t) {
   auto *Block = static_cast<BlockingRepresentativeAdmission *>(ctx);
   Block->entered.store(true, std::memory_order_release);
   while (!Block->allow.load(std::memory_order_acquire))
@@ -655,7 +655,7 @@ TEST_F(SharedTaskPoolTest, RepresentativeMailboxTimeoutKeepsRunningLease) {
   std::atomic<bool> PeerDone{false};
   std::thread Producer([&] {
     EJitCoreId::setCurrentForTest(1);
-    Result = Peer.requestRepresentativeAdmission(7, nullptr, 0, 0);
+    Result = Peer.requestRepresentativeAdmission(7, nullptr, 0, 0, 0);
     PeerDone.store(true, std::memory_order_release);
   });
   std::thread Service([&] {
@@ -741,7 +741,7 @@ TEST_F(SharedTaskPoolTest,
   std::atomic<bool> ADone{false};
   std::thread A([&] {
     EJitCoreId::setCurrentForTest(1);
-    AResult = Peer.requestRepresentativeAdmission(7, nullptr, 0, 0);
+    AResult = Peer.requestRepresentativeAdmission(7, nullptr, 0, 0, 0);
     ADone.store(true, std::memory_order_release);
   });
   std::thread ServiceA([&] {
@@ -803,7 +803,7 @@ TEST_F(SharedTaskPoolTest,
   if (ARecycled) {
     B = std::thread([&] {
       EJitCoreId::setCurrentForTest(1);
-      BResult = Peer.requestRepresentativeAdmission(8, nullptr, 0, 0);
+      BResult = Peer.requestRepresentativeAdmission(8, nullptr, 0, 0, 0);
       BDone.store(true, std::memory_order_release);
     });
     ServiceB = std::thread([&] {
@@ -2421,6 +2421,57 @@ void observingStop(void *ctx) {
   auto *o = static_cast<StopObserver *>(ctx);
   o->stateAtStop = o->st->initState.loadAcquire();
   ++o->calls;
+}
+
+// Repeated real mailbox handshakes must leave a turn for queued compilation.
+TEST_F(SharedTaskPoolTest, RepresentativeMailboxTrafficCannotStarveCompileQueue) {
+  EJitSharedTaskPool Owner, Peer;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setRepresentativeSharingEnabled(true);
+  unsigned Compiles = 0;
+  Owner.setCompiler(+[](void *Ctx, const EJitCompileRequest &Req, void **Fn) {
+    ++*static_cast<unsigned *>(Ctx);
+    *Fn = codeFor(Req.funcIndex);
+    return true;
+  }, &Compiles);
+  unsigned Admissions = 0;
+  Owner.setSamplingAdmissionCallback(
+      +[](void *Ctx, uint32_t, const EJitDimPair *, uint32_t, uint32_t,
+          uint64_t) {
+        ++*static_cast<unsigned *>(Ctx);
+        return EJitSharedTaskPool::SamplingAdmission::Deny;
+      }, &Admissions);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(Owner.compileOrGet(1, nullptr, 0, codeFor(1)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+
+  EJitCoreId::setCurrentForTest(1);
+  Peer.bind(state_.get());
+  Peer.setMode(EJitCompileMode::Async);
+  Peer.setRepresentativeSharingEnabled(true);
+  ASSERT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+  DriveOwnerCtx Drive{&Owner, 1};
+  Peer.setWorkerIdleHook(&driveOwnerOnRequesterIdle, &Drive);
+  // Each synchronous peer handshake drives the real owner worker once.
+  // Replenish the mailbox before the next step, as a busy producer can do
+  // while the SRE worker is throttled. No sleeps or background threads.
+  for (unsigned I = 0; I < 128; ++I)
+    EXPECT_EQ(Peer.requestRepresentativeAdmission(2, nullptr, 0, 0, 0),
+              EJitSharedTaskPool::SamplingAdmission::Deny);
+  EXPECT_EQ(Admissions, 128u);
+  std::printf("[FAIRNESS] admissions=%u compiles_during_traffic=%u\n",
+              Admissions, Compiles);
+  EXPECT_EQ(Compiles, 1u) << "Mailbox traffic starved an already queued compile";
+
+  // Control: stop producing mailbox requests. The same queued request must
+  // compile without changing configuration or the compiler callback.
+  EJitCoreId::setCurrentForTest(0);
+  (void)Owner.workerPollOnce();
+  EXPECT_EQ(Compiles, 1u);
+  std::printf("[FAIRNESS] compiles_after_traffic_stops=%u\n", Compiles);
+  Owner.ownerShutdown();
 }
 
 // 七.1 — the REAL worker state machine: it WAITS on Initializing (never exits),

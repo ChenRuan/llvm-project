@@ -6256,28 +6256,31 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
     return EJitWorkerStep::Exit;
   uint32_t st = state_->initState.loadAcquire();
   switch (static_cast<EJitSharedInitState>(st)) {
-  case EJitSharedInitState::Ready:
+  case EJitSharedInitState::Ready: {
     workerConsumeLoops_.fetchAdd(1);
     // Peer representative callbacks are synchronous identity/decision
     // handshakes. Service one before maintenance and queue work so a peer
     // never waits behind a continuously replenished compile queue.
-    if (serviceRepresentativeCommand())
-      return EJitWorkerStep::Consumed;
+    // A busy peer can replenish the mailbox during every worker throttle.
+    // Finish one handshake first, but still give maintenance/publication and
+    // the compile queue a turn before throttling again.
+    bool Consumed = serviceRepresentativeCommand();
     // A replenished compile queue must not starve cold-session cancellation.
     if (ownerMaintenanceFn_ && ownerMaintenanceFn_(ownerMaintenanceCtx_))
-      return EJitWorkerStep::Consumed;
+      Consumed = true;
     // Explicit publication must not starve behind a continuously replenished
     // compile queue or diagnostics. serviceCodeBatchRequest() snapshots and
     // drains the work that predates the request before publishing it.
     if (serviceCodeBatchRequest())
-      return EJitWorkerStep::Consumed;
+      Consumed = true;
     if (serviceMayConstRankingRequest())
-      return EJitWorkerStep::Consumed;
+      Consumed = true;
     if (pollOne())
       return EJitWorkerStep::Consumed;
     if (serviceAutoTier2Publish())
       return EJitWorkerStep::Consumed;
-    return EJitWorkerStep::Idle;
+    return Consumed ? EJitWorkerStep::Consumed : EJitWorkerStep::Idle;
+  }
   case EJitSharedInitState::Initializing:
     // The owner is still arming the pool. The SRE task may have been scheduled
     // before the owner published Ready; WAIT for Ready/Failed — never exit
