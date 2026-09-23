@@ -433,6 +433,17 @@ typedef struct {
 /// off), EJIT_ERR_NOT_ACTIVE otherwise.
 ejit_status_t ejit_representative_get_stats(ejit_representative_stats_t *out);
 
+/// Owner-core-only cold-path reuse diagnostics. Configure AFTER initialization
+/// on ejit_taskpool_get_worker_core(), before starting the workload. No shared
+/// ABI or remote mailbox. level: 0 off, 1 summaries (default *), 2 bounded paired
+/// excerpts; entry is an exact name or "*" (max 95 bytes). Capture/print retains
+/// 16 records, may evict/drop, and never retains a second full IR. Config clears
+/// prior records; reset clears records but preserves config. In-flight events
+/// may straddle a reset. EJIT_PENDING means busy; retry, never spin in a caller.
+ejit_status_t ejit_reuse_diag_config(const char *entry, uint32_t level);
+ejit_status_t ejit_reuse_diag_print(void);
+ejit_status_t ejit_reuse_diag_reset(void);
+
 /// Scope of a deactivated lifecycle's compiler-source borrows. This is additive
 /// to the existing C ABI and does not change ejit_config_t or shared POD layout.
 typedef struct ejit_borrow_fence_t {

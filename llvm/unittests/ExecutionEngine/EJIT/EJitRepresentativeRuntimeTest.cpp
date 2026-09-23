@@ -34,6 +34,8 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRepresentativeGroup.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitReuseDiagnostics.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "llvm/IR/BasicBlock.h"
@@ -1689,6 +1691,16 @@ TEST_F(EJitRepresentativeRuntimeTest,
     ASSERT_EQ(ejit_init_representative(&Cfg), EJIT_OK);
   }
   ASSERT_EQ(ejit_representative_test_timeout(5000000000ULL, 2), EJIT_OK);
+  ASSERT_EQ(ejit_reuse_diag_config("entry_rep_pressure_0", 2), EJIT_OK);
+  auto RestoreDiagnostics = make_scope_exit([] {
+    (void)reuseDiagnosticStore().configure("*", 1);
+  });
+  const uint32_t OriginalCore = EJitCoreId::current();
+  EJitCoreId::setCurrentForTest(OriginalCore + 1);
+  EXPECT_EQ(ejit_reuse_diag_config("*", 0), EJIT_ERR_NOT_ACTIVE);
+  EXPECT_EQ(ejit_reuse_diag_print(), EJIT_ERR_NOT_ACTIVE);
+  EXPECT_EQ(ejit_reuse_diag_reset(), EJIT_ERR_NOT_ACTIVE);
+  EJitCoreId::setCurrentForTest(OriginalCore);
   auto *Pool = static_cast<EJitSharedTaskPool *>(ejit_representative_test_pool());
   ASSERT_NE(Pool, nullptr);
   auto &Rows = RepresentativeRuntime::pressureRows();
@@ -1779,6 +1791,25 @@ TEST_F(EJitRepresentativeRuntimeTest,
   EXPECT_EQ(Final.sharedPhysicalReuses - After.sharedPhysicalReuses, 20u);
   EXPECT_EQ(Pool->pendingCount(), 0u);
   EXPECT_EQ(Pool->liveRequestAttemptCount(), 0u);
+  EJitReuseDiagnosticStore::Snapshot Diag;
+  ASSERT_TRUE(reuseDiagnosticStore().snapshot(Diag));
+  bool FoundUnequal = false;
+  for (unsigned I = 0; I < Diag.count; ++I) {
+    const auto &R = Diag.records[I];
+    if (StringRef(R.entry) == "entry_rep_pressure_0" &&
+        StringRef(R.stage) == "CANDIDATE" &&
+        StringRef(R.reason) == "PREFIX_IR_DIFF") {
+      FoundUnequal = true;
+      EXPECT_GT(R.peerGroup, 0u);
+      EXPECT_STREQ(R.action, "NEW_GROUP");
+      EXPECT_NE(R.left[0], 0);
+      EXPECT_NE(R.right[0], 0);
+      EXPECT_NE(StringRef(R.left), StringRef(R.right));
+    }
+  }
+  EXPECT_TRUE(FoundUnequal) << "real unequal candidate must explain its split";
+  EXPECT_EQ(ejit_reuse_diag_print(), EJIT_OK);
+  EXPECT_EQ(ejit_reuse_diag_reset(), EJIT_OK);
 }
 
 /// The default-off policy on the REAL runtime: an ordinary initialization never

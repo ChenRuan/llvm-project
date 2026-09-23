@@ -3,6 +3,9 @@
 Source: `examples/ejit_reuse_sre_test.c`, a single header-free C file.
 Replace the previous file defining `test_ejit_period`; do not link both demos.
 The companion `ejit_reuse_host_check.c` is a host-only mock, NOT a board source.
+For optional mismatch reasons and paired bounded IR excerpts on core 6, see
+[reuse diagnostics](EJIT_REUSE_DIAGNOSTICS.md). Enable capture after worker
+initialization and before starting core 16; the smoke source need not change.
 
 ## Build And Startup
 

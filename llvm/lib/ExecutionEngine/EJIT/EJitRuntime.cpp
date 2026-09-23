@@ -14,6 +14,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h" // ejit_reg_entry_t layout
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitReuseDiagnostics.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h" // EJitDimPair layout
 // Build-time-generated: EJIT_GIT_COMMIT / EJIT_GIT_BRANCH (git HEAD of the
 // llvm-project source tree). Lives in the LLVMEJIT build directory.
@@ -439,8 +440,13 @@ void ejit_shutdown(void) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   setDumpSharedState(nullptr);
 #endif
+  bool WasReuseOwner = false;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  WasReuseOwner = gEJIT && gEJIT->sharedTaskPool() && gEJIT->sharedTaskPool()->isOwner();
+#endif
   delete gEJIT;
   gEJIT = nullptr;
+  if (WasReuseOwner) (void)reuseDiagnosticStore().configure("*", 1);
   EJIT_DIAG("shutdown complete");
 }
 
@@ -1994,6 +2000,45 @@ void ejit_taskpool_print_compiled() {
   EJIT_DIAG_RAW("print_compiled: shared taskpool not enabled");
 #endif
 #endif
+}
+
+static bool reuseDiagOnOwner() {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  return gEJIT && gEJIT->sharedTaskPool() && gEJIT->sharedTaskPool()->isOwner() &&
+         gEJIT->sharedTaskPool()->state() &&
+         EJitCoreId::current() ==
+             gEJIT->sharedTaskPool()->state()->ownerCoreId.loadAcquire();
+#else
+  return false;
+#endif
+}
+
+ejit_status_t ejit_reuse_diag_config(const char *entry, uint32_t level) {
+  if (!reuseDiagOnOwner()) return EJIT_ERR_NOT_ACTIVE;
+  if (!entry || level > 2) return EJIT_ERR_INVALID_PARAM;
+  size_t Size = 0;
+  while (Size < 96 && entry[Size]) ++Size;
+  if (!EJitReuseDiagnosticStore::validFilter(StringRef(entry, Size)))
+    return EJIT_ERR_INVALID_PARAM;
+  return reuseDiagnosticStore().configure(StringRef(entry, Size), level)
+             ? EJIT_OK : EJIT_PENDING;
+}
+
+ejit_status_t ejit_reuse_diag_reset(void) {
+  if (!reuseDiagOnOwner()) return EJIT_ERR_NOT_ACTIVE;
+  return reuseDiagnosticStore().reset() ? EJIT_OK : EJIT_PENDING;
+}
+
+ejit_status_t ejit_reuse_diag_print(void) {
+  if (!reuseDiagOnOwner()) return EJIT_ERR_NOT_ACTIVE;
+  EJitReuseDiagnosticStore::Snapshot S;
+  if (!reuseDiagnosticStore().snapshot(S)) return EJIT_PENDING;
+  EJIT_DIAG_RAW("[REUSE_DIAG] retained=%u capacity=%u level=%u filter=%s "
+                "evicted=%llu dropped=%llu (bounded first differences, not full IR)",
+                S.count, EJitReuseDiagnosticStore::Capacity, S.level, S.filter,
+                (unsigned long long)S.evicted, (unsigned long long)S.dropped);
+  for (unsigned I = 0; I < S.count; ++I) printReuseDiagnostic(S.records[I]);
+  return EJIT_OK;
 }
 
 void ejit_dump_func(const char *name) {

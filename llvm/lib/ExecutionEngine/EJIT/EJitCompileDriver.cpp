@@ -15,6 +15,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRepresentativeGroup.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+#include "llvm/ExecutionEngine/EJIT/EJitReuseDiagnostics.h"
 #ifdef EJIT_SRE_CODE_POOL
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #endif
@@ -29,6 +30,71 @@
 
 using namespace llvm;
 using namespace llvm::ejit;
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+namespace {
+EJitReuseDiagnostic makeReuseDiagnostic(
+    const EJitCompileRequest &Req, StringRef Entry, StringRef Stage,
+    StringRef Reason, StringRef Action, uint64_t Group, uint64_t GroupGeneration) {
+  EJitReuseDiagnostic R;
+  R.level = reuseDiagnosticStore().levelFor(Entry);
+  R.identity.funcIndex = stripReqTier(Req.funcIndex);
+  R.identity.generation = Req.generation;
+  R.identity.attemptToken = Req.attemptToken;
+  R.identity.groupId = Group;
+  R.identity.groupGeneration = GroupGeneration;
+  R.identity.numDims = std::min(Req.numDims, kEJitMaxRequestDims);
+  for (unsigned I = 0; I < R.identity.numDims; ++I) {
+    R.identity.dims[I] = Req.dims[I];
+    R.identity.versions[I] = Req.versions[I];
+  }
+  R.truncated |= EJitReuseDiagnosticStore::copyText(R.entry, Entry);
+  R.truncated |= EJitReuseDiagnosticStore::copyText(R.stage, Stage);
+  R.truncated |= EJitReuseDiagnosticStore::copyText(R.reason, Reason);
+  R.truncated |= EJitReuseDiagnosticStore::copyText(R.action, Action);
+  return R;
+}
+void logReuseFailure(const EJitCompileRequest &Req, StringRef Entry,
+                     StringRef Reason, StringRef Detail, uint64_t Group,
+                     uint64_t GroupGeneration) {
+  auto R = makeReuseDiagnostic(Req, Entry, "FINAL", Reason, "ORDINARY_ROUTE",
+                               Group, GroupGeneration);
+  if (!R.level) return;
+  R.truncated |= EJitReuseDiagnosticStore::copyText(R.detail, Detail);
+  if (R.level >= 2) {
+    const size_t ModuleAt = Detail.find("module triple=");
+    const size_t JitAt = Detail.find("; jit triple=");
+    if (ModuleAt != StringRef::npos && JitAt != StringRef::npos && JitAt > ModuleAt) {
+      R.truncated |= EJitReuseDiagnosticStore::copyText(R.left, Detail.substr(JitAt + 2));
+      R.truncated |= EJitReuseDiagnosticStore::copyText(
+          R.right, Detail.slice(ModuleAt, JitAt));
+    }
+  }
+  recordReuseDiagnostic(R);
+}
+void attachReuseDifference(EJitReuseDiagnostic &R, const EJitIdentityDiagnostic &D) {
+  StringRef Reason = D.reasonToken();
+  if (D.kind == EJitIdentityDiagnostic::Kind::IRMismatch)
+    Reason = StringRef(R.stage) == "CANDIDATE" ? "PREFIX_IR_DIFF" : "FINAL_IR_DIFF";
+  R.truncated |= EJitReuseDiagnosticStore::copyText(R.reason, Reason);
+  const bool IsIR = D.kind == EJitIdentityDiagnostic::Kind::IRMismatch ||
+                    D.kind == EJitIdentityDiagnostic::Kind::PrefixIRMismatch;
+  const std::string Detail = "field=" + D.field +
+      (IsIR ? " peer_bytes=" : " peer=") + D.lhsValue +
+      (IsIR ? " request_bytes=" : " request=") + D.rhsValue;
+  R.truncated |= EJitReuseDiagnosticStore::copyText(R.detail, Detail);
+  R.truncated |= D.valuesTruncated || D.excerptsTruncated;
+  R.diffOffset = D.firstDiffOffset;
+  R.diffLine = static_cast<uint32_t>(std::min<uint64_t>(D.firstDiffLine, UINT32_MAX));
+  if (R.level >= 2) {
+    R.truncated |= EJitReuseDiagnosticStore::copyText(
+        R.left, D.lhsExcerpt.empty() ? D.lhsValue : D.lhsExcerpt);
+    R.truncated |= EJitReuseDiagnosticStore::copyText(
+        R.right, D.rhsExcerpt.empty() ? D.rhsValue : D.rhsExcerpt);
+  }
+}
+} // namespace
+#endif
 
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 namespace {
@@ -814,6 +880,8 @@ bool EJitCompileDriver::classifyRepresentativeRequest(const EJitCompileRequest &
   // is classified exactly, keep those requests on independent compilation.
   uint64_t Group = UINT64_MAX;
   bool ExistingCandidate = false;
+  uint64_t CandidatePeerGroup = 0;
+  std::optional<EJitIdentityDiagnostic> CandidateDifference;
   EJitRepresentativeDiagReason CandidateReason =
       EJitRepresentativeDiagReason::Unclassified;
   EJitRepresentativeDiagOutcome CandidateOutcome =
@@ -826,6 +894,8 @@ bool EJitCompileDriver::classifyRepresentativeRequest(const EJitCompileRequest &
     if (Candidate) {
       Group = Candidate->groupId;
       ExistingCandidate = Candidate->existing;
+      CandidatePeerGroup = Candidate->relatedGroupId;
+      CandidateDifference = std::move(Candidate->diagnostic);
     } else {
       CandidateDetail = toString(Candidate.takeError());
       CandidateReason = diagReasonForCandidateError(CandidateDetail);
@@ -892,6 +962,24 @@ bool EJitCompileDriver::classifyRepresentativeRequest(const EJitCompileRequest &
             : (ExistingCandidate ? EJitRepresentativeDiagReason::CandidateMatch
                                   : EJitRepresentativeDiagReason::NewGroup);
     CandidateOutcome = EJitRepresentativeDiagOutcome::Pending;
+  }
+  if (Current && CandidateDifference) {
+    auto R = makeReuseDiagnostic(Req, Ctx.fnName, "CANDIDATE", "", "NEW_GROUP",
+                                 Group, 0);
+    if (R.level) {
+      R.peerGroup = CandidatePeerGroup;
+      attachReuseDifference(R, *CandidateDifference);
+      recordReuseDiagnostic(R);
+    }
+  } else if (Current && CandidateEvent) {
+    auto R = makeReuseDiagnostic(Req, Ctx.fnName, "CANDIDATE",
+        ejitRepresentativeDiagReasonToken(CandidateReason),
+        Route == CandidateAdmissionRoute::Independent ? "INDEPENDENT" : "AOT_FALLBACK",
+        Group, 0);
+    if (R.level) {
+      R.truncated |= EJitReuseDiagnosticStore::copyText(R.detail, CandidateDetail);
+      recordReuseDiagnostic(R);
+    }
   }
   EJIT_DIAG(
     "ejit_diag stage=%s outcome=%s reason=%s entry=%s func=%u generation=%u "
@@ -1565,6 +1653,8 @@ void *EJitCompileDriver::sharePhysicalTier2(
     return nullptr;
   EJitPreparedCodeEmitter *Emitter = jitEngine_->preparedEmitter();
   if (!Emitter) {
+    logReuseFailure(*Request, FuncName, "NO_EMITTER", "prepared-code emitter unavailable",
+                    G.groupId, G.generation);
     EJIT_DIAG("representative group %llu gen %llu: no prepared-code emitter, "
               "key=0x%016lx stays on the ordinary route",
               static_cast<unsigned long long>(G.groupId),
@@ -1591,6 +1681,8 @@ void *EJitCompileDriver::sharePhysicalTier2(
       }
     unlockRepGroups();
     if (!HaveWaiter) {
+      logReuseFailure(*Request, FuncName, "NO_MEMBER_RECORD", "no current waiter identity",
+                      G.groupId, G.generation);
       // Not an admitted member of this generation (for example the compile owner
       // is not the one that admitted the request): the ordinary ORC route is the
       // only honest fallback, and it never claims to be shared code.
@@ -1626,11 +1718,16 @@ void *EJitCompileDriver::sharePhysicalTier2(
       jitEngine_->prepareFinalCode(Bitcode, CacheKey, FuncName, Scope);
   jitEngine_->setActiveContext(nullptr);
   if (!Prepared) {
+    const std::string ErrorText = toString(Prepared.takeError());
+    logReuseFailure(*Request, FuncName,
+                    StringRef(ErrorText).contains("target mismatch")
+                        ? "TARGET_MISMATCH" : "PREPARE_REJECTED",
+                    ErrorText, G.groupId, G.generation);
     EJIT_DIAG("representative group %llu gen %llu: key=0x%016lx final-code "
               "preparation rejected (%s), ordinary route",
               static_cast<unsigned long long>(G.groupId),
               static_cast<unsigned long long>(G.generation), CacheKey,
-              toString(Prepared.takeError()).c_str());
+              ErrorText.c_str());
     return nullptr;
   }
 
@@ -1640,11 +1737,16 @@ void *EJitCompileDriver::sharePhysicalTier2(
     // object count is real and the stored identity is comparable.
     auto Linked = Emitter->link(std::move(*Prepared));
     if (!Linked) {
+      const std::string ErrorText = toString(Linked.takeError());
+      logReuseFailure(*Request, FuncName,
+                      StringRef(ErrorText).contains("emitter target")
+                          ? "TARGET_MISMATCH" : "LINK_FAILED",
+                      ErrorText, G.groupId, G.generation);
       EJIT_DIAG("representative group %llu gen %llu: representative Tier-2 link "
                 "failed (%s)",
                 static_cast<unsigned long long>(G.groupId),
                 static_cast<unsigned long long>(G.generation),
-                toString(Linked.takeError()).c_str());
+                ErrorText.c_str());
       return nullptr;
     }
     bool Noted = false;
@@ -1655,6 +1757,8 @@ void *EJitCompileDriver::sharePhysicalTier2(
       unlockRepGroups();
     }
     if (!Noted) {
+      logReuseFailure(*Request, FuncName, "STALE_SESSION",
+                      "representative code was not recorded", G.groupId, G.generation);
       EJIT_DIAG("representative group %llu gen %llu: representative code not "
                 "recorded (stale session or an object already exists)",
                 static_cast<unsigned long long>(G.groupId),
@@ -1673,9 +1777,11 @@ void *EJitCompileDriver::sharePhysicalTier2(
   // A member: compare the FINAL identity with the generation's physical object
   // (full IR + effective bindings + scope) and only then emit or reuse.
   EJitShareDecision Decision;
+  uint64_t PeerCode = 0;
   {
     lockRepGroups();
     Decision = repGroups_->decideMember(Waiter, (*Prepared)->identity(), *Emitter);
+    PeerCode = repGroups_->snapshot(G).physicalCodeId;
     unlockRepGroups();
   }
   if (Decision.kind == EJitMemberShare::Reuse) {
@@ -1687,6 +1793,8 @@ void *EJitCompileDriver::sharePhysicalTier2(
       unlockRepGroups();
     }
     if (!Settled) {
+      logReuseFailure(*Request, FuncName, "STALE_MEMBER",
+                      "reuse decision did not settle", G.groupId, G.generation);
       EJIT_DIAG("representative group %llu gen %llu: member key=0x%016lx reuse "
                 "not settled (stale/cancelled)",
                 static_cast<unsigned long long>(G.groupId),
@@ -1708,6 +1816,9 @@ void *EJitCompileDriver::sharePhysicalTier2(
     return Decision.fn;
   }
   if (Decision.kind != EJitMemberShare::Emit) {
+    logReuseFailure(*Request, FuncName,
+                    ejitRepresentativeDiagReasonToken(diagReasonForMember(Decision.kind)),
+                    Decision.reason, G.groupId, G.generation);
     // NotReady / Stale / Cancelled / SchemaRejected: never share, never emit
     // here. The ordinary route (or AOT) is the honest outcome.
     EJIT_DIAG("ejit_diag stage=%s outcome=%s reason=%s group=%llu generation=%llu "
@@ -1727,8 +1838,24 @@ void *EJitCompileDriver::sharePhysicalTier2(
 
   // A distinct final identity: this member emits its OWN physical object, kept
   // as an independent logical member record.
+  if (PeerCode) {
+    auto R = makeReuseDiagnostic(*Request, FuncName, "FINAL", "", "TRY_SEPARATE_CODE",
+                                 G.groupId, G.generation);
+    if (R.level) {
+      auto Difference = Emitter->explainLinkedIdentity(
+          PeerCode, (*Prepared)->identity(), R.level >= 2 ? 256u : 0u);
+      if (Difference) {
+        R.peerCode = PeerCode;
+        attachReuseDifference(R, *Difference);
+        recordReuseDiagnostic(R);
+      }
+    }
+  }
   auto Linked = Emitter->link(std::move(*Prepared));
   if (!Linked) {
+    const std::string ErrorText = toString(Linked.takeError());
+    logReuseFailure(*Request, FuncName, "LINK_FAILED", ErrorText,
+                    G.groupId, G.generation);
     EJIT_DIAG("ejit_diag stage=%s outcome=FAILURE reason=%s group=%llu "
               "generation=%llu attempt=%llu key=0x%016lx detail=%s",
               ejitRepresentativeDiagStageToken(
@@ -1738,7 +1865,7 @@ void *EJitCompileDriver::sharePhysicalTier2(
               static_cast<unsigned long long>(G.groupId),
               static_cast<unsigned long long>(G.generation),
               static_cast<unsigned long long>(Request->attemptToken), CacheKey,
-              toString(Linked.takeError()).c_str());
+              ErrorText.c_str());
     return nullptr;
   }
   bool Settled = false;
@@ -1749,6 +1876,8 @@ void *EJitCompileDriver::sharePhysicalTier2(
     unlockRepGroups();
   }
   if (!Settled) {
+    logReuseFailure(*Request, FuncName, "STALE_MEMBER",
+                    "independent emission did not settle", G.groupId, G.generation);
     EJIT_DIAG("representative group %llu gen %llu: member key=0x%016lx emit not "
               "settled (stale/cancelled)",
               static_cast<unsigned long long>(G.groupId),

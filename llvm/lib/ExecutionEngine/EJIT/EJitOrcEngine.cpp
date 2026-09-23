@@ -11,6 +11,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitLinkOptimizationPlugin.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitReuseDiagnostics.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
@@ -51,6 +52,39 @@
 
 using namespace llvm;
 using namespace llvm::ejit;
+
+EJitReuseDiagnosticStore &llvm::ejit::reuseDiagnosticStore() {
+  static EJitReuseDiagnosticStore Store;
+  return Store;
+}
+
+void llvm::ejit::printReuseDiagnostic(const EJitReuseDiagnostic &R) {
+  EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu entry=%s func=%u stage=%s reason=%s "
+                "action=%s generation=%u attempt=%llu group=%llu group_gen=%llu "
+                "peer_group=%llu peer_code=%llu repeats=%llu truncated=%u detail=%s",
+                (unsigned long long)R.sequence, R.entry, R.identity.funcIndex,
+                R.stage, R.reason, R.action, R.identity.generation,
+                (unsigned long long)R.identity.attemptToken,
+                (unsigned long long)R.identity.groupId,
+                (unsigned long long)R.identity.groupGeneration,
+                (unsigned long long)R.peerGroup, (unsigned long long)R.peerCode,
+                (unsigned long long)R.repeats, unsigned(R.truncated), R.detail);
+  for (unsigned I = 0; I < R.identity.numDims && I < kEJitMaxRequestDims; ++I)
+    EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu dim=%u instance=%u version=%u",
+                  (unsigned long long)R.sequence, R.identity.dims[I].dimType,
+                  R.identity.dims[I].instanceId, R.identity.versions[I]);
+  if (R.level >= 2 && (R.left[0] || R.right[0])) {
+    EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu first_diff_line=%u byte=%llu "
+                  "left(peer)=%s", (unsigned long long)R.sequence, R.diffLine,
+                  (unsigned long long)R.diffOffset, R.left);
+    EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu right(request)=%s",
+                  (unsigned long long)R.sequence, R.right);
+  }
+}
+
+void llvm::ejit::recordReuseDiagnostic(EJitReuseDiagnostic R) {
+  if (reuseDiagnosticStore().record(R)) printReuseDiagnostic(R);
+}
 
 Error llvm::ejit::detail::normalizeJitModuleTarget(
     Module &M, const Triple &Target, const DataLayout &Layout) {
@@ -1215,7 +1249,9 @@ Expected<EJitCandidateResult> EJitOrcEngine::classifyCandidate(
                                    inconvertibleErrorCode());
   EJitCodeIdentityScope BindingScope = Scope;
   BindingScope.bindingGeneration = EJitBindingGeneration(Bindings);
-  EJitCandidateCapture Capture(Directory, BindingScope, Bindings);
+  const unsigned DiagLevel = reuseDiagnosticStore().levelFor(Scope.entry);
+  EJitCandidateCapture Capture(Directory, BindingScope, Bindings,
+      EJitIdentityDiagnosticOptions{DiagLevel != 0, DiagLevel >= 2 ? 256u : 0u});
   Ctx.candidateCapture = &Capture;
   P->optimizer->clearAnalyses();
   P->optimizer->runPipeline(M, Ctx);
