@@ -469,6 +469,73 @@ TEST(EJitCandidateDirectory, RealPreservedCellPrefixRetainsDynamicSemantics) {
   EXPECT_NE(A.groupId, C.groupId);
 }
 
+TEST(EJitCandidateDirectory, MultipleActualFrozenValuesAndUnchangedIdentity) {
+  struct Row { uint32_t a, b; } Rows[2] = {{3, 5}, {17, 9}};
+  const char *IR = R"(
+    %Row = type { i32, i32 }
+    @rows = external global [2 x %Row], !ejit.metadata !0
+    define i32 @f(i64 %cell, i32 %x) !ejit.metadata !4 {
+      %p = getelementptr [2 x %Row], ptr @rows, i64 0, i64 %cell, i32 0
+      %q = getelementptr [2 x %Row], ptr @rows, i64 0, i64 %cell, i32 1
+      %a = load i32, ptr %p, !ejit.may_const !7
+      %b = load i32, ptr %q, !ejit.may_const !7
+      %v = mul i32 %a, %x
+      %r = add i32 %v, %b
+      ret i32 %r
+    }
+    !0 = !{!1, !2, !3}
+    !1 = !{!"ejit_period_arr", !"cell", i64 2}
+    !2 = !{!"ejit_may_const_field", i64 0}
+    !3 = !{!"ejit_may_const_field", i64 4}
+    !4 = !{!5, !6}
+    !5 = !{!"ejit_entry"}
+    !6 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !7 = !{}
+  )";
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "rows", Rows, 2);
+  EJitOptimizer O(Registry, true);
+  EJitCandidateDirectory Directory;
+  auto Run = [&](unsigned Cell) {
+    EJitCandidateCapture Capture(Directory, scope(),
+        {{"rows", reinterpret_cast<uintptr_t>(Rows), false}}, {true, 256});
+    auto TSM = parse(IR);
+    TSM.withModuleDo([&](Module &M) {
+      SpecializationContext X;
+      X.fnName = "f";
+      X.tier = CompileTier::Instrumented;
+      X.dimensions.push_back({"cell", static_cast<uint8_t>(Cell)});
+      X.candidateCapture = &Capture;
+      O.clearAnalyses();
+      O.runPipeline(M, X);
+      ASSERT_EQ(Capture.frozen.count, 2u);
+      EXPECT_EQ(Capture.frozen.omitted, 0u);
+      for (Function &F : M)
+        for (BasicBlock &BB : F)
+          for (Instruction &I : BB)
+            EXPECT_EQ(I.getMetadata(FrozenSiteMD), nullptr);
+      O.clearAnalyses();
+    });
+    return cantFail(Capture.takeResult());
+  };
+  auto A = Run(0);
+  auto B = Run(1);
+  ASSERT_TRUE(B.diagnostic);
+  const auto &D = B.diagnostic->frozen;
+  ASSERT_TRUE(D.available);
+  EXPECT_FALSE(D.incomplete);
+  EXPECT_EQ(D.compared, 2u);
+  ASSERT_EQ(D.shown, 2u);
+  EXPECT_STREQ(D.differences[0].peer, "i32 3");
+  EXPECT_STREQ(D.differences[0].request, "i32 17");
+  EXPECT_STREQ(D.differences[1].peer, "i32 5");
+  EXPECT_STREQ(D.differences[1].request, "i32 9");
+  Rows[1] = Rows[0];
+  auto Same = Run(1);
+  EXPECT_TRUE(Same.existing);
+  EXPECT_EQ(Same.groupId, A.groupId);
+}
+
 TEST(EJitFinalCodeIdentity, NormalizesOnlyDisplayNamesAndModulePaths) {
   auto A = prepare(Simple);
   auto B = prepare(R"(
@@ -479,6 +546,18 @@ TEST(EJitFinalCodeIdentity, NormalizesOnlyDisplayNamesAndModulePaths) {
       ret i32 %long_display_name
     })");
   ASSERT_TRUE(A && B);
+  EXPECT_TRUE(A->identity().equals(B->identity()));
+}
+
+TEST(EJitFinalCodeIdentity, FrozenProvenanceDoesNotChangeIdentity) {
+  auto A = prepare(Simple);
+  auto B = prepare(R"(
+    define i32 @f(i32 %x) {
+      %r = add i32 %x, 7, !ejit.reuse.frozen.site !0
+      ret i32 %r
+    }
+    !0 = !{i64 999, !"diagnostic-only"}
+  )");
   EXPECT_TRUE(A->identity().equals(B->identity()));
 }
 

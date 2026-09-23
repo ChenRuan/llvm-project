@@ -1805,6 +1805,14 @@ TEST_F(EJitRepresentativeRuntimeTest,
       EXPECT_NE(R.left[0], 0);
       EXPECT_NE(R.right[0], 0);
       EXPECT_NE(StringRef(R.left), StringRef(R.right));
+      EXPECT_TRUE(R.frozen.available);
+      EXPECT_FALSE(R.frozen.incomplete);
+      ASSERT_EQ(R.frozen.different, 1u);
+      ASSERT_EQ(R.frozen.shown, 1u);
+      // Peer selection is the oldest retained same-source group, whose
+      // earlier lifecycle froze 7, not necessarily the current equal group.
+      EXPECT_STREQ(R.frozen.differences[0].peer, "i32 7");
+      EXPECT_STREQ(R.frozen.differences[0].request, "i32 201");
     }
   }
   EXPECT_TRUE(FoundUnequal) << "real unequal candidate must explain its split";

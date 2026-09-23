@@ -4,6 +4,7 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
+#include "llvm/ExecutionEngine/EJIT/EJitFrozenValues.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRepresentativeDiagnostics.h"
 #include <algorithm>
 #include <cstring>
@@ -13,6 +14,7 @@ namespace ejit {
 
 // Diagnostic-only copies; no pointers to LLVM IR, business data, or registries.
 struct EJitReuseDiagnostic {
+  EJitFrozenComparison frozen;
   uint64_t sequence = 0, peerGroup = 0, peerCode = 0, repeats = 0;
   EJitRepresentativeDiagIdentity identity;
   uint32_t level = 1, diffLine = 0;

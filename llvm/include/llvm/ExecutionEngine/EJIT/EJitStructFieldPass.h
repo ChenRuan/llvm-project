@@ -16,6 +16,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ExecutionEngine/EJIT/EJitBoundPtr.h"
+#include "llvm/ExecutionEngine/EJIT/EJitFrozenValues.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/IR/PassManager.h"
@@ -104,6 +105,8 @@ public:
 
   /// Rebuild the metadata and assumption maps from the current module.
   void initFromModule(Module &M);
+  static void tagFrozenSites(Module &M);
+  EJitFrozenSnapshot *frozenCapture = nullptr;
 
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
   /// Identify loads using the same metadata and field-offset fallback as the

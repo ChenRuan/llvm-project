@@ -68,13 +68,66 @@ is the group's retained physical code object.
 Differences distinguish source/policy/entry scope, binding symbol/address/kind,
 profile schema fields, and canonical IR. Left is the retained peer identity;
 right is the incoming request. IR line/byte offsets refer to CANONICAL IR, not
-the C source line. A constant may already be folded into an expression: this
-version does NOT promise source-level mayconst names or reconstruct original
-frozen values. It reports IR differences honestly instead of labeling them
-`MAYCONST_VALUE_DIFF` without provenance. For bindings, field/name and actual
-compared values are available directly. Only the first difference is reported.
+the C source line. A constant may already be folded into an expression:
+the IR excerpt alone cannot reconstruct original mayconst values or names.
+The separate replacement records below provide frozen values when available.
+For bindings, field/name and actual compared values are available directly.
+Only the first IR difference is reported; frozen-value differences have their
+own bounded multi-record output.
 
 ## Bounds and safety
+
+### Frozen mayconst values (candidate splits)
+
+Candidate preparation now copies the actual scalar constant at the load
+replacement point. It does NOT read business memory again for diagnostics.
+When two candidate groups split, the default capture also compares their
+recorded substitutions. The existing IR reason and reuse decision are unchanged.
+For example, explicit `ejit_reuse_diag_print` can add:
+
+```text
+[REUSE_DIAG] seq=1 frozen_available=1 frozen_compared=2 frozen_different=2 shown=2 incomplete=0 (recorded substitutions, not verifier)
+[REUSE_DIAG] seq=1 MAYCONST_VALUE_DIFF site=1 origin=f:rows+field_offset=0 peer_frozen=i32 3 request_frozen=i32 17
+[REUSE_DIAG] seq=1 MAYCONST_VALUE_DIFF site=2 origin=f:rows+field_offset=4 peer_frozen=i32 5 request_frozen=i32 9
+```
+
+Use `seq` to join these lines to the entry/dimensions/version and `peer_group`.
+The peer is the oldest retained same-entry/source candidate, possibly from an
+earlier lifecycle, NOT necessarily the current equal-value group. A frozen-value
+difference accompanies the IR split; it does not prove it was the only cause.
+Equal recorded values do not prove identical IR, and this is not the verifier's
+comparison of frozen versus actual execution-time values.
+
+Sites are input-load ordinals assigned before specialization, scoped to the
+same source module. They are not C line numbers. Origin is the input function,
+base symbol when recoverable, and field offset when recoverable; field names
+and source lines are not promised. Cloned/repeated sites, lost metadata, missing
+records, unsupported constants or truncated text produce incomplete diagnostics,
+not an invented correspondence. A transformed-away load may never reach the
+replacement pass; comparison describes recorded replacements, not every
+mayconst in the source.
+
+Each snapshot retains up to 32 substitutions (64-byte origin and 48-byte typed
+value buffers), with at most 128 reference snapshots per candidate directory,
+roughly 0.5 MiB payload maximum on 64-bit builds. These are separate from the
+identity admission budget. Input tagging is capped at 4096 loads; replacement
+sites without tags count as omitted. No LLVM/business pointers are retained.
+Each diagnostic stores up to four differing pairs but reports the total
+differences found among comparable records; `different > shown` means output
+was capped. `incomplete=1` means some comparisons could not be made;
+`frozen_available=0` means paired history is unavailable. Neither means equal.
+
+Automatic logs print counts only; level 2 explicit print shows values. These
+records are available for candidate splits, not arbitrary final-only IR changes.
+Reference snapshots follow the candidate directory lifetime; shell reset/config
+only clears the event window, not this compiler-owned history. Snapshot capture
+is independent of the output level so future splits can still be explained;
+level 0 disables events, not this bounded provenance collection.
+Diagnostic tags are stripped before PGO schema generation and from canonical
+identity. No additional sample, verifier behavior, code-identity rule, or shared
+taskpool ABI change is introduced.
+
+### Event retention
 
 There are 16 fixed-size owner-local retained records. Oldest records are evicted
 when full. The same function/generation/dimensions/versions/group/peer/stage/reason/action is logged
@@ -85,8 +138,8 @@ that all requests shared. At most 256 bytes per IR side and 192 bytes of detail
 are retained per record; names/reasons also have fixed limits. Control characters
 are replaced with spaces for one-line logs. Select one function to avoid unrelated
 events evicting the interesting one. Addresses and IR may reveal application
-details: restrict access to diagnostic output and use level 0/1 where detailed
-capture is inappropriate.
+details: restrict access to diagnostic output. Level 0/1 limits event output;
+it is not a security switch to disable compiler-owned frozen-value history.
 
 Existing identity material is reused to calculate the difference. No extra full
 module/IR copy is retained, no worker registry pointer escapes, and no shared

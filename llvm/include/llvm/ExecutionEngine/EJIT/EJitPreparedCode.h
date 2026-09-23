@@ -13,6 +13,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
+#include "llvm/ExecutionEngine/EJIT/EJitFrozenValues.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/Support/Error.h"
 #include <array>
@@ -59,6 +60,7 @@ struct EJitCodeIdentityScope {
 /// computed from identities already retained by the candidate directory or
 /// emitter; it never changes their equality or sharing decisions.
 struct EJitIdentityDiagnostic {
+  EJitFrozenComparison frozen;
   enum class Kind : uint8_t {
     Equal,
     SourceMismatch,
@@ -137,7 +139,8 @@ private:
   classifyCanonical(std::string CanonicalIR, EJitCodeIdentityScope Scope,
                     ArrayRef<EJitCodeBinding> Bindings,
                     ArrayRef<PgoFunctionSchema> Schema,
-                    EJitIdentityDiagnosticOptions Diag = {});
+                    EJitIdentityDiagnosticOptions Diag = {},
+                    const EJitFrozenSnapshot *Frozen = nullptr);
   struct Impl;
   std::unique_ptr<Impl> P;
 };
@@ -155,6 +158,7 @@ public:
   void complete(ArrayRef<PgoFunctionSchema> Schema);
   bool prefixCaptured() const { return PrefixCaptured; }
   bool completed() const { return Completed; }
+  EJitFrozenSnapshot frozen;
   Expected<EJitCandidateResult> takeResult();
 
 private:

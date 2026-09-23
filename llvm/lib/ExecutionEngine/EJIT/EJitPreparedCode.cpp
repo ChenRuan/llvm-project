@@ -76,9 +76,11 @@ Error canonicalizeIdentityIR(const Module &M, std::string &Out,
       A.setName("");
     for (BasicBlock &BB : F) {
       BB.setName("");
-      for (Instruction &I : BB)
+      for (Instruction &I : BB) {
+        I.setMetadata(FrozenSiteMD, nullptr);
         if (!I.getType()->isVoidTy())
           I.setName("");
+      }
     }
   }
   BoundedIRStream OS(Out, MaxBytes);
@@ -796,6 +798,9 @@ makeCandidate(std::string CanonicalIR, EJitCodeIdentityScope Scope,
 }
 } // namespace
 struct EJitCandidateDirectory::Impl {
+  // Separate bounded diagnostic storage, excluded from equality/hash/budget
+  // admission. Missing history must not change compilation or reuse.
+  DenseMap<uint64_t, std::unique_ptr<EJitFrozenSnapshot>> frozen;
   EJitCandidateLimits limits;
   BucketHash hash;
   uint64_t bytes = 0, nextGroup = 1;
@@ -826,7 +831,7 @@ EJitCandidateDirectory::classify(const Module &M, EJitCodeIdentityScope Scope,
 Expected<EJitCandidateResult> EJitCandidateDirectory::classifyCanonical(
     std::string CanonicalIR, EJitCodeIdentityScope Scope,
     ArrayRef<EJitCodeBinding> Bindings, ArrayRef<PgoFunctionSchema> Schema,
-    EJitIdentityDiagnosticOptions Diag) {
+    EJitIdentityDiagnosticOptions Diag, const EJitFrozenSnapshot *Frozen) {
   if (!candidateInputFits(P->limits.maxIdentityBytes, Scope, Bindings, Schema,
                           CanonicalIR))
     return exhausted("candidate identity budget exceeded");
@@ -867,11 +872,16 @@ Expected<EJitCandidateResult> EJitCandidateDirectory::classifyCanonical(
           Related->scope, Related->bindings, Related->schema, Related->ir,
           ID.scope, ID.bindings, ID.schema, ID.ir, Diag.excerptBytes,
           /*CandidatePrefix=*/true);
+      auto History = P->frozen.find(RelatedGroup);
+      if (Result.diagnostic && Frozen && History != P->frozen.end())
+        Result.diagnostic->frozen = compareFrozen(*History->second, *Frozen);
     }
   }
   P->bytes += IdentityBytes;
   ++P->count;
   P->groups[Hash].push_back({G, std::move(ID)});
+  if (Frozen && P->frozen.size() < 128)
+    P->frozen[G] = std::make_unique<EJitFrozenSnapshot>(*Frozen);
   return Result;
 }
 uint32_t EJitCandidateDirectory::groupCount() const {
@@ -925,7 +935,7 @@ void EJitCandidateCapture::complete(ArrayRef<PgoFunctionSchema> Schema) {
   if (Failure)
     return;
   auto R = Directory.classifyCanonical(std::move(CanonicalIR), std::move(Scope),
-                                        Bindings, Schema, Diag);
+                                        Bindings, Schema, Diag, &frozen);
   if (R)
     Result = *R;
   else
