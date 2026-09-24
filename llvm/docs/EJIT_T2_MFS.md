@@ -76,14 +76,26 @@ Pool IDs are interpreted together with kind/base, not as global cell identities.
 
 Board source: `ejit_test/ejit_mfs_zero_count_sre_multicore_test.c`.
 This is the source PR's 16-cell acceptance workload, not the PR230 light demo.
-Product startup must run constructors once on BOTH cores; commands do not
-repeat init-array. Compile with the custom EJIT Clang, not stock Clang.
+Like the PR230 reuse demo, `MFS_RUN_INIT_ARRAY=1` is the default: the first
+accepted setup on EACH core runs `call_init_array_functions()` before EJIT
+initialization. Repeated commands do not rerun constructors. If product startup
+already runs the relevant constructors, compile the demo with
+`MFS_RUN_INIT_ARRAY=0`; never initialize through both paths. This switch is a
+demo compile definition, not an LLVM CMake option. Compile with the custom EJIT
+Clang, not stock Clang.
 
-1. After fresh coordinated startup, core6: `test_ejit_mfs`.
+1. After a fresh coordinated reset, core6: `test_ejit_mfs`.
 2. Core16: `test_ejit_mfs`.
 3. `test_ejit_mfs_print` prints diagnostics without reinitializing.
 4. A failed/timed-out run requires coordinated reset. A completed repeat
    validates already-published code.
+
+First setup rejects any pre-existing runtime with `-21`, even if its worker
+is core6: `ejit_init_pgo()` does not upgrade an already initialized non-PGO
+runtime. Do not run reuse and MFS demos sequentially in the same live image,
+or clear the demo's shared state while old constructors/runtime remain live.
+The startup-owned mode still requires externally verified constructors on both
+cores; worker readiness and a static registry are not proof of LLVM C++ init.
 
 Use the same board source with `MFS_EXPECT_SPLIT=0` for the OFF control.
 It trains only the hot path, waits for actual T2 execution, then executes the
@@ -137,3 +149,20 @@ and772-byte cold section; OFF has a788-byte hot section and no cold section.
 Both final fixtures have no remaining relocations. This tests an artificial
 32MiB layout, not the product image or BE execution. The host runtime tests
 execute both paths in native ARM64 JIT code with real RW/NX/RX transitions.
+
+### Board initialization follow-up
+
+The one-shot init-array adaptation was checked in all four combinations of
+`MFS_RUN_INIT_ARRAY=0/1` and `MFS_EXPECT_SPLIT=0/1`. Mocks verify constructors
+precede runtime initialization, one call per participating core in shell mode,
+no calls in startup-owned mode, repeat/print/concurrent-setup protection, and
+rejection of a pre-existing worker or producer runtime before constructors.
+These mocks do not validate the product's actual init-array contents.
+
+A separate host allocation probe repeated the six real-JIT integration tests
+20 times (120 passes), wrapping C allocations, ordinary C++ new and mmap.
+It recorded4,999,836 requests with a maximum request of4,194,304 bytes; no
+0xffffffff request was reproduced. Requests at or above256MiB would terminate
+the diagnostic probe, not clamp production allocations. This hosted run has
+normal C++ initialization and is not a reproduction of the old zero-dimension
+const_after_init board workload. The historical4GiB-1 failure remains unresolved.

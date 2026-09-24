@@ -19,6 +19,8 @@ static uint32_t g_register_calls[256];
 static uint32_t g_activate_calls;
 static uint32_t g_print_calls;
 static uint32_t g_init_array_calls;
+static uint32_t g_ctor_calls[256];
+static uint32_t g_ctor_ready[256];
 static uint32_t g_delay_calls;
 static uint32_t g_failures;
 static uint32_t g_classify_enabled;
@@ -35,11 +37,16 @@ static uint32_t g_delay_mode;
     }                                                                          \
   } while (0)
 
-void call_init_array_functions(void) { ++g_init_array_calls; }
+void call_init_array_functions(void) {
+  ++g_init_array_calls;
+  ++g_ctor_calls[g_ucLocalCoreID];
+  g_ctor_ready[g_ucLocalCoreID] = 1u;
+}
 
 int ejit_init_pgo(const ejit_config_t *config) {
   (void)config;
   ++g_init_calls[g_ucLocalCoreID];
+  CHECK(g_ctor_ready[g_ucLocalCoreID], "constructors precede runtime init");
   g_runtime_ready[g_ucLocalCoreID] = 1u;
   return 0;
 }
@@ -79,6 +86,8 @@ uint32_t ejit_taskpool_classify_tier2_pc(uintptr_t pc) {
 }
 
 int ejit_get_cold_code_pool_stats(ejit_code_pool_stats_t *out) {
+  if (!g_runtime_ready[g_ucLocalCoreID])
+    return -2; // Public API: EJIT_ERR_NOT_ACTIVE, not initialized.
   ejit_code_pool_stats_t empty = {0};
   *out = empty;
   out->usedBytes = MFS_EXPECT_SPLIT ? 4096u : 0u;
@@ -108,6 +117,8 @@ static void reset_fixture(uint32_t classify, uint32_t delayMode) {
     g_runtime_ready[i] = 0u;
     g_init_calls[i] = 0u;
     g_register_calls[i] = 0u;
+    g_ctor_calls[i] = 0u;
+    g_ctor_ready[i] = MFS_RUN_INIT_ARRAY ? 0u : 1u;
   }
   ejit_taskpool_stats_t empty = {0};
   g_stats = empty;
@@ -165,8 +176,11 @@ int main(void) {
             g_register_calls[MFS_PRODUCER_CORE] == 4u,
         "producer setup performed once");
   CHECK(g_activate_calls == 16u, "all identities activated once");
-  CHECK(g_init_array_calls == 0u,
-        "repeatable commands never invoke product init-array");
+  CHECK(g_init_array_calls == (MFS_RUN_INIT_ARRAY ? 2u : 0u),
+        "shell owns two one-shot initializations; startup mode owns none");
+  CHECK(g_ctor_calls[MFS_WORKER_CORE] == (MFS_RUN_INIT_ARRAY ? 1u : 0u) &&
+            g_ctor_calls[MFS_PRODUCER_CORE] == (MFS_RUN_INIT_ARRAY ? 1u : 0u),
+        "each participating core initialized exactly once when requested");
 
   const uint32_t initBeforeRepeat = g_init_calls[MFS_PRODUCER_CORE];
   const uint32_t registerBeforeRepeat = g_register_calls[MFS_PRODUCER_CORE];
@@ -186,6 +200,29 @@ int main(void) {
         "completed worker preserves live setup");
   CHECK(g_runtime_ready[MFS_WORKER_CORE] != 0u,
         "worker remains live after repeated commands");
+  CHECK(g_init_array_calls == (MFS_RUN_INIT_ARRAY ? 2u : 0u),
+        "repeated commands and print never rerun constructors");
+
+  reset_fixture(1u, DELAY_NORMAL);
+  g_runtime_ready[MFS_WORKER_CORE] = 1u;
+  CHECK(run_on(MFS_WORKER_CORE) == MFS_RC_EXISTING_RUNTIME,
+        "pre-existing worker runtime rejected even with correct worker ID");
+  CHECK(g_init_array_calls == 0u && g_init_calls[MFS_WORKER_CORE] == 0u,
+        "existing worker rejected before any constructors or init");
+
+  reset_fixture(1u, DELAY_NORMAL);
+  CHECK(run_on(MFS_WORKER_CORE) == 0, "existing producer case worker setup");
+  g_runtime_ready[MFS_PRODUCER_CORE] = 1u;
+  CHECK(run_on(MFS_PRODUCER_CORE) == MFS_RC_EXISTING_RUNTIME,
+        "pre-existing producer runtime rejected");
+  CHECK(g_ctor_calls[MFS_PRODUCER_CORE] == 0u &&
+            g_init_calls[MFS_PRODUCER_CORE] == 0u,
+        "existing producer rejected before constructors or init");
+
+  reset_fixture(1u, DELAY_NORMAL);
+  g_mfs_setup_state[0] = MFS_SETUP_ACTIVE;
+  CHECK(run_on(MFS_WORKER_CORE) == -4, "in-progress setup rejected");
+  CHECK(g_init_array_calls == 0u, "concurrent setup never runs constructors");
 
   reset_fixture(0u, DELAY_COMPILE_FAIL);
   CHECK(run_on(MFS_WORKER_CORE) == 0, "failure case worker setup");

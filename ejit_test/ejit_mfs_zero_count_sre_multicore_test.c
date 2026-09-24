@@ -1,7 +1,9 @@
-/* Header-free board acceptance. Product startup owns init-array execution.
- * This repeatable command never calls call_init_array_functions(). In a
- * standalone shell without product startup, expose init-array as a separate,
- * coordinated one-shot setup command per core.
+/* Header-free board acceptance. Like the PR230 reuse demo, the default shell
+ * setup calls init-array once per participating core, before EJIT init.
+ * If product startup already ran those constructors, build this source with
+ * MFS_RUN_INIT_ARRAY=0. Never run both startup and demo initialization.
+ * The setup state requires fresh shared storage and survives repeated calls;
+ * do not zero it or reload this demo while the old runtime is still live.
  *
  * Run test_ejit_mfs on worker core 6, then producer core 16. Repeated worker
  * calls preserve shared configuration and the live worker. A completed
@@ -69,6 +71,13 @@ extern uint32_t SRE_TaskDelay(uint32_t);
 extern void SRE_printf(const char *, ...);
 extern uint8_t g_ucLocalCoreID;
 
+#ifndef MFS_RUN_INIT_ARRAY
+#define MFS_RUN_INIT_ARRAY 1
+#endif
+#if MFS_RUN_INIT_ARRAY
+extern void call_init_array_functions(void);
+#endif
+
 #ifdef EJIT_MFS_HOST_TEST
 #define SHARED
 #define ENTRY
@@ -94,6 +103,8 @@ extern uint8_t g_ucLocalCoreID;
 #define MFS_RUN_COMPLETE 2u
 #define MFS_RUN_FAILED 3u
 #define MFS_RC_PREVIOUS_FAILED -20
+#define MFS_RC_EXISTING_RUNTIME -21
+#define MFS_EJIT_ERR_NOT_ACTIVE -2
 #ifndef MFS_EXPECT_SPLIT
 #define MFS_EXPECT_SPLIT 1
 #endif
@@ -152,16 +163,20 @@ static uint32_t mfs_setup_index(uint32_t core) {
 }
 
 static int mfs_ensure_ejit_ready(uint32_t core) {
-  uint32_t worker = ejit_taskpool_get_worker_core();
-  if (worker == MFS_WORKER_CORE)
-    return 0;
+  // ejit_init_pgo returns OK without changing an already existing runtime.
+  // Do not mistake an earlier non-PGO runtime for this test's PGO setup.
+  ejit_code_pool_stats_t prior = {0};
+  if (ejit_get_cold_code_pool_stats(&prior) != MFS_EJIT_ERR_NOT_ACTIVE) {
+    SRE_printf("[MFS] existing runtime: coordinated reset required\n");
+    return MFS_RC_EXISTING_RUNTIME;
+  }
   ejit_config_t config = {0};
   config.compileMode = 1;
   config.optLevel = 2;
   config.enableLogger = 1;
   config.forceStaticRegistry = 1;
   int rc = ejit_init_pgo(&config);
-  worker = ejit_taskpool_get_worker_core();
+  uint32_t worker = ejit_taskpool_get_worker_core();
   SRE_printf("[MFS][core=%u] init rc=%d worker=%u\n", core, rc, worker);
   if (rc != 0)
     return -2;
@@ -185,7 +200,23 @@ static int mfs_setup_current_core(uint32_t core) {
                                    __ATOMIC_ACQUIRE))
     return expected == MFS_SETUP_FAILED ? MFS_RC_PREVIOUS_FAILED : -4;
 
-  int rc = mfs_ensure_ejit_ready(core);
+  // Check before constructors too: never rerun init-array over a live runtime.
+  ejit_code_pool_stats_t prior = {0};
+  int rc = 0;
+  if (ejit_get_cold_code_pool_stats(&prior) != MFS_EJIT_ERR_NOT_ACTIVE) {
+    SRE_printf("[MFS][core=%u] pre-existing runtime; reset before this demo\n",
+               core);
+    rc = MFS_RC_EXISTING_RUNTIME;
+  } else {
+#if MFS_RUN_INIT_ARRAY
+    SRE_printf("[MFS][core=%u] init-array begin (once)\n", core);
+    call_init_array_functions();
+    SRE_printf("[MFS][core=%u] init-array done\n", core);
+#else
+    SRE_printf("[MFS][core=%u] init-array owned by product startup\n", core);
+#endif
+    rc = mfs_ensure_ejit_ready(core);
+  }
   if (rc != 0) {
     __atomic_store_n(&g_mfs_setup_state[index], MFS_SETUP_FAILED,
                      __ATOMIC_RELEASE);
