@@ -15,6 +15,8 @@
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/ProfileData/InstrProfWriter.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
@@ -27,6 +29,10 @@
 
 using namespace llvm;
 using namespace llvm::ejit;
+
+// Optional fail-fast hooks supplied by the freestanding diagnostic harness.
+extern "C" void ejit_test_begin_no_file_io() __attribute__((weak));
+extern "C" void ejit_test_end_no_file_io() __attribute__((weak));
 
 // Only the SRE boundary is simulated. These have the repository's declared
 // public primitive signatures and perform actual host RW/NX <-> RX changes.
@@ -404,6 +410,30 @@ TEST(EJitMfsIntegration, KnownZeroProfileHonorsProductOnOff) {
   EXPECT_EQ(Fn(1, Data), -Fn(0, Data));
   if (Hit.hasReadToken)
     C.Pool.releaseRead(Hit.bucketIndex);
+}
+
+// Also run against a freestanding-compiled PGOInstrumentation.cpp with lseek
+// trapped at link time: even explicitly requesting the optional hash trace
+// must not construct errs() while generating the Tier-1 profile.
+TEST(EJitMfsIntegration, ExplicitPGOHashTraceStillCompiles) {
+  auto *Trace = cl::getRegisteredOptions().lookup("pgo-trace-func-hash");
+  ASSERT_NE(Trace, nullptr);
+  auto Reset = make_scope_exit([&] { Trace->reset(); });
+  ASSERT_FALSE(Trace->addOccurrence(0, "pgo-trace-func-hash", "entry"));
+  Cycle C;
+  ASSERT_TRUE(C.initialize()) << C.ErrorText;
+  if (ejit_test_begin_no_file_io)
+    ejit_test_begin_no_file_io();
+  auto EndTrap = make_scope_exit([] {
+    if (ejit_test_end_no_file_io)
+      ejit_test_end_no_file_io();
+  });
+  ASSERT_TRUE(C.train()) << C.ErrorText;
+  ASSERT_EQ(C.T1Counts.size(), 2u);
+  EXPECT_EQ(C.T1Counts[0], 64u);
+  EXPECT_EQ(C.T1Counts[1], 0u);
+  ASSERT_TRUE(C.Pool.flushCodeBatch());
+  EXPECT_TRUE(C.Engine->isCodeReady(C.LastT2));
 }
 
 TEST(EJitMfsIntegration, ColdOwnerFailureNeverPublishesAndCanRetry) {
