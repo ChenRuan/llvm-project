@@ -25,6 +25,7 @@
 #ifdef EJIT_SRE_CODE_POOL
 
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
+#include "llvm/ExecutionEngine/EJIT/EJitColdReservation.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h" // seal/split granule contract
 
@@ -346,14 +347,28 @@ llvm::ejit::makeSreColdCodePoolManager() {
   const uintptr_t End = reinterpret_cast<uintptr_t>(__ejit_cold_end);
   const uintptr_t NearBase = reinterpret_cast<uintptr_t>(__ejit_code_start);
   const uintptr_t NearEnd = reinterpret_cast<uintptr_t>(__ejit_code_end);
-  if (Base == 0 || End <= Base || Base % k2MiB != 0 ||
-      (End - Base) % k2MiB != 0 || NearBase == 0 || NearEnd <= NearBase ||
-      !(End <= NearBase || Base >= NearEnd)) {
-    EJIT_DIAG("make cold pool: missing, unaligned or overlapping reservation");
+  uintptr_t AlignedBase = 0, AlignedEnd = 0;
+  if (const char *Reason = alignColdReservation(
+          Base, End, NearBase, NearEnd, AlignedBase, AlignedEnd)) {
+    EJIT_DIAG("make cold pool: rejected reason=%s cold=[0x%llx,0x%llx) "
+              "near=[0x%llx,0x%llx)", Reason,
+              static_cast<unsigned long long>(Base),
+              static_cast<unsigned long long>(End),
+              static_cast<unsigned long long>(NearBase),
+              static_cast<unsigned long long>(NearEnd));
     return nullptr;
   }
+  EJIT_DIAG("make cold pool: reserved=[0x%llx,0x%llx) "
+            "aligned=[0x%llx,0x%llx) usable=%llu headSlack=%llu tailSlack=%llu",
+            static_cast<unsigned long long>(Base),
+            static_cast<unsigned long long>(End),
+            static_cast<unsigned long long>(AlignedBase),
+            static_cast<unsigned long long>(AlignedEnd),
+            static_cast<unsigned long long>(AlignedEnd - AlignedBase),
+            static_cast<unsigned long long>(AlignedBase - Base),
+            static_cast<unsigned long long>(End - AlignedEnd));
   return makeSreCodePoolManager(EJitCodePoolPlacement::NearFixed,
-                                Base, End - Base);
+                                AlignedBase, AlignedEnd - AlignedBase);
 #else
   return nullptr;
 #endif

@@ -42,19 +42,25 @@ uses 16MiB with alignment slack). Add an independent executable cold section in
 the product linker script, as shown in the existing `ejit_registry.ld` example:
 
 ```ld
-.text.ejit_cold ALIGN(2M) :
+.text.ejit_cold ALIGN(4K) :
 {
   __ejit_cold_start = .;
-  . += 8M;
+  . += 8M; /* 6MiB usable when the loaded base is not 2MiB-aligned */
   __ejit_cold_end = .;
 } > CODE
 ```
 
 The configurable example uses `--defsym=__ejit_cold_bytes=0x800000` instead.
 The script is an integration example: preserve the board's MEMORY/SECTIONS
-layout rather than replacing it blindly. Reserve at least 2MiB, in multiples
-of 2MiB. The cold region must be separate from near and placed within appropriate
-AArch64 branch reach. Missing/empty/unaligned/overlapping reservations fail closed.
+layout rather than replacing it blindly. DLIB needs only 4KiB section alignment;
+the runtime rounds the loaded start up and end down to 2MiB boundaries, using
+only complete large pages inside the reservation. An 8MiB reservation provides
+6MiB usable unless already 2MiB-aligned; reserve 10MiB to guarantee 8MiB usable.
+At least one complete 2MiB page must remain after alignment. The cold region must
+be separate from near and placed within appropriate AArch64 branch reach.
+Missing/invalid/overlapping or too-small reservations fail closed, with actual
+bounds and a specific reason logged. Successful setup logs usable bounds and
+head/tail alignment slack. No dynamic allocation fallback is used for rejection.
 OFF does not require cold memory; omit its reservation for an ordinary OFF image.
 
 Cold memory is additional capacity, not free space: it does not shrink near

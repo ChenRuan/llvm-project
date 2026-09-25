@@ -16,6 +16,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCodePool.h"
+#include "llvm/ExecutionEngine/EJIT/EJitColdReservation.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
 #include "llvm/ExecutionEngine/JITLink/JITLinkDylib.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
@@ -32,6 +33,56 @@
 using namespace llvm;
 using namespace llvm::ejit;
 using namespace llvm::jitlink;
+
+TEST(EJitColdReservation, AlreadyAligned) {
+  uintptr_t Base = 0, End = 0;
+  EXPECT_EQ(nullptr, alignColdReservation(0x42000000, 0x42800000,
+                                          0x40000000, 0x42000000, Base, End));
+  EXPECT_EQ(0x42000000u, Base);
+  EXPECT_EQ(0x42800000u, End);
+}
+
+TEST(EJitColdReservation, FourKAlignedEightMiBBecomesSixMiB) {
+  uintptr_t Base = 0, End = 0;
+  EXPECT_EQ(nullptr, alignColdReservation(0x42ac3000, 0x432c3000,
+                                          0x40ac3000, 0x42ac3000, Base, End));
+  EXPECT_EQ(0x42c00000u, Base);
+  EXPECT_EQ(0x43200000u, End);
+  EXPECT_EQ(6u * 1024u * 1024u, End - Base);
+}
+
+TEST(EJitColdReservation, TenMiBReservationKeepsEightMiB) {
+  uintptr_t Base = 0, End = 0;
+  EXPECT_EQ(nullptr, alignColdReservation(0x42001000, 0x42a01000,
+                                          0x40000000, 0x42000000, Base, End));
+  EXPECT_EQ(8u * 1024u * 1024u, End - Base);
+}
+
+TEST(EJitColdReservation, RejectsInvalidRangesAndClearsOutputs) {
+  const uintptr_t Cases[][4] = {
+      {0, 0x800000, 0x1000000, 0x2000000},
+      {0x800000, 0x800000, 0x1000000, 0x2000000},
+      {0x800000, 0x400000, 0x1000000, 0x2000000},
+      {0x800000, 0x1000000, 0, 0x400000},
+      {0x800000, 0x1000000, 0x400000, 0x400000},
+      {0x800000, 0x1000000, 0x400000, 0xc00000},
+      {0x401000, 0x601000, 0x1000000, 0x2000000},
+      {UINTPTR_MAX - 4095, UINTPTR_MAX, 0x1000000, 0x2000000}};
+  for (const auto &C : Cases) {
+    uintptr_t Base = 123, End = 456;
+    EXPECT_NE(nullptr, alignColdReservation(C[0], C[1], C[2], C[3], Base, End));
+    EXPECT_EQ(0u, Base);
+    EXPECT_EQ(0u, End);
+  }
+}
+
+TEST(EJitColdReservation, ColdBeforeNearAndExactMinimum) {
+  uintptr_t Base = 0, End = 0;
+  EXPECT_EQ(nullptr, alignColdReservation(0x201000, 0x600000,
+                                          0x600000, 0x1000000, Base, End));
+  EXPECT_EQ(0x400000u, Base);
+  EXPECT_EQ(0x600000u, End);
+}
 
 namespace {
 
