@@ -38,6 +38,16 @@ private:
   void initialize(ArrayRef<ejit_reg_entry_t> Records);
   bool active_ = false;
 };
+/// One capture-only fault against a real compiled inventory. The owner worker
+/// must arm it; it is tied to the exact Host/generation and restored on return.
+/// There is no freestanding setter or public C/SDK interface.
+enum class SmallTableSreCounterFaultForTest : uint8_t {
+  None, NullName, MissingProfc, MissingProfd, NameBindingMismatch,
+  ZeroCounters, CounterWordsOverflow
+};
+bool armSmallTableSreCounterFaultForTest(
+    const OwnerWorkerContext &Worker, SmallTableSreCounterFaultForTest Fault,
+    uint32_t PairIndex);
 }
 #endif
 EJit *smallTableSreLocalRuntime();

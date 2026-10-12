@@ -3680,6 +3680,270 @@ protected:
       if (ejit_activate(kWrapPeriod, C) != EJIT_OK) return false;
     return true;
   }
+  std::string branchCounterBody(StringRef SourceFilename = {}) {
+    std::string Body = entryBodyText("g_wrap", "g_wrap_out", kWrapCells);
+    if (!SourceFilename.empty())
+      Body = "source_filename = \"" + SourceFilename.str() + "\"\n" + Body;
+    const std::string Needle = "      %xm = mul i32 %x, 3\n";
+    const size_t Offset = Body.find(Needle);
+    if (Offset == std::string::npos) {
+      ADD_FAILURE() << "the real branch fixture has no multiplication to replace";
+      return {};
+    }
+    Body.replace(Offset, Needle.size(),
+        "      %positive = icmp sge i32 %x, 0\n"
+        "      br i1 %positive, label %pos, label %neg\n"
+        "    pos:\n"
+        "      %pv = call i32 @bridge_positive(i32 %x)\n"
+        "      br label %join\n"
+        "    neg:\n"
+        "      %nv = call i32 @bridge_negative(i32 %x)\n"
+        "      br label %join\n"
+        "    join:\n"
+        "      %xm = phi i32 [ %pv, %pos ], [ %nv, %neg ]\n");
+    Body += "\n    define internal i32 @bridge_positive(i32 %x) noinline {\n"
+            "      %v = mul i32 %x, 3\n      ret i32 %v\n    }\n"
+            "    define internal i32 @bridge_negative(i32 %x) noinline {\n"
+            "      %v = mul i32 %x, 5\n      ret i32 %v\n    }\n";
+    return Body;
+  }
+  void refuseUnrepresentableCounterName(StringRef SourceFilename) {
+    std::string Body = branchCounterBody(SourceFilename);
+    ASSERT_FALSE(Body.empty());
+    ASSERT_TRUE(buildWrapper(false, false, &Body));
+    ASSERT_NO_FATAL_FAILURE(request(64));
+
+    struct ActualCounter {
+      std::string canonicalName;
+      uintptr_t profcAddress = 0;
+      uintptr_t profdAddress = 0;
+      std::vector<uint64_t> counts;
+    };
+    std::vector<ActualCounter> Counters;
+    auto *Pool = EJitWrapperRuntimeTestAccess::pool();
+    ASSERT_NE(Pool, nullptr);
+    const auto Inspect = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+        *Pool, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+          ASSERT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+              *Pool, Context));
+          auto *CommonHost = EJitSmallTableHost::global();
+          ASSERT_NE(CommonHost, nullptr);
+          ASSERT_EQ(CommonHost->funcIndex(), FuncIdx);
+          auto &Engine = CommonHost->runtime().engine();
+          for (const std::string &Name : Engine.getLastCounterNames()) {
+            const StringRef Canonical = Engine.getCounterProfileName(Name);
+            auto Counts = Engine.lookup(1, "__profc_" + Name);
+            auto Data = Engine.lookup(1, "__profd_" + Name);
+            ASSERT_TRUE(static_cast<bool>(Counts))
+                << toString(Counts.takeError());
+            ASSERT_TRUE(static_cast<bool>(Data)) << toString(Data.takeError());
+            ASSERT_NE(*Counts, nullptr);
+            ASSERT_NE(*Data, nullptr);
+            const auto *Header = reinterpret_cast<
+                const RawInstrProf::ProfileData<uintptr_t> *>(*Data);
+            ASSERT_GT(Header->NumCounters, 0u);
+            ASSERT_LE(Header->NumCounters, EJIT_STAB_SRE_MAX_COUNTER_WORDS);
+            ASSERT_EQ(Header->NameRef,
+                      IndexedInstrProf::ComputeHash(Canonical));
+            const auto *Raw = static_cast<const uint64_t *>(*Counts);
+            Counters.push_back({Canonical.str(),
+                                reinterpret_cast<uintptr_t>(*Counts),
+                                reinterpret_cast<uintptr_t>(*Data),
+                                std::vector<uint64_t>(Raw,
+                                    Raw + Header->NumCounters)});
+          }
+          EXPECT_EQ(CommonHost->runtime().currentSessionSamples(), 0u);
+          EXPECT_EQ(CommonHost->runtime().sessionInFlight(), 0u);
+          EXPECT_EQ(CommonHost->bundle(), nullptr);
+        });
+    ASSERT_EQ(Inspect.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+    ASSERT_EQ(Counters.size(), 3u)
+        << "the real T1 must resolve root and both internal helper pairs";
+    unsigned LongNames = 0;
+    for (const ActualCounter &Counter : Counters) {
+      EXPECT_NE(Counter.profcAddress, 0u);
+      EXPECT_NE(Counter.profdAddress, 0u);
+      for (uint64_t Count : Counter.counts)
+        EXPECT_EQ(Count, 0u);
+      if (Counter.canonicalName != "f_entry") {
+        EXPECT_TRUE(Counter.canonicalName ==
+                        (SourceFilename + ";bridge_positive").str() ||
+                    Counter.canonicalName ==
+                        (SourceFilename + ";bridge_negative").str());
+        EXPECT_GE(Counter.canonicalName.size(), EJIT_STAB_SRE_NAME_BYTES);
+        ++LongNames;
+      }
+      outs() << "[PR231 long-path real counter] source_filename="
+             << SourceFilename << " name=" << Counter.canonicalName
+             << " name_bytes=" << Counter.canonicalName.size()
+             << " snapshot_name_bound=" << EJIT_STAB_SRE_NAME_BYTES
+             << " profc=" << Counter.profcAddress
+             << " profd=" << Counter.profdAddress
+             << " words=" << Counter.counts.size() << "\n";
+    }
+    ASSERT_EQ(LongNames, 2u);
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before),
+              EJIT_STAB_SRE_FAILED);
+    size_t FirstLong = 0;
+    while (FirstLong < Counters.size() &&
+           Counters[FirstLong].canonicalName.size() < EJIT_STAB_SRE_NAME_BYTES)
+      ++FirstLong;
+    ASSERT_LT(FirstLong, Counters.size());
+    const std::string ExpectedReason =
+        "counter snapshot refused: NAME_TOO_LONG pair=" +
+        std::to_string(FirstLong) + " name_bytes=" +
+        std::to_string(Counters[FirstLong].canonicalName.size()) +
+        " capacity=" + std::to_string(EJIT_STAB_SRE_NAME_BYTES);
+    EXPECT_STREQ(Before.reason, ExpectedReason.c_str());
+    EXPECT_EQ(Before.expectedCounterPairs, 3u);
+    EXPECT_EQ(Before.tier, 1u);
+    EXPECT_EQ(Before.sampleLimit, 64u);
+    EXPECT_EQ(Before.sampleCount, 0u);
+    EXPECT_EQ(Before.physicalExecutions, 0u);
+    EXPECT_EQ(Before.borrowReaders, 0u);
+    EXPECT_EQ(Before.fullProfileValid, 0u);
+    EXPECT_EQ(Before.profileBytes, 0u);
+    EXPECT_EQ(Before.genericAsyncEnqueues, 0u);
+    EXPECT_EQ(Before.genericAsyncCompiles, 0u);
+    EXPECT_EQ(Before.genericPending, 0u);
+    // A failed EXACT inventory is not permission to freeze only the fitting
+    // root record, truncate the helper names or publish a partial-profile T2.
+    EXPECT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_FAILED);
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After),
+              EJIT_STAB_SRE_FAILED);
+    EXPECT_STREQ(After.reason, ExpectedReason.c_str());
+    EXPECT_EQ(After.sampleCount, 0u);
+    EXPECT_EQ(After.physicalExecutions, 0u);
+    EXPECT_EQ(After.borrowReaders, 0u);
+    EXPECT_EQ(After.fullProfileValid, 0u);
+    EXPECT_EQ(After.profileBytes, 0u);
+    EXPECT_EQ(After.tier, 1u);
+    EXPECT_EQ(g_aotCalls, 0u);
+    const auto Recheck = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+        *Pool, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+          ASSERT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+              *Pool, Context));
+          auto *CommonHost = EJitSmallTableHost::global();
+          ASSERT_NE(CommonHost, nullptr);
+          EXPECT_EQ(CommonHost->bundle(), nullptr);
+          EXPECT_EQ(CommonHost->runtime().currentSessionSamples(), 0u);
+          for (const ActualCounter &Counter : Counters) {
+            const auto *Raw = reinterpret_cast<const uint64_t *>(
+                Counter.profcAddress);
+            for (size_t I = 0; I < Counter.counts.size(); ++I)
+              EXPECT_EQ(Raw[I], Counter.counts[I]);
+          }
+        });
+    EXPECT_EQ(Recheck.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+  }
+  void finishBranchEightSamples() {
+    for (unsigned I = 0; I < 8; ++I) {
+      const int X = I % 2 ? -4 : 4;
+      EXPECT_EQ(Wrapper->call(I % kWrapReadyCells, X),
+                wrapAotResult(g_wrap[I % kWrapReadyCells], X) +
+                    (X < 0 ? 2 * X : 0));
+    }
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before),
+              EJIT_STAB_SRE_OK);
+    EXPECT_EQ(Before.sampleCount, 8u);
+    EXPECT_EQ(Before.counterPairs, 3u);
+    ASSERT_EQ(Before.counterWordCount, 4u);
+    for (uint32_t I = 0; I < Before.counterWordCount; ++I)
+      EXPECT_EQ(Before.counts[I], 4u);
+    EXPECT_EQ(Before.physicalExecutions, 0u);
+    EXPECT_EQ(Before.inFlight, 0u);
+    // Exhausting the quota and returning the last call does not freeze the
+    // still-open sampling session. Its one protected borrow survives until
+    // successful finish/freeze closes the window; it must not release early.
+    EXPECT_EQ(Before.borrowReaders, 1u);
+    EXPECT_EQ(SourceState.readers, 1u);
+    EXPECT_EQ(g_aotCalls, 0u);
+    ASSERT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_OK);
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After),
+              EJIT_STAB_SRE_OK);
+    EXPECT_EQ(After.tier, 2u);
+    EXPECT_EQ(After.fullProfileValid, 1u);
+    EXPECT_EQ(After.counterPairs, 3u);
+    EXPECT_EQ(After.countersDigest, Before.countersDigest);
+    EXPECT_EQ(After.rootEntryCountValid, 1u);
+    EXPECT_EQ(After.rootEntryCount, 8u);
+    EXPECT_GT(After.profileBytes, 0u);
+    EXPECT_EQ(After.inFlight, 0u);
+    EXPECT_EQ(After.borrowReaders, 0u);
+    EXPECT_EQ(SourceState.readers, 0u);
+    EXPECT_EQ(After.genericAsyncEnqueues, 0u);
+    EXPECT_EQ(After.genericPending, 0u);
+    EXPECT_EQ(Wrapper->call(0, -5), wrapAotResult(g_wrap[0], -5) - 10);
+    EXPECT_EQ(g_aotCalls, 0u);
+  }
+  void refuseOneCounterFaultThenResume(
+      llvm::ejit::detail::SmallTableSreCounterFaultForTest Fault,
+      const char *Reason, bool DiagnosticsOff = false) {
+    std::string Body = branchCounterBody();
+    ASSERT_FALSE(Body.empty());
+    ASSERT_TRUE(buildWrapper(false, false, &Body));
+    ASSERT_NO_FATAL_FAILURE(request(8));
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before),
+              EJIT_STAB_SRE_OK);
+    ASSERT_EQ(Before.expectedCounterPairs, 3u);
+    ASSERT_EQ(Before.counterPairs, 3u);
+    ASSERT_EQ(Before.counterWordCount, 4u);
+    const uint32_t Pair = Before.counterPairs - 1;
+    const size_t NameBytes = std::strlen(Before.counters[Pair].name);
+    auto *Pool = EJitWrapperRuntimeTestAccess::pool();
+    ASSERT_NE(Pool, nullptr);
+    const auto Armed = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+        *Pool, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+          ASSERT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+              *Pool, Context));
+          ASSERT_TRUE(llvm::ejit::detail::armSmallTableSreCounterFaultForTest(
+              Context, Fault, Pair));
+        });
+    ASSERT_EQ(Armed.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+    ejit_small_table_sre_snapshot_t Failed{};
+    {
+      const ejit_log_level_t PreviousLevel = ejit_get_log_level();
+      auto RestoreLevel = make_scope_exit(
+          [&] { ejit_set_log_level(PreviousLevel); });
+      if (DiagnosticsOff) ejit_set_log_level(EJIT_LOG_OFF);
+      EXPECT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Failed),
+                EJIT_STAB_SRE_FAILED);
+    }
+    const std::string ExpectedReason =
+        "counter snapshot refused: " + std::string(Reason) +
+        " pair=" + std::to_string(Pair) +
+        " name_bytes=" + std::to_string(NameBytes) +
+        " capacity=" + std::to_string(EJIT_STAB_SRE_NAME_BYTES);
+    EXPECT_STREQ(Failed.reason, ExpectedReason.c_str());
+    EXPECT_EQ(Failed.status, EJIT_STAB_SRE_FAILED);
+    EXPECT_EQ(Failed.expectedCounterPairs, 3u);
+    EXPECT_EQ(Failed.sampleCount, 0u);
+    EXPECT_EQ(Failed.physicalExecutions, 0u);
+    EXPECT_EQ(Failed.borrowReaders, 0u);
+    EXPECT_EQ(Failed.fullProfileValid, 0u);
+    EXPECT_EQ(Failed.profileBytes, 0u);
+    EXPECT_EQ(Failed.tier, 1u);
+    // This is the same real compiled inventory, restored by the fault scope:
+    // every original name/hash/count word must survive, not just sampleCount.
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After),
+              EJIT_STAB_SRE_OK);
+    ASSERT_EQ(After.counterPairs, Before.counterPairs);
+    ASSERT_EQ(After.counterWordCount, Before.counterWordCount);
+    EXPECT_EQ(After.countersDigest, Before.countersDigest);
+    EXPECT_EQ(After.sampleCount, 0u);
+    EXPECT_EQ(After.fullProfileValid, 0u);
+    for (uint32_t I = 0; I < Before.counterPairs; ++I) {
+      EXPECT_STREQ(After.counters[I].name, Before.counters[I].name);
+      EXPECT_EQ(After.counters[I].hash, Before.counters[I].hash);
+      EXPECT_EQ(After.counters[I].firstWord, Before.counters[I].firstWord);
+      EXPECT_EQ(After.counters[I].wordCount, Before.counters[I].wordCount);
+    }
+    for (uint32_t I = 0; I < Before.counterWordCount; ++I) {
+      EXPECT_EQ(Before.counts[I], 0u);
+      EXPECT_EQ(After.counts[I], Before.counts[I]);
+    }
+    finishBranchEightSamples();
+  }
   bool buildActualCompilerRegistry2d(bool SingleTuCallback = false) {
     ejit_shutdown();
     for (unsigned C = 0; C < 6; ++C)
@@ -4558,24 +4822,8 @@ TEST_F(GeneratedWrapperSreBridgeTest, ActualCompilerOuterCountSixByTwoCold64Comp
   EXPECT_EQ(g_aotCalls, 1u);
 }
 TEST_F(GeneratedWrapperSreBridgeTest, BranchCountersAreNotEntryCountAndCompleteProfileFeedsT2) {
-  std::string Body = entryBodyText("g_wrap", "g_wrap_out", kWrapCells);
-  const std::string Needle = "      %xm = mul i32 %x, 3\n";
-  ASSERT_NE(Body.find(Needle), std::string::npos);
-  Body.replace(Body.find(Needle), Needle.size(),
-      "      %positive = icmp sge i32 %x, 0\n"
-      "      br i1 %positive, label %pos, label %neg\n"
-      "    pos:\n"
-      "      %pv = call i32 @bridge_positive(i32 %x)\n"
-      "      br label %join\n"
-      "    neg:\n"
-      "      %nv = call i32 @bridge_negative(i32 %x)\n"
-      "      br label %join\n"
-      "    join:\n"
-      "      %xm = phi i32 [ %pv, %pos ], [ %nv, %neg ]\n");
-  Body += "\n    define internal i32 @bridge_positive(i32 %x) noinline {\n"
-          "      %v = mul i32 %x, 3\n      ret i32 %v\n    }\n"
-          "    define internal i32 @bridge_negative(i32 %x) noinline {\n"
-          "      %v = mul i32 %x, 5\n      ret i32 %v\n    }\n";
+  std::string Body = branchCounterBody();
+  ASSERT_FALSE(Body.empty());
   ASSERT_TRUE(buildWrapper(false, false, &Body)); request(64);
   for (unsigned I = 0; I < 64; ++I) {
     const int X = I % 2 ? -4 : 4;
@@ -4610,6 +4858,182 @@ TEST_F(GeneratedWrapperSreBridgeTest, BranchCountersAreNotEntryCountAndCompleteP
   EXPECT_EQ(g_aotCalls, 1u);
   EXPECT_EQ(After.genericPending, 0u);
   EXPECT_EQ(After.genericAsyncEnqueues, 0u);
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       LongSourceFilenameRealCounterPairsRefuseExactSnapshotAndFinish) {
+  const std::string SourceFilename = "/SDK_CPU_HCC/build/BiSheng_arm64be/" +
+      std::string(112, 'p') + "/ejit_smalltable_sre_test.c";
+  ASSERT_GT(SourceFilename.size(), 120u);
+  refuseUnrepresentableCounterName(SourceFilename);
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       CanonicalCounterNameAt96ByteBoundRefusesWithoutConsumingSamples) {
+  const std::string Suffix = ";bridge_positive";
+  const std::string SourceFilename = "/SDK/" +
+      std::string(EJIT_STAB_SRE_NAME_BYTES - Suffix.size() - 7, 'p') + ".c";
+  ASSERT_EQ((SourceFilename + Suffix).size(), EJIT_STAB_SRE_NAME_BYTES);
+  refuseUnrepresentableCounterName(SourceFilename);
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       CanonicalCounterNameAt95BytesFeedsComplete64ProfileAndT2) {
+  const std::string Suffix = ";bridge_positive";
+  const std::string SourceFilename = "/SDK/" +
+      std::string(EJIT_STAB_SRE_NAME_BYTES - Suffix.size() - 8, 'p') + ".c";
+  ASSERT_EQ((SourceFilename + Suffix).size(), EJIT_STAB_SRE_NAME_BYTES - 1);
+  std::string Body = branchCounterBody(SourceFilename);
+  ASSERT_FALSE(Body.empty());
+  ASSERT_TRUE(buildWrapper(false, false, &Body));
+  ASSERT_NO_FATAL_FAILURE(request(64));
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before),
+            EJIT_STAB_SRE_OK);
+  ASSERT_EQ(Before.counterPairs, 3u);
+  unsigned ExactHelpers = 0;
+  for (uint32_t I = 0; I < Before.counterPairs; ++I) {
+    const StringRef Name = Before.counters[I].name;
+    if (Name == "f_entry") continue;
+    EXPECT_EQ(Name.size(), EJIT_STAB_SRE_NAME_BYTES - 1);
+    EXPECT_TRUE(Name == SourceFilename + ";bridge_positive" ||
+                Name == SourceFilename + ";bridge_negative");
+    ++ExactHelpers;
+  }
+  EXPECT_EQ(ExactHelpers, 2u);
+  for (unsigned I = 0; I < 64; ++I) {
+    const int X = I % 2 ? -4 : 4;
+    EXPECT_EQ(Wrapper->call(I % kWrapReadyCells, X),
+              wrapAotResult(g_wrap[I % kWrapReadyCells], X) +
+                  (X < 0 ? 2 * X : 0));
+  }
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before),
+            EJIT_STAB_SRE_OK);
+  EXPECT_EQ(Before.sampleCount, 64u);
+  EXPECT_EQ(Before.counterPairs, 3u);
+  ASSERT_EQ(Before.counterWordCount, 4u);
+  for (uint32_t I = 0; I < Before.counterWordCount; ++I)
+    EXPECT_EQ(Before.counts[I], 32u);
+  EXPECT_EQ(g_aotCalls, 0u);
+  ASSERT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_OK);
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After),
+            EJIT_STAB_SRE_OK);
+  EXPECT_EQ(After.tier, 2u);
+  EXPECT_EQ(After.fullProfileValid, 1u);
+  EXPECT_EQ(After.counterPairs, 3u);
+  EXPECT_EQ(After.countersDigest, Before.countersDigest);
+  EXPECT_EQ(After.rootEntryCountValid, 1u);
+  EXPECT_EQ(After.rootEntryCount, 64u);
+  EXPECT_GT(After.profileBytes, 0u);
+  EXPECT_EQ(After.borrowReaders, 0u);
+  EXPECT_EQ(After.genericAsyncEnqueues, 0u);
+  EXPECT_EQ(After.genericPending, 0u);
+  EXPECT_EQ(Wrapper->call(0, -5), wrapAotResult(g_wrap[0], -5) - 10);
+  EXPECT_EQ(g_aotCalls, 0u);
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       NullExpectedCounterNameFailsClosedAndRealProfileSurvives) {
+  refuseOneCounterFaultThenResume(
+      llvm::ejit::detail::SmallTableSreCounterFaultForTest::NullName,
+      "NULL_NAME");
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       MissingExpectedProfcFailsClosedAndRealProfileSurvives) {
+  refuseOneCounterFaultThenResume(
+      llvm::ejit::detail::SmallTableSreCounterFaultForTest::MissingProfc,
+      "MISSING_PROFC");
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       MissingExpectedProfdFailsClosedAndRealProfileSurvives) {
+  refuseOneCounterFaultThenResume(
+      llvm::ejit::detail::SmallTableSreCounterFaultForTest::MissingProfd,
+      "MISSING_PROFD");
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       UnsafeCounterNameBindingFailsWithoutDereferenceAndRealProfileSurvives) {
+  refuseOneCounterFaultThenResume(
+      llvm::ejit::detail::SmallTableSreCounterFaultForTest::NameBindingMismatch,
+      "NAME_BINDING_MISMATCH");
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       ZeroActualCounterCountFailsClosedAndRealProfileSurvives) {
+  refuseOneCounterFaultThenResume(
+      llvm::ejit::detail::SmallTableSreCounterFaultForTest::ZeroCounters,
+      "ZERO_COUNTERS");
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       ActualCounterWordOverflowFailsClosedAndRealProfileSurvives) {
+  refuseOneCounterFaultThenResume(
+      llvm::ejit::detail::SmallTableSreCounterFaultForTest::CounterWordsOverflow,
+      "COUNTER_WORDS_OVERFLOW");
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       DiagnosticsOffStillReportsExactRefusalAndRealProfileSurvives) {
+  refuseOneCounterFaultThenResume(
+      llvm::ejit::detail::SmallTableSreCounterFaultForTest::MissingProfc,
+      "MISSING_PROFC", /*DiagnosticsOff=*/true);
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       CounterFaultArmedForOldGenerationDoesNotCorruptReplacementProfile) {
+  std::string Body = branchCounterBody();
+  ASSERT_FALSE(Body.empty());
+  ASSERT_TRUE(buildWrapper(false, false, &Body));
+  ASSERT_NO_FATAL_FAILURE(request(8));
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before),
+            EJIT_STAB_SRE_OK);
+  ASSERT_EQ(Before.counterPairs, 3u);
+  auto *Pool = EJitWrapperRuntimeTestAccess::pool();
+  ASSERT_NE(Pool, nullptr);
+  const auto Armed = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+      *Pool, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+        ASSERT_TRUE(llvm::ejit::detail::armSmallTableSreCounterFaultForTest(
+            Context,
+            llvm::ejit::detail::SmallTableSreCounterFaultForTest::MissingProfd,
+            Before.counterPairs - 1));
+      });
+  ASSERT_EQ(Armed.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+  Request.codeGeneration = 2;
+  ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After),
+            EJIT_STAB_SRE_OK);
+  EXPECT_EQ(After.codeGeneration, 2u);
+  EXPECT_EQ(After.sampleCount, 0u);
+  EXPECT_EQ(After.counterPairs, 3u);
+  EXPECT_EQ(After.counterWordCount, 4u);
+  EXPECT_EQ(After.fullProfileValid, 0u);
+  EXPECT_EQ(After.borrowReaders, 0u);
+  EXPECT_EQ(After.genericPending, 0u);
+  finishBranchEightSamples();
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       CounterFaultArmedForStoppedWorkerDoesNotCorruptReinitializedProfile) {
+  std::string Body = branchCounterBody();
+  ASSERT_FALSE(Body.empty());
+  ASSERT_TRUE(buildWrapper(false, false, &Body));
+  ASSERT_NO_FATAL_FAILURE(request(8));
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before),
+            EJIT_STAB_SRE_OK);
+  ASSERT_EQ(Before.counterPairs, 3u);
+  const uint64_t PreviousOwner = Before.ownerIdentity;
+  auto *Pool = EJitWrapperRuntimeTestAccess::pool();
+  ASSERT_NE(Pool, nullptr);
+  const auto Armed = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+      *Pool, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+        ASSERT_TRUE(llvm::ejit::detail::armSmallTableSreCounterFaultForTest(
+            Context,
+            llvm::ejit::detail::SmallTableSreCounterFaultForTest::NullName,
+            Before.counterPairs - 1));
+      });
+  ASSERT_EQ(Armed.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+  // The generated wrapper/payload rebuild joins the old worker before the
+  // genuine Async runtime starts again, with the same codeGeneration=1.
+  ASSERT_TRUE(buildWrapper(false, false, &Body));
+  ASSERT_NO_FATAL_FAILURE(request(8));
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After),
+            EJIT_STAB_SRE_OK);
+  EXPECT_NE(After.ownerIdentity, PreviousOwner);
+  EXPECT_EQ(After.codeGeneration, 1u);
+  EXPECT_EQ(After.sampleCount, 0u);
+  EXPECT_EQ(After.counterPairs, 3u);
+  EXPECT_EQ(After.counterWordCount, 4u);
+  EXPECT_EQ(After.borrowReaders, 0u);
+  finishBranchEightSamples();
 }
 TEST_F(GeneratedWrapperSreBridgeTest, RefusedSourceBorrowClosesAllocatedPreparationPin) {
   ASSERT_TRUE(buildWrapper()); request(8);

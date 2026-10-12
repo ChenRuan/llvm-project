@@ -16,6 +16,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTableHost.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSreTask.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -27,6 +28,7 @@
 #include <cassert>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <set>
 #include <type_traits>
 
@@ -352,6 +354,69 @@ struct OwnerControl {
   Lease leases[LeaseSlots];
 };
 OwnerControl &owner() { static OwnerControl O; return O; }
+#ifndef EJIT_FREESTANDING
+using CounterFaultKind = llvm::ejit::detail::SmallTableSreCounterFaultForTest;
+struct CounterFaultState {
+  CounterFaultKind fault = CounterFaultKind::None;
+  uint32_t pair = 0;
+  uint64_t ownerIdentity = 0, policyEpoch = 0, codeGeneration = 0;
+  uint64_t resourceGeneration = 0;
+  EJitSmallTableHost *host = nullptr;
+};
+CounterFaultState TestCounterFault;
+struct ScopedCounterFault {
+  PgoCounterRef *ref = nullptr;
+  PgoCounterRef saved{};
+  std::optional<RawInstrProf::ProfileData<uintptr_t>> data;
+  explicit ScopedCounterFault(OwnerControl &O) {
+    const CounterFaultState Pending = TestCounterFault;
+    TestCounterFault = {};
+    auto *Host = O.runtime ? O.runtime->smallTableHost() : nullptr;
+    if (Pending.fault == CounterFaultKind::None ||
+        !Host || Host != Pending.host ||
+        Pending.ownerIdentity != load64(&Shared.ownerIdentity) ||
+        Pending.policyEpoch != load64(&Shared.policyEpoch) ||
+        Pending.codeGeneration != O.codeGeneration ||
+        Pending.resourceGeneration != Host->runtime().resourceGeneration() ||
+        Pending.pair >= O.counterRefs.size())
+      return;
+    ref = &O.counterRefs[Pending.pair];
+    saved = *ref;
+    switch (Pending.fault) {
+    case CounterFaultKind::NullName:
+      ref->pgoName = nullptr; break;
+    case CounterFaultKind::MissingProfc:
+      ref->profcAddr = 0; break;
+    case CounterFaultKind::MissingProfd:
+      ref->profdAddr = 0; break;
+    case CounterFaultKind::NameBindingMismatch:
+      ref->pgoName = reinterpret_cast<const char *>(uintptr_t{1}); break;
+    case CounterFaultKind::ZeroCounters:
+    case CounterFaultKind::CounterWordsOverflow: {
+      if (!saved.profdAddr) break;
+      const auto &Real = *reinterpret_cast<
+          const RawInstrProf::ProfileData<uintptr_t> *>(saved.profdAddr);
+      const uint32_t Count = Pending.fault ==
+          CounterFaultKind::ZeroCounters
+              ? 0u : EJIT_STAB_SRE_MAX_COUNTER_WORDS + 1u;
+      static_assert(IPVK_Last == 2,
+                    "fault header must preserve every value-site field");
+      // ProfileData has const fields: construct a separate complete header,
+      // never const-cast or overwrite the actual JIT metadata.
+      data.emplace(RawInstrProf::ProfileData<uintptr_t>{
+          Real.NameRef, Real.FuncHash, Real.CounterPtr, Real.BitmapPtr,
+          Real.FunctionPointer, Real.Values, Count,
+          {Real.NumValueSites[0], Real.NumValueSites[1], Real.NumValueSites[2]},
+          Real.NumBitmapBytes});
+      ref->profdAddr = reinterpret_cast<uintptr_t>(&*data);
+      break;
+    }
+    case CounterFaultKind::None: break;
+    }
+  }
+  ~ScopedCounterFault() { if (ref) *ref = saved; }
+};
+#endif
 Lease *lease(uint64_t Ticket) {
   for (Lease &L : owner().leases)
     if (L.ticket == Ticket && Ticket)
@@ -415,30 +480,106 @@ int fail(Command &C, int Code, StringRef Why) {
   return Code;
 }
 
+bool refuseCounterSnapshot(std::string &Why, const char *Reason, size_t Pair,
+                           const PgoCounterRef *Ref,
+                           const std::string *OwnedName,
+                           uint32_t RequestedWords = 0,
+                           uint32_t CapturedWords = 0) {
+  const size_t NameBytes = OwnedName ? OwnedName->size() : 0;
+  // The reason is always set, even when diagnostics are compiled out/OFF.
+  // Keep it bounded for the unchanged 192-byte C snapshot reason field.
+  Why = "counter snapshot refused: " + std::string(Reason) +
+        " pair=" + utostr(Pair) +
+        " name_bytes=" + utostr(NameBytes) +
+        " capacity=" + utostr(EJIT_STAB_SRE_NAME_BYTES);
+  const auto &O = owner();
+  (void)O;
+  (void)RequestedWords;
+  (void)CapturedWords;
+  EJIT_DIAG_RAW("[STAB231_COUNTER] reason=%s pair=%llu total=%llu name_bytes=%llu capacity=%u",
+                Reason, (unsigned long long)Pair,
+                (unsigned long long)O.counterRefs.size(),
+                (unsigned long long)NameBytes, EJIT_STAB_SRE_NAME_BYTES);
+  ejitDiagPrintThrottle();
+  EJIT_DIAG_RAW("[STAB231_COUNTER] code_gen=%llu resource_gen=%llu requested_words=%u captured_words=%u word_capacity=%u",
+                (unsigned long long)O.codeGeneration,
+                (unsigned long long)(O.runtime && O.runtime->smallTableHost()
+                    ? O.runtime->smallTableHost()->runtime().resourceGeneration() : 0),
+                RequestedWords, CapturedWords, EJIT_STAB_SRE_MAX_COUNTER_WORDS);
+  ejitDiagPrintThrottle();
+  (void)Ref;
+  EJIT_DIAG_RAW("[STAB231_COUNTER] name_ptr=%p profc=%p profd=%p name_source=owner",
+                Ref ? static_cast<const void *>(Ref->pgoName) : nullptr,
+                Ref ? reinterpret_cast<const void *>(Ref->profcAddr) : nullptr,
+                Ref ? reinterpret_cast<const void *>(Ref->profdAddr) : nullptr);
+  ejitDiagPrintThrottle();
+#ifdef EJIT_DIAG_ENABLE
+  if (OwnedName && gEJitDiagLevel >= EJIT_LOG_LVL_INFO) {
+    // Only diagnostic text is bounded, not the actual profile identity. Never
+    // dereference an untrusted/null borrowed name pointer while reporting it.
+    constexpr size_t MaxNameLogBytes = 4096, ChunkBytes = 160;
+    const size_t Logged = std::min(NameBytes, MaxNameLogBytes);
+    for (size_t Offset = 0; Offset < Logged; Offset += ChunkBytes) {
+      const size_t Count = std::min(ChunkBytes, Logged - Offset);
+      EJIT_DIAG_RAW("[STAB231_COUNTER] name offset=%llu: %.*s",
+                    (unsigned long long)Offset, static_cast<int>(Count),
+                    OwnedName->data() + Offset);
+      ejitDiagPrintThrottle();
+    }
+    if (Logged != NameBytes) {
+      EJIT_DIAG_RAW("[STAB231_COUNTER] name_log_truncated=1 shown=%llu actual=%llu; profile identity is unchanged",
+                    (unsigned long long)Logged, (unsigned long long)NameBytes);
+      ejitDiagPrintThrottle();
+    }
+  }
+#endif
+  return false;
+}
+
 bool captureCounters(ejit_small_table_sre_snapshot_t &S, std::string &Why) {
   OwnerControl &O = owner();
-  if (O.counterRefs.empty() || O.counterRefs.size() > EJIT_STAB_SRE_MAX_COUNTERS) {
-    Why = "missing or out-of-bounds complete counter inventory";
-    return false;
-  }
+  if (O.counterRefs.empty())
+    return refuseCounterSnapshot(Why, "EMPTY_INVENTORY", 0, nullptr, nullptr);
+  if (O.counterRefs.size() > EJIT_STAB_SRE_MAX_COUNTERS)
+    return refuseCounterSnapshot(Why, "COUNTER_PAIRS_OVERFLOW", 0, nullptr, nullptr);
+  if (O.counterNames.size() != O.counterRefs.size())
+    return refuseCounterSnapshot(Why, "NAME_INVENTORY_MISMATCH", 0, nullptr, nullptr);
+#ifndef EJIT_FREESTANDING
+  ScopedCounterFault Fault(O);
+#endif
   S.expectedCounterPairs = O.counterRefs.size();
   S.counterPairs = S.counterWordCount = 0;
   S.rootEntryCount = 0;
   S.rootEntryCountValid = 0;
   S.countersDigest = 1469598103934665603ULL;
   auto Mix = [&](uint64_t V) { S.countersDigest = (S.countersDigest ^ V) * 1099511628211ULL; };
-  for (const PgoCounterRef &R : O.counterRefs) {
-    if (!R.pgoName || !R.profcAddr || !R.profdAddr ||
-        std::strlen(R.pgoName) >= EJIT_STAB_SRE_NAME_BYTES) {
-      Why = "missing expected counter/data pair or unrepresentable name";
-      return false;
-    }
+  for (size_t Pair = 0; Pair < O.counterRefs.size(); ++Pair) {
+    const PgoCounterRef &R = O.counterRefs[Pair];
+    const std::string &Name = O.counterNames[Pair];
+    if (!R.pgoName)
+      return refuseCounterSnapshot(Why, "NULL_NAME", Pair, &R, &Name);
+    if (R.pgoName != Name.c_str())
+      return refuseCounterSnapshot(Why, "NAME_BINDING_MISMATCH", Pair, &R, &Name);
+    if (Name.empty())
+      return refuseCounterSnapshot(Why, "EMPTY_NAME", Pair, &R, &Name);
+    if (Name.find('\0') != std::string::npos)
+      return refuseCounterSnapshot(Why, "EMBEDDED_NUL", Pair, &R, &Name);
+    if (!R.profcAddr && !R.profdAddr)
+      return refuseCounterSnapshot(Why, "MISSING_COUNTER_DATA_PAIR", Pair, &R, &Name);
+    if (!R.profcAddr)
+      return refuseCounterSnapshot(Why, "MISSING_PROFC", Pair, &R, &Name);
+    if (!R.profdAddr)
+      return refuseCounterSnapshot(Why, "MISSING_PROFD", Pair, &R, &Name);
+    if (Name.size() >= EJIT_STAB_SRE_NAME_BYTES)
+      return refuseCounterSnapshot(Why, "NAME_TOO_LONG", Pair, &R, &Name);
     const auto *Header = reinterpret_cast<const RawInstrProf::ProfileData<uintptr_t> *>(R.profdAddr);
     const uint32_t N = Header->NumCounters;
-    if (!N || N > EJIT_STAB_SRE_MAX_COUNTER_WORDS - S.counterWordCount) {
-      Why = "actual counter inventory exceeds exact snapshot bounds";
-      return false;
-    }
+    if (!N)
+      return refuseCounterSnapshot(Why, "ZERO_COUNTERS", Pair, &R, &Name,
+                                   N, S.counterWordCount);
+    if (N > EJIT_STAB_SRE_MAX_COUNTER_WORDS - S.counterWordCount)
+      return refuseCounterSnapshot(Why, "COUNTER_WORDS_OVERFLOW", Pair, &R,
+                                   &Name, N, S.counterWordCount);
     auto &Record = S.counters[S.counterPairs++];
     copyText(Record.name, sizeof(Record.name), R.pgoName);
     Record.hash = Header->FuncHash;
@@ -570,6 +711,9 @@ int setupRequest(Command &C, const llvm::ejit::detail::OwnerWorkerContext &Worke
   O.frozen = {};
   O.counterNames.clear();
   O.counterRefs.clear();
+#ifndef EJIT_FREESTANDING
+  TestCounterFault = {};
+#endif
   O.codeGeneration = R.codeGeneration;
   store32(&Shared.function, Func);
   smallTableSrePolicyChanged();
@@ -1041,6 +1185,47 @@ void completeRealLeave(Command &C) {
 
 namespace llvm { namespace ejit {
 #ifndef EJIT_FREESTANDING
+bool detail::armSmallTableSreCounterFaultForTest(
+    const detail::OwnerWorkerContext &Worker,
+    detail::SmallTableSreCounterFaultForTest Fault, uint32_t PairIndex) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (!LocalWorkerPool || !isActualBridgeWorker(*LocalWorkerPool, Worker) ||
+      !bridgeLayoutCurrent())
+    return false;
+  switch (Fault) {
+  case detail::SmallTableSreCounterFaultForTest::NullName:
+  case detail::SmallTableSreCounterFaultForTest::MissingProfc:
+  case detail::SmallTableSreCounterFaultForTest::MissingProfd:
+  case detail::SmallTableSreCounterFaultForTest::NameBindingMismatch:
+  case detail::SmallTableSreCounterFaultForTest::ZeroCounters:
+  case detail::SmallTableSreCounterFaultForTest::CounterWordsOverflow:
+    break;
+  default: return false;
+  }
+  auto &O = owner();
+  auto *Host = O.runtime ? O.runtime->smallTableHost() : nullptr;
+  const uint64_t Identity = load64(&Shared.ownerIdentity);
+  if (!Host || O.runtime != smallTableSreLocalRuntime() ||
+      !Identity || Identity != currentEJitRuntimeOwnerIdentity() ||
+      O.retirementObserved || O.fullProfileValid || O.finishing ||
+      Host->activeTier() != "instrumented" || Host->physicalExecutions() ||
+      Host->runtime().sessionInFlight() ||
+      O.counterNames.size() != O.counterRefs.size() ||
+      PairIndex >= O.counterRefs.size())
+    return false;
+  const auto &Ref = O.counterRefs[PairIndex];
+  if (Ref.pgoName != O.counterNames[PairIndex].c_str() ||
+      !Ref.profcAddr || !Ref.profdAddr)
+    return false;
+  TestCounterFault = {Fault, PairIndex, Identity,
+                      load64(&Shared.policyEpoch), O.codeGeneration,
+                      Host->runtime().resourceGeneration(), Host};
+  return true;
+#else
+  (void)Worker; (void)Fault; (void)PairIndex;
+  return false;
+#endif
+}
 detail::ScopedSmallTableSreStaticDomainForTest::
 ScopedSmallTableSreStaticDomainForTest(ArrayRef<EJitWritableRange> Ranges) {
   SmallVector<ejit_reg_entry_t, 16> Records;
@@ -1222,6 +1407,9 @@ void smallTableSreWorkerExit(EJitSharedTaskPool &Pool,
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (!bridgeLayoutCurrent() || LocalWorkerPool != &Pool || !load32(&LocalPrepared) ||
       !Worker.activeFor(Pool)) return;
+#ifndef EJIT_FREESTANDING
+  TestCounterFault = {};
+#endif
   for (Lease &L : owner().leases)
     if (L.ticket) {
       EJIT_DIAG("SRE worker exited with live physical ticket=%llu; NOT reclaimed",
