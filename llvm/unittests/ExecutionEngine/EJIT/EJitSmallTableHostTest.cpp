@@ -867,6 +867,131 @@ TEST_F(SmallTableHostTest, UnboundFunctionIndexNeverEntersTheFeature) {
   EXPECT_EQ(ejit_small_table_published_slots(), 0u);
 }
 
+TEST_F(SmallTableHostTest,
+       ColdPlanResolvesDistinctLifecycleNamesToRegisteredSlots) {
+  auto M = parseHost("f_entry", "g_focus", "g_focus_out", kCells, kTrps + 1);
+  ASSERT_NE(M, nullptr);
+  ASSERT_TRUE(makeHost(makeFacts("g_focus", &g_focus[0][0], sizeof(g_focus),
+                                 0xF00D, kCells, kTrps)));
+  ASSERT_TRUE(Host->dimTypes().empty());
+
+  // Dense slots are registration identities, not positions in the plan. A
+  // preceding unrelated lifecycle and reverse registration order make the
+  // expected binding [2, 1], exercising the initially empty duplicate scan as
+  // well as the second distinct name.
+  ASSERT_EQ(registerLifecycle("unrelated_period"), 0u);
+  const uint32_t TrpSlot = registerLifecycle(kTrpPeriod);
+  const uint32_t CellSlot = registerLifecycle(kCellPeriod);
+  ASSERT_EQ(TrpSlot, 1u);
+  ASSERT_EQ(CellSlot, 2u);
+
+  EJitSmallTableHost::EntryRequest Req;
+  Req.module = M.get();
+  Req.entryName = "f_entry";
+  Req.funcIndex = EJitFuncRegistry::instance().resolveAssign("f_entry");
+  Req.sourceVarName = "g_focus";
+  LocalDims = focusDims();
+  Req.dims = LocalDims;
+  Periods = {kCellPeriod, kTrpPeriod};
+  Req.dimPeriodNames = Periods;
+  Req.codeGeneration = 1;
+  std::string Why;
+  auto Plan = Host->planEntry(Req, Why);
+  ASSERT_TRUE(static_cast<bool>(Plan)) << Why;
+  EXPECT_TRUE(Host->bound());
+  EXPECT_EQ(*Plan, Host->plan());
+  ASSERT_EQ(Host->dimTypes().size(), 2u);
+  EXPECT_EQ(Host->dimTypes()[0], CellSlot);
+  EXPECT_EQ(Host->dimTypes()[1], TrpSlot);
+  EXPECT_EQ(Host->admittedCoordinates().size(), kCells * kTrps);
+  EXPECT_EQ(EJitLifecycleRegistry::instance().count(), 3u);
+  EXPECT_EQ(Facts->outstandingBorrows(), 0u);
+  EXPECT_EQ(Host->publishedSlots(), 0u)
+      << "planning alone must not publish callable code";
+  EXPECT_FALSE(Host->codeReady());
+}
+
+TEST_F(SmallTableHostTest,
+       ColdPlanRejectsTwoDimensionsWithTheSameRegisteredLifecycle) {
+  auto M = parseHost("f_entry", "g_focus", "g_focus_out", kCells, kTrps + 1);
+  ASSERT_NE(M, nullptr);
+  ASSERT_TRUE(makeHost(makeFacts("g_focus", &g_focus[0][0], sizeof(g_focus),
+                                 0xF00D, kCells, kTrps)));
+  ASSERT_TRUE(Host->dimTypes().empty());
+  const uint32_t CellSlot = registerLifecycle(kCellPeriod);
+  ASSERT_NE(CellSlot, kEJitInvalidDimType);
+  ASSERT_EQ(registerLifecycle(kCellPeriod), CellSlot)
+      << "the same registered name must keep its real dimType identity";
+
+  EJitSmallTableHost::EntryRequest Req;
+  Req.module = M.get();
+  Req.entryName = "f_entry";
+  Req.funcIndex = EJitFuncRegistry::instance().resolveAssign("f_entry");
+  Req.sourceVarName = "g_focus";
+  LocalDims = focusDims();
+  Req.dims = LocalDims;
+  Periods = {kCellPeriod, kCellPeriod};
+  Req.dimPeriodNames = Periods;
+  Req.codeGeneration = 1;
+  std::string Why;
+  auto Plan = Host->planEntry(Req, Why);
+  ASSERT_FALSE(static_cast<bool>(Plan));
+  EXPECT_EQ(toString(Plan.takeError()), Why);
+  EXPECT_NE(
+      Why.find("two declared dimensions resolve to the same dimType slot " +
+               std::to_string(CellSlot)),
+      std::string::npos)
+      << Why;
+  EXPECT_NE(Why.find(kCellPeriod), std::string::npos) << Why;
+  EXPECT_FALSE(Host->bound());
+  EXPECT_EQ(Host->publishedSlots(), 0u);
+  EXPECT_FALSE(Host->codeReady());
+  EXPECT_EQ(Host->activeExecutions(), 0u);
+  EXPECT_EQ(Facts->outstandingBorrows(), 0u);
+  EXPECT_EQ(EJitLifecycleRegistry::instance().count(), 1u);
+}
+
+TEST_F(SmallTableHostTest,
+       ColdPlanRefusesAnUnregisteredLifecycleWithoutAssigning) {
+  auto M = parseHost("f_entry", "g_focus", "g_focus_out", kCells, kTrps + 1);
+  ASSERT_NE(M, nullptr);
+  ASSERT_TRUE(makeHost(makeFacts("g_focus", &g_focus[0][0], sizeof(g_focus),
+                                 0xF00D, kCells, kTrps)));
+  ASSERT_TRUE(Host->dimTypes().empty());
+  ASSERT_NE(registerLifecycle(kCellPeriod), kEJitInvalidDimType);
+  ASSERT_EQ(EJitLifecycleRegistry::instance().lookup(kTrpPeriod),
+            kEJitInvalidDimType);
+  const uint32_t AssignedBefore = EJitLifecycleRegistry::instance().count();
+
+  EJitSmallTableHost::EntryRequest Req;
+  Req.module = M.get();
+  Req.entryName = "f_entry";
+  Req.funcIndex = EJitFuncRegistry::instance().resolveAssign("f_entry");
+  Req.sourceVarName = "g_focus";
+  LocalDims = focusDims();
+  Req.dims = LocalDims;
+  Periods = {kCellPeriod, kTrpPeriod};
+  Req.dimPeriodNames = Periods;
+  Req.codeGeneration = 1;
+  std::string Why;
+  auto Plan = Host->planEntry(Req, Why);
+  ASSERT_FALSE(static_cast<bool>(Plan));
+  EXPECT_EQ(toString(Plan.takeError()), Why);
+  EXPECT_NE(Why.find("was never registered by the AOT wrapper"),
+            std::string::npos)
+      << Why;
+  EXPECT_NE(Why.find(kTrpPeriod), std::string::npos) << Why;
+  EXPECT_EQ(EJitLifecycleRegistry::instance().lookup(kTrpPeriod),
+            kEJitInvalidDimType)
+      << "a failed lookup may not invent a lifecycle slot";
+  EXPECT_EQ(EJitLifecycleRegistry::instance().count(), AssignedBefore);
+  EXPECT_FALSE(Host->bound());
+  EXPECT_EQ(Host->publishedSlots(), 0u);
+  EXPECT_FALSE(Host->codeReady());
+  EXPECT_EQ(Host->activeExecutions(), 0u);
+  EXPECT_EQ(Facts->outstandingBorrows(), 0u);
+}
+
 TEST_F(SmallTableHostTest, BoundEntrySamplesTheCommonT1UntilCodeIsReady) {
   // The plan exists and some members are admitted, but no FINAL code generation
   // is published yet. Two rules hold at once:

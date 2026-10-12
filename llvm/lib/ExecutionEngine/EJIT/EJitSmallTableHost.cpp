@@ -442,7 +442,17 @@ bool EJitSmallTableHost::resolveDimTypes(std::string &Why) {
             "dimension cannot be identified";
       return false;
     }
-    if (std::find(dimTypes_.begin(), dimTypes_.end(), Slot) != dimTypes_.end()) {
+    // libc++ can lower std::find on uint32_t to wmemchr, which is not part of
+    // the freestanding SRE platform contract. This small integer lookup must
+    // also work for the initially empty list without calling that library.
+    bool Duplicate = false;
+    for (uint32_t BoundSlot : dimTypes_) {
+      if (BoundSlot == Slot) {
+        Duplicate = true;
+        break;
+      }
+    }
+    if (Duplicate) {
       Why = "small-table host: two declared dimensions resolve to the same "
             "dimType slot " +
             std::to_string(Slot) + " (lifecycle '" + Name + "')";
