@@ -549,7 +549,13 @@ uint64_t EJitSmallTablePlan::fieldRowStride(const EJitSmallTableField &Field,
 
 bool EJitSmallTablePlan::fieldRetainsDim(const EJitSmallTableField &Field,
                                          unsigned Dim) const {
-  return llvm::is_contained(Field.retainedAxes, Dim);
+  // llvm::is_contained falls back to std::find for this integer vector, and
+  // libc++ can lower that search to wmemchr. Keep this freestanding lookup
+  // independent of the platform's wide-character library.
+  for (unsigned RetainedDim : Field.retainedAxes)
+    if (RetainedDim == Dim)
+      return true;
+  return false;
 }
 
 uint64_t EJitSmallTablePlan::tableBytes() const {

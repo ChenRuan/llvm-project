@@ -1026,6 +1026,94 @@ protected:
 };
 
 //===----------------------------------------------------------------------===//
+// Plan field-retention lookup
+//===----------------------------------------------------------------------===//
+
+EJitSmallTablePlan fieldRetentionPlan(ArrayRef<unsigned> RetainedAxes) {
+  EJitSmallTablePlan Plan;
+  Plan.entryName = "field_retention";
+  Plan.sourceVarName = "g_field_retention";
+  Plan.elementBytes = 4;
+  constexpr unsigned NumAxes = 6;
+  for (unsigned Dim = 0; Dim < NumAxes; ++Dim)
+    Plan.dims.push_back({EJitSmallTableDim::Kind::Argument, Dim, 0, 2});
+  Plan.sourceStrides.resize(NumAxes);
+  uint64_t Stride = Plan.elementBytes;
+  for (unsigned Dim = NumAxes; Dim-- > 0;) {
+    Plan.sourceStrides[Dim] = Stride;
+    Stride *= Plan.dims[Dim].extent;
+  }
+  Plan.readiness = {1, "test.field-retention.not-product", true, true};
+  EJitSmallTableField Field;
+  Field.accessSize = 4;
+  Field.bitWidth = 32;
+  Field.retainedAxes.append(RetainedAxes.begin(), RetainedAxes.end());
+  if (RetainedAxes.empty()) {
+    Field.strategy = EJitSmallTableStrategy::Uniform;
+    Field.uniformValue = 23;
+  } else {
+    Field.tableRows = uint64_t{1} << RetainedAxes.size();
+    Field.tableBytes = Field.tableRows * Field.accessSize;
+    Field.columnName = "__ejit_stab_field_retention_c0";
+  }
+  Plan.fields.push_back(std::move(Field));
+  for (uint64_t Row = 0; Row < Plan.numRows(); ++Row) {
+    const EJitSmallTableField &StoredField = Plan.fields[0];
+    const uint64_t Bits = StoredField.isUniform()
+                              ? *StoredField.uniformValue
+                              : Plan.projectRow(StoredField, Row);
+    Plan.rows.push_back({true, {Bits}});
+  }
+  return Plan;
+}
+
+TEST(SmallTablePlanTest, FieldRetainsDimEmptyUniformFieldNeverMatches) {
+  auto Plan = fieldRetentionPlan({});
+  std::string Error;
+  ASSERT_TRUE(Plan.isConsistent(&Error)) << Error;
+  const EJitSmallTableField &Field = Plan.fields[0];
+  ASSERT_TRUE(Field.isUniform());
+  ASSERT_TRUE(Field.retainedAxes.empty());
+  for (unsigned Dim = 0; Dim < Plan.dims.size(); ++Dim)
+    EXPECT_FALSE(Plan.fieldRetainsDim(Field, Dim)) << "dim=" << Dim;
+  EXPECT_TRUE(Field.retainedAxes.empty());
+  EXPECT_TRUE(Plan.isConsistent(&Error)) << Error;
+}
+
+TEST(SmallTablePlanTest, FieldRetainsDimMatchesOnlySelectedInlineAxes) {
+  auto Plan = fieldRetentionPlan({1, 3});
+  std::string Error;
+  ASSERT_TRUE(Plan.isConsistent(&Error)) << Error;
+  const EJitSmallTableField &Field = Plan.fields[0];
+  ASSERT_EQ(Field.retainedAxes.size(), 2u);
+  const auto OriginalAxes = Field.retainedAxes;
+  for (unsigned Dim = 0; Dim < Plan.dims.size(); ++Dim)
+    EXPECT_EQ(Plan.fieldRetainsDim(Field, Dim), Dim == 1 || Dim == 3)
+        << "dim=" << Dim;
+  EXPECT_EQ(Field.retainedAxes, OriginalAxes);
+  EXPECT_TRUE(Plan.isConsistent(&Error)) << Error;
+}
+
+TEST(SmallTablePlanTest, FieldRetainsDimSearchesSpilledAxesWithoutMutation) {
+  auto Plan = fieldRetentionPlan({0, 1, 2, 3, 5});
+  std::string Error;
+  ASSERT_TRUE(Plan.isConsistent(&Error)) << Error;
+  const EJitSmallTableField &Field = Plan.fields[0];
+  ASSERT_GT(Field.retainedAxes.size(), 2u); // Beyond the inline capacity.
+  const auto OriginalAxes = Field.retainedAxes;
+  const unsigned *OriginalData = Field.retainedAxes.data();
+  const size_t OriginalCapacity = Field.retainedAxes.capacity();
+  EXPECT_TRUE(Plan.fieldRetainsDim(Field, Field.retainedAxes.front()));
+  EXPECT_TRUE(Plan.fieldRetainsDim(Field, Field.retainedAxes.back()));
+  for (unsigned Dim = 0; Dim < Plan.dims.size(); ++Dim)
+    EXPECT_EQ(Plan.fieldRetainsDim(Field, Dim), Dim != 4) << "dim=" << Dim;
+  EXPECT_EQ(Field.retainedAxes, OriginalAxes);
+  EXPECT_EQ(Field.retainedAxes.data(), OriginalData);
+  EXPECT_EQ(Field.retainedAxes.capacity(), OriginalCapacity);
+  EXPECT_TRUE(Plan.isConsistent(&Error)) << Error;
+}
+
+//===----------------------------------------------------------------------===//
 // Planner
 //===----------------------------------------------------------------------===//
 
