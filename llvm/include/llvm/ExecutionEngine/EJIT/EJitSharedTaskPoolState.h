@@ -39,6 +39,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h" // EJitWritableRange bound
+#include "llvm/ExecutionEngine/EJIT/EJitGlobalLayout.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h" // EJitCompileRequest, EJitDimPair
 #include <cstddef>
@@ -236,6 +237,9 @@ struct EJitSharedCacheSlot {
   /// compile driver via ORC lookup and kept driver-private — they do not
   /// need to live in the shared slot.
   EJitAtomicU64 hitCount;
+  /// T1-only real execution leases, including NO_RECLAIM builds.
+  EJitAtomicU32 samplingExecutions;
+  EJitAtomicU32 samplingReturns;
   /// PGO (§7.1): current compile tier of the published code.  0 = Baseline /
   /// not yet published, 1 = Instrumented (Tier-1), 2 = PGOUse (Tier-2).
   /// Used to suppress the Tier-2 auto-trigger on slots that are already
@@ -421,6 +425,17 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   //    validated by every other core. Compared by value (endian-safe).
   uint32_t magic;
   uint32_t abiVersion;
+  EJitAtomicU32 globalLayoutState;
+  EJitAtomicU32 globalLayoutRequired;
+  EJitAtomicU32 globalLayoutReady;
+  EJitAtomicU32 globalLayoutPublished;
+  EJitAtomicU32 globalLayoutError;
+  EJitAtomicU32 globalLayoutErrorRank;
+  EJitAtomicU64 globalLayoutArtifactBytes;
+  /// Never reset across owner generations: NO_RECLAIM code and failed holes.
+  EJitAtomicU64 globalLayoutRetainedNearBytes;
+  EJitAtomicU64 globalLayoutRetainedFarBytes;
+  EJitAtomicU32 globalLayoutLegacyOwnerSeen; // untracked legacy pool ownership
   uint32_t structSize;
   uint32_t headerReserved;
 

@@ -82,6 +82,15 @@ struct EJitSharedDiagnostics {
   uint64_t tier1Compiles;
   uint64_t tier2Compiles;
   uint64_t profileMergeFails;
+  uint32_t globalLayoutState;
+  uint32_t globalLayoutRequired;
+  uint32_t globalLayoutReady;
+  uint32_t globalLayoutPublished;
+  uint32_t globalLayoutError;
+  uint32_t globalLayoutErrorRank;
+  uint64_t globalLayoutArtifactBytes;
+  uint64_t globalLayoutRetainedNearBytes;
+  uint64_t globalLayoutRetainedFarBytes;
 };
 
 //===----------------------------------------------------------------------===//
@@ -430,41 +439,25 @@ public:
     NoState,             ///< bind() not called.
   };
 
-  /// Returned by every lookup, so its size is on the per-call hot path: AAPCS64
-  /// returns an aggregate <= 16 bytes in x0:x1 but passes anything larger via
-  /// sret, i.e. the callee stores the fields to caller stack and the caller
-  /// loads them straight back. Two things keep this at 16: fnPtr comes first,
-  /// so its alignment forces no padding ahead of it, and bucketIndex is a byte,
-  /// which leaves the three flags exactly filling the tail.
+  /// AAPCS64 register return: pointer + status + 16-bit leave token + flags
+  /// stays at 16 bytes. T1-only leases use bit 15 and a complete cache slot ID.
+  /// Stable T2 still uses the ordinary bucket/no-token representation.
   struct CompileOrGetResult {
     void *fnPtr = nullptr;
     EJitCompileOrGetStatus status = EJitCompileOrGetStatus::CompileFailed;
-    /// Narrowed to a byte purely to close the struct at 16 bytes (see above);
-    /// it holds 0..kEJitSharedCacheBuckets, the latter being the out-of-range
-    /// sentinel. A byte field costs a plain ldrb/strb, whereas packing these
-    /// four into a bit-field would trade the sret round-trip for ubfx/bfi
-    /// masking on every access.
-    uint8_t bucketIndex = 0;
-    bool hasReadToken = false;
-    /// True when a Ready result exists but this core may not read the
-    /// cross-core pointer (code sharing not platform-validated): a clean
-    /// fallback that did NOT re-enqueue.
-    bool readyButNotShareable = false;
-    /// Set by tryCacheHit() when the request was fully resolved on the fast
-    /// cache-hit path (a cache hit, a disabled instance, a not-yet-Ready pool,
-    /// or a ready-but-not-shareable fallback). When true the caller returns
-    /// this result directly and MUST NOT enter the compileOrGet() slow path.
-    /// When false the request is a true miss that still needs compileOrGet().
-    /// This flag is an internal control signal; it does not affect status
-    /// mapping or the C ABI.
-    bool fastPathTerminal = false;
+    uint16_t bucketIndex = 0;
+    bool hasReadToken : 1;
+    bool readyButNotShareable : 1;
+    bool fastPathTerminal : 1;
+    CompileOrGetResult()
+        : hasReadToken(false), readyButNotShareable(false),
+          fastPathTerminal(false) {}
   };
-  static_assert(kEJitSharedCacheBuckets < 255,
-                "bucketIndex is a uint8_t: the bucket count and its sentinel "
-                "must fit in a byte");
   static_assert(sizeof(CompileOrGetResult) <= 16,
                 "CompileOrGetResult must stay <= 16 bytes so AAPCS returns it "
                 "in registers rather than through sret memory");
+  static_assert(kEJitSharedCacheBuckets < 0x8000u,
+                "bucket index and sentinel must not overlap the T1 leave tag");
 
   EJitSharedTaskPool() = default;
   EJitSharedTaskPool(const EJitSharedTaskPool &) = delete;
@@ -737,6 +730,10 @@ public:
                        static_cast<uint32_t>(EJitSharedInitState::Ready))
       return;
 
+    if ((state_->pgoEnabled.loadAcquire() != 0) != enable ||
+        state_->tier2Threshold.loadAcquire() != (enable ? threshold : 0u) ||
+        state_->pgoMaxActiveFunctions.loadAcquire() != maxConcurrentProfiles)
+      invalidateMaterializedLayout(true);
     // Publish the threshold before enabling so a peer that acquires the
     // enabled flag also observes the matching threshold. Disable first when
     // turning PGO off so no new hit can arm a Tier-2 request.
@@ -930,6 +927,50 @@ public:
                                    uint32_t inst2, uint32_t dim3,
                                    uint32_t inst3);
   void releaseRead(uint32_t bucketIndex);
+  using PrepareArtifactCallback = bool (*)(void *, const EJitCompileRequest &,
+                                           void **, uint64_t *);
+  using LinkArtifactCallback = bool (*)(void *, void *, void **);
+  using DropArtifactCallback = void (*)(void *, void *);
+  using SamplingPreparedCallback = void (*)(void *, const EJitCompileRequest &);
+  /// Owner setup only, before Ready. Entries are copied in caller rank order.
+  bool configureGlobalLayout(const std::vector<EJitCompileRequest> &manifest,
+                             const EJitLayoutBudgets &budgets,
+                             PrepareArtifactCallback prepare,
+                             LinkArtifactCallback link,
+                             DropArtifactCallback drop, void *ctx,
+                             SamplingPreparedCallback sampled = nullptr);
+  /// Legacy fixed pools have no persistent retirement offsets. Do not switch
+  /// allocation ownership policies over retained code without a cold reset.
+  bool checkGlobalLayoutReservationHistory(bool global) {
+    if (!state_)
+      return false;
+    if (global)
+      return state_->globalLayoutLegacyOwnerSeen.loadAcquire() == 0;
+    if (state_->globalLayoutRetainedNearBytes.loadAcquire() ||
+        state_->globalLayoutRetainedFarBytes.loadAcquire())
+      return false;
+    state_->globalLayoutLegacyOwnerSeen.storeRelease(1);
+    return true;
+  }
+  uint64_t reserveGlobalLayoutCodeBytes(uint64_t bytes, bool near,
+                                        uint64_t limit) {
+    if (!state_ || bytes > limit)
+      return UINT64_MAX;
+    auto &Ledger = near ? state_->globalLayoutRetainedNearBytes
+                        : state_->globalLayoutRetainedFarBytes;
+    uint64_t used = Ledger.loadAcquire();
+    while (used <= limit - bytes) {
+      uint64_t before = used;
+      if (Ledger.compareExchange(used, used + bytes))
+        return before;
+    }
+    return UINT64_MAX;
+  }
+  EJitGlobalLayoutState globalLayoutState() const {
+    return state_ ? static_cast<EJitGlobalLayoutState>(
+                        state_->globalLayoutState.loadAcquire())
+                  : EJitGlobalLayoutState::Disabled;
+  }
   /// Drive one end of a period-value mutation window for a lifecycle instance.
   ///
   /// The shared `enabled` bit is the JIT compile gate and is CAS'd, so only the
@@ -1351,6 +1392,45 @@ private:
   bool flushPendingPublishes(bool compileBatchRequests = true);
   bool serviceCodeBatchRequest();
   bool serviceAutoTier2Publish();
+  SharedLookup resolveMatchedSlotImpl(EJitSharedCacheBucket &B, uint32_t bucket,
+                                      uint32_t slot);
+  struct LayoutMember {
+    EJitCompileRequest req{};
+    void *artifact = nullptr;
+    void *fn = nullptr;
+    EJitCompiledCodeInfo range{};
+    uint64_t bytes = 0;
+    bool ready = false;
+    bool published = false;
+    bool samplingReleased = false;
+  };
+  std::vector<LayoutMember> layoutMembers_;
+  std::vector<EJitCompileRequest> layoutDraining_;
+  EJitLayoutBudgets layoutBudgets_;
+  PrepareArtifactCallback layoutPrepare_ = nullptr;
+  LinkArtifactCallback layoutLink_ = nullptr;
+  DropArtifactCallback layoutDrop_ = nullptr;
+  void *layoutCtx_ = nullptr;
+  SamplingPreparedCallback layoutSampled_ = nullptr;
+  uint32_t layoutPolls_ = 0;
+  uint32_t layoutSamplingThreshold_ = 0;
+  uint32_t layoutSamplingMax_ = 0;
+  bool layoutConfigured_ = false;
+  bool layoutFailureRecorded_ = false;
+  void invalidateMaterializedLayout(bool includeCollection = false);
+  bool transitionGlobalLayout(EJitGlobalLayoutState from,
+                              EJitGlobalLayoutState to) {
+    uint32_t expected = static_cast<uint32_t>(from);
+    return state_->globalLayoutState.compareExchange(expected,
+                                                     static_cast<uint32_t>(to));
+  }
+  bool serviceGlobalLayout();
+  bool stageGlobalArtifact(const EJitCompileRequest &req);
+  bool samplingDrained(const EJitCompileRequest &req) const;
+  void releaseSamplingAdmission(const EJitCompileRequest &req);
+  void failGlobalLayout(EJitGlobalLayoutError error, uint32_t rank);
+  void clearGlobalArtifacts();
+  size_t globalMemberFor(const EJitCompileRequest &req) const;
 
   /// Release staged-PGO ownership if \p funcIndex still owns it. Tier-2
   /// completion and terminal worker failures call this; transient queue-full

@@ -360,7 +360,8 @@ EJit::EJit(const Config &config) : config_(config) {
         // PGO and the default-off profile audit share the temporary
         // Instrumented-tier hit window. Audit-only mode publishes ordinary
         // Baseline code after collecting the window.
-        if (config_.enablePgo || config_.enableProfileAudit) {
+        if (config_.enablePgo ||
+            (config_.enableProfileAudit && config_.globalLayout.empty())) {
           constexpr uint32_t kDefaultPgoThreshold = 64;
 #ifdef EJIT_SRE_SHARED_TASKPOOL
           compileDriver_->sharedTaskPool()->setPgoEnabled(

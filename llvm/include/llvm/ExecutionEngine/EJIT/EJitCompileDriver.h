@@ -64,6 +64,8 @@ public:
   /// taskpool's compile callback (the taskpool owns its own fixed cache).
   /// Returns the JIT function pointer or nullptr.
   void *compileNow(const EJitCompileRequest &req);
+  void *prepareNow(const EJitCompileRequest &req);
+  void notifyTaskpoolPrepared(const EJitCompileRequest &req);
 
   /// Taskpool commit notification. A value-profile round is consumed only
   /// after Tier-2 is actually published, so failed commits keep collecting.
@@ -110,6 +112,11 @@ public:
   EJitModuleLoader &getLoader() { return loader_; }
   const Config &getConfig() { return config_; }
   EJitOrcEngine *getJitEngine() { return jitEngine_.get(); }
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  uint64_t layoutPreparedValueSamples() const {
+    return layoutPreparedValueSamples_;
+  }
+#endif
 #ifndef EJIT_FREESTANDING
   EJitLogger *getLogger() { return logger_; }
 #else
@@ -180,7 +187,9 @@ private:
   /// the request's funcIndex high bits (EJitSreQueue.h); gated by
   /// Config::enablePgo (off => Baseline regardless).
   void *compileCold(uint64_t cacheKey, uint32_t tier, bool storeLru,
-                    const EJitCompileRequest *request = nullptr);
+                    const EJitCompileRequest *request = nullptr,
+                    bool prepareOnly = false);
+  void *compileRequest(const EJitCompileRequest &req, bool prepareOnly);
 
   /// PGO: Tier-1 captured counter refs per cacheKey (EJIT_ONLINE_PGO.md
   /// §5.2). Filled after a Tier-1 compile (ORC lookup of __profc_/__profd_
@@ -220,6 +229,10 @@ private:
   /// merge), touched only by the single owner worker: the collector is armed
   /// at the first Tier-1 capture and disarmed once the last round merged.
   uint32_t vpRoundsActive_ = 0;
+  /// Whole-collector snapshots contain sibling rounds. Preserve, then consume
+  /// only the current complete inventory. Bounded by the layout profile budget.
+  std::vector<EJitVpSiteSample> layoutVpPending_;
+  uint64_t layoutPreparedValueSamples_ = 0;
 #endif
 };
 

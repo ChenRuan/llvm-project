@@ -213,6 +213,9 @@ TEST(EJitOrcEngine, NestedEntryResolvesThroughRegisteredWrapper) {
   auto FnOrErr = Engine->lookup(Ctx.cacheKey, Ctx.fnName);
   ASSERT_TRUE(static_cast<bool>(FnOrErr));
   Engine->setActiveContext(nullptr);
+#if defined(EJIT_SRE_CODE_POOL) && defined(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  ASSERT_FALSE(errorToBool(Engine->flushPendingCode()));
+#endif
 
   using FnTy = int (*)(int);
   auto Fn = reinterpret_cast<FnTy>(*FnOrErr);
@@ -228,6 +231,9 @@ TEST(EJitOrcEngine, NestedEntryResolvesThroughRegisteredWrapper) {
   FnOrErr = Engine->lookup(Ctx.cacheKey, Ctx.fnName);
   ASSERT_TRUE(static_cast<bool>(FnOrErr));
   Engine->setActiveContext(nullptr);
+#if defined(EJIT_SRE_CODE_POOL) && defined(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  ASSERT_FALSE(errorToBool(Engine->flushPendingCode()));
+#endif
   Fn = reinterpret_cast<FnTy>(*FnOrErr);
   EXPECT_EQ(Fn(5), 6);
 }
@@ -1265,7 +1271,11 @@ TEST(EJitCApiTaskpool, IcacheSlotRegistrationCarriesTheSentinel) {
                             &missFnStandIn);
   ejit_register_icache_slot("guarded_c_fn", &guardedCells[0], 1, nullptr);
 
-  EJit ejit(Config{});
+  Config config;
+  // This exercises sentinel draining, not the separate sampling-cache gate.
+  config.enableProfileAudit = false;
+  config.enablePgo = false;
+  EJit ejit(config);
   ASSERT_FALSE(ejit.initFailed());
   EJitSharedTaskPool *sp = ejit.sharedTaskPool();
   ASSERT_NE(sp, nullptr);
@@ -3991,7 +4001,7 @@ TEST(EJitStructFieldPass, SpuriousMetadataOnNonPeriodGVNoReplace) {
   auto AuditSites = sp.collectMayConstLoadSites(*M);
   ASSERT_EQ(AuditSites.size(), 1u)
       << "audit must recognize metadata-marked may_const loads";
-  EXPECT_EQ(AuditSites.front().globalName, "g_arr");
+  EXPECT_EQ(AuditSites.front().globalName, "g_plain");
   EXPECT_TRUE(AuditSites.front().hasFieldOffset);
 #endif
   auto PA = sp.run(*F, H.FAM);
