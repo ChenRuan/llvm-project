@@ -351,6 +351,7 @@ struct OwnerControl {
   bool fullProfileValid = false;
   bool finishing = false;
   bool retirementObserved = false;
+  bool counterNameAliasesLogged = false; // owner-private, never shared
   Lease leases[LeaseSlots];
 };
 OwnerControl &owner() { static OwnerControl O; return O; }
@@ -392,19 +393,22 @@ struct ScopedCounterFault {
     case CounterFaultKind::NameBindingMismatch:
       ref->pgoName = reinterpret_cast<const char *>(uintptr_t{1}); break;
     case CounterFaultKind::ZeroCounters:
-    case CounterFaultKind::CounterWordsOverflow: {
+    case CounterFaultKind::CounterWordsOverflow:
+    case CounterFaultKind::NameRefMismatch: {
       if (!saved.profdAddr) break;
       const auto &Real = *reinterpret_cast<
           const RawInstrProf::ProfileData<uintptr_t> *>(saved.profdAddr);
-      const uint32_t Count = Pending.fault ==
-          CounterFaultKind::ZeroCounters
-              ? 0u : EJIT_STAB_SRE_MAX_COUNTER_WORDS + 1u;
+      const uint32_t Count = Pending.fault == CounterFaultKind::ZeroCounters
+          ? 0u : Pending.fault == CounterFaultKind::CounterWordsOverflow
+              ? EJIT_STAB_SRE_MAX_COUNTER_WORDS + 1u : Real.NumCounters;
+      const uint64_t NameRef = Pending.fault == CounterFaultKind::NameRefMismatch
+          ? Real.NameRef ^ uint64_t{1} : Real.NameRef;
       static_assert(IPVK_Last == 2,
                     "fault header must preserve every value-site field");
       // ProfileData has const fields: construct a separate complete header,
       // never const-cast or overwrite the actual JIT metadata.
       data.emplace(RawInstrProf::ProfileData<uintptr_t>{
-          Real.NameRef, Real.FuncHash, Real.CounterPtr, Real.BitmapPtr,
+          NameRef, Real.FuncHash, Real.CounterPtr, Real.BitmapPtr,
           Real.FunctionPointer, Real.Values, Count,
           {Real.NumValueSites[0], Real.NumValueSites[1], Real.NumValueSites[2]},
           Real.NumBitmapBytes});
@@ -480,6 +484,65 @@ int fail(Command &C, int Code, StringRef Why) {
   return Code;
 }
 
+void printCanonicalCounterName(const std::string &Name,
+                               size_t MaxNameLogBytes = 4096) {
+#ifdef EJIT_DIAG_ENABLE
+  if (gEJitDiagLevel >= EJIT_LOG_LVL_INFO) {
+    // Bound only log text, never the actual profile identity. Only owned
+    // strings enter this function; borrowed/null name pointers are not read.
+    constexpr size_t ChunkBytes = 160;
+    const size_t Logged = std::min(Name.size(), MaxNameLogBytes);
+    for (size_t Offset = 0; Offset < Logged; Offset += ChunkBytes) {
+      const size_t Count = std::min(ChunkBytes, Logged - Offset);
+      EJIT_DIAG_RAW("[STAB231_COUNTER] name offset=%llu: %.*s",
+                    (unsigned long long)Offset, static_cast<int>(Count),
+                    Name.data() + Offset);
+      ejitDiagPrintThrottle();
+    }
+    if (Logged != Name.size()) {
+      EJIT_DIAG_RAW("[STAB231_COUNTER] name_log_truncated=1 shown=%llu actual=%llu; profile identity is unchanged",
+                    (unsigned long long)Logged, (unsigned long long)Name.size());
+      ejitDiagPrintThrottle();
+    }
+  }
+#else
+  (void)Name;
+  (void)MaxNameLogBytes;
+#endif
+}
+
+std::string counterDisplayName(size_t Pair) {
+  // This is an explicit view label, not a prefix/hash substitute for a name.
+  // Pair indexes are scoped by the snapshot's owner/code/resource generation.
+  return "<canonical-name@pair=" + utostr(Pair) + ">";
+}
+
+bool printCounterNameAliases() {
+#ifdef EJIT_DIAG_ENABLE
+  if (gEJitDiagLevel < EJIT_LOG_LVL_INFO) return false;
+  const auto &O = owner();
+  size_t NameLogBytesRemaining = 4096; // total across all names, not per pair
+  for (size_t Pair = 0; Pair < O.counterNames.size(); ++Pair) {
+    const auto &Name = O.counterNames[Pair];
+    if (Name.size() < EJIT_STAB_SRE_NAME_BYTES) continue;
+    const auto Display = counterDisplayName(Pair);
+    EJIT_DIAG_RAW("[STAB231_COUNTER] display_alias=%s pair=%llu name_bytes=%llu owner=%llu code_gen=%llu resource_gen=%llu; full canonical name retained, NOT truncated profile",
+                  Display.c_str(), (unsigned long long)Pair,
+                  (unsigned long long)Name.size(),
+                  (unsigned long long)load64(&Shared.ownerIdentity),
+                  (unsigned long long)O.codeGeneration,
+                  (unsigned long long)(O.runtime && O.runtime->smallTableHost()
+                      ? O.runtime->smallTableHost()->runtime().resourceGeneration() : 0));
+    ejitDiagPrintThrottle();
+    printCanonicalCounterName(Name, NameLogBytesRemaining);
+    NameLogBytesRemaining -= std::min(Name.size(), NameLogBytesRemaining);
+  }
+  return true;
+#else
+  return false;
+#endif
+}
+
 bool refuseCounterSnapshot(std::string &Why, const char *Reason, size_t Pair,
                            const PgoCounterRef *Ref,
                            const std::string *OwnedName,
@@ -513,26 +576,7 @@ bool refuseCounterSnapshot(std::string &Why, const char *Reason, size_t Pair,
                 Ref ? reinterpret_cast<const void *>(Ref->profcAddr) : nullptr,
                 Ref ? reinterpret_cast<const void *>(Ref->profdAddr) : nullptr);
   ejitDiagPrintThrottle();
-#ifdef EJIT_DIAG_ENABLE
-  if (OwnedName && gEJitDiagLevel >= EJIT_LOG_LVL_INFO) {
-    // Only diagnostic text is bounded, not the actual profile identity. Never
-    // dereference an untrusted/null borrowed name pointer while reporting it.
-    constexpr size_t MaxNameLogBytes = 4096, ChunkBytes = 160;
-    const size_t Logged = std::min(NameBytes, MaxNameLogBytes);
-    for (size_t Offset = 0; Offset < Logged; Offset += ChunkBytes) {
-      const size_t Count = std::min(ChunkBytes, Logged - Offset);
-      EJIT_DIAG_RAW("[STAB231_COUNTER] name offset=%llu: %.*s",
-                    (unsigned long long)Offset, static_cast<int>(Count),
-                    OwnedName->data() + Offset);
-      ejitDiagPrintThrottle();
-    }
-    if (Logged != NameBytes) {
-      EJIT_DIAG_RAW("[STAB231_COUNTER] name_log_truncated=1 shown=%llu actual=%llu; profile identity is unchanged",
-                    (unsigned long long)Logged, (unsigned long long)NameBytes);
-      ejitDiagPrintThrottle();
-    }
-  }
-#endif
+  if (OwnedName) printCanonicalCounterName(*OwnedName);
   return false;
 }
 
@@ -551,6 +595,8 @@ bool captureCounters(ejit_small_table_sre_snapshot_t &S, std::string &Why) {
   S.counterPairs = S.counterWordCount = 0;
   S.rootEntryCount = 0;
   S.rootEntryCountValid = 0;
+  S.reason[0] = 0;
+  uint32_t Aliases = 0;
   S.countersDigest = 1469598103934665603ULL;
   auto Mix = [&](uint64_t V) { S.countersDigest = (S.countersDigest ^ V) * 1099511628211ULL; };
   for (size_t Pair = 0; Pair < O.counterRefs.size(); ++Pair) {
@@ -570,9 +616,9 @@ bool captureCounters(ejit_small_table_sre_snapshot_t &S, std::string &Why) {
       return refuseCounterSnapshot(Why, "MISSING_PROFC", Pair, &R, &Name);
     if (!R.profdAddr)
       return refuseCounterSnapshot(Why, "MISSING_PROFD", Pair, &R, &Name);
-    if (Name.size() >= EJIT_STAB_SRE_NAME_BYTES)
-      return refuseCounterSnapshot(Why, "NAME_TOO_LONG", Pair, &R, &Name);
     const auto *Header = reinterpret_cast<const RawInstrProf::ProfileData<uintptr_t> *>(R.profdAddr);
+    if (Header->NameRef != IndexedInstrProf::ComputeHash(Name))
+      return refuseCounterSnapshot(Why, "NAME_REF_MISMATCH", Pair, &R, &Name);
     const uint32_t N = Header->NumCounters;
     if (!N)
       return refuseCounterSnapshot(Why, "ZERO_COUNTERS", Pair, &R, &Name,
@@ -581,7 +627,12 @@ bool captureCounters(ejit_small_table_sre_snapshot_t &S, std::string &Why) {
       return refuseCounterSnapshot(Why, "COUNTER_WORDS_OVERFLOW", Pair, &R,
                                    &Name, N, S.counterWordCount);
     auto &Record = S.counters[S.counterPairs++];
-    copyText(Record.name, sizeof(Record.name), R.pgoName);
+    if (Name.size() < sizeof(Record.name)) {
+      copyText(Record.name, sizeof(Record.name), Name);
+    } else {
+      copyText(Record.name, sizeof(Record.name), counterDisplayName(Pair));
+      ++Aliases;
+    }
     Record.hash = Header->FuncHash;
     Record.firstWord = S.counterWordCount;
     Record.wordCount = N;
@@ -591,7 +642,16 @@ bool captureCounters(ejit_small_table_sre_snapshot_t &S, std::string &Why) {
       Mix(Counts[I]);
     }
     Mix(Record.hash);
-    for (const char *P = R.pgoName; *P; ++P) Mix(static_cast<unsigned char>(*P));
+    for (char Byte : Name) Mix(static_cast<unsigned char>(Byte));
+  }
+  if (Aliases) {
+    // Functional display warning survives diagnostics OFF, and is retained in
+    // the frozen snapshot. No display label participates in profile validation.
+    copyText(S.reason, sizeof(S.reason),
+             "canonical-name-aliases=" + utostr(Aliases) +
+             "; display labels only; complete canonical names retained on owner");
+    if (!O.counterNameAliasesLogged)
+      O.counterNameAliasesLogged = printCounterNameAliases();
   }
   return true;
 }
@@ -599,10 +659,58 @@ bool captureCounters(ejit_small_table_sre_snapshot_t &S, std::string &Why) {
 bool validateProfile(const EJitSmallTableProfileBundle &Bundle,
                      const ejit_small_table_sre_snapshot_t &S,
                      std::string &Why) {
+  const OwnerControl &O = owner();
   if (Bundle.counters.size() != S.expectedCounterPairs ||
-      S.counterPairs != S.expectedCounterPairs || Bundle.profileData.empty()) {
+      O.counterNames.size() != S.expectedCounterPairs ||
+      O.counterRefs.size() != S.expectedCounterPairs ||
+      S.counterPairs != S.expectedCounterPairs ||
+      S.counterPairs > EJIT_STAB_SRE_MAX_COUNTERS ||
+      S.counterWordCount > EJIT_STAB_SRE_MAX_COUNTER_WORDS ||
+      Bundle.profileData.empty()) {
     Why = "frozen profile does not contain the complete expected inventory";
     return false;
+  }
+  std::set<std::string> ExpectedNames;
+  uint32_t WordCursor = 0;
+  for (size_t I = 0; I < O.counterRefs.size(); ++I) {
+    const auto &Ref = O.counterRefs[I];
+    const auto &Name = O.counterNames[I];
+    const auto &Expected = S.counters[I];
+    if (Ref.pgoName != Name.c_str() || !Ref.profcAddr || !Ref.profdAddr ||
+        Name.empty() || !ExpectedNames.insert(Name).second ||
+        Expected.firstWord != WordCursor || !Expected.wordCount ||
+        WordCursor > S.counterWordCount ||
+        Expected.wordCount > S.counterWordCount - WordCursor) {
+      Why = "frozen profile expected canonical inventory is invalid";
+      return false;
+    }
+    WordCursor += Expected.wordCount;
+    size_t Matches = 0;
+    for (const auto &FrozenRef : Bundle.counters)
+      if (FrozenRef.profcAddr == Ref.profcAddr &&
+          FrozenRef.profdAddr == Ref.profdAddr && FrozenRef.pgoName)
+        ++Matches;
+    // Only compare real address pairs. Runtime owns its separate borrowed-name
+    // storage; do not require pointer equality or dereference a foreign pointer.
+    if (Matches != 1) {
+      Why = "frozen profile counter addresses differ from actual full T1 capture";
+      return false;
+    }
+  }
+  if (WordCursor != S.counterWordCount) {
+    Why = "frozen profile count inventory has gaps or unused words";
+    return false;
+  }
+  for (const auto &FrozenRef : Bundle.counters) {
+    size_t Matches = 0;
+    for (const auto &Ref : O.counterRefs)
+      if (FrozenRef.profcAddr == Ref.profcAddr &&
+          FrozenRef.profdAddr == Ref.profdAddr)
+        ++Matches;
+    if (Matches != 1) {
+      Why = "frozen profile address inventory is not one-to-one";
+      return false;
+    }
   }
   // Runtime freeze synthesizes an indexed InstrProfWriter buffer. Select that
   // exact format, reject others, and do not pull unrelated MachO/COFF readers
@@ -616,7 +724,7 @@ bool validateProfile(const EJitSmallTableProfileBundle &Bundle,
     }
     const ejit_small_table_sre_counter_t *Expected = nullptr;
     for (uint32_t I = 0; I < S.counterPairs; ++I)
-      if (Record.Name == S.counters[I].name) Expected = &S.counters[I];
+      if (Record.Name == O.counterNames[I]) Expected = &S.counters[I];
     if (!Expected || Record.Hash != Expected->hash ||
         Record.Counts.size() != Expected->wordCount ||
         !std::equal(Record.Counts.begin(), Record.Counts.end(),
@@ -708,6 +816,7 @@ int setupRequest(Command &C, const llvm::ejit::detail::OwnerWorkerContext &Worke
   O.fullProfileValid = false;
   O.finishing = false;
   O.retirementObserved = false;
+  O.counterNameAliasesLogged = false;
   O.frozen = {};
   O.counterNames.clear();
   O.counterRefs.clear();
@@ -818,7 +927,6 @@ int snapshot(Command &C) {
     if (!captureCounters(S, Why)) return fail(C, EJIT_STAB_SRE_FAILED, Why);
   }
   S.status = C.result = EJIT_STAB_SRE_OK;
-  S.reason[0] = 0;
   return C.result;
 }
 
@@ -1088,6 +1196,13 @@ void process(Command &C, const llvm::ejit::detail::OwnerWorkerContext &Worker) {
               (unsigned long long)S.genericAsyncEnqueues,
               (unsigned long long)S.genericAsyncCompiles,
               (unsigned long long)S.genericPending);
+    if (S.reason[0]) {
+      EJIT_DIAG_RAW("[STAB231_COUNTER] %s", S.reason);
+      ejitDiagPrintThrottle();
+      // Explicit print can re-show complete owner names even after T2 or after
+      // the first automatic INFO log; no new shell command or C ABI is needed.
+      (void)printCounterNameAliases();
+    }
 #ifdef EJIT_SRE_CODE_POOL
     const auto DataStats = getSreSmallTableStorageStats();
     EJIT_DIAG("SRE_STAB_DATA snapshot_valid=%u claimed=%llu consumed=%llu live=%llu released=%llu failed=%llu failed_claim=%llu blocks=%u records=%u; DataOnly RW/NX no reset/reuse",
@@ -1199,6 +1314,7 @@ bool detail::armSmallTableSreCounterFaultForTest(
   case detail::SmallTableSreCounterFaultForTest::NameBindingMismatch:
   case detail::SmallTableSreCounterFaultForTest::ZeroCounters:
   case detail::SmallTableSreCounterFaultForTest::CounterWordsOverflow:
+  case detail::SmallTableSreCounterFaultForTest::NameRefMismatch:
     break;
   default: return false;
   }
@@ -1429,6 +1545,7 @@ void smallTableSreWorkerExit(EJitSharedTaskPool &Pool,
   O.fullProfileValid = false;
   O.finishing = false;
   O.retirementObserved = false;
+  O.counterNameAliasesLogged = false;
   O.codeGeneration = 0;
   LocalWorkerPool = nullptr; LocalWorkerTask = 0;
 #else

@@ -102,16 +102,22 @@ typedef struct {
 } ejit_small_table_sre_request_t;
 
 typedef struct {
+  /// Diagnostic display, not a profile key. Short canonical names are copied
+  /// exactly; longer names use <canonical-name@pair=N>. Interpret N only with
+  /// this snapshot's owner/code/resource generation. The owner retains and
+  /// validates the complete original name; no PGO identity is abbreviated.
   char name[EJIT_STAB_SRE_NAME_BYTES];
   uint64_t hash;
   uint32_t firstWord;
   uint32_t wordCount;
 } ejit_small_table_sre_counter_t;
 
-/// A bounded EXACT inventory, never a silently truncated profile. If any real
-/// pair/name/counts exceed these bounds, snapshot/finish fail closed. fullProfile
-/// Valid is set only after parsing the actual frozen profile and checking every
-/// expected name/hash/count word; sampleCount alone does not imply that flag.
+/// A bounded EXACT hash/count inventory, never a silently truncated profile.
+/// Pair/count bounds fail closed. Names are diagnostic displays as documented
+/// above; successful reason reports canonical-name-aliases=N when present.
+/// fullProfileValid is set only after the owner parses the actual frozen profile
+/// and checks every COMPLETE canonical name/hash/count word. sampleCount or a
+/// display label alone never implies that flag. The ABI/layout is unchanged.
 typedef struct {
   uint32_t abiVersion;
   uint32_t structSize;

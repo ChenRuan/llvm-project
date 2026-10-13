@@ -3707,21 +3707,21 @@ protected:
             "      %v = mul i32 %x, 5\n      ret i32 %v\n    }\n";
     return Body;
   }
-  void refuseUnrepresentableCounterName(StringRef SourceFilename) {
-    std::string Body = branchCounterBody(SourceFilename);
-    ASSERT_FALSE(Body.empty());
-    ASSERT_TRUE(buildWrapper(false, false, &Body));
-    ASSERT_NO_FATAL_FAILURE(request(64));
-
-    struct ActualCounter {
-      std::string canonicalName;
-      uintptr_t profcAddress = 0;
-      uintptr_t profdAddress = 0;
-      std::vector<uint64_t> counts;
-    };
+  struct ActualCounter {
+    std::string canonicalName;
+    uintptr_t profcAddress = 0;
+    uintptr_t profdAddress = 0;
+    uint64_t functionHash = 0;
+    std::vector<uint64_t> counts;
+  };
+  std::vector<ActualCounter> inspectActualCommonT1Counters() {
     std::vector<ActualCounter> Counters;
+    const uint64_t CodeGeneration = Request.codeGeneration;
     auto *Pool = EJitWrapperRuntimeTestAccess::pool();
-    ASSERT_NE(Pool, nullptr);
+    if (!Pool) {
+      ADD_FAILURE() << "the real common T1 owner pool is missing";
+      return Counters;
+    }
     const auto Inspect = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
         *Pool, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
           ASSERT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
@@ -3732,8 +3732,8 @@ protected:
           auto &Engine = CommonHost->runtime().engine();
           for (const std::string &Name : Engine.getLastCounterNames()) {
             const StringRef Canonical = Engine.getCounterProfileName(Name);
-            auto Counts = Engine.lookup(1, "__profc_" + Name);
-            auto Data = Engine.lookup(1, "__profd_" + Name);
+            auto Counts = Engine.lookup(CodeGeneration, "__profc_" + Name);
+            auto Data = Engine.lookup(CodeGeneration, "__profd_" + Name);
             ASSERT_TRUE(static_cast<bool>(Counts))
                 << toString(Counts.takeError());
             ASSERT_TRUE(static_cast<bool>(Data)) << toString(Data.takeError());
@@ -3749,52 +3749,135 @@ protected:
             Counters.push_back({Canonical.str(),
                                 reinterpret_cast<uintptr_t>(*Counts),
                                 reinterpret_cast<uintptr_t>(*Data),
+                                Header->FuncHash,
                                 std::vector<uint64_t>(Raw,
                                     Raw + Header->NumCounters)});
           }
-          EXPECT_EQ(CommonHost->runtime().currentSessionSamples(), 0u);
-          EXPECT_EQ(CommonHost->runtime().sessionInFlight(), 0u);
-          EXPECT_EQ(CommonHost->bundle(), nullptr);
         });
-    ASSERT_EQ(Inspect.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+    EXPECT_EQ(Inspect.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+    return Counters;
+  }
+  void checkExactCounterSnapshot(
+      const ejit_small_table_sre_snapshot_t &Snapshot,
+      const std::vector<ActualCounter> &Counters) {
+    ASSERT_EQ(Snapshot.expectedCounterPairs, Counters.size());
+    ASSERT_EQ(Snapshot.counterPairs, Counters.size());
+    uint64_t Digest = 1469598103934665603ULL;
+    auto Mix = [&](uint64_t V) { Digest = (Digest ^ V) * 1099511628211ULL; };
+    uint32_t Word = 0;
+    unsigned Aliases = 0;
+    for (size_t Pair = 0; Pair < Counters.size(); ++Pair) {
+      const ActualCounter &Counter = Counters[Pair];
+      const auto &Record = Snapshot.counters[Pair];
+      // A view-only tag is explicit and distinct from a truncated canonical
+      // profile identity. Full names remain the actual worker-owned names.
+      const bool IsAlias = Counter.canonicalName.size() >=
+                           EJIT_STAB_SRE_NAME_BYTES;
+      const std::string Display = IsAlias
+          ? "<canonical-name@pair=" + std::to_string(Pair) + ">"
+          : Counter.canonicalName;
+      EXPECT_STREQ(Record.name, Display.c_str());
+      Aliases += IsAlias;
+      EXPECT_EQ(Record.hash, Counter.functionHash);
+      EXPECT_EQ(Record.firstWord, Word);
+      ASSERT_EQ(Record.wordCount, Counter.counts.size());
+      for (uint64_t Count : Counter.counts) {
+        ASSERT_LT(Word, Snapshot.counterWordCount);
+        EXPECT_EQ(Snapshot.counts[Word++], Count);
+        Mix(Count);
+      }
+      Mix(Counter.functionHash);
+      for (unsigned char C : Counter.canonicalName) Mix(C);
+    }
+    EXPECT_EQ(Snapshot.counterWordCount, Word);
+    // The digest covers the COMPLETE canonical names, never display tags.
+    EXPECT_EQ(Snapshot.countersDigest, Digest);
+    if (Aliases) {
+      EXPECT_TRUE(StringRef(Snapshot.reason).contains(
+          "canonical-name-aliases=" + std::to_string(Aliases)))
+          << Snapshot.reason;
+      EXPECT_TRUE(StringRef(Snapshot.reason).contains("display labels only"))
+          << Snapshot.reason;
+      EXPECT_TRUE(StringRef(Snapshot.reason).contains(
+          "complete canonical names retained on owner")) << Snapshot.reason;
+    } else {
+      EXPECT_STREQ(Snapshot.reason, "");
+    }
+  }
+  void checkExactFrozenProfile(const std::vector<ActualCounter> &Counters) {
+    auto *Pool = EJitWrapperRuntimeTestAccess::pool();
+    ASSERT_NE(Pool, nullptr);
+    const auto Inspect = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+        *Pool, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+          ASSERT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+              *Pool, Context));
+          auto *CommonHost = EJitSmallTableHost::global();
+          ASSERT_NE(CommonHost, nullptr);
+          const auto *Bundle = CommonHost->bundle();
+          ASSERT_NE(Bundle, nullptr);
+          ASSERT_EQ(Bundle->counters.size(), Counters.size());
+          EXPECT_EQ(Bundle->sampleCount, 64u);
+          for (const PgoCounterRef &Ref : Bundle->counters) {
+            ASSERT_NE(Ref.pgoName, nullptr);
+            const ActualCounter *Expected = nullptr;
+            for (const auto &Candidate : Counters)
+              if (Candidate.canonicalName == Ref.pgoName) Expected = &Candidate;
+            ASSERT_NE(Expected, nullptr) << Ref.pgoName;
+            EXPECT_EQ(Ref.profcAddr, Expected->profcAddress);
+            EXPECT_EQ(Ref.profdAddr, Expected->profdAddress);
+          }
+          // Decode the REAL frozen indexed bytes, not the display snapshot.
+          // Equal-prefix/equal-CFG-hash helpers must retain different full
+          // identities and different actual branch counts in the profile.
+          auto Reader = IndexedInstrProfReader::create(
+              MemoryBuffer::getMemBufferCopy(Bundle->profileData));
+          ASSERT_TRUE(static_cast<bool>(Reader)) << toString(Reader.takeError());
+          std::set<std::string> Seen;
+          for (const auto &Record : **Reader) {
+            EXPECT_TRUE(Seen.insert(Record.Name.str()).second);
+            EXPECT_FALSE(Record.Name.starts_with("<canonical-name@pair="));
+            const ActualCounter *Expected = nullptr;
+            for (const auto &Candidate : Counters)
+              if (Candidate.canonicalName == Record.Name) Expected = &Candidate;
+            ASSERT_NE(Expected, nullptr) << Record.Name.str();
+            EXPECT_EQ(Record.Hash, Expected->functionHash);
+            EXPECT_EQ(Record.Counts, Expected->counts) << Record.Name.str();
+          }
+          EXPECT_FALSE((*Reader)->hasError());
+          EXPECT_EQ(Seen.size(), Counters.size());
+          for (const auto &Counter : Counters)
+            EXPECT_EQ(Seen.count(Counter.canonicalName), 1u)
+                << "a display tag or prefix must never replace a profile name";
+        });
+    EXPECT_EQ(Inspect.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+  }
+  void runExactLongCounterSession(std::vector<ActualCounter> Counters,
+                                 bool ObserveLastLeave = false) {
+    const unsigned AotBefore = g_aotCalls;
     ASSERT_EQ(Counters.size(), 3u)
         << "the real T1 must resolve root and both internal helper pairs";
-    unsigned LongNames = 0;
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before),
+              EJIT_STAB_SRE_OK);
+    ASSERT_NO_FATAL_FAILURE(checkExactCounterSnapshot(Before, Counters));
+    const ActualCounter *Positive = nullptr, *Negative = nullptr;
     for (const ActualCounter &Counter : Counters) {
       EXPECT_NE(Counter.profcAddress, 0u);
       EXPECT_NE(Counter.profdAddress, 0u);
       for (uint64_t Count : Counter.counts)
         EXPECT_EQ(Count, 0u);
-      if (Counter.canonicalName != "f_entry") {
-        EXPECT_TRUE(Counter.canonicalName ==
-                        (SourceFilename + ";bridge_positive").str() ||
-                    Counter.canonicalName ==
-                        (SourceFilename + ";bridge_negative").str());
-        EXPECT_GE(Counter.canonicalName.size(), EJIT_STAB_SRE_NAME_BYTES);
-        ++LongNames;
-      }
-      outs() << "[PR231 long-path real counter] source_filename="
-             << SourceFilename << " name=" << Counter.canonicalName
-             << " name_bytes=" << Counter.canonicalName.size()
-             << " snapshot_name_bound=" << EJIT_STAB_SRE_NAME_BYTES
-             << " profc=" << Counter.profcAddress
-             << " profd=" << Counter.profdAddress
-             << " words=" << Counter.counts.size() << "\n";
+      const StringRef Name = Counter.canonicalName;
+      if (Name.ends_with(";bridge_positive")) Positive = &Counter;
+      if (Name.ends_with(";bridge_negative")) Negative = &Counter;
     }
-    ASSERT_EQ(LongNames, 2u);
-    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before),
-              EJIT_STAB_SRE_FAILED);
-    size_t FirstLong = 0;
-    while (FirstLong < Counters.size() &&
-           Counters[FirstLong].canonicalName.size() < EJIT_STAB_SRE_NAME_BYTES)
-      ++FirstLong;
-    ASSERT_LT(FirstLong, Counters.size());
-    const std::string ExpectedReason =
-        "counter snapshot refused: NAME_TOO_LONG pair=" +
-        std::to_string(FirstLong) + " name_bytes=" +
-        std::to_string(Counters[FirstLong].canonicalName.size()) +
-        " capacity=" + std::to_string(EJIT_STAB_SRE_NAME_BYTES);
-    EXPECT_STREQ(Before.reason, ExpectedReason.c_str());
+    ASSERT_NE(Positive, nullptr);
+    ASSERT_NE(Negative, nullptr);
+    EXPECT_NE(Positive->canonicalName, Negative->canonicalName);
+    // Both real noinline helpers have the same single-block CFG, so these are
+    // natural equal FuncHashes, not injected hashes or forged collisions.
+    EXPECT_EQ(Positive->functionHash, Negative->functionHash);
+    if (Positive->canonicalName.size() > 111u)
+      EXPECT_EQ(StringRef(Positive->canonicalName).take_front(95),
+                StringRef(Negative->canonicalName).take_front(95));
     EXPECT_EQ(Before.expectedCounterPairs, 3u);
     EXPECT_EQ(Before.tier, 1u);
     EXPECT_EQ(Before.sampleLimit, 64u);
@@ -3806,35 +3889,154 @@ protected:
     EXPECT_EQ(Before.genericAsyncEnqueues, 0u);
     EXPECT_EQ(Before.genericAsyncCompiles, 0u);
     EXPECT_EQ(Before.genericPending, 0u);
-    // A failed EXACT inventory is not permission to freeze only the fitting
-    // root record, truncate the helper names or publish a partial-profile T2.
-    EXPECT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_FAILED);
+    unsigned Observations = 0;
+    if (ObserveLastLeave) {
+      auto *Pool = EJitWrapperRuntimeTestAccess::pool();
+      ASSERT_NE(Pool, nullptr);
+      uintptr_t OriginalCode = 0, OriginalTable = 0;
+      const auto PinEvidence =
+          EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+              *Pool, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+                ASSERT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+                    *Pool, Context));
+                auto *CommonHost = EJitSmallTableHost::global();
+                ASSERT_NE(CommonHost, nullptr);
+                ASSERT_NE(CommonHost->runtime().resource(), nullptr);
+                OriginalCode = reinterpret_cast<uintptr_t>(CommonHost->activeEntry());
+                OriginalTable = reinterpret_cast<uintptr_t>(
+                    CommonHost->runtime().resource()->base());
+              });
+      ASSERT_EQ(PinEvidence.status,
+                EJitSharedTaskPool::OwnerControlStatus::Completed);
+      ASSERT_NE(OriginalCode, 0u);
+      ASSERT_NE(OriginalTable, 0u);
+      g_observe = [&, Pool, OriginalCode, OriginalTable] {
+        if (++Observations != 64) return;
+        ejit_small_table_sre_snapshot_t InCall{};
+        EXPECT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &InCall),
+                  EJIT_STAB_SRE_BUSY);
+        EXPECT_EQ(InCall.sampleCount, 64u);
+        EXPECT_EQ(InCall.physicalExecutions, 1u);
+        EXPECT_EQ(InCall.inFlight, 1u);
+        EXPECT_GT(InCall.borrowReaders, 0u);
+        EXPECT_EQ(InCall.fullProfileValid, 0u);
+        EXPECT_EQ(InCall.profileBytes, 0u);
+        EXPECT_EQ(InCall.resourceGeneration, Before.resourceGeneration);
+        EXPECT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_BUSY);
+        EXPECT_GT(SourceState.readers, 0u);
+        const auto StillLive =
+            EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+                *Pool, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+                  ASSERT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+                      *Pool, Context));
+                  auto *CommonHost = EJitSmallTableHost::global();
+                  ASSERT_NE(CommonHost, nullptr);
+                  ASSERT_NE(CommonHost->runtime().resource(), nullptr);
+                  EXPECT_EQ(CommonHost->bundle(), nullptr);
+                  EXPECT_EQ(reinterpret_cast<uintptr_t>(CommonHost->activeEntry()),
+                            OriginalCode);
+                  EXPECT_EQ(reinterpret_cast<uintptr_t>(
+                                CommonHost->runtime().resource()->base()),
+                            OriginalTable);
+                });
+        EXPECT_EQ(StillLive.status,
+                  EJitSharedTaskPool::OwnerControlStatus::Completed);
+      };
+    }
+    auto ClearObserver = make_scope_exit([&] { g_observe = nullptr; });
+    for (unsigned I = 0; I < 64; ++I) {
+      // Deliberately unequal REAL counts distinguish the two equal-hash,
+      // equal-display-prefix helpers, including swapped-record bugs.
+      const int X = I < 48 ? 4 : -4;
+      EXPECT_EQ(Wrapper->call(I % kWrapReadyCells, X),
+                wrapAotResult(g_wrap[I % kWrapReadyCells], X) +
+                    (X < 0 ? 2 * X : 0));
+    }
+    if (ObserveLastLeave) EXPECT_EQ(Observations, 64u);
+    g_observe = nullptr;
+    const auto CompletedCounters = inspectActualCommonT1Counters();
+    ASSERT_EQ(CompletedCounters.size(), Counters.size());
+    for (const ActualCounter &Counter : CompletedCounters) {
+      if (Counter.canonicalName == "f_entry") {
+        ASSERT_EQ(Counter.counts.size(), 2u);
+        EXPECT_EQ(Counter.counts[0] + Counter.counts[1], 64u);
+        EXPECT_TRUE((Counter.counts[0] == 48 && Counter.counts[1] == 16) ||
+                    (Counter.counts[0] == 16 && Counter.counts[1] == 48));
+      } else {
+        ASSERT_EQ(Counter.counts.size(), 1u);
+        EXPECT_EQ(Counter.counts[0],
+            StringRef(Counter.canonicalName).ends_with(";bridge_positive")
+                ? 48u : 16u);
+      }
+    }
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before),
+              EJIT_STAB_SRE_OK);
+    ASSERT_NO_FATAL_FAILURE(checkExactCounterSnapshot(Before, CompletedCounters));
+    EXPECT_EQ(Before.sampleCount, 64u);
+    EXPECT_EQ(Before.physicalExecutions, 0u);
+    EXPECT_EQ(Before.inFlight, 0u);
+    EXPECT_EQ(Before.borrowReaders, 1u);
+    EXPECT_EQ(SourceState.readers, 1u);
+    EXPECT_EQ(g_aotCalls, AotBefore);
+    // Exhaustion cannot silently run T1 again while T2 is not yet published.
+    EXPECT_EQ(Wrapper->call(0, 4), wrapAotResult(g_wrap[0], 4));
+    EXPECT_EQ(g_aotCalls, AotBefore + 1);
     ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After),
-              EJIT_STAB_SRE_FAILED);
-    EXPECT_STREQ(After.reason, ExpectedReason.c_str());
-    EXPECT_EQ(After.sampleCount, 0u);
+              EJIT_STAB_SRE_OK);
+    ASSERT_NO_FATAL_FAILURE(checkExactCounterSnapshot(After, CompletedCounters));
+    EXPECT_EQ(After.sampleCount, 64u);
+    ASSERT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_OK);
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After),
+              EJIT_STAB_SRE_OK);
+    ASSERT_NO_FATAL_FAILURE(checkExactCounterSnapshot(After, CompletedCounters));
+    EXPECT_EQ(After.tier, 2u);
+    EXPECT_EQ(After.fullProfileValid, 1u);
+    EXPECT_EQ(After.rootEntryCountValid, 1u);
+    EXPECT_EQ(After.rootEntryCount, 64u);
+    EXPECT_GT(After.profileBytes, 0u);
+    EXPECT_EQ(After.inFlight, 0u);
     EXPECT_EQ(After.physicalExecutions, 0u);
     EXPECT_EQ(After.borrowReaders, 0u);
-    EXPECT_EQ(After.fullProfileValid, 0u);
-    EXPECT_EQ(After.profileBytes, 0u);
-    EXPECT_EQ(After.tier, 1u);
-    EXPECT_EQ(g_aotCalls, 0u);
-    const auto Recheck = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
-        *Pool, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
-          ASSERT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
-              *Pool, Context));
-          auto *CommonHost = EJitSmallTableHost::global();
-          ASSERT_NE(CommonHost, nullptr);
-          EXPECT_EQ(CommonHost->bundle(), nullptr);
-          EXPECT_EQ(CommonHost->runtime().currentSessionSamples(), 0u);
-          for (const ActualCounter &Counter : Counters) {
-            const auto *Raw = reinterpret_cast<const uint64_t *>(
-                Counter.profcAddress);
-            for (size_t I = 0; I < Counter.counts.size(); ++I)
-              EXPECT_EQ(Raw[I], Counter.counts[I]);
-          }
-        });
-    EXPECT_EQ(Recheck.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+    EXPECT_EQ(SourceState.readers, 0u);
+    EXPECT_EQ(After.genericAsyncEnqueues, 0u);
+    EXPECT_EQ(After.genericAsyncCompiles, 0u);
+    EXPECT_EQ(After.genericPending, 0u);
+    ASSERT_NO_FATAL_FAILURE(checkExactFrozenProfile(CompletedCounters));
+    EXPECT_EQ(Wrapper->call(0, -5), wrapAotResult(g_wrap[0], -5) - 10);
+    EXPECT_EQ(Wrapper->call(1, 5), wrapAotResult(g_wrap[1], 5));
+    EXPECT_EQ(g_aotCalls, AotBefore + 1);
+  }
+  void exactLongCanonicalProfile(StringRef SourceFilename,
+                                 bool DiagnosticsOff = false,
+                                 bool ObserveLastLeave = false) {
+    std::string Body = branchCounterBody(SourceFilename);
+    ASSERT_FALSE(Body.empty());
+    if (ObserveLastLeave) {
+      const std::string Phi =
+          "      %xm = phi i32 [ %pv, %pos ], [ %nv, %neg ]\n";
+      const size_t Position = Body.find(Phi);
+      ASSERT_NE(Position, std::string::npos);
+      Body.insert(Position + Phi.size(),
+                  "      %observe = call i32 @wrap_observe(i32 %cell)\n");
+      Body += "\n    declare i32 @wrap_observe(i32)\n";
+    }
+    const ejit_log_level_t PreviousLevel = ejit_get_log_level();
+    auto RestoreLevel = make_scope_exit(
+        [&] { ejit_set_log_level(PreviousLevel); });
+    if (DiagnosticsOff) ejit_set_log_level(EJIT_LOG_OFF);
+    ASSERT_TRUE(buildWrapper(false, ObserveLastLeave, &Body));
+    ASSERT_NO_FATAL_FAILURE(request(64));
+    auto Counters = inspectActualCommonT1Counters();
+    ASSERT_EQ(Counters.size(), 3u);
+    for (const ActualCounter &Counter : Counters) {
+      if (Counter.canonicalName == "f_entry") continue;
+      EXPECT_TRUE(Counter.canonicalName ==
+                      (SourceFilename + ";bridge_positive").str() ||
+                  Counter.canonicalName ==
+                      (SourceFilename + ";bridge_negative").str());
+      EXPECT_GE(Counter.canonicalName.size(), EJIT_STAB_SRE_NAME_BYTES);
+    }
+    runExactLongCounterSession(std::move(Counters), ObserveLastLeave);
   }
   void finishBranchEightSamples() {
     for (unsigned I = 0; I < 8; ++I) {
@@ -4860,19 +5062,19 @@ TEST_F(GeneratedWrapperSreBridgeTest, BranchCountersAreNotEntryCountAndCompleteP
   EXPECT_EQ(After.genericAsyncEnqueues, 0u);
 }
 TEST_F(GeneratedWrapperSreBridgeTest,
-       LongSourceFilenameRealCounterPairsRefuseExactSnapshotAndFinish) {
+       LongSourceFilenameRealCounterPairsPreserveExact64ProfileAndT2) {
   const std::string SourceFilename = "/SDK_CPU_HCC/build/BiSheng_arm64be/" +
       std::string(112, 'p') + "/ejit_smalltable_sre_test.c";
   ASSERT_GT(SourceFilename.size(), 120u);
-  refuseUnrepresentableCounterName(SourceFilename);
+  exactLongCanonicalProfile(SourceFilename);
 }
 TEST_F(GeneratedWrapperSreBridgeTest,
-       CanonicalCounterNameAt96ByteBoundRefusesWithoutConsumingSamples) {
+       CanonicalCounterNameAt96BytesFeedsComplete64ProfileAndT2) {
   const std::string Suffix = ";bridge_positive";
   const std::string SourceFilename = "/SDK/" +
       std::string(EJIT_STAB_SRE_NAME_BYTES - Suffix.size() - 7, 'p') + ".c";
   ASSERT_EQ((SourceFilename + Suffix).size(), EJIT_STAB_SRE_NAME_BYTES);
-  refuseUnrepresentableCounterName(SourceFilename);
+  exactLongCanonicalProfile(SourceFilename);
 }
 TEST_F(GeneratedWrapperSreBridgeTest,
        CanonicalCounterNameAt95BytesFeedsComplete64ProfileAndT2) {
@@ -4928,6 +5130,70 @@ TEST_F(GeneratedWrapperSreBridgeTest,
   EXPECT_EQ(g_aotCalls, 0u);
 }
 TEST_F(GeneratedWrapperSreBridgeTest,
+       CanonicalNamesBeyond4096BytesPreserveEveryRealProfileRecordAndT2) {
+  const std::string SourceFilename = "/SDK_CPU_HCC/" +
+      std::string(4200, 'p') + "/ejit_smalltable_sre_test.c";
+  ASSERT_GT(SourceFilename.size(), 4096u);
+  exactLongCanonicalProfile(SourceFilename);
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       LongCanonicalNamesWithDiagnosticsOffStillConsumeExact64ProfileAndT2) {
+  const std::string SourceFilename = "/SDK_CPU_HCC/" +
+      std::string(112, 'p') + "/ejit_smalltable_sre_test.c";
+  exactLongCanonicalProfile(SourceFilename, /*DiagnosticsOff=*/true);
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       LongCanonicalProfileCannotFreezeBeforeThe64thActualWrapperLeave) {
+  const std::string SourceFilename = "/SDK_CPU_HCC/" +
+      std::string(112, 'p') + "/ejit_smalltable_sre_test.c";
+  exactLongCanonicalProfile(SourceFilename, /*DiagnosticsOff=*/false,
+                            /*ObserveLastLeave=*/true);
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       ReusedPairDisplayTagsDoNotReuseOldGenerationCountersOrFrozenProfile) {
+  const std::string SourceFilename = "/SDK_CPU_HCC/" +
+      std::string(112, 'p') + "/ejit_smalltable_sre_test.c";
+  std::string Body = branchCounterBody(SourceFilename);
+  ASSERT_FALSE(Body.empty());
+  ASSERT_TRUE(buildWrapper(false, false, &Body));
+  ASSERT_NO_FATAL_FAILURE(request(64));
+  const auto OldCounters = inspectActualCommonT1Counters();
+  ASSERT_EQ(OldCounters.size(), 3u);
+  ASSERT_NO_FATAL_FAILURE(runExactLongCounterSession(OldCounters));
+  const ejit_small_table_sre_snapshot_t OldFrozen = After;
+  ASSERT_EQ(OldFrozen.codeGeneration, 1u);
+  ASSERT_EQ(OldFrozen.fullProfileValid, 1u);
+  Request.codeGeneration = 2;
+  ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
+  const auto NewCounters = inspectActualCommonT1Counters();
+  ASSERT_EQ(NewCounters.size(), OldCounters.size());
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before),
+            EJIT_STAB_SRE_OK);
+  ASSERT_NO_FATAL_FAILURE(checkExactCounterSnapshot(Before, NewCounters));
+  EXPECT_EQ(Before.codeGeneration, 2u);
+  EXPECT_NE(Before.policyEpoch, OldFrozen.policyEpoch);
+  EXPECT_EQ(Before.sampleCount, 0u);
+  EXPECT_EQ(Before.fullProfileValid, 0u);
+  EXPECT_EQ(Before.profileBytes, 0u);
+  EXPECT_EQ(Before.tier, 1u);
+  EXPECT_EQ(Before.borrowReaders, 0u);
+  EXPECT_EQ(Before.genericPending, 0u);
+  EXPECT_NE(Before.countersDigest, OldFrozen.countersDigest);
+  for (size_t Pair = 0; Pair < NewCounters.size(); ++Pair) {
+    EXPECT_STREQ(Before.counters[Pair].name, OldFrozen.counters[Pair].name);
+    EXPECT_EQ(NewCounters[Pair].canonicalName, OldCounters[Pair].canonicalName);
+    EXPECT_NE(NewCounters[Pair].profcAddress, 0u);
+    EXPECT_NE(NewCounters[Pair].profdAddress, 0u);
+    // Every old call already returned and its generation was fully retired.
+    // A native allocator may legally reuse that VA: exact new lookup/NameRef,
+    // generation metadata and zero live counts prove isolation, not VA alone.
+    for (uint64_t Count : NewCounters[Pair].counts) EXPECT_EQ(Count, 0u);
+  }
+  // The same labels can be displayed, but the actual second-generation
+  // indexed profile must be built from its fresh live pairs and real counts.
+  runExactLongCounterSession(NewCounters);
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
        NullExpectedCounterNameFailsClosedAndRealProfileSurvives) {
   refuseOneCounterFaultThenResume(
       llvm::ejit::detail::SmallTableSreCounterFaultForTest::NullName,
@@ -4962,6 +5228,12 @@ TEST_F(GeneratedWrapperSreBridgeTest,
   refuseOneCounterFaultThenResume(
       llvm::ejit::detail::SmallTableSreCounterFaultForTest::CounterWordsOverflow,
       "COUNTER_WORDS_OVERFLOW");
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       CanonicalNameRefMismatchFailsClosedAndRealProfileSurvives) {
+  refuseOneCounterFaultThenResume(
+      llvm::ejit::detail::SmallTableSreCounterFaultForTest::NameRefMismatch,
+      "NAME_REF_MISMATCH");
 }
 TEST_F(GeneratedWrapperSreBridgeTest,
        DiagnosticsOffStillReportsExactRefusalAndRealProfileSurvives) {

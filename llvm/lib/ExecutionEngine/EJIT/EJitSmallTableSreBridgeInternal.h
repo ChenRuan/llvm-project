@@ -43,7 +43,7 @@ private:
 /// There is no freestanding setter or public C/SDK interface.
 enum class SmallTableSreCounterFaultForTest : uint8_t {
   None, NullName, MissingProfc, MissingProfd, NameBindingMismatch,
-  ZeroCounters, CounterWordsOverflow
+  ZeroCounters, CounterWordsOverflow, NameRefMismatch
 };
 bool armSmallTableSreCounterFaultForTest(
     const OwnerWorkerContext &Worker, SmallTableSreCounterFaultForTest Fault,
