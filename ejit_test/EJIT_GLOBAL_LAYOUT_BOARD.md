@@ -4,13 +4,14 @@ Use only `ejit_global_layout_sre_test.c` and the matching
 `llvm/ExecutionEngine/EJIT/EJitRuntime.h`. No test helper header is needed.
 This is a cold-image smoke, not a board acceptance result.
 
-Current packaging gate: this revision's runtime `lipo.py gc-merge` optional root
-list omits `ejit_init_global_layout`, `ejit_get_global_layout_status`,
-`ejit_refresh_global_layout` and `ejit_shutdown_checked`. A scoped native archive
-check reproduces loss of all four exports. Do not deploy the GC-merged runtime
-until the packaging fix is independently reviewed and validated. Demo-object GC
-retention alone does not resolve this runtime-package gap. No proposed lipo patch
-is applied by this demo change.
+Use this revision's `lipo.py gc-merge`, which retains the defined runtime exports
+`ejit_init_global_layout`, `ejit_get_global_layout_status`,
+`ejit_refresh_global_layout` and `ejit_shutdown_checked`. Older scripts discard
+these application-only entry points before the demo object is linked. Rebuild
+the runtime package and confirm all four exports survive in the final SDK
+artifact. Demo-object GC retention alone does not verify runtime-package
+retention or final SDK linking. Older runtime archives without these APIs do
+not acquire undefined roots from the optional retention list.
 
 ## Build The Image
 
