@@ -1,5 +1,4 @@
-//===-- EJitFreeDim.h - Local value-boundary protocol ------------*- C++
-//-*-===//
+//===-- EJitFreeDim.h - Local value boundaries ------------------*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -10,6 +9,7 @@
 #ifndef LLVM_TRANSFORMS_EMBEDDEDJIT_EJITFREEDIM_H
 #define LLVM_TRANSFORMS_EMBEDDEDJIT_EJITFREEDIM_H
 
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
@@ -49,6 +49,38 @@ inline bool isEJitLocalFreeDim(const Value *V) {
   auto *F = Call ? Call->getCalledFunction() : nullptr;
   return F && isEJitLocalFreeDimFunction(*F) && Call->arg_size() == 1 &&
          Call->getType() == Call->getArgOperand(0)->getType();
+}
+
+// Inspect nodes through operand distance 16, including markers at that
+// boundary. Breadth-first order makes the first visit the shortest path, so a
+// shared node reached at the depth limit cannot hide a later, shallower marker
+// path. Visited state belongs to this query only: callers may mutate IR between
+// calls. VisitedValues optionally exposes deterministic work counts for
+// regressions.
+inline bool usesEJitLocalFreeDim(const Value *Root, bool HasLocalMarkers,
+                                 unsigned *VisitedValues = nullptr) {
+  if (VisitedValues)
+    *VisitedValues = 0;
+  if (!HasLocalMarkers)
+    return false;
+
+  SmallPtrSet<const Value *, 32> Seen;
+  SmallVector<std::pair<const Value *, unsigned>, 32> Work;
+  Seen.insert(Root);
+  Work.emplace_back(Root, 0);
+  for (size_t I = 0; I != Work.size(); ++I) {
+    const auto [V, Depth] = Work[I];
+    if (VisitedValues)
+      ++*VisitedValues;
+    if (isEJitLocalFreeDim(V))
+      return true;
+    if (Depth == 16 || (!isa<Instruction>(V) && !isa<ConstantExpr>(V)))
+      continue;
+    for (const Value *Op : cast<User>(V)->operand_values())
+      if (Seen.insert(Op).second)
+        Work.emplace_back(Op, Depth + 1);
+  }
+  return false;
 }
 
 inline bool lowerEJitLocalFreeDims(Module &M) {

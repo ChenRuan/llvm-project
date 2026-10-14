@@ -204,17 +204,12 @@ static bool hasMatchingBoundArgumentContract(
 
 static std::optional<uint64_t>
 accumulateArgumentOffset(const DataLayout &DL, const Value *PtrOp,
-                         const Argument *Root, const AssumedArgMap &Assumed);
+                         const Argument *Root,
+                         const EJitFreeDimAssumptions &Assumed);
 
-static bool usesLocalFreeDim(const Value *V, unsigned Depth = 0) {
-  if (isEJitLocalFreeDim(V))
-    return true;
-  if (Depth >= 16 || (!isa<Instruction>(V) && !isa<ConstantExpr>(V)))
-    return false;
-  for (const Value *Op : cast<User>(V)->operand_values())
-    if (usesLocalFreeDim(Op, Depth + 1))
-      return true;
-  return false;
+static bool usesLocalFreeDim(const Value *V,
+                             const EJitFreeDimAssumptions &Assumed) {
+  return usesEJitLocalFreeDim(V, Assumed.hasLocalMarkers);
 }
 
 /// Depth cap for evalWithAssumed. An index expression that needs more than this
@@ -235,7 +230,8 @@ static constexpr unsigned kMaxAssumedEvalDepth = 16;
 /// wants a byte offset to read process memory at, and the IR must be left
 /// exactly as it was so the stores through the same address stay correct.
 static std::optional<APInt>
-evalWithAssumed(const Value *V, const AssumedArgMap &Assumed, unsigned Depth) {
+evalWithAssumed(const Value *V, const EJitFreeDimAssumptions &Assumed,
+                unsigned Depth) {
   if (Depth > kMaxAssumedEvalDepth || !V->getType()->isIntegerTy())
     return std::nullopt;
 
@@ -244,12 +240,12 @@ evalWithAssumed(const Value *V, const AssumedArgMap &Assumed, unsigned Depth) {
 
   // Stop at the declaration's value boundary. Never evaluate the initializer
   // or transfer witness authorization to its input SSA value.
-  if (isEJitLocalFreeDim(V) && Assumed.contains(V))
+  if (isEJitLocalFreeDim(V) && Assumed.values.contains(V))
     return APInt(V->getType()->getIntegerBitWidth(), 0);
 
   if (const auto *Arg = dyn_cast<Argument>(V)) {
-    auto It = Assumed.find(Arg);
-    if (It == Assumed.end())
+    auto It = Assumed.values.find(Arg);
+    if (It == Assumed.values.end())
       return std::nullopt;
     return APInt(V->getType()->getIntegerBitWidth(), It->second);
   }
@@ -314,7 +310,7 @@ evalWithAssumed(const Value *V, const AssumedArgMap &Assumed, unsigned Depth) {
     // Local authorization must not cross a merge containing an unmarked
     // dynamic arm, even if zero would choose the marked arm. Keep the legacy
     // parameter-only behavior unchanged.
-    if (usesLocalFreeDim(V) &&
+    if (usesLocalFreeDim(V, Assumed) &&
         (!evalWithAssumed(Op->getOperand(1), Assumed, Depth + 1) ||
          !evalWithAssumed(Op->getOperand(2), Assumed, Depth + 1)))
       return std::nullopt;
@@ -437,17 +433,20 @@ evalWithAssumed(const Value *V, const AssumedArgMap &Assumed, unsigned Depth) {
   }
 }
 
-static std::optional<APInt> computeAbsoluteGEPOffset(
-    const GEPOperator *GEP, const DataLayout &DL, const AssumedArgMap &Assumed,
-    const APInt *BaseAddress, SmallVectorImpl<APInt> *IntermediateAddresses,
-    bool *HasNonZeroIndex, bool *UsedAssumption);
+static std::optional<APInt>
+computeAbsoluteGEPOffset(const GEPOperator *GEP, const DataLayout &DL,
+                         const EJitFreeDimAssumptions &Assumed,
+                         const APInt *BaseAddress,
+                         SmallVectorImpl<APInt> *IntermediateAddresses,
+                         bool *HasNonZeroIndex, bool *UsedAssumption);
 
 /// Compute the cumulative byte offset of a GEP. Every index must be a
 /// ConstantInt, or fold to one under \p Assumed.
 static std::optional<uint64_t>
 computeGEPOffset(const GEPOperator *GEP, const DataLayout &DL,
-                 const AssumedArgMap &Assumed, bool *UsedAssumption = nullptr) {
-  if (usesLocalFreeDim(GEP)) {
+                 const EJitFreeDimAssumptions &Assumed,
+                 bool *UsedAssumption = nullptr) {
+  if (usesLocalFreeDim(GEP, Assumed)) {
     auto Offset = computeAbsoluteGEPOffset(GEP, DL, Assumed, nullptr, nullptr,
                                            nullptr, UsedAssumption);
     return Offset ? std::optional<uint64_t>(Offset->getZExtValue())
@@ -459,7 +458,7 @@ computeGEPOffset(const GEPOperator *GEP, const DataLayout &DL,
       IdxList.push_back(*I);
       continue;
     }
-    if (Assumed.empty())
+    if (Assumed.values.empty())
       return std::nullopt;
     auto Folded = evalWithAssumed(*I, Assumed, 0);
     if (!Folded)
@@ -480,7 +479,7 @@ computeGEPOffset(const GEPOperator *GEP, const DataLayout &DL,
 /// or fold to constants under \p Assumed.
 static std::optional<uint64_t>
 accumulateFullOffset(const DataLayout &DL, const Value *PtrOp,
-                     const AssumedArgMap &Assumed,
+                     const EJitFreeDimAssumptions &Assumed,
                      bool *UsedAssumption = nullptr) {
   APInt total(DL.getPointerSizeInBits(0), 0);
 
@@ -496,7 +495,7 @@ accumulateFullOffset(const DataLayout &DL, const Value *PtrOp,
     auto off = computeGEPOffset(GEP, DL, Assumed, UsedAssumption);
     if (!off)
       return std::nullopt;
-    if (usesLocalFreeDim(PtrOp)) {
+    if (usesLocalFreeDim(PtrOp, Assumed)) {
       bool Overflow = false;
       total = total.sadd_ov(APInt(total.getBitWidth(), *off), Overflow);
       if (Overflow)
@@ -513,7 +512,8 @@ accumulateFullOffset(const DataLayout &DL, const Value *PtrOp,
 
 static std::optional<uint64_t>
 accumulateArgumentOffset(const DataLayout &DL, const Value *PtrOp,
-                         const Argument *Root, const AssumedArgMap &Assumed) {
+                         const Argument *Root,
+                         const EJitFreeDimAssumptions &Assumed) {
   APInt Total(DL.getPointerSizeInBits(0), 0);
   while (PtrOp) {
     PtrOp = PtrOp->stripPointerCasts();
@@ -533,7 +533,8 @@ accumulateArgumentOffset(const DataLayout &DL, const Value *PtrOp,
 
 static std::optional<uint64_t>
 getBoundPointerOffset(const Value *V, const AssumedArgMap &BoundArguments,
-                      const DataLayout &DL, const AssumedArgMap &Assumed) {
+                      const DataLayout &DL,
+                      const EJitFreeDimAssumptions &Assumed) {
   const Argument *Root = findRootArgument(V);
   if (!Root)
     return std::nullopt;
@@ -656,12 +657,15 @@ callUsesSameBoundDimension(const CallBase &CB, StringRef BoundPeriodName,
 /// simply absent from the map; the assumption does not propagate across a call
 /// that survived inlining.
 void EJitStructFieldPass::initFreeDimAssumptions(Module &M) {
-  freeDimArgs_.clear();
+  freeDimAssumptions_.values.clear();
+  freeDimAssumptions_.hasLocalMarkers = false;
   for (Function &F : M) {
     for (BasicBlock &BB : F)
       for (Instruction &I : BB)
-        if (isEJitLocalFreeDim(&I))
-          freeDimArgs_[&I] = 0;
+        if (isEJitLocalFreeDim(&I)) {
+          freeDimAssumptions_.values[&I] = 0;
+          freeDimAssumptions_.hasLocalMarkers = true;
+        }
     MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
     if (!MD)
       continue;
@@ -681,10 +685,11 @@ void EJitStructFieldPass::initFreeDimAssumptions(Module &M) {
       Argument *Arg = F.getArg(static_cast<unsigned>(ArgIdx));
       if (!Arg->getType()->isIntegerTy())
         continue;
-      freeDimArgs_[Arg] = 0;
+      freeDimAssumptions_.values[Arg] = 0;
     }
   }
-  EJIT_DIAG_VERBOSE("struct-field free dims: %zu", freeDimArgs_.size());
+  EJIT_DIAG_VERBOSE("struct-field free dims: %u",
+                    freeDimAssumptions_.values.size());
 }
 
 void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
@@ -698,7 +703,7 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
   // prove an argument relationship: two calls whose offsets differ in the free
   // parameter would map one formal to one of them. Address computation for a
   // may_const LOAD does use the assumption — see run().
-  const AssumedArgMap NoAssumed;
+  const EJitFreeDimAssumptions NoAssumed;
   const DataLayout &DL = M.getDataLayout();
   SmallVector<CallBase *, 32> DirectCalls;
   DenseMap<const Function *, SmallVector<CallBase *, 4>> CallsByCallee;
@@ -871,7 +876,8 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
 static bool
 isBoundMayConstLoad(LoadInst *LI, const AssumedArgMap &BoundArguments,
                     ArrayRef<std::pair<uint64_t, uint64_t>> MayConstFields,
-                    const DataLayout &DL, const AssumedArgMap &Assumed) {
+                    const DataLayout &DL,
+                    const EJitFreeDimAssumptions &Assumed) {
   if (LI->isVolatile() || LI->isAtomic())
     return false;
   auto Offset = getBoundPointerOffset(LI->getPointerOperand(), BoundArguments,
@@ -879,7 +885,7 @@ isBoundMayConstLoad(LoadInst *LI, const AssumedArgMap &BoundArguments,
   if (!Offset)
     return false;
   if (LI->hasMetadata(MD_EJIT_MAY_CONST) &&
-      !usesLocalFreeDim(LI->getPointerOperand()))
+      !usesLocalFreeDim(LI->getPointerOperand(), Assumed))
     return true;
 
   TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
@@ -896,9 +902,10 @@ static bool offsetFitsInObject(const GlobalVariable *GV, uint64_t ByteOffset,
                                 Type *LoadTy, const DataLayout &DL);
 
 /// Check whether a load is (or can be treated as) a may_const access.
-static bool
-isMayConstLoad(const LoadInst *LI, const MayConstOffsetMap &mayConstFieldMap,
-               const DataLayout &DL, const AssumedArgMap &Assumed) {
+static bool isMayConstLoad(const LoadInst *LI,
+                           const MayConstOffsetMap &mayConstFieldMap,
+                           const DataLayout &DL,
+                           const EJitFreeDimAssumptions &Assumed) {
   // Never substituted. Checked ahead of the metadata, not just ahead of the
   // fallback, so that a pass which copies !ejit.may_const onto a volatile or
   // atomic load cannot defeat the frontend's exclusion.
@@ -914,7 +921,7 @@ isMayConstLoad(const LoadInst *LI, const MayConstOffsetMap &mayConstFieldMap,
   // field it starts at.
   const GlobalVariable *RootGV = nullptr;
   auto Off = ejitMayConstFieldOffset(LI->getPointerOperand(), DL, RootGV);
-  if (!Off && usesLocalFreeDim(LI->getPointerOperand())) {
+  if (!Off && usesLocalFreeDim(LI->getPointerOperand(), Assumed)) {
     RootGV = findRootGV(LI->getPointerOperand());
     auto Witness = accumulateFullOffset(DL, LI->getPointerOperand(), Assumed);
     if (RootGV && Witness &&
@@ -952,7 +959,8 @@ EJitStructFieldPass::collectMayConstLoadSites(const Module &M) const {
     for (const BasicBlock &BB : F) {
       for (const Instruction &I : BB) {
         const auto *LI = dyn_cast<LoadInst>(&I);
-        if (!LI || !isMayConstLoad(LI, mayConstFieldMap_, DL, freeDimArgs_))
+        if (!LI ||
+            !isMayConstLoad(LI, mayConstFieldMap_, DL, freeDimAssumptions_))
           continue;
 
         EJitMayConstLoadSite Site;
@@ -1004,7 +1012,8 @@ EJitStructFieldPass::instrumentMayConstLoadSites(Module &M) {
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
         auto *LI = dyn_cast<LoadInst>(&I);
-        if (!LI || !isMayConstLoad(LI, mayConstFieldMap_, DL, freeDimArgs_))
+        if (!LI ||
+            !isMayConstLoad(LI, mayConstFieldMap_, DL, freeDimAssumptions_))
           continue;
 
         const uint64_t SiteID = SiteIndex + 1;
@@ -1179,13 +1188,11 @@ static bool absoluteAddressAddSignedOffsetNoWrap(const APInt &Address,
 /// obligation carried by the GEP and optionally return the address after each
 /// individual index. This matters because a valid final address does not make
 /// an earlier flagged step valid.
-static std::optional<APInt>
-computeAbsoluteGEPOffset(const GEPOperator *GEP, const DataLayout &DL,
-                        const AssumedArgMap &Assumed,
-                        const APInt *BaseAddress = nullptr,
-                        SmallVectorImpl<APInt> *IntermediateAddresses = nullptr,
-                        bool *HasNonZeroIndex = nullptr,
-                        bool *UsedAssumption = nullptr) {
+static std::optional<APInt> computeAbsoluteGEPOffset(
+    const GEPOperator *GEP, const DataLayout &DL,
+    const EJitFreeDimAssumptions &Assumed, const APInt *BaseAddress = nullptr,
+    SmallVectorImpl<APInt> *IntermediateAddresses = nullptr,
+    bool *HasNonZeroIndex = nullptr, bool *UsedAssumption = nullptr) {
   constexpr unsigned HostPointerBits = sizeof(uintptr_t) * 8;
   if (!GEP->getType()->isPointerTy() ||
       DL.getIndexTypeSizeInBits(GEP->getType()) != HostPointerBits)
@@ -1205,7 +1212,7 @@ computeAbsoluteGEPOffset(const GEPOperator *GEP, const DataLayout &DL,
       Indices.push_back(CI->getValue());
       continue;
     }
-    if (Assumed.empty())
+    if (Assumed.values.empty())
       return std::nullopt;
     auto Folded = evalWithAssumed(*I, Assumed, 0);
     if (!Folded || Folded->getBitWidth() > 64)
@@ -1361,7 +1368,8 @@ collectAbsoluteGEPChain(const Value *Ptr, const DataLayout &DL) {
 
 static std::optional<APInt>
 getAbsoluteTarget(const Value *Ptr, const DataLayout &DL,
-                 const AssumedArgMap &Assumed, bool *UsedAssumption = nullptr) {
+                  const EJitFreeDimAssumptions &Assumed,
+                  bool *UsedAssumption = nullptr) {
   constexpr unsigned HostPointerBits = sizeof(uintptr_t) * 8;
   auto Chain = collectAbsoluteGEPChain(Ptr, DL);
   if (!Chain)
@@ -1479,7 +1487,7 @@ static bool absoluteAddressInObject(const APInt &Address, uintptr_t ObjectBase,
 /// same allocation, and an inbounds GEP's base must already be in that
 /// allocation (or one-past it).
 static bool absoluteGEPChainFitsObject(const Value *Ptr, const DataLayout &DL,
-                                       const AssumedArgMap &Assumed,
+                                       const EJitFreeDimAssumptions &Assumed,
                                        uintptr_t ObjectBase,
                                        uint64_t ObjectSize) {
   auto Chain = collectAbsoluteGEPChain(Ptr, DL);
@@ -1540,7 +1548,7 @@ static bool absoluteFieldAuthorized(
 static Constant *tryReplacePeriodAbsoluteAddress(
     LoadInst *LI, const Function &F, const GVPeriodMap &gvMap,
     const MayConstOffsetMap &mayConstFieldMap, PeriodArrayRegistry &reg,
-    const DataLayout &DL, const AssumedArgMap &Assumed) {
+    const DataLayout &DL, const EJitFreeDimAssumptions &Assumed) {
   if (LI->isVolatile() || LI->isAtomic())
     return nullptr;
   TypeSize AccessTypeSize = DL.getTypeStoreSize(LI->getType());
@@ -1553,7 +1561,7 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   if (!TargetValue)
     return nullptr;
   const uintptr_t Target = static_cast<uintptr_t>(TargetValue->getZExtValue());
-  if (usesLocalFreeDim(LI->getPointerOperand()) &&
+  if (usesLocalFreeDim(LI->getPointerOperand(), Assumed) &&
       (Target % LI->getAlign().value() ||
        Target % DL.getABITypeAlign(LI->getType()).value()))
     return nullptr;
@@ -1626,7 +1634,7 @@ static Constant *tryReplaceBoundPointer(LoadInst *LI, const uint8_t *Data,
                                         uint32_t Size,
                                         const AssumedArgMap &BoundArguments,
                                         const DataLayout &DL,
-                                        const AssumedArgMap &Assumed) {
+                                        const EJitFreeDimAssumptions &Assumed) {
   if (!Data || !Size)
     return nullptr;
   auto Offset = getBoundPointerOffset(LI->getPointerOperand(), BoundArguments,
@@ -1635,7 +1643,7 @@ static Constant *tryReplaceBoundPointer(LoadInst *LI, const uint8_t *Data,
   if (!Offset || AccessSize.isScalable() || *Offset > Size ||
       AccessSize.getFixedValue() > Size - *Offset)
     return nullptr;
-  if (usesLocalFreeDim(LI->getPointerOperand())) {
+  if (usesLocalFreeDim(LI->getPointerOperand(), Assumed)) {
     uintptr_t Address = reinterpret_cast<uintptr_t>(Data + *Offset);
     if (Address % LI->getAlign().value() ||
         Address % DL.getABITypeAlign(LI->getType()).value())
@@ -1694,7 +1702,7 @@ static Constant *tryReplaceLocalWitnessGEP(
     LoadInst *LI, const Value *Ptr, const GlobalVariable *GV,
     const GVPeriodInfo &Info, const MayConstOffsetMap &Fields,
     PeriodArrayRegistry &Registry, const DataLayout &DL,
-    const AssumedArgMap &Assumed, std::optional<uint8_t> KnownCell) {
+    const EJitFreeDimAssumptions &Assumed, std::optional<uint8_t> KnownCell) {
   auto Fail = [&](const char *Reason) -> Constant * {
     EJIT_DIAG_DEBUG("local-free-dim missed fn=%s reason=%s",
                     LI->getFunction()->getName().str().c_str(), Reason);
@@ -1730,7 +1738,7 @@ static Constant *tryReplaceLocalWitnessGEP(
       if (!Array || !RootGEP || RootGEP->getSourceElementType() != Array ||
           RootGEP->getNumIndices() < 2 ||
           !match(RootGEP->getOperand(1), m_Zero()) ||
-          usesLocalFreeDim(RootGEP->getOperand(2)))
+          usesLocalFreeDim(RootGEP->getOperand(2), Assumed))
         return Fail("untracked-cell-identity");
       Cell = evalWithAssumed(RootGEP->getOperand(2), Assumed, 0);
     }
@@ -1780,13 +1788,11 @@ static Constant *tryReplaceLocalWitnessGEP(
 
 /// Pattern 2: load via a GEP chain rooted at a GlobalVariable.
 /// e.g. @g_cellCfg → GEP 0, idx → GEP 0, fieldIdx → load
-static Constant *tryReplaceDirectGEP(LoadInst *LI, const Value *PtrOp,
-                                     const GVPeriodMap &gvMap,
-                                     const MayConstOffsetMap &Fields,
-                                     PeriodArrayRegistry &reg,
-                                     const DataLayout &DL,
-                                     const AssumedArgMap &Assumed,
-                                     const StringMap<uint8_t> *LocalPeriods) {
+static Constant *
+tryReplaceDirectGEP(LoadInst *LI, const Value *PtrOp, const GVPeriodMap &gvMap,
+                    const MayConstOffsetMap &Fields, PeriodArrayRegistry &reg,
+                    const DataLayout &DL, const EJitFreeDimAssumptions &Assumed,
+                    const StringMap<uint8_t> *LocalPeriods) {
   const GlobalVariable *GV = findRootGV(PtrOp);
   if (!GV)
     return nullptr;
@@ -1795,7 +1801,7 @@ static Constant *tryReplaceDirectGEP(LoadInst *LI, const Value *PtrOp,
   if (it == gvMap.end())
     return nullptr;
 
-  if (usesLocalFreeDim(PtrOp)) {
+  if (usesLocalFreeDim(PtrOp, Assumed)) {
     std::optional<uint8_t> Cell;
     if (LocalPeriods &&
         hasAbsoluteAddressContract(*LI->getFunction(), it->second.periodName)) {
@@ -1844,7 +1850,7 @@ tryReplaceIndirect(LoadInst *LI, const Value *PtrOp,
   // tryReplaceDirectGEP bounds one. Declining the assumption is the
   // conservative half of that trade: a constant index still resolves exactly
   // as before, and no address the program may never form is dereferenced.
-  const AssumedArgMap Assumed;
+  const EJitFreeDimAssumptions Assumed;
   // Walk the GEP chain from the load's pointer operand to find
   // the base LoadInst that reads the pointer value from a GV.
   const Value *V = PtrOp;
@@ -1928,7 +1934,7 @@ tryReplaceIndirect(LoadInst *LI, const Value *PtrOp,
 ///   unsupported-type  — createConstantFromMemory cannot build the load type
 static void logReplaceFailure(LoadInst *LI, const GVPeriodMap &gvMap,
                               PeriodArrayRegistry &reg, const DataLayout &DL,
-                              const AssumedArgMap &Assumed) {
+                              const EJitFreeDimAssumptions &Assumed) {
   Value *Ptr = LI->getPointerOperand();
   const GlobalVariable *GV = findRootGV(Ptr);
   if (!GV) {
@@ -2022,10 +2028,11 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       bool BoundMayConst = false;
       for (const BoundPointerState &State : boundStates_)
-        BoundMayConst |= isBoundMayConstLoad(
-            LI, State.boundArguments, State.mayConstFields, DL, freeDimArgs_);
+        BoundMayConst |=
+            isBoundMayConstLoad(LI, State.boundArguments, State.mayConstFields,
+                                DL, freeDimAssumptions_);
       if (!BoundMayConst &&
-          !isMayConstLoad(LI, mayConstFieldMap_, DL, freeDimArgs_))
+          !isMayConstLoad(LI, mayConstFieldMap_, DL, freeDimAssumptions_))
         continue;
 #ifdef EJIT_DIAG_ENABLE
       ++mayConstLoads;
@@ -2036,7 +2043,7 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       // Try each access pattern in order.
       Constant *C = tryReplacePeriodAbsoluteAddress(
           LI, F, gvPeriodMap_, mayConstFieldMap_, registry_, DL,
-          freeDimArgs_);
+          freeDimAssumptions_);
 
       // Pattern 0: an ejit_bound_ptr parameter. Only the marked load is read
       // from the shared object; the pointer argument and all dynamic fields
@@ -2044,7 +2051,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       if (!C) {
         for (const BoundPointerState &State : boundStates_) {
           C = tryReplaceBoundPointer(LI, State.view.rawPtr, State.view.size,
-                                     State.boundArguments, DL, freeDimArgs_);
+                                     State.boundArguments, DL,
+                                     freeDimAssumptions_);
           if (C)
             break;
         }
@@ -2058,10 +2066,11 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       // Pattern 2: GEP-based access (array or struct field).
       if (!C)
-        C = tryReplaceDirectGEP(
-            LI, PtrOp, gvPeriodMap_, mayConstFieldMap_, registry_, DL,
-            freeDimArgs_, F.getName() == boundRootFunction_
-                              ? &localWitnessPeriods_ : nullptr);
+        C = tryReplaceDirectGEP(LI, PtrOp, gvPeriodMap_, mayConstFieldMap_,
+                                registry_, DL, freeDimAssumptions_,
+                                F.getName() == boundRootFunction_
+                                    ? &localWitnessPeriods_
+                                    : nullptr);
 
       // Pattern 3: indirect pointer access (pointer-type period variable).
       if (!C)
@@ -2071,7 +2080,7 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
         replacements.push_back({LI, C});
 #ifdef EJIT_DIAG_ENABLE
       else
-        logReplaceFailure(LI, gvPeriodMap_, registry_, DL, freeDimArgs_);
+        logReplaceFailure(LI, gvPeriodMap_, registry_, DL, freeDimAssumptions_);
 #endif
     }
   }

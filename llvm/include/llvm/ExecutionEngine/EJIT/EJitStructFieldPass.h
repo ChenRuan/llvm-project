@@ -45,6 +45,13 @@ using MayConstOffsetMap =
 /// appear here; their initializer inputs are deliberately absent.
 using AssumedArgMap = DenseMap<const Value *, uint64_t>;
 
+struct EJitFreeDimAssumptions {
+  AssumedArgMap values;
+  // Set only while collecting validated local marker calls. The pass never
+  // creates markers, so marker-free modules need no dependency graph walks.
+  bool hasLocalMarkers = false;
+};
+
 struct EJitLocalWitnessPeriod {
   StringRef periodName;
   uint8_t instance;
@@ -125,7 +132,7 @@ private:
   /// a may_const load: the argument itself is never replaced, so the stores and
   /// the address arithmetic the source performs keep the live parameter. See
   /// initFreeDimAssumptions().
-  AssumedArgMap freeDimArgs_;
+  EJitFreeDimAssumptions freeDimAssumptions_;
   void initFreeDimAssumptions(Module &M);
 
   // Cached metadata maps — built once per module, reused across functions.

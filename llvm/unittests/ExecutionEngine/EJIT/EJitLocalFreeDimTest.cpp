@@ -1,5 +1,4 @@
-//===-- EJitLocalFreeDimTest.cpp - Local witness regressions
-//---------------===//
+//===-- EJitLocalFreeDimTest.cpp - Local witness regressions --------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -128,6 +127,141 @@ std::string serialize(Module &M) {
   return Bitcode;
 }
 } // namespace
+
+TEST(EJitLocalFreeDim, DependencyQueryVisitsSharedDAGOnce) {
+  LLVMContext C;
+  auto M = makeLocalModule(C);
+  ASSERT_NE(M, nullptr);
+  Function *F = M->getFunction("local_work");
+  Instruction *Ret = F->getEntryBlock().getTerminator();
+  Value *Root = F->getArg(1);
+  for (unsigned I = 0; I != 16; ++I)
+    Root = BinaryOperator::CreateAdd(Root, Root, "diamond", Ret->getIterator());
+
+  // A validated marker exists elsewhere, but none is reachable from this DAG.
+  // The old recursive walk made 131071 visits to these same 17 values.
+  unsigned Visited = 0;
+  EXPECT_FALSE(usesEJitLocalFreeDim(Root, true, &Visited));
+  EXPECT_EQ(Visited, 17u);
+  EXPECT_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST(EJitLocalFreeDim, DependencyQuerySkipsMarkerFreeGraphs) {
+  LLVMContext C;
+  Module M("marker-free", C);
+  auto *FT =
+      FunctionType::get(Type::getInt64Ty(C), {Type::getInt64Ty(C)}, false);
+  auto *F = Function::Create(FT, GlobalValue::ExternalLinkage, "plain", M);
+  auto *BB = BasicBlock::Create(C, "entry", F);
+  IRBuilder<> B(BB);
+  Value *Root = F->getArg(0);
+  for (unsigned I = 0; I != 64; ++I)
+    Root = B.CreateAdd(Root, Root);
+  B.CreateRet(Root);
+
+  // Parameter assumptions also take the no-local-marker fast path.
+  EJitFreeDimAssumptions Assumed;
+  Assumed.values[F->getArg(0)] = 0;
+  unsigned Visited = 123;
+  EXPECT_FALSE(usesEJitLocalFreeDim(Root, Assumed.hasLocalMarkers, &Visited));
+  EXPECT_EQ(Visited, 0u);
+  EXPECT_FALSE(verifyModule(M, &errs()));
+}
+
+TEST(EJitLocalFreeDim, DependencyQueryPreservesDepthAndShorterPaths) {
+  LLVMContext C;
+  auto M = makeLocalModule(C);
+  ASSERT_NE(M, nullptr);
+  Function *F = M->getFunction("local_work");
+  Instruction *Ret = F->getEntryBlock().getTerminator();
+  Value *Marker = F->getValueSymbolTable()->lookup("local");
+  ASSERT_TRUE(isEJitLocalFreeDim(Marker));
+
+  Value *AtLimit = Marker;
+  for (unsigned I = 0; I != 16; ++I)
+    AtLimit =
+        BinaryOperator::CreateAdd(AtLimit, AtLimit, "deep", Ret->getIterator());
+  unsigned Visited = 0;
+  EXPECT_TRUE(usesEJitLocalFreeDim(AtLimit, true, &Visited));
+  EXPECT_EQ(Visited, 17u);
+  Value *TooDeep = BinaryOperator::CreateAdd(AtLimit, AtLimit, "too.deep",
+                                             Ret->getIterator());
+  EXPECT_FALSE(usesEJitLocalFreeDim(TooDeep, true, &Visited));
+  EXPECT_EQ(Visited, 17u);
+
+  Value *Shared = BinaryOperator::CreateAdd(Marker, F->getArg(1), "shared",
+                                            Ret->getIterator());
+  Value *LongPath = Shared;
+  for (unsigned I = 0; I != 15; ++I)
+    LongPath = BinaryOperator::CreateAdd(LongPath, LongPath, "long.path",
+                                         Ret->getIterator());
+  Value *Mixed =
+      BinaryOperator::CreateAdd(LongPath, Shared, "mixed", Ret->getIterator());
+  // DFS reaches Shared at depth16 first. Caching that negative by Value alone
+  // would hide the valid two-edge path through the second operand.
+  EXPECT_TRUE(usesEJitLocalFreeDim(Mixed, true, &Visited));
+  EXPECT_LE(Visited, 6u);
+  EXPECT_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST(EJitLocalFreeDim, DependencyQueryHandlesCyclicSSA) {
+  LLVMContext C;
+  Module M("cyclic", C);
+  auto *I64 = Type::getInt64Ty(C);
+  auto *FT = FunctionType::get(I64, {I64, Type::getInt1Ty(C)}, false);
+  auto *F = Function::Create(FT, GlobalValue::ExternalLinkage, "loop", M);
+  auto *Entry = BasicBlock::Create(C, "entry", F);
+  auto *Loop = BasicBlock::Create(C, "loop", F);
+  auto *Exit = BasicBlock::Create(C, "exit", F);
+  IRBuilder<> B(Entry);
+  Value *Marker = B.CreateCall(getEJitLocalFreeDim(M, I64), {F->getArg(0)});
+  B.CreateBr(Loop);
+  B.SetInsertPoint(Loop);
+  auto *Plain = B.CreatePHI(I64, 2);
+  auto *Marked = B.CreatePHI(I64, 2);
+  Value *PlainNext = B.CreateAdd(Plain, Plain);
+  Value *MarkedNext = B.CreateAdd(Marked, Marked);
+  Plain->addIncoming(F->getArg(0), Entry);
+  Plain->addIncoming(PlainNext, Loop);
+  Marked->addIncoming(Marker, Entry);
+  Marked->addIncoming(MarkedNext, Loop);
+  B.CreateCondBr(F->getArg(1), Loop, Exit);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(Plain);
+  EXPECT_FALSE(verifyModule(M, &errs()));
+
+  unsigned Visited = 0;
+  EXPECT_FALSE(usesEJitLocalFreeDim(Plain, true, &Visited));
+  EXPECT_EQ(Visited, 3u);
+  EXPECT_TRUE(usesEJitLocalFreeDim(Marked, true, &Visited));
+  EXPECT_EQ(Visited, 2u);
+}
+
+TEST(EJitLocalFreeDim, DependencyQueryRevalidatesAfterIRMutation) {
+  LLVMContext C;
+  auto M = makeLocalModule(C);
+  ASSERT_NE(M, nullptr);
+  Function *F = M->getFunction("local_work");
+  Instruction *Ret = F->getEntryBlock().getTerminator();
+  auto *Marker = cast<CallInst>(F->getValueSymbolTable()->lookup("local"));
+  auto *Root = BinaryOperator::CreateAdd(F->getArg(1), F->getArg(1), "root",
+                                         Ret->getIterator());
+  EXPECT_FALSE(usesEJitLocalFreeDim(Root, true));
+  Root->setOperand(0, Marker);
+  EXPECT_TRUE(usesEJitLocalFreeDim(Root, true));
+
+  // An apparent marker with the wrong protocol version is not authorization.
+  Function *Decl = Marker->getCalledFunction();
+  Decl->addFnAttr("ejit.local_free_dim", "v2");
+  EXPECT_FALSE(usesEJitLocalFreeDim(Root, true));
+  Decl->addFnAttr("ejit.local_free_dim", "v1");
+  EXPECT_TRUE(usesEJitLocalFreeDim(Root, true));
+
+  Marker->replaceAllUsesWith(F->getArg(1));
+  Marker->eraseFromParent();
+  EXPECT_FALSE(usesEJitLocalFreeDim(Root, true));
+  EXPECT_FALSE(verifyModule(*M, &errs()));
+}
 
 TEST(EJitLocalFreeDim, ReadsLengthDelimitedNonterminatedEmbeddedBitcode) {
   LLVMContext C;
