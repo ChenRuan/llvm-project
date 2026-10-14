@@ -98,10 +98,19 @@ standalone workload: `pending_count()==0` alone is NOT a borrow fence.
 The synchronous compile callback returns before publication in this runtime;
 no compiler-source borrower remains for these completed identities.
 
-Waits are bounded by30000 rounds with one SRE tick per wait. This is not a
-promise of30000 milliseconds: SDK tick length, compilation, mailbox handshakes
-and serial logging affect wall time. Progress logs appear every1000 rounds.
-Do not disable the runtime's separate no-progress timeout to make a run pass.
+Board waits have no round limit by default (`LFD_WAIT_ROUNDS=0`), for both
+PGO publication and queue draining. No extra compiler option is needed.
+The worker-ready banner prints `waitRounds=0 (0=unlimited)`. Each wait yields
+one SRE tick and progress logs appear every1000 rounds, including drain waits.
+Compile/publish/queue errors, failed delays and business mismatches still fail
+immediately. A stalled runtime can therefore wait indefinitely without PASS;
+reset the image to abandon that run. Configuration is never changed before
+the drain succeeds. Runtime safety/no-progress limits are unchanged.
+
+Host regression tests can explicitly set a positive `LFD_WAIT_ROUNDS` for a
+finite budget and retain an external process timeout. A round is not a fixed
+number of milliseconds: SDK ticks, compilation, handshakes and logging affect
+wall time. Do not enable a finite override for the normal board run.
 
 ## Final Acceptance
 

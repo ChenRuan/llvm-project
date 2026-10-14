@@ -5,6 +5,7 @@
 // then core6 test_ejit_local_free_dim_print. All four arguments are ignored.
 // Runtime: existing build.sh --stats or -DEJIT_STATS_ENABLE=ON; audit ON.
 // A macro on this demo alone cannot enable counters in the runtime library.
+// Board waits have no round limit by default; real errors still fail immediately.
 //
 //===----------------------------------------------------------------------===//
 
@@ -37,7 +38,7 @@ extern uint8_t g_ucLocalCoreID;
 #define LFD_RUN_INIT_ARRAY 1
 #endif
 #ifndef LFD_WAIT_ROUNDS
-#define LFD_WAIT_ROUNDS 30000u
+#define LFD_WAIT_ROUNDS 0u
 #endif
 #define LFD_SHARED __attribute__((section(".mc_shared"), aligned(64)))
 #define LFD_SLOTS 10u
@@ -106,10 +107,14 @@ static int lfd_idle(const ejit_taskpool_stats_t *s) {
 // Callers must first observe both selected identities' completed T2 publication,
 // stop all lookups/business calls, and exclude every other producer/writer.
 static int lfd_wait_idle(void) {
-  for (unsigned round = 0; round != LFD_WAIT_ROUNDS; ++round) {
+  for (unsigned round = 0;
+       LFD_WAIT_ROUNDS == 0u || round < LFD_WAIT_ROUNDS; ++round) {
     ejit_taskpool_stats_t s = {0};
     if (lfd_stats(&s)) return -1;
     if (lfd_idle(&s)) return 0;
+    if (round == 0u || (round + 1u) % 1000u == 0u)
+      SRE_printf("[LFD247] waiting drain round=%u pending=%u queue=%u\n",
+                 round + 1u, s.pendingEntries, s.queueApproxSize);
     if (lfd_delay()) return -1;
   }
   return lfd_fail("drain timeout; configuration NOT modified");
@@ -156,7 +161,8 @@ static int lfd_generation(unsigned phase, unsigned cell, unsigned mode) {
   if (lfd_call(cell, 9u, mode, 0u, 1, 0) != 1) return -1;
   unsigned executed = 0, warned_stats = 0;
   void *first = 0, *last = 0;
-  for (unsigned round = 0; round != LFD_WAIT_ROUNDS; ++round) {
+  for (unsigned round = 0;
+       LFD_WAIT_ROUNDS == 0u || round < LFD_WAIT_ROUNDS; ++round) {
     void *fn = 0;
     int rc = lfd_call(cell, round % LFD_SLOTS, mode, 0u, 0, &fn);
     if (rc < 0) return -1;
@@ -295,7 +301,8 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   if (core == 6u) {
     ejit_dump_func("local_free_work");
     __atomic_store_n(&g_local_free_stage, LFD_READY, __ATOMIC_RELEASE);
-    SRE_printf("[LFD247] WORKER_READY core6; core16: test_ejit_period\n");
+    SRE_printf("[LFD247] WORKER_READY core6 waitRounds=%u (0=unlimited); "
+               "core16: test_ejit_period\n", (unsigned)LFD_WAIT_ROUNDS);
     return 0;
   }
   return lfd_owner_workload();
