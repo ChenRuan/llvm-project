@@ -248,6 +248,11 @@ typedef struct {
   uint32_t numDims;
   ejit_dim_pair_t dims[4];
   uint32_t versions[4];
+  /* 0 (default): capture live versions on first active admission; supplied
+   * versions are ignored. 1: assert every dimension is active with exactly
+   * these versions now; malformed/stale descriptors reject the whole request.
+   */
+  uint32_t versionPolicy;
   uint32_t boundCount;
   ejit_bound_ptr_t bounds[8];
 } ejit_layout_target_t;
@@ -261,7 +266,7 @@ ejit_status_t ejit_init_global_layout(const ejit_config_t *config,
 
 typedef struct {
   uint32_t state; /* 0 disabled,1 collecting,2 linking,3 linked,4 sealing,
-                    5 publishing,6 complete,7 failed,8 cancelled */
+                    5 publishing,6 complete,7 failed,8 cancelled,9 refreshing */
   uint32_t generation;
   uint32_t required;
   uint32_t ready;
@@ -275,6 +280,15 @@ typedef struct {
 } ejit_global_layout_status_t;
 
 ejit_status_t ejit_get_global_layout_status(ejit_global_layout_status_t *out);
+/// Owner-side asynchronous replacement of the complete expanded manifest.
+/// Returns PENDING after copying; status/generation reports eventual
+/// completion. Bound backing must remain valid until preparation and all
+/// consumers finish.
+ejit_status_t ejit_refresh_global_layout(const ejit_layout_target_t *targets,
+                                         uint32_t count);
+/// Checked shutdown: PENDING means live T1 leases retain the runtime; retry
+/// after real calls return. The original void ejit_shutdown is preserved.
+ejit_status_t ejit_shutdown_checked(void);
 
 ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
                                            const ejit_dim_pair_t *dims,

@@ -316,6 +316,10 @@ void ejitVpBumpScalarSpecialized(uint64_t n);
 void ejitVpStatsSnapshot(EJitVpStatsOut &out);
 void ejitVpSetLosslessMode(bool enabled);
 bool ejitVpLosslessFailed();
+/// Owner only, with T1 dispatch closed and every true return complete. Refuses
+/// active writers; preserves aggregate diagnostics but clears both payload
+/// halves.
+bool ejitVpResetDrained();
 
 /// Process-global collector blob. Placed in the cross-core shared section on
 /// real multi-core builds (EJIT_SHARED_SECTION); ordinary .bss on host.

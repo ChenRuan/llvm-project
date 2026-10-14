@@ -660,6 +660,10 @@ void EJitSharedTaskPool::retireDispatchCache() {
 
 void EJitSharedTaskPool::l0Fill(uint32_t funcIndex, void *fnPtr,
                                 const EJitDimPair *dims, uint32_t numDims) {
+  if (state_ && funcIndex < kEJitSharedMaxFuncIndex &&
+      state_->globalLayoutBoundFunctions[funcIndex].loadAcquire())
+    return;
+
   if (!icacheReclamationSafeShared() || !state_ || !fnPtr)
     return;
   // PGO hotness is counted in resolveMatchedSlot(). An L0 hit bypasses that
@@ -720,6 +724,10 @@ bool gIcacheFillOkLogged;
 void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
                                     const EJitDimPair *dims, uint32_t numDims,
                                     uint64_t token) {
+  if (state_ && funcIndex < kEJitSharedMaxFuncIndex &&
+      state_->globalLayoutBoundFunctions[funcIndex].loadAcquire())
+    return;
+
   if (!icacheReclamationSafeShared()) {
     if (!gIcacheFillRejectLogged[kFillRejectReclaim]) {
       gIcacheFillRejectLogged[kFillRejectReclaim] = true;
@@ -952,8 +960,10 @@ bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,
   // re-enqueues a dropped compile. An unconditional bump would let N cores
   // activating the same instance at startup stall the JIT permanently.
   if (flipped) {
-    invalidateMaterializedLayout();
     state_->version[dimType][instanceId].fetchAdd(1);
+    // Invalidate AFTER publishing the version: a worker may finish linking
+    // between the enable CAS and this point, and must not keep COMPLETE stale.
+    invalidateMaterializedLayout();
   }
   // Latch on the first enable of ANY instance: this brackets the init→activate
   // window during which instanceDisabled hits are tallied separately
@@ -982,8 +992,8 @@ uint32_t EJitSharedTaskPool::setAllInstancesEnabled(uint32_t dimType,
       continue;
     ++flippedCount;
     // As in setInstanceEnabled: version[] moves only on a real transition.
-    invalidateMaterializedLayout();
     state_->version[dimType][i].fetchAdd(1);
+    invalidateMaterializedLayout();
   }
   // ONE epoch bump and ONE drain: both are global, so doing them per instance
   // was pure amplification.
@@ -1166,9 +1176,9 @@ bool EJitSharedTaskPool::isPublishedTier2(uint32_t funcIndex, void *fnPtr,
 #endif
 }
 
-EJitSharedTaskPool::SharedLookup
-EJitSharedTaskPool::cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
-                                uint32_t numDims) {
+EJitSharedTaskPool::SharedLookup EJitSharedTaskPool::cacheLookup(
+    uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+    const EJitBoundPtrDescriptor *bounds, uint32_t boundCount) {
   SharedLookup R;
   if (numDims > 4)
     return R;
@@ -1202,7 +1212,7 @@ EJitSharedTaskPool::cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
     // Identity + versions match: resolve the fnPtr gate (owner/memoized fast
     // return, clean reject, or cold peer preparation). Terminal — a bucket
     // holds at most one slot per identity.
-    return resolveMatchedSlot(B, bucket, s);
+    return resolveMatchedSlot(B, bucket, s, bounds, boundCount);
   }
 
   bucketReadRelease(B);
@@ -1219,9 +1229,9 @@ EJitSharedTaskPool::cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
 // fall back. Memory-safe ONLY because a published fnPtr is never freed in this
 // build, so a returned pointer that holds no read token can never dangle.
 //===----------------------------------------------------------------------===//
-EJitSharedTaskPool::SharedLookup
-EJitSharedTaskPool::cacheLookupSeq(uint32_t funcIndex, const EJitDimPair *dims,
-                                   uint32_t numDims) {
+EJitSharedTaskPool::SharedLookup EJitSharedTaskPool::cacheLookupSeq(
+    uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+    const EJitBoundPtrDescriptor *bounds, uint32_t boundCount) {
   SharedLookup R;
   if (numDims > 4)
     return R;
@@ -1256,7 +1266,7 @@ EJitSharedTaskPool::cacheLookupSeq(uint32_t funcIndex, const EJitDimPair *dims,
         }
       if (!versionsOk)
         break; // identity matched but stale -> clean miss
-      hit = resolveMatchedSlot(B, bucket, s);
+      hit = resolveMatchedSlot(B, bucket, s, bounds, boundCount);
       break;
     }
     // Validate that the scan + resolve observed a single stable publish epoch.
@@ -1424,19 +1434,43 @@ EJitSharedTaskPool::cacheLookupSeq2D(uint32_t funcIndex, uint32_t dim0,
 // clean readyButNotShareable fallback; the rare non-owner first touch is
 // delegated to the out-of-line peerPrepareSlot().
 //===----------------------------------------------------------------------===//
-EJitSharedTaskPool::SharedLookup
-EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
-                                       uint32_t bucket, uint32_t slotIndex) {
+EJitSharedTaskPool::SharedLookup EJitSharedTaskPool::resolveMatchedSlot(
+    EJitSharedCacheBucket &B, uint32_t bucket, uint32_t slotIndex,
+    const EJitBoundPtrDescriptor *bounds, uint32_t boundCount) {
   auto &S = B.slots[slotIndex];
+  if (S.layoutBoundCount) {
+    bool same = S.layoutBoundCount == boundCount + 1;
+    for (uint32_t I = 0; same && I < boundCount; ++I)
+      same = bounds && S.layoutBounds[I].argIndex == bounds[I].argIndex &&
+             S.layoutBounds[I].rawPtr == bounds[I].rawPtr &&
+             S.layoutBounds[I].size == bounds[I].size;
+    if (!same) {
+      bucketReadRelease(B);
+      return {};
+    }
+  }
   bool Lease = S.tier.loadAcquire() == kEJitTierInstrumented &&
                state_->globalLayoutState.loadAcquire() !=
                    static_cast<uint32_t>(EJitGlobalLayoutState::Disabled);
   if (!Lease)
     return resolveMatchedSlotImpl(B, bucket, slotIndex);
+  auto SamplingOpen = [&] {
+    return globalLayoutState() == EJitGlobalLayoutState::Collecting;
+  };
+  if (!SamplingOpen()) {
+    bucketReadRelease(B);
+    SharedLookup Closed;
+    Closed.pgoSamplingComplete = true;
+    return Closed;
+  }
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
   uint32_t Seq = B.publishSeq.loadAcquire();
 #endif
   S.samplingExecutions.fetchAdd(1);
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  if (samplingLeaseHook_)
+    samplingLeaseHook_(samplingLeaseHookCtx_);
+#endif
   if (S.state.loadAcquire() !=
           static_cast<uint32_t>(EJitSharedSlotState::Ready) ||
       S.tier.loadAcquire() != kEJitTierInstrumented ||
@@ -1449,7 +1483,7 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
     bucketReadRelease(B);
     return {};
   }
-  if (globalLayoutState() == EJitGlobalLayoutState::Failed) {
+  if (!SamplingOpen()) {
     S.samplingExecutions.fetchSub(1);
     bucketReadRelease(B);
     SharedLookup Closed;
@@ -1665,13 +1699,22 @@ void EJitSharedTaskPool::enqueueTier2FromSlot(
 }
 
 bool EJitSharedTaskPool::admitPgoFunction(uint32_t funcIndex,
-                                          bool &newlyAdmitted) {
+                                          bool &newlyAdmitted,
+                                          uint32_t expectedGeneration) {
   newlyAdmitted = false;
   const uint32_t encoded = funcIndex + 1;
   uint32_t expected = 0;
   while (!state_->pgoAdmissionLock.compareExchange(expected, 1))
     expected = 0;
 
+  if (expectedGeneration &&
+      (state_->generation.loadAcquire() != expectedGeneration ||
+       state_->initState.loadAcquire() !=
+           static_cast<uint32_t>(EJitSharedInitState::Ready) ||
+       globalLayoutState() == EJitGlobalLayoutState::Refreshing)) {
+    state_->pgoAdmissionLock.storeRelease(0);
+    return false;
+  }
   uint32_t freeSlot = kEJitSharedMaxConcurrentProfiles;
   for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
     uint32_t active = state_->pgoActiveFunctions[i].loadRelaxed();
@@ -1708,12 +1751,18 @@ bool EJitSharedTaskPool::admitPgoFunction(uint32_t funcIndex,
 }
 
 void EJitSharedTaskPool::finishPgoFunction(uint32_t funcIndex, bool completed,
-                                           const char *reason) {
+                                           const char *reason,
+                                           uint32_t expectedGeneration) {
   const uint32_t encoded = funcIndex + 1;
   uint32_t expected = 0;
   while (!state_->pgoAdmissionLock.compareExchange(expected, 1))
     expected = 0;
 
+  if (expectedGeneration &&
+      state_->generation.loadAcquire() != expectedGeneration) {
+    state_->pgoAdmissionLock.storeRelease(0);
+    return;
+  }
   uint32_t slot = kEJitSharedMaxConcurrentProfiles;
   for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i)
     if (state_->pgoActiveFunctions[i].loadRelaxed() == encoded) {
@@ -2573,7 +2622,7 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
 
   if (target->samplingExecutions.loadAcquire() != 0) {
     bucketWriteRelease(B);
-    return EJitPublishStatus::Failed;
+    return EJitPublishStatus::Retry;
   }
   void *oldFn = reinterpret_cast<void *>(target->fnPtr.loadAcquire());
 
@@ -2583,6 +2632,9 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   target->numDims = req.numDims;
   target->generation = req.generation; // the request's generation, not curGen
   target->identityHash = key;
+  target->layoutBoundCount = layoutConfigured_ ? req.boundCount + 1 : 0;
+  for (uint32_t I = 0; I < req.boundCount; ++I)
+    target->layoutBounds[I] = req.boundPointers[I];
   for (uint32_t i = 0; i < req.numDims; ++i) {
     target->dims[i] = req.dims[i];
     target->versions[i] = req.versions[i];
@@ -2714,6 +2766,8 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   st->pgoEnabled.storeRelaxed(pgoEnabled ? 1 : 0);
   st->pgoAdmissionLock.storeRelaxed(0);
   st->pgoMaxActiveFunctions.storeRelaxed(pgoMaxConcurrentProfiles);
+  for (auto &F : st->globalLayoutBoundFunctions)
+    F.storeRelaxed(0);
   st->globalLayoutState.storeRelaxed(
       static_cast<uint32_t>(EJitGlobalLayoutState::Disabled));
   st->globalLayoutRequired.storeRelaxed(0);
@@ -2883,6 +2937,7 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
       }
       // PGO (§6): clear hitCount + tier so a re-init never leaks stale
       // hotness state or tier-tracking from a prior generation.
+      Slot.layoutBoundCount = 0;
       Slot.samplingExecutions.storeRelaxed(0);
       Slot.samplingReturns.storeRelaxed(0);
       Slot.hitCount.storeRelaxed(0);
@@ -3026,6 +3081,8 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
         cpuRelax();
       break;
     case EJitSharedInitState::Ready:
+      if (globalLayoutState() == EJitGlobalLayoutState::Refreshing)
+        return InitResult::InitInProgress;
       if (state_->magic != kEJitSharedAbiMagic ||
           state_->abiVersion != kEJitSharedAbiVersion ||
           state_->structSize != sizeof(EJitSharedTaskPoolState)) {
@@ -3114,6 +3171,23 @@ void EJitSharedTaskPool::ownerShutdown() {
                 "owner remains Stopping and resources are retained");
       return; // No slot reuse, generation bump or owner/resource release.
     }
+    if (layoutReset_ && !layoutReset_(layoutCtx_)) {
+      state_->globalLayoutState.storeRelease(
+          static_cast<uint32_t>(EJitGlobalLayoutState::Cancelled));
+      EJIT_DIAG("global layout shutdown deferred: VP writer has not drained");
+      return;
+    }
+    uint32_t expected = 0;
+    while (!state_->pgoAdmissionLock.compareExchange(expected, 1))
+      expected = 0;
+    for (auto &F : state_->pgoActiveFunctions)
+      F.storeRelaxed(0);
+    for (auto &Q : state_->pgoProgressQuarters)
+      Q.storeRelaxed(0);
+    state_->pgoActiveFunctionCount.storeRelaxed(0);
+    state_->pgoAdmissionLock.storeRelease(0);
+    layoutRefreshMembers_.clear();
+    layoutRefreshCommand_.storeRelease(0);
   }
   // A failed enable_ex may leave linked, non-executable objects queued after
   // the worker's final flush attempt. Drop their owner-private metadata before
@@ -3234,9 +3308,11 @@ EJitSharedTaskPool::CompileOrGetResult EJitSharedTaskPool::tryCacheHit(
   // Cache lookup (§5.2 step 1) — runs BEFORE the Off check, so an already
   // compiled entry is still served even when the pool is globally Off.
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-  SharedLookup Hit = cacheLookupSeq(funcIndex, dims, numDims);
+  SharedLookup Hit =
+      cacheLookupSeq(funcIndex, dims, numDims, boundPointers, boundCount);
 #else
-  SharedLookup Hit = cacheLookup(funcIndex, dims, numDims);
+  SharedLookup Hit =
+      cacheLookup(funcIndex, dims, numDims, boundPointers, boundCount);
 #endif
   if (Hit.tier2Arm && Hit.slot) {
     if (boundCount)
@@ -3418,6 +3494,10 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     R.status = EJitCompileOrGetStatus::OffMode;
     return R;
   }
+  if (globalLayoutState() == EJitGlobalLayoutState::Refreshing) {
+    R.status = EJitCompileOrGetStatus::AlreadyPending;
+    return R;
+  }
   // Off mode (§5.2 step 2).
   if (state_->mode.loadAcquire() ==
       static_cast<uint32_t>(EJitCompileMode::Off)) {
@@ -3557,7 +3637,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   }
 
   bool newlyAdmitted = false;
-  if (pgoForRequest && !admitPgoFunction(funcIndex, newlyAdmitted)) {
+  if (pgoForRequest && !admitPgoFunction(funcIndex, newlyAdmitted, gen)) {
     // All profiling slots are occupied. Keep this miss on the AOT fallback
     // and do not add work to the compiler queue.
     dedupClear(funcIndex, gen);
@@ -3582,11 +3662,13 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   Req.boundCount = boundCount;
   for (uint32_t i = 0; i < boundCount; ++i)
     Req.boundPointers[i] = boundPointers[i];
-  if (!versionsCurrent(Req) || state_->generation.loadAcquire() != gen) {
+  if (!versionsCurrent(Req) || state_->generation.loadAcquire() != gen ||
+      state_->initState.loadAcquire() !=
+          static_cast<uint32_t>(EJitSharedInitState::Ready)) {
     dedupClear(funcIndex, gen);
-    if (newlyAdmitted)
+    if (newlyAdmitted && state_->generation.loadAcquire() == gen)
       finishPgoFunction(funcIndex, /*completed=*/false,
-                        "lifecycle-changed-during-admission");
+                        "lifecycle-changed-during-admission", gen);
     EJIT_DIAG(
         "shared taskpool async bound request drop func=%u: lifecycle changed",
         funcIndex);
@@ -3595,8 +3677,9 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   }
   if (!queuePush(Req)) {
     dedupClear(funcIndex, gen); // queue full → roll back the in-flight slot.
-    if (newlyAdmitted)
-      finishPgoFunction(funcIndex, /*completed=*/false, "tier1-queue-full");
+    if (newlyAdmitted && state_->generation.loadAcquire() == gen)
+      finishPgoFunction(funcIndex, /*completed=*/false, "tier1-queue-full",
+                        gen);
     EJIT_STAT_INC(state_->counters.queueFull);
     EJIT_DIAG("shared taskpool fallback func=%u: queue full", funcIndex);
     R.status = EJitCompileOrGetStatus::QueueFullFallback;
@@ -3989,7 +4072,11 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
               static_cast<unsigned>(ok), fn);
     return;
   }
-  const EJitCompileRequest PublishReq = requestForPublication(req);
+  // Layout descriptors remain opaque identity metadata after compilation;
+  // no pointed-to bytes are read here. Ordinary borrowed publication is
+  // unchanged.
+  const EJitCompileRequest PublishReq =
+      layoutConfigured_ ? req : requestForPublication(req);
   // Resolve the real executable range for the freshly compiled pointer (from
   // the owner's code-pool finalize metadata) so it can be published into the
   // cache slot for cross-core 4K sealing. Optional: if no provider is wired or
@@ -4101,6 +4188,12 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     EJIT_DIAG("shared worker publish drop func=%u: version mismatch",
               req.funcIndex);
     return;
+  case EJitPublishStatus::Retry:
+    if (layoutConfigured_ && tier == kEJitTierInstrumented) {
+      pendingPublishes_.push_back({PublishReq, fn});
+      return; // Keep counters/admission and retry this exact linked T1.
+    }
+    [[fallthrough]];
   case EJitPublishStatus::InvalidParam:
   case EJitPublishStatus::Failed:
     if (publishFn_)
@@ -4129,9 +4222,16 @@ bool EJitSharedTaskPool::pollOne() {
   if (!queuePop(Req))
     return false;
   if (layoutConfigured_) {
+    if (Req.generation != state_->generation.loadAcquire()) {
+      dedupClear(Req.funcIndex, Req.generation);
+      return true;
+    }
     auto Phase = globalLayoutState();
     if (Phase == EJitGlobalLayoutState::Failed ||
         Phase == EJitGlobalLayoutState::Complete) {
+      if (decodeReqTier(Req.funcIndex) == kEJitTierInstrumented)
+        finishPgoFunction(stripReqTier(Req.funcIndex), false,
+                          "layout-terminal-drop");
       dedupClear(Req.funcIndex, Req.generation);
       return true;
     }

@@ -442,6 +442,9 @@ public:
   /// AAPCS64 register return: pointer + status + 16-bit leave token + flags
   /// stays at 16 bytes. T1-only leases use bit 15 and a complete cache slot ID.
   /// Stable T2 still uses the ordinary bucket/no-token representation.
+  /// The slot token exceeds8 bits. Packed flags may need ubfx/bfi, but avoid
+  /// growing the return into sret;16-byte ABI checks are not cycle
+  /// measurements.
   struct CompileOrGetResult {
     void *fnPtr = nullptr;
     EJitCompileOrGetStatus status = EJitCompileOrGetStatus::CompileFailed;
@@ -718,6 +721,17 @@ public:
   /// slot's hitCount; the hit that crosses \p threshold arms a one-shot
   /// Tier-2 (PGOUse) lazy recompile via enqueue. \p threshold 0 disables
   /// the trigger (hits are still counted).
+  /// Seed an attaching facade without mutating an existing owner's settings.
+  void configurePgoForInit(bool enable, uint32_t threshold) {
+    pgoEnabled_.storeRelaxed(enable ? 1 : 0);
+    tier2Threshold_.storeRelaxed(enable ? threshold : 0);
+    pgoMaxConcurrentProfiles_.storeRelaxed(
+        std::max(1u, std::min<uint32_t>(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES,
+                                        kEJitSharedMaxConcurrentProfiles)));
+  }
+  /// Called only after successful init/attach has validated the shared ABI.
+  bool validateGlobalLayoutAttachment(
+      const std::vector<EJitCompileRequest> &manifest);
   void setPgoEnabled(
       bool enable, uint32_t threshold,
       uint32_t maxConcurrentProfiles = EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES) {
@@ -769,7 +783,8 @@ public:
   /// Return true when this miss may start a staged PGO function. Only one
   /// specialization of a funcIndex may own admission at a time; later versions
   /// stay on AOT until the current Tier-2 finishes.
-  bool admitPgoFunction(uint32_t funcIndex, bool &newlyAdmitted);
+  bool admitPgoFunction(uint32_t funcIndex, bool &newlyAdmitted,
+                        uint32_t expectedGeneration = 0);
 
   //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
   /// Publish the compile/taskpool mode as cross-core shared runtime state.
@@ -932,6 +947,13 @@ public:
   using LinkArtifactCallback = bool (*)(void *, void *, void **);
   using DropArtifactCallback = void (*)(void *, void *);
   using SamplingPreparedCallback = void (*)(void *, const EJitCompileRequest &);
+  using LayoutResetCallback = bool (*)(void *);
+  void setLayoutResetCallback(LayoutResetCallback fn) { layoutReset_ = fn; }
+  /// Owner-side command, copied before the worker observes Requested. The
+  /// caller must keep manifest bound backing valid through compilation.
+  bool
+  requestGlobalLayoutRefresh(const std::vector<EJitCompileRequest> &manifest,
+                             uint64_t fingerprint = 0);
   /// Owner setup only, before Ready. Entries are copied in caller rank order.
   bool configureGlobalLayout(const std::vector<EJitCompileRequest> &manifest,
                              const EJitLayoutBudgets &budgets,
@@ -965,6 +987,9 @@ public:
         return before;
     }
     return UINT64_MAX;
+  }
+  uint32_t globalLayoutGeneration() const {
+    return state_ ? state_->generation.loadAcquire() : 0;
   }
   EJitGlobalLayoutState globalLayoutState() const {
     return state_ ? static_cast<EJitGlobalLayoutState>(
@@ -1235,13 +1260,17 @@ private:
   bool isPublishedTier2(uint32_t funcIndex, void *fnPtr,
                         const EJitDimPair *dims, uint32_t numDims);
   SharedLookup cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
-                           uint32_t numDims);
+                           uint32_t numDims,
+                           const EJitBoundPtrDescriptor *bounds = nullptr,
+                           uint32_t boundCount = 0);
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
   /// Load-only seqlock cache lookup (no per-hit read-token RMW). Returned hits
   /// carry no read token (SharedLookup::noTokenHit). See the .cpp for the
   /// never-free safety precondition.
   SharedLookup cacheLookupSeq(uint32_t funcIndex, const EJitDimPair *dims,
-                              uint32_t numDims);
+                              uint32_t numDims,
+                              const EJitBoundPtrDescriptor *bounds = nullptr,
+                              uint32_t boundCount = 0);
   /// Fixed-dimension load-only seqlock specializations (0-2 dims). Same
   /// never-free seqlock discipline as cacheLookupSeq() but with the identity
   /// hashing, slot identity comparison, and version comparison unrolled exactly
@@ -1280,8 +1309,9 @@ private:
   /// pointer gets a clean readyButNotShareable fallback (lock released). The
   /// rare non-owner first-touch case is delegated to peerPrepareSlot(). Shared
   /// by cacheLookup() and all fixed-dimension specializations.
-  SharedLookup resolveMatchedSlot(EJitSharedCacheBucket &bucket,
-                                  uint32_t bucketIndex, uint32_t slotIndex);
+  SharedLookup resolveMatchedSlot(
+      EJitSharedCacheBucket &bucket, uint32_t bucketIndex, uint32_t slotIndex,
+      const EJitBoundPtrDescriptor *bounds = nullptr, uint32_t boundCount = 0);
   /// Submit Tier-2 from an identity/version-validated slot while its bucket
   /// read lock is held. This preserves the exact slot snapshot without
   /// enlarging the 16-byte CompileOrGetResult hot-path return value.
@@ -1403,6 +1433,7 @@ private:
     bool ready = false;
     bool published = false;
     bool samplingReleased = false;
+    bool versionCaptured = false;
   };
   std::vector<LayoutMember> layoutMembers_;
   std::vector<EJitCompileRequest> layoutDraining_;
@@ -1412,6 +1443,18 @@ private:
   DropArtifactCallback layoutDrop_ = nullptr;
   void *layoutCtx_ = nullptr;
   SamplingPreparedCallback layoutSampled_ = nullptr;
+  LayoutResetCallback layoutReset_ = nullptr;
+  std::vector<LayoutMember> layoutRefreshMembers_;
+  // Owner-private command publication: 0 idle,1 caller writing,2 requested.
+  EJitAtomicU32 layoutRefreshCommand_{};
+  uint64_t layoutRefreshFingerprint_ = 0;
+  uint32_t layoutRefreshPolls_ = 0;
+  uint32_t layoutPublishPolls_ = 0;
+  bool validateLayoutManifest(const std::vector<EJitCompileRequest> &manifest,
+                              const EJitLayoutBudgets &budgets,
+                              std::vector<LayoutMember> &members);
+  bool serviceGlobalLayoutRefresh();
+  bool captureLayoutVersions(LayoutMember &member, bool validateExplicit);
   uint32_t layoutPolls_ = 0;
   uint32_t layoutSamplingThreshold_ = 0;
   uint32_t layoutSamplingMax_ = 0;
@@ -1436,7 +1479,8 @@ private:
   /// completion and terminal worker failures call this; transient queue-full
   /// leaves ownership intact so the next hit can retry.
   void finishPgoFunction(uint32_t funcIndex, bool completed,
-                         const char *reason = nullptr);
+                         const char *reason = nullptr,
+                         uint32_t expectedGeneration = 0);
 
   /// Owner-only: snapshot the owner-core code-pool stats via the registered
   /// provider and storeRelaxed them into the shared mirror. Called after every
@@ -1489,6 +1533,17 @@ private:
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   IcacheFillMidpointHook icacheFillMidpointHook_ = nullptr;
   void *icacheFillMidpointCtx_ = nullptr;
+#endif
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+public:
+  void setSamplingLeaseHook(TestHookFn fn, void *ctx) {
+    samplingLeaseHook_ = fn;
+    samplingLeaseHookCtx_ = ctx;
+  }
+
+private:
+  TestHookFn samplingLeaseHook_ = nullptr;
+  void *samplingLeaseHookCtx_ = nullptr;
 #endif
   struct PendingPublish {
     EJitCompileRequest req{};

@@ -233,6 +233,24 @@ if(EJIT_TEST_FIXED_WORKER_CORE)
 endif()
 
 # Convenience target: build + run only the cross-core shared taskpool tests.
+set(EJIT_LAYOUT_LINK_SAVED "${LLVM_LINK_COMPONENTS}")
+set(LLVM_LINK_COMPONENTS Support)
+add_llvm_unittest(EJITLayoutNoReclaimTests
+  EJitGlobalLayoutStateTest.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitGlobalLayout.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
+  PARTIAL_SOURCES_INTENDED
+  )
+set(LLVM_LINK_COMPONENTS "${EJIT_LAYOUT_LINK_SAVED}")
+get_target_property(EJIT_LAYOUT_TEST_DEFS EJITSharedTaskPoolTests COMPILE_DEFINITIONS)
+target_compile_definitions(EJITLayoutNoReclaimTests PRIVATE
+  ${EJIT_LAYOUT_TEST_DEFS}
+  EJIT_SRE_TASKPOOL_NO_RECLAIM
+  EJIT_SRE_SHARED_CODE_POINTERS
+  )
+
 add_custom_target(check-ejit-shared-taskpool
   COMMAND $<TARGET_FILE:EJITSharedTaskPoolTests>
   DEPENDS EJITSharedTaskPoolTests

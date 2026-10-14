@@ -108,7 +108,7 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// v18: the old inline payload is replaced by a fixed table of borrowed
 /// raw bound-pointer descriptors; no pointee bytes or ownership cross the
 /// shared queue.
-constexpr uint32_t kEJitSharedAbiVersion = 19u;
+constexpr uint32_t kEJitSharedAbiVersion = 20u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

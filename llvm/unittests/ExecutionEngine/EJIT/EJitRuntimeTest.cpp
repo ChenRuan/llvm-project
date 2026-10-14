@@ -913,6 +913,8 @@ typedef struct {
 } ejit_function_body_cycles_test_t;
 extern ejit_status_test_t ejit_init(const void *config);
 extern void ejit_shutdown(void);
+extern ejit_status_test_t ejit_shutdown_checked(void);
+extern ejit_status_test_t ejit_refresh_global_layout(const void *, uint32_t);
 extern ejit_status_test_t ejit_activate(const char *, uint32_t);
 extern ejit_status_test_t ejit_deactivate(const char *, uint32_t);
 extern bool ejit_is_active(const char *, uint32_t);
@@ -6305,4 +6307,10 @@ TEST(EJitStructFieldPass,
     SCOPED_TRACE(static_cast<int>(Case));
     expectIR01BControl(Case);
   }
+}
+
+TEST(EJitCApiTaskpool, CheckedShutdownReturnsObservableCompletion) {
+  resetTaskpoolRegState();
+  EXPECT_EQ(ejit_shutdown_checked(), EJIT_OK_C);
+  EXPECT_EQ(static_cast<int>(ejit_refresh_global_layout(nullptr, 0)), -1);
 }

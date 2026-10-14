@@ -1274,7 +1274,8 @@ Error EJitOrcEngine::loadBitcodeModuleImpl(StringRef bitcodeData,
     if (!Object)
       return Object.takeError();
     // Charge container capacity and bookkeeping conservatively, not just
-    // executable bytes. Profile/IR compiler scratch is separately budgeted.
+    // executable bytes. Profile ownership is separately budgeted; LLVM compiler
+    // scratch is not a hard-bounded allocation domain.
     Prepared->ownedBytes = (*Object)->getBufferSize() + origFnName.size() +
                            sizeof(PreparedObject) + 1024 +
                            globalSymbols.size() * 256;
@@ -1299,7 +1300,8 @@ Error EJitOrcEngine::loadBitcodeModuleImpl(StringRef bitcodeData,
   // path (deferring removeJITDylib until after cachePublish succeeds)
   // would be needed for reclaimable memory managers (§5 JD lifecycle).
   auto it = P->specDylibs.find(cacheKey);
-  if (it != P->specDylibs.end()) {
+  if (it != P->specDylibs.end() &&
+      !(P->activeCtx && P->activeCtx->globalLayoutCompilation)) {
     if (auto Err = P->J->getExecutionSession().removeJITDylib(*it->second))
       EJIT_DIAG("loadBitcode key=0x%016lx: remove stale JD FAILED: %s",
                 cacheKey, toString(std::move(Err)).c_str());
@@ -1310,8 +1312,11 @@ Error EJitOrcEngine::loadBitcodeModuleImpl(StringRef bitcodeData,
       P->activeCtx && P->activeCtx->tier == CompileTier::Instrumented ? "t1"
       : P->activeCtx && P->activeCtx->tier == CompileTier::PGOUse     ? "t2"
                                                                       : "base";
-  auto JDOrErr = P->J->createJITDylib("spec_" + std::string(TierTag) + "_" +
-                                      std::to_string(cacheKey));
+  std::string Name =
+      "spec_" + std::string(TierTag) + "_" + std::to_string(cacheKey);
+  if (P->activeCtx && P->activeCtx->globalLayoutCompilation)
+    Name += "_layout_" + std::to_string(++P->layoutLinkSerial);
+  auto JDOrErr = P->J->createJITDylib(Name);
   if (!JDOrErr) {
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: create JITDylib error", cacheKey);
     return JDOrErr.takeError();

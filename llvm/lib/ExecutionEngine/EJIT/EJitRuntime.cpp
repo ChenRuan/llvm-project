@@ -357,21 +357,9 @@ static_assert(sizeof(ejit_config_t) ==
 static_assert(std::is_standard_layout<ejit_config_t>::value,
               "ejit_config_t must be standard-layout for a stable C ABI");
 
-// Shared init implementation for ejit_init / ejit_init_pgo. \p forcePgo forces
-// the online-PGO auto-trigger on regardless of the (unversioned) config.
-static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo,
-                                  const ejit_layout_target_t *targets = nullptr,
-                                  uint32_t count = 0) {
-  if (gEJIT) {
-    if (targets || count)
-      return EJIT_ERR_INVALID_PARAM; // A new manifest is never silently
-                                     // ignored.
-    EJIT_DIAG("already initialized, returning OK");
-    return EJIT_OK;
-  }
-
-  Config cfg;
-  parseConfig(config, cfg);
+static ejit_status_t
+copyGlobalLayoutTargets(Config &cfg, const ejit_layout_target_t *targets,
+                        uint32_t count) {
   if (targets || count) {
     if (!targets || count == 0 || count > cfg.globalLayoutBudgets.maxMembers)
       return EJIT_ERR_INVALID_PARAM;
@@ -387,6 +375,9 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo,
       EJitLayoutTarget Member;
       Member.entryName.assign(T.entryName, NameSize);
       Member.identity.numDims = T.numDims;
+      if (T.versionPolicy > 1)
+        return EJIT_ERR_INVALID_PARAM;
+      Member.identity.layoutVersionPolicy = T.versionPolicy;
       for (uint32_t D = 0; D < T.numDims; ++D) {
         Member.identity.dims[D] = {T.dims[D].dimType, T.dims[D].instanceId};
         Member.identity.versions[D] = T.versions[D];
@@ -401,6 +392,26 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo,
       cfg.globalLayout.push_back(std::move(Member));
     }
   }
+  return EJIT_OK;
+}
+
+// Shared init implementation for ejit_init / ejit_init_pgo. \p forcePgo forces
+// the online-PGO auto-trigger on regardless of the (unversioned) config.
+static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo,
+                                  const ejit_layout_target_t *targets = nullptr,
+                                  uint32_t count = 0) {
+  if (gEJIT) {
+    if (targets || count)
+      return EJIT_ERR_INVALID_PARAM; // A new manifest is never silently
+                                     // ignored.
+    EJIT_DIAG("already initialized, returning OK");
+    return EJIT_OK;
+  }
+
+  Config cfg;
+  parseConfig(config, cfg);
+  if (copyGlobalLayoutTargets(cfg, targets, count) != EJIT_OK)
+    return EJIT_ERR_INVALID_PARAM;
 #if defined(EJIT_SRE_SHARED_TASKPOOL) &&                                  \
     defined(EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE)
   // Fixed-worker deployments may skip EJIT constructors on producer cores.
@@ -473,8 +484,17 @@ ejit_status_t ejit_get_global_layout_status(ejit_global_layout_status_t *out) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (!gEJIT || !gEJIT->sharedTaskPool())
     return EJIT_ERR_NOT_ACTIVE;
+  auto *pool = gEJIT->sharedTaskPool();
+  uint32_t before = pool->globalLayoutGeneration();
   EJitSharedDiagnostics D{};
-  gEJIT->sharedTaskPool()->getDiagnostics(D);
+  pool->getDiagnostics(D);
+  uint32_t after = pool->globalLayoutGeneration();
+  if (before != after || D.generation != after ||
+      D.globalLayoutState != static_cast<uint32_t>(pool->globalLayoutState())) {
+    out->state = static_cast<uint32_t>(EJitGlobalLayoutState::Refreshing);
+    out->generation = after;
+    return EJIT_OK; // Never mix a COMPLETE flag with another generation's set.
+  }
   out->state = D.globalLayoutState;
   out->generation = D.generation;
   out->required = D.globalLayoutRequired;
@@ -490,6 +510,29 @@ ejit_status_t ejit_get_global_layout_status(ejit_global_layout_status_t *out) {
 #else
   return EJIT_ERR_NOT_ACTIVE;
 #endif
+}
+
+ejit_status_t ejit_refresh_global_layout(const ejit_layout_target_t *targets,
+                                         uint32_t count) {
+  if (!targets || !count)
+    return EJIT_ERR_INVALID_PARAM;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  Config cfg;
+  auto parsed = copyGlobalLayoutTargets(cfg, targets, count);
+  if (parsed != EJIT_OK)
+    return parsed;
+  return gEJIT->refreshGlobalLayout(cfg.globalLayout) ? EJIT_PENDING
+                                                      : EJIT_ERR_INVALID_PARAM;
+#else
+  return EJIT_ERR_NOT_ACTIVE;
+#endif
+}
+
+ejit_status_t ejit_shutdown_checked(void) {
+  ejit_shutdown();
+  return gEJIT ? EJIT_PENDING : EJIT_OK;
 }
 
 void ejit_shutdown(void) {

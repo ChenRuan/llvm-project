@@ -435,3 +435,17 @@ TEST_F(VpCollectorTest, ConcurrentProducersSnapshotStability) {
   EJitCoreId::resetForTest();
 }
 #endif // !EJIT_FREESTANDING
+
+TEST_F(VpCollectorTest,
+       GenerationResetRequiresDrainedWritersAndClearsBothHalves) {
+  ASSERT_TRUE(ejitVpEnsureInitialized());
+  ejitVpSetArmed(true);
+  ejit_vp_record_scalar(123, 0, 7);
+  gEJitVpState.shards[0].writers[0].storeRelaxed(1);
+  EXPECT_FALSE(ejitVpResetDrained());
+  gEJitVpState.shards[0].writers[0].storeRelaxed(0);
+  EXPECT_TRUE(ejitVpResetDrained());
+  std::vector<EJitVpSiteSample> samples;
+  ASSERT_TRUE(ejitVpTakeSnapshot(samples));
+  EXPECT_TRUE(samples.empty());
+}

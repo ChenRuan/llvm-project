@@ -231,8 +231,10 @@ TEST(EJitGlobalLayoutState, InvalidationDuringLinkCannotBecomeComplete) {
   H.request(0);
   H.request(1);
   H.pool.workerPollOnce();
-  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Failed);
+  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Refreshing);
   EXPECT_EQ(H.state->globalLayoutPublished.loadAcquire(), 1u);
+  H.pool.workerPollOnce();
+  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Collecting);
 }
 
 TEST(EJitGlobalLayoutState, StagedVersionInvalidationReleasesObjects) {
@@ -251,7 +253,9 @@ TEST(EJitGlobalLayoutState, StagedVersionInvalidationReleasesObjects) {
   EXPECT_EQ(H.prepared, 1u);
   H.pool.setInstanceEnabled(0, 0, false);
   H.pool.workerPollOnce();
-  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Failed);
+  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Refreshing);
+  H.pool.workerPollOnce();
+  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Collecting);
   EXPECT_EQ(H.dropped, 1u);
   EXPECT_EQ(H.linked, 0u);
 }
@@ -283,4 +287,130 @@ TEST(EJitGlobalLayoutState, FullCellTrpOrderIsExplicitNotDimensionMajor) {
     Previous = reinterpret_cast<uintptr_t>(Hit.fnPtr);
     H.pool.releaseRead(Hit.bucketIndex);
   }
+}
+
+TEST(EJitGlobalLayoutState, ExplicitStaleOrInactiveVersionsRejectImmediately) {
+  Harness H;
+  auto M = manifest({0});
+  M[0].numDims = 1;
+  M[0].dims[0] = {0, 0};
+  M[0].layoutVersionPolicy = 1;
+  EXPECT_FALSE(H.configure(M));
+  H.pool.setInstanceEnabled(0, 0, true);
+  EXPECT_FALSE(H.configure(M));
+  M[0].versions[0] = 1;
+  EXPECT_TRUE(H.configure(M));
+}
+
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+TEST(EJitGlobalLayoutState, PausedRejectedLeaseRetriesSameSealedBodies) {
+  Harness H;
+  H.pool.setPgoEnabled(true, 1, 4);
+  auto M = manifest({0});
+  M[0].funcIndex = encodeReqTier(0, kEJitTierPgoUse);
+  H.pool.setCompiler(
+      [](void *, const EJitCompileRequest &, void **out) {
+        *out = reinterpret_cast<void *>(0x900000);
+        return true;
+      },
+      nullptr);
+  ASSERT_TRUE(H.configure(M));
+  H.request(0);
+  auto sample = H.pool.compileOrGet(0, nullptr, 0, nullptr);
+  ASSERT_NE(sample.fnPtr, nullptr);
+  H.pool.releaseRead(sample.bucketIndex);
+  H.pool.workerPollOnce(); // emits owned object, still Collecting
+  ASSERT_EQ(H.state->globalLayoutReady.loadAcquire(), 1u);
+  H.pool.setSamplingLeaseHook(
+      [](void *p) {
+        auto &H = *static_cast<Harness *>(p);
+        H.pool.workerPollOnce(); // publishes against the paused acquisition
+        EXPECT_EQ(H.pool.globalLayoutState(),
+                  EJitGlobalLayoutState::Publishing);
+        EXPECT_EQ(H.state->globalLayoutPublished.loadAcquire(), 0u);
+      },
+      &H);
+  auto rejected = H.pool.compileOrGet(0, nullptr, 0, nullptr);
+  EXPECT_EQ(rejected.fnPtr, nullptr); // freeze never permits a genuine new T1
+  H.pool.setSamplingLeaseHook(nullptr, nullptr);
+  EXPECT_EQ(H.linked, 1u);
+  EXPECT_EQ(H.sealed, 1u);
+  H.pool.workerPollOnce();
+  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Complete);
+  EXPECT_EQ(H.linked, 1u);
+  EXPECT_EQ(H.sealed, 1u);
+}
+#endif
+
+TEST(EJitGlobalLayoutState, TerminalQueuedTier1ReleasesAdmission) {
+  Harness H;
+  H.pool.setPgoEnabled(true, 8, 4);
+  auto M = manifest({0});
+  M[0].funcIndex = encodeReqTier(0, kEJitTierPgoUse);
+  ASSERT_TRUE(H.configure(M));
+  H.pool.compileOrGet(0, nullptr, 0, nullptr);
+  ASSERT_EQ(H.state->pgoActiveFunctionCount.loadAcquire(), 1u);
+  H.pool.setPgoEnabled(false, 0, 4);
+  for (unsigned I = 0; I < 4; ++I)
+    H.pool.workerPollOnce();
+  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Failed);
+  EXPECT_EQ(H.state->pgoActiveFunctionCount.loadAcquire(), 0u);
+}
+
+TEST(EJitGlobalLayoutState, FailedBudgetNeedsNewEventOrExplicitRefresh) {
+  Harness H;
+  EJitLayoutBudgets B;
+  B.maxCollectionPolls = 2;
+  ASSERT_TRUE(H.configure(manifest({0}), B));
+  for (unsigned I = 0; I < 10; ++I)
+    H.pool.workerPollOnce();
+  ASSERT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Failed);
+  uint32_t gen = H.state->generation.loadAcquire();
+  for (unsigned I = 0; I < 10; ++I)
+    H.pool.workerPollOnce();
+  EXPECT_EQ(H.state->generation.loadAcquire(), gen);
+  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Failed);
+  ASSERT_TRUE(H.pool.requestGlobalLayoutRefresh(manifest({0})));
+  H.pool.workerPollOnce();
+  EXPECT_EQ(H.state->generation.loadAcquire(), gen + 1);
+  H.request(0);
+  H.pool.workerPollOnce();
+  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Complete);
+}
+
+TEST(EJitGlobalLayoutState, FailedLayoutStillServesUnaffectedLegalCachedHits) {
+  Harness H;
+  ASSERT_TRUE(H.configure(manifest({0})));
+  H.request(0);
+  H.pool.workerPollOnce();
+  ASSERT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Complete);
+  auto old = H.pool.compileOrGet(0, nullptr, 0, nullptr);
+  ASSERT_NE(old.fnPtr, nullptr);
+  H.pool.releaseRead(old.bucketIndex);
+  H.pool.setPgoEnabled(true, 8, 4); // Unsupported control change is diagnosed.
+  ASSERT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Failed);
+  auto legal = H.pool.compileOrGet(0, nullptr, 0, nullptr);
+  EXPECT_EQ(legal.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(legal.fnPtr, old.fnPtr);
+  H.pool.releaseRead(legal.bucketIndex);
+  auto miss =
+      H.pool.compileOrGet(1, nullptr, 0, reinterpret_cast<void *>(0x777));
+  EXPECT_EQ(miss.status, EJitCompileOrGetStatus::OffMode);
+  EXPECT_EQ(miss.fnPtr, reinterpret_cast<void *>(0x777));
+}
+
+TEST(EJitGlobalLayoutState, PeerInitSeedCannotChangeLiveOwnerSampling) {
+  Harness H;
+  ASSERT_TRUE(H.configure(manifest({0})));
+  EJitSharedTaskPool peer;
+  peer.bind(H.state.get());
+  peer.configurePgoForInit(true, 8);
+  EXPECT_EQ(H.state->pgoEnabled.loadAcquire(), 0u);
+  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Collecting);
+  auto M = manifest({0});
+  M[0].numDims = 1;
+  M[0].dims[0] = {0, 0};
+  M[0].layoutVersionPolicy = 1;
+  EXPECT_FALSE(peer.validateGlobalLayoutAttachment(M));
+  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Collecting);
 }

@@ -360,8 +360,10 @@ EJit::EJit(const Config &config) : config_(config) {
         // PGO and the default-off profile audit share the temporary
         // Instrumented-tier hit window. Audit-only mode publishes ordinary
         // Baseline code after collecting the window.
-        if (config_.enablePgo ||
-            (config_.enableProfileAudit && config_.globalLayout.empty())) {
+        // Complete layouts freeze sampling controls before worker startup in
+        // the compile driver. An attaching facade must not rewrite that owner.
+        if ((config_.enablePgo || config_.enableProfileAudit) &&
+            config_.globalLayout.empty()) {
           constexpr uint32_t kDefaultPgoThreshold = 64;
 #ifdef EJIT_SRE_SHARED_TASKPOOL
           compileDriver_->sharedTaskPool()->setPgoEnabled(
@@ -1056,3 +1058,9 @@ void EJit::printActive() const {
   EJIT_DIAG_RAW("active static vars: %zu (always active)",
                 reg.getStaticVars().size());
 }
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+bool EJit::refreshGlobalLayout(const std::vector<EJitLayoutTarget> &targets) {
+  return compileDriver_ && compileDriver_->refreshGlobalLayout(targets);
+}
+#endif

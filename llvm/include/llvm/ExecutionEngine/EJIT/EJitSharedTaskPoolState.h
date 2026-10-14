@@ -191,6 +191,8 @@ struct EJitSharedCacheSlot {
   EJitDimPair dims[4];   ///< identity
   uint32_t versions[4];  ///< per-instance version snapshot at publish
   uint64_t identityHash; ///< hash(funcIndex, dims) — fast reject before compare
+  uint32_t layoutBoundCount; // 0 legacy, otherwise complete bound count + 1
+  EJitBoundPtrDescriptor layoutBounds[kEJitMaxBoundPointers];
   EJitAtomicUPtr fnPtr;  ///< compiled function pointer (cross-core read gated)
   /// Bit N means core N has successfully installed execute permission for this
   /// code address. Core ids >= 64 are supported but cannot be memoized here,
@@ -425,6 +427,7 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   //    validated by every other core. Compared by value (endian-safe).
   uint32_t magic;
   uint32_t abiVersion;
+  EJitAtomicU8 globalLayoutBoundFunctions[kEJitSharedMaxFuncIndex];
   EJitAtomicU32 globalLayoutState;
   EJitAtomicU32 globalLayoutRequired;
   EJitAtomicU32 globalLayoutReady;

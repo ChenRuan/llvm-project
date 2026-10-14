@@ -425,3 +425,26 @@ void ejit::ejitVpSetLosslessMode(bool enabled) {
 bool ejit::ejitVpLosslessFailed() {
   return gEJitVpState.losslessFailed.loadAcquire() != 0;
 }
+
+bool ejit::ejitVpResetDrained() {
+  if (!ejitVpEnsureInitialized())
+    return false;
+  ejitVpSetArmed(false);
+  for (const auto &S : gEJitVpState.shards)
+    if (S.writers[0].loadAcquire() || S.writers[1].loadAcquire())
+      return false;
+  for (auto &S : gEJitVpState.shards)
+    for (auto &P : S.payload) {
+      P.updateBusy.storeRelaxed(0);
+      for (auto &Site : P.sites) {
+        Site.total.storeRelaxed(0);
+        for (auto &C : Site.cand) {
+          C.value.storeRelaxed(0);
+          C.count.storeRelaxed(0);
+        }
+        Site.siteKey.storeRelease(0);
+      }
+    }
+  gEJitVpState.losslessFailed.storeRelease(0);
+  return true;
+}

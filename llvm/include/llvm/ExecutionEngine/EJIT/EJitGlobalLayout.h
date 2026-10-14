@@ -14,7 +14,9 @@
 
 namespace llvm::ejit {
 /// Each element's array position is its authoritative physical-body rank.
-/// Dimensions must be canonical; versions and bound identities are explicit.
+/// Dimensions/bounds are exact. Version policy0 captures live admission
+/// versions; policy1 asserts an explicit active snapshot (see
+/// EJitCompileRequest).
 struct EJitLayoutTarget {
   std::string entryName;
   EJitCompileRequest identity{};
@@ -38,7 +40,8 @@ enum class EJitGlobalLayoutState : uint32_t {
   Publishing,
   Complete,
   Failed,
-  Cancelled
+  Cancelled,
+  Refreshing
 };
 
 enum class EJitGlobalLayoutError : uint32_t {

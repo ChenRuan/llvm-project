@@ -54,25 +54,12 @@ EJitCompileRequest slotRequest(const EJitSharedCacheSlot &S) {
 }
 } // namespace
 
-bool EJitSharedTaskPool::configureGlobalLayout(
+bool EJitSharedTaskPool::validateLayoutManifest(
     const std::vector<EJitCompileRequest> &manifest,
-    const EJitLayoutBudgets &budgets, PrepareArtifactCallback prepare,
-    LinkArtifactCallback link, DropArtifactCallback drop, void *ctx,
-    SamplingPreparedCallback sampled) {
-  if (!state_ || manifest.empty() || !prepare || !link || !drop ||
-      layoutConfigured_ ||
-      kEJitSharedCacheBuckets * kEJitSharedCacheSlots >= 0x8000u ||
-      budgets.maxMembers == 0 || manifest.size() > budgets.maxMembers ||
-      manifest.size() > kEJitSharedQueueSlots ||
-      budgets.maxCollectionPolls == 0 || budgets.maxArtifactBytes == 0)
+    const EJitLayoutBudgets &budgets, std::vector<LayoutMember> &members) {
+  if (manifest.empty() || manifest.size() > budgets.maxMembers ||
+      manifest.size() > kEJitSharedQueueSlots)
     return false;
-  const auto Init =
-      static_cast<EJitSharedInitState>(state_->initState.loadAcquire());
-  if (Init != EJitSharedInitState::Initializing &&
-      !(Init == EJitSharedInitState::Ready &&
-        state_->workerTaskId.loadAcquire() == 0))
-    return false;
-  std::vector<LayoutMember> members;
   std::vector<uint32_t> occupancy(kEJitSharedCacheBuckets, 0);
   for (size_t I = 0; I < manifest.size(); ++I) {
     EJitCompileRequest R = manifest[I];
@@ -110,6 +97,13 @@ bool EJitSharedTaskPool::configureGlobalLayout(
       return false;
     LayoutMember M;
     M.req = R;
+    if (R.layoutVersionPolicy > 1) {
+      EJIT_DIAG("global layout invalid version policy rank=%zu policy=%u", I,
+                R.layoutVersionPolicy);
+      return false;
+    }
+    if (!captureLayoutVersions(M, true))
+      return false;
     members.push_back(M);
     EJIT_DIAG("global layout manifest rank=%zu func=%u dims=%u tier=%u", I,
               stripReqTier(R.funcIndex), R.numDims, tier);
@@ -123,6 +117,167 @@ bool EJitSharedTaskPool::configureGlobalLayout(
           R.boundPointers[B].argIndex, R.boundPointers[B].rawPtr,
           R.boundPointers[B].size);
   }
+  return true;
+}
+
+bool EJitSharedTaskPool::captureLayoutVersions(LayoutMember &M,
+                                               bool validateExplicit) {
+  bool active = true;
+  for (uint32_t D = 0; D < M.req.numDims; ++D) {
+    auto P = M.req.dims[D];
+    uint32_t current = instanceVersion(P.dimType, P.instanceId);
+    bool enabled = isInstanceEnabled(P.dimType, P.instanceId);
+    if (M.req.layoutVersionPolicy == 1 && validateExplicit &&
+        (!enabled || M.req.versions[D] != current)) {
+      EJIT_DIAG("global layout explicit version rejected func=%u dim=%u "
+                "instance=%u expected=%u live=%u enabled=%u",
+                stripReqTier(M.req.funcIndex), P.dimType, P.instanceId,
+                M.req.versions[D], current, static_cast<unsigned>(enabled));
+      return false;
+    }
+    active &= enabled;
+    M.req.versions[D] = current;
+  }
+  M.versionCaptured = active;
+  return true;
+}
+
+bool EJitSharedTaskPool::requestGlobalLayoutRefresh(
+    const std::vector<EJitCompileRequest> &manifest, uint64_t fingerprint) {
+  if (!state_ || !isOwner_ || !layoutConfigured_ ||
+      state_->initState.loadAcquire() !=
+          static_cast<uint32_t>(EJitSharedInitState::Ready))
+    return false;
+  uint32_t expected = 0;
+  if (!layoutRefreshCommand_.compareExchange(expected, 1))
+    return false;
+  std::vector<LayoutMember> members;
+  if (!validateLayoutManifest(manifest, layoutBudgets_, members)) {
+    layoutRefreshCommand_.storeRelease(0);
+    return false; // An invalid replacement never invalidates the legal layout.
+  }
+  layoutRefreshMembers_ = std::move(members);
+  layoutRefreshFingerprint_ = fingerprint;
+  layoutRefreshCommand_.storeRelease(2);
+  return true;
+}
+
+bool EJitSharedTaskPool::serviceGlobalLayoutRefresh() {
+  if (layoutRefreshCommand_.loadAcquire() == 2 &&
+      globalLayoutState() != EJitGlobalLayoutState::Refreshing) {
+    layoutRefreshPolls_ = 0;
+    state_->globalLayoutState.storeRelease(
+        static_cast<uint32_t>(EJitGlobalLayoutState::Refreshing));
+  }
+  if (globalLayoutState() != EJitGlobalLayoutState::Refreshing)
+    return false;
+  for (const auto &B : state_->buckets)
+    for (const auto &S : B.slots)
+      if (S.samplingExecutions.loadAcquire() != 0) {
+        if (++layoutRefreshPolls_ > layoutBudgets_.maxCollectionPolls) {
+          if (layoutRefreshCommand_.loadAcquire() == 2) {
+            layoutRefreshMembers_.clear();
+            layoutRefreshCommand_.storeRelease(0);
+          }
+          failGlobalLayout(EJitGlobalLayoutError::Cancelled, 0);
+        }
+        return true; // Nonblocking; no profile reset or slot reuse before
+                     // leaves.
+      }
+  clearGlobalArtifacts();
+  pendingPublishes_.clear();
+  layoutDraining_.clear();
+  // Drain old requests before the epoch changes. No new misses are admitted in
+  // Refreshing; late producers retain the old generation and are dropped later.
+  EJitCompileRequest old{};
+  while (queuePop(old))
+    dedupClear(old.funcIndex, old.generation);
+  if (layoutReset_ && !layoutReset_(layoutCtx_)) {
+    failGlobalLayout(EJitGlobalLayoutError::Preparation, 0);
+    return true;
+  }
+  uint32_t expected = 0;
+  while (!state_->pgoAdmissionLock.compareExchange(expected, 1))
+    expected = 0;
+  for (auto &F : state_->pgoActiveFunctions)
+    F.storeRelaxed(0);
+  for (auto &Q : state_->pgoProgressQuarters)
+    Q.storeRelaxed(0);
+  state_->pgoActiveFunctionCount.storeRelaxed(0);
+  state_->pgoCompletedFunctions.storeRelaxed(0);
+  const uint32_t previousGeneration = state_->generation.fetchAdd(1);
+  state_->pgoAdmissionLock.storeRelease(0);
+  for (uint32_t F = 0; F < kEJitSharedMaxFuncIndex; ++F)
+    dedupClear(F, previousGeneration);
+  const bool replacement = layoutRefreshCommand_.loadAcquire() == 2;
+  if (replacement)
+    layoutMembers_ = std::move(layoutRefreshMembers_);
+  const uint32_t generation = previousGeneration + 1;
+  for (auto &M : layoutMembers_) {
+    auto req = M.req;
+    // Explicit descriptors assert the requested admission snapshot, not an
+    // instruction to keep executing a stale version after lifecycle turnover.
+    if (!replacement)
+      req.layoutVersionPolicy = 0;
+    M = LayoutMember{};
+    M.req = req;
+    M.req.generation = generation;
+    if (!captureLayoutVersions(M, replacement)) {
+      failGlobalLayout(EJitGlobalLayoutError::Manifest,
+                       &M - layoutMembers_.data());
+      layoutRefreshCommand_.storeRelease(0);
+      return true;
+    }
+  }
+  state_->dispatchEpoch.fetchAdd(1);
+  icacheDrainAll("global-layout-refresh");
+  layoutPolls_ = layoutRefreshPolls_ = layoutPublishPolls_ = 0;
+  layoutFailureRecorded_ = false;
+  state_->globalLayoutRequired.storeRelaxed(layoutMembers_.size());
+  state_->globalLayoutReady.storeRelaxed(0);
+  state_->globalLayoutPublished.storeRelaxed(0);
+  state_->globalLayoutError.storeRelaxed(0);
+  state_->globalLayoutErrorRank.storeRelaxed(0);
+  if (replacement) {
+    if (layoutRefreshFingerprint_) {
+      regFingerprint_ = layoutRefreshFingerprint_;
+      state_->registrationFingerprint.storeRelease(regFingerprint_);
+    }
+    layoutRefreshCommand_.storeRelease(0);
+  }
+  state_->globalLayoutState.storeRelease(
+      static_cast<uint32_t>(EJitGlobalLayoutState::Collecting));
+  EJIT_DIAG("global layout refreshed in-process gen=%u members=%zu; retired "
+            "pools retained",
+            generation, layoutMembers_.size());
+  return true;
+}
+
+bool EJitSharedTaskPool::configureGlobalLayout(
+    const std::vector<EJitCompileRequest> &manifest,
+    const EJitLayoutBudgets &budgets, PrepareArtifactCallback prepare,
+    LinkArtifactCallback link, DropArtifactCallback drop, void *ctx,
+    SamplingPreparedCallback sampled) {
+  if (!state_ || manifest.empty() || !prepare || !link || !drop ||
+      layoutConfigured_ ||
+      kEJitSharedCacheBuckets * kEJitSharedCacheSlots >= 0x8000u ||
+      budgets.maxMembers == 0 || manifest.size() > budgets.maxMembers ||
+      manifest.size() > kEJitSharedQueueSlots ||
+      budgets.maxCollectionPolls == 0 || budgets.maxArtifactBytes == 0)
+    return false;
+  const auto Init =
+      static_cast<EJitSharedInitState>(state_->initState.loadAcquire());
+  if (Init != EJitSharedInitState::Initializing &&
+      !(Init == EJitSharedInitState::Ready &&
+        state_->workerTaskId.loadAcquire() == 0))
+    return false;
+  std::vector<LayoutMember> members;
+  if (!validateLayoutManifest(manifest, budgets, members))
+    return false;
+  for (const auto &M : members)
+    if (M.req.boundCount)
+      state_->globalLayoutBoundFunctions[stripReqTier(M.req.funcIndex)]
+          .storeRelease(1);
   layoutMembers_ = std::move(members);
   layoutBudgets_ = budgets;
   layoutPrepare_ = prepare;
@@ -193,12 +348,21 @@ void EJitSharedTaskPool::clearGlobalArtifacts() {
 
 void EJitSharedTaskPool::invalidateMaterializedLayout(bool includeCollection) {
   uint32_t phase = state_->globalLayoutState.loadAcquire();
+  if (!includeCollection &&
+      phase == static_cast<uint32_t>(EJitGlobalLayoutState::Failed)) {
+    state_->globalLayoutState.compareExchange(
+        phase, static_cast<uint32_t>(EJitGlobalLayoutState::Refreshing));
+    return;
+  }
   while (phase >= static_cast<uint32_t>(includeCollection
                                             ? EJitGlobalLayoutState::Collecting
                                             : EJitGlobalLayoutState::Linking) &&
          phase <= static_cast<uint32_t>(EJitGlobalLayoutState::Complete)) {
     if (state_->globalLayoutState.compareExchange(
-            phase, static_cast<uint32_t>(EJitGlobalLayoutState::Failed))) {
+            phase,
+            static_cast<uint32_t>(includeCollection
+                                      ? EJitGlobalLayoutState::Failed
+                                      : EJitGlobalLayoutState::Refreshing))) {
       state_->globalLayoutError.storeRelease(
           static_cast<uint32_t>(EJitGlobalLayoutError::StaleIdentity));
       return;
@@ -208,9 +372,23 @@ void EJitSharedTaskPool::invalidateMaterializedLayout(bool includeCollection) {
 
 void EJitSharedTaskPool::failGlobalLayout(EJitGlobalLayoutError error,
                                           uint32_t rank) {
+  if (globalLayoutState() == EJitGlobalLayoutState::Refreshing &&
+      error == EJitGlobalLayoutError::StaleIdentity)
+    return; // Worker will retire this attempt and rebuild the full generation.
   if (globalLayoutState() == EJitGlobalLayoutState::Failed &&
       layoutFailureRecorded_)
     return;
+  bool lifecycleChanged = false;
+  for (const auto &M : layoutMembers_)
+    lifecycleChanged |= M.versionCaptured && !versionsCurrent(M.req);
+  if (error == EJitGlobalLayoutError::StaleIdentity && lifecycleChanged &&
+      state_->mode.loadAcquire() ==
+          static_cast<uint32_t>(EJitCompileMode::Async)) {
+    state_->globalLayoutState.storeRelease(
+        static_cast<uint32_t>(EJitGlobalLayoutState::Refreshing));
+    layoutRefreshPolls_ = 0;
+    return;
+  }
   layoutFailureRecorded_ = true;
   state_->globalLayoutError.storeRelaxed(static_cast<uint32_t>(error));
   state_->globalLayoutErrorRank.storeRelaxed(rank);
@@ -229,6 +407,14 @@ void EJitSharedTaskPool::failGlobalLayout(EJitGlobalLayoutError error,
     EJIT_DIAG("global layout failure member rank=%zu published=%u body=%p", I,
               static_cast<unsigned>(layoutMembers_[I].published),
               layoutMembers_[I].fn);
+  for (const auto &P : pendingPublishes_) {
+    if (publishFn_)
+      publishFn_(publishCtx_, P.req, false);
+    finishPgoFunction(stripReqTier(P.req.funcIndex), false,
+                      "layout-pending-t1-abort");
+    dedupClear(P.req.funcIndex, P.req.generation);
+  }
+  pendingPublishes_.clear();
   // Objects are not executable. Linked/published NO_RECLAIM bytes remain
   // charged to their pools and are NEVER freed or overwritten here.
   clearGlobalArtifacts();
@@ -295,6 +481,41 @@ bool EJitSharedTaskPool::stageGlobalArtifact(const EJitCompileRequest &R) {
 bool EJitSharedTaskPool::serviceGlobalLayout() {
   if (!layoutConfigured_)
     return false;
+  if (serviceGlobalLayoutRefresh())
+    return true;
+  if (globalLayoutState() == EJitGlobalLayoutState::Collecting &&
+      !pendingPublishes_.empty()) {
+    auto P = pendingPublishes_.front();
+    if (P.req.generation != state_->generation.loadAcquire() ||
+        !versionsCurrent(P.req)) {
+      failGlobalLayout(EJitGlobalLayoutError::StaleIdentity,
+                       globalMemberFor(P.req));
+      return true;
+    }
+    EJitCompiledCodeInfo info{};
+    if (!codeRangeFn_ || !codeRangeFn_(codeRangeCtx_, P.fn, &info)) {
+      failGlobalLayout(EJitGlobalLayoutError::Range, globalMemberFor(P.req));
+      return true;
+    }
+    auto result = cachePublish(P.req, P.fn, &info, false);
+    if (result == EJitPublishStatus::Retry) {
+      if (++layoutPublishPolls_ > layoutBudgets_.maxCollectionPolls)
+        failGlobalLayout(EJitGlobalLayoutError::Publish,
+                         globalMemberFor(P.req));
+      return false; // Other queue/control work may continue while this retries.
+    }
+    if (result != EJitPublishStatus::Published) {
+      failGlobalLayout(EJitGlobalLayoutError::Publish, globalMemberFor(P.req));
+      return true;
+    }
+    if (publishFn_)
+      publishFn_(publishCtx_, P.req, true);
+    dedupClear(P.req.funcIndex, P.req.generation);
+    EJIT_STAT_INC(state_->counters.tier1Compiles);
+    EJIT_STAT_INC(state_->counters.asyncCompiles);
+    pendingPublishes_.erase(pendingPublishes_.begin());
+    return true;
+  }
   if (globalLayoutState() == EJitGlobalLayoutState::Failed) {
     if (!layoutFailureRecorded_)
       failGlobalLayout(EJitGlobalLayoutError::StaleIdentity, 0);
@@ -324,6 +545,18 @@ bool EJitSharedTaskPool::serviceGlobalLayout() {
       }
     }
     return false;
+  }
+  // Capture live versions on the first active admission, not cold init's zero.
+  // A later turnover rebuilds ALL members, including unchanged required roots.
+  for (auto &M : layoutMembers_) {
+    if (!M.versionCaptured) {
+      captureLayoutVersions(M, false);
+    } else if (!versionsCurrent(M.req)) {
+      layoutRefreshPolls_ = 0;
+      state_->globalLayoutState.storeRelease(
+          static_cast<uint32_t>(EJitGlobalLayoutState::Refreshing));
+      return true;
+    }
   }
   bool ExpectedPgo =
       decodeReqTier(layoutMembers_.front().req.funcIndex) == kEJitTierPgoUse;
@@ -452,6 +685,11 @@ bool EJitSharedTaskPool::serviceGlobalLayout() {
       }
       auto PS = cachePublish(M.req, M.fn, &M.range,
                              decodeReqTier(M.req.funcIndex) == kEJitTierPgoUse);
+      if (PS == EJitPublishStatus::Retry) {
+        if (++layoutPublishPolls_ > layoutBudgets_.maxCollectionPolls)
+          failGlobalLayout(EJitGlobalLayoutError::Publish, I);
+        return true; // Linked/sealed addresses and published subset stay owned.
+      }
       if (PS != EJitPublishStatus::Published) {
         failGlobalLayout(PS == EJitPublishStatus::VersionMismatch
                              ? EJitGlobalLayoutError::StaleIdentity
@@ -486,4 +724,17 @@ bool EJitSharedTaskPool::serviceGlobalLayout() {
     return true;
   }
   return false;
+}
+
+bool EJitSharedTaskPool::validateGlobalLayoutAttachment(
+    const std::vector<EJitCompileRequest> &manifest) {
+  if (!state_ || state_->initState.loadAcquire() !=
+                     static_cast<uint32_t>(EJitSharedInitState::Ready))
+    return true; // Initial owner validates after field initialization.
+  if (globalLayoutState() == EJitGlobalLayoutState::Disabled ||
+      globalLayoutState() == EJitGlobalLayoutState::Refreshing)
+    return false;
+  std::vector<LayoutMember> members;
+  EJitLayoutBudgets limits;
+  return validateLayoutManifest(manifest, limits, members);
 }

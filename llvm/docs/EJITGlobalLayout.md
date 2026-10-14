@@ -24,8 +24,9 @@ V1 provides sequential safe publication after ALL bodies have linked, passed
 actual address/range validation and sealed. It does not promise all-entry atomic
 visibility. Mixed still-valid old/new dispatch is permitted during cutover.
 Partial failure retains published resources, reports published/unpublished ranks
-and remains FAILED, never COMPLETE. Recovery is a new explicit generation after
-the existing lifecycle permits shutdown; no invalid identity is silently retried.
+and remains FAILED, never COMPLETE. A new explicit refresh command or actual
+lifecycle event can start a complete in-process generation; invalid identities
+are never reused or retried as an unordered subset.
 
 ## Manifest and Identity
 
@@ -145,7 +146,7 @@ remain, retaining its runtime for a later retry. Direct C++ destruction with an
 unreturned T1 retains one compiler and leaves the shared domain Stopping: this
 conservative terminal retention is preferable to UAF, not a successful shutdown.
 Platform obligations for stable NO_RECLAIM code/registered data remain unchanged.
-Shared ABI is 19 and VP ABI is 3: rebuild every participating image together.
+Shared ABI is 20 and VP ABI is 3: rebuild every participating image together.
 
 ## Verification Boundaries
 
@@ -164,3 +165,85 @@ SDK/BE final DLIB linking and QA12 cold core6/core16 board execution are pending
 QA13 overhead/latency/I-cache/iTLB/business-cycle measurements remain pending.
 No layout speedup, board readiness or issue closure is claimed. Raw commands,
 flags, counts and retained failure logs are recorded in the task support RESULT.
+
+## In-Process Generation Refresh (Review Follow-Up)
+
+Normal lifecycle turnover is not terminal until process restart. The owner worker
+enters REFRESHING (status9), closes T1 dispatch, nonblockingly waits for true
+returns, drops only unexecuted objects/obsolete queued work, and resets complete
+old profiling ownership AFTER drain. Both VP payload halves are cleared under the
+same drained-writer contract; per-wave snapshots remain preserved within a
+generation. The compiler, old JITDylibs, data/code allocations and reservation
+ledgers remain alive. Advancing the shared generation invalidates old dispatch
+slots/late requests; legal AOT remains available while the entire new manifest is
+prepared and linked again. The owner/worker is not restarted or reelected.
+
+The default declaration version policy0 ignores supplied version numbers and
+captures live versions at first active admission, so cold init followed by
+activate works without hardcoded1. A member with inactive dimensions remains
+required, not silently removed. Policy1 explicitly asserts all dimensions are
+active and match the supplied versions NOW; inactive, malformed or stale inputs
+reject the whole initialization/replacement immediately with function/dimension/
+instance/expected/live diagnostics. A later real turnover creates new live
+identities, rather than treating an old assertion as permission to execute stale
+code. Caller rank and full binding identity are retained across automatic rebuilds.
+
+`ejit_refresh_global_layout` / `EJitCompileDriver::refreshGlobalLayout` copies a
+complete owner-side replacement manifest and returns PENDING/accepted. It can
+change explicit rank, instance expansion and bindings within the frozen registered
+catalog. Invalid input leaves the current legal layout installed. The worker
+publishes a matching new registration fingerprint; attaching during REFRESHING
+is deferred. Opt-level/triple/mode/budgets and the registered source catalog are
+initialization settings, not silently changed by a manifest refresh. Their
+existing quiescent reinitialization path remains available; global-to-global
+owner generations retain the same retirement ledgers, not a process-only reset.
+
+Published slots carry complete opaque bound identity, compared under existing
+lookup validation without a manifest scan or private data copy. Bound roots do
+not use descriptor-blind L0/inline shortcuts. This prevents a replaced binding
+from serving a body compiled with another binding's facts. Keep bound backing
+alive through its real compile/execution consumers, including prior generations.
+
+A transient sampled-slot lease returns Retry, not Failed. The worker retains
+linked/sealed addresses and the published subset, checks identity again, and
+retries boundedly without recompiling, reallocating or resealing. T1 publication
+uses the same retention rule during a refresh. Real T1 execution is closed once
+collection freezes; a preempted acquisition that later rejects cannot execute T1.
+Retry and refresh-drain budgets use maxCollectionPolls; exhaustion stays terminal
+until a NEW lifecycle event or explicit command, never a self-renewing budget.
+
+Audit-only requests are honored, not silently disabled. They use real temporary
+sampling and the same drained admission/object path; the final optimizer runs
+ordinary Baseline, not PGOUse guidance. Its served slot uses the existing terminal
+T2 marker to prevent resampling. Ordinary PGO branch audit and VP remain compiled
+ON and tested separately. `ejit_shutdown_checked` reports PENDING for deferred
+shutdown; the existing void API remains compatible. A retained C++ compiler keeps
+the domain Stopping, so new owners cannot accumulate while that lease is live.
+
+Native regressions include three complete real cell/TRP+bound generations,
+automatic turnover, explicit reverse-rank/binding replacement, first activation
+with zero-initialized versions, explicit-stale rejection, real T1 refresh drain,
+bounded terminal recovery, and paused lookup/publish retry in NO_RECLAIM builds.
+These do not establish SDK/board/performance acceptance. The hot result remains
+16 bytes on tested LE/BE compilation; packed flag masks have no measured target
+cycle guarantee. Shared queue requests are now208 bytes on64-bit (168 on32-bit),
+so ABI20 requires all participating images and queue users rebuilt together.
+
+Native ABI probes of the actual published/current headers (32 buckets,16 slots,
+1024 queue entries) report a16-byte lookup result in both builds. Queue requests
+grow200->208 bytes, cache slots224->360, and the shared state358080->440000 bytes
+(+81920 bytes/80 KiB). This is real compatibility/space cost, not a speedup claim.
+Audit-only fixture coverage has zero new ICP observations; ordinary PGO preserves
+160 and the unmodified64-hit cold configuration preserves1280 across20 roots.
+Owner control commands and shutdown must be serialized with the existing runtime
+object lifetime; the compiler worker processes accepted refreshes concurrently.
+Owner shutdown still uses its existing bounded synchronous yield loop; checked
+shutdown adds observability, not a hard-real-time return guarantee. LLVM compiler
+scratch and externally owned input/backing memory are not hard-capped by staged
+object-byte limits. Retained pools, staged owned objects/profiles, and member
+counts remain bounded as described; target peak memory is still a QA13 gate.
+
+NO_RECLAIM is still intentional: repeated successful refreshes consume retained
+Near/Far capacity. They are not an unlimited-cycle reclamation promise. Once
+those bounded reserves exhaust, the generation fails with legal fallback;
+safe region reclamation requires a separate lifetime/platform contract.

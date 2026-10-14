@@ -103,6 +103,12 @@ public:
   /// owner, start the ONE shared worker. Returns false on a clean init failure
   /// (owner worker-start failed / ABI mismatch). Idempotent across instances.
   bool startSharedTaskPool();
+  uint64_t
+  globalLayoutFingerprint(const std::vector<EJitLayoutTarget> &targets);
+  bool buildGlobalLayoutManifest(const std::vector<EJitLayoutTarget> &targets,
+                                 std::vector<EJitCompileRequest> &manifest);
+  bool refreshGlobalLayout(const std::vector<EJitLayoutTarget> &targets);
+  bool resetGlobalLayoutProfiles();
 
   /// Owner-only orderly shutdown of the shared worker (soft-stop + join).
   void stopSharedTaskPool() { sharedPool_.ownerShutdown(); }
