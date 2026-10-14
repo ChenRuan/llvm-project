@@ -213,6 +213,11 @@ aarch64_be-none-elf. The consumer link is relocatable, not a final SDK package.
 
 ## Board procedure (not executed)
 
+The hardened PR247 single-C artifact and current build/startup/acceptance
+instructions are in [EJIT_LOCAL_FREE_DIM_BOARD.md](EJIT_LOCAL_FREE_DIM_BOARD.md).
+That guide supersedes the abbreviated procedure below, including shared startup
+gating, bounded real PGO dispatches, quiescent renewal and read-only printing.
+
 1. Build the single-C SRE demo into the established EJIT package without new
    SDK macros or initialization APIs; retain branch audit/required diagnostics.
 2. Reset. Run `test_ejit_period` on core6 first; it initializes the shared
