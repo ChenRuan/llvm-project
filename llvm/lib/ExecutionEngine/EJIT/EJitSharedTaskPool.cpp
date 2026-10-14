@@ -3081,8 +3081,6 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
         cpuRelax();
       break;
     case EJitSharedInitState::Ready:
-      if (globalLayoutState() == EJitGlobalLayoutState::Refreshing)
-        return InitResult::InitInProgress;
       if (state_->magic != kEJitSharedAbiMagic ||
           state_->abiVersion != kEJitSharedAbiVersion ||
           state_->structSize != sizeof(EJitSharedTaskPoolState)) {
@@ -3092,6 +3090,9 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
                   sizeof(EJitSharedTaskPoolState));
         return InitResult::AbiMismatch;
       }
+      // Layout fields are meaningful only after validating the shared ABI.
+      if (globalLayoutState() == EJitGlobalLayoutState::Refreshing)
+        return InitResult::InitInProgress;
       // Registration consistency: a peer whose funcIndex/dimType mapping digest
       // differs from the owner's must NOT submit requests against mismatched
       // indices. Clean-fail instead (the owner itself re-observes its own

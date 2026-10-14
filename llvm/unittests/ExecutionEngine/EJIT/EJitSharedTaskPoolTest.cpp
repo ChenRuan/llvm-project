@@ -1957,6 +1957,41 @@ TEST_F(SharedTaskPoolTest, AbiMismatchRefused) {
   EXPECT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AbiMismatch);
 }
 
+TEST_F(SharedTaskPoolTest, RefreshingDoesNotMaskAbiVersionMismatch) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  state_->abiVersion = kEJitSharedAbiVersion + 1;
+  state_->globalLayoutState.storeRelease(
+      static_cast<uint32_t>(EJitGlobalLayoutState::Refreshing));
+  EJitSharedTaskPool peer;
+  peer.bind(state_.get());
+  EJitCoreId::setCurrentForTest(1);
+  EXPECT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AbiMismatch);
+}
+
+TEST_F(SharedTaskPoolTest, RefreshingDoesNotMaskStructSizeMismatch) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  state_->structSize = sizeof(EJitSharedTaskPoolState) - 1;
+  state_->globalLayoutState.storeRelease(
+      static_cast<uint32_t>(EJitGlobalLayoutState::Refreshing));
+  EJitSharedTaskPool peer;
+  peer.bind(state_.get());
+  EJitCoreId::setCurrentForTest(1);
+  EXPECT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AbiMismatch);
+}
+
+TEST_F(SharedTaskPoolTest, MatchingAbiRefreshingRemainsInProgress) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  state_->globalLayoutState.storeRelease(
+      static_cast<uint32_t>(EJitGlobalLayoutState::Refreshing));
+  EJitSharedTaskPool peer;
+  peer.bind(state_.get());
+  EJitCoreId::setCurrentForTest(1);
+  EXPECT_EQ(peer.init(), EJitSharedTaskPool::InitResult::InitInProgress);
+}
+
 //===----------------------------------------------------------------------===//
 // Instance-disabled producers fall back and never enqueue.
 //===----------------------------------------------------------------------===//
