@@ -1,193 +1,331 @@
-// Cold board flow: core 6 test_ejit_period initializes the single worker;
-// core 16 test_ejit_period runs the bounded workload. Do not shutdown between
-// shell calls. Use the existing SDK registry/init-array and shared-code setup.
-// Build the runtime with worker core 6, four PGO admissions, audit/diagnostics
-// ON. a==0 selects Baseline, a!=0 selects real online PGO; use the same value
-// on both cores after a fresh reset. This is a demo fixture, NOT board
-// evidence.
-#include "ejit_test_helpers.h"
-#include <stdint.h>
+// Standalone PR248 board smoke. Build with this revision's EJIT Clang/header.
+// Fresh isolated image: core6 test_ejit_period, core16 test_ejit_period,
+// core6 test_ejit_global_layout_print. All shell arguments are ignored.
+#if !__has_attribute(ejit_entry)
+#error "Use the matching EJIT Clang; ignoring unknown attributes is not valid"
+#endif
+#ifdef EJIT_DISABLE
+#error "This smoke requires real EJIT annotations and generated wrappers"
+#endif
+#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+#ifndef LAYOUT_SHARED
+#define LAYOUT_SHARED __attribute__((section(".mc_shared")))
+#endif
+#ifndef LAYOUT_RUN_INIT_ARRAY
+#define LAYOUT_RUN_INIT_ARRAY 1
+#endif
+#ifndef LAYOUT_WAIT_ROUNDS
+#define LAYOUT_WAIT_ROUNDS 30000u
+#endif
+#ifndef LAYOUT_DUMP_IR
+#define LAYOUT_DUMP_IR 1
+#endif
 
 extern void SRE_printf(const char *, ...);
 extern uint32_t SRE_TaskDelay(uint32_t);
 extern void call_init_array_functions(void);
 extern uint8_t g_ucLocalCoreID;
 
-static __attribute__((noinline)) uint32_t layout_business(uint32_t input,
+// EJitRuntime.h exposes layout states as uint32_t with a documented 0..9 ABI.
+// These local names mirror that public contract, not private C++ structures.
+enum {
+  LAYOUT_DISABLED,
+  LAYOUT_COLLECTING,
+  LAYOUT_LINKING,
+  LAYOUT_LINKED,
+  LAYOUT_SEALING,
+  LAYOUT_PUBLISHING,
+  LAYOUT_COMPLETE,
+  LAYOUT_FAILED,
+  LAYOUT_CANCELLED,
+  LAYOUT_REFRESHING
+};
+_Static_assert(LAYOUT_COMPLETE == 6 && LAYOUT_REFRESHING == 9,
+               "Update local names if the public layout state ABI changes");
+_Static_assert(sizeof(void *) == 8 && sizeof(ejit_config_t) == 56 &&
+                   sizeof(ejit_global_layout_status_t) == 56 &&
+                   sizeof(ejit_taskpool_stats_t) == 88,
+               "Matching 64-bit ABI required");
+
+#define LAYOUT_EACH(APPLY)                                                     \
+  APPLY(A, 0)                                                                  \
+  APPLY(B, 1) APPLY(C, 2) APPLY(D, 3) APPLY(E, 4) APPLY(F, 5) APPLY(G, 6)      \
+      APPLY(H, 7) APPLY(I, 8) APPLY(J, 9) APPLY(K, 10) APPLY(L, 11)            \
+          APPLY(M, 12) APPLY(N, 13) APPLY(O, 14) APPLY(P, 15) APPLY(Q, 16)     \
+              APPLY(R, 17) APPLY(S, 18) APPLY(T, 19) APPLY(U, 20) APPLY(V, 21) \
+                  APPLY(W, 22) APPLY(X, 23) APPLY(Y, 24) APPLY(Z, 25)
+#define LAYOUT_COUNT 26u
+
+static __attribute__((noinline)) uint32_t layout_business(uint32_t x,
                                                           uint32_t tag) {
-  uint32_t value = input + tag;
+  uint32_t value = x + tag;
   for (uint32_t i = 0; i < 16; ++i)
-    if ((value ^ i) & 1)
-      value = value * 3 + i;
+    if ((value ^ i) & 1u)
+      value = value * 3u + i;
     else
-      value = value + 7 + tag;
+      value += 7u + tag;
   return value;
 }
-#define LAYOUT_ENTRY(NAME, TAG)                                                \
+#define LAYOUT_DEFINE(NAME, TAG)                                               \
   ejit_entry uint32_t global_layout_##NAME(uint32_t x) {                       \
     return layout_business(x, TAG);                                            \
   }
-LAYOUT_ENTRY(A, 0u)
-LAYOUT_ENTRY(B, 1u)
-LAYOUT_ENTRY(C, 2u)
-LAYOUT_ENTRY(D, 3u)
-LAYOUT_ENTRY(E, 4u)
-LAYOUT_ENTRY(F, 5u)
-LAYOUT_ENTRY(G, 6u)
-LAYOUT_ENTRY(H, 7u)
-LAYOUT_ENTRY(I, 8u)
-LAYOUT_ENTRY(J, 9u)
-LAYOUT_ENTRY(K, 10u)
-LAYOUT_ENTRY(L, 11u)
-LAYOUT_ENTRY(M, 12u)
-LAYOUT_ENTRY(N, 13u)
-LAYOUT_ENTRY(O, 14u)
-LAYOUT_ENTRY(P, 15u)
-LAYOUT_ENTRY(Q, 16u)
-LAYOUT_ENTRY(R, 17u)
-LAYOUT_ENTRY(S, 18u)
-LAYOUT_ENTRY(T, 19u)
-LAYOUT_ENTRY(U, 20u)
-LAYOUT_ENTRY(V, 21u)
-LAYOUT_ENTRY(W, 22u)
-LAYOUT_ENTRY(X, 23u)
-LAYOUT_ENTRY(Y, 24u)
-LAYOUT_ENTRY(Z, 25u)
-
+LAYOUT_EACH(LAYOUT_DEFINE)
 typedef uint32_t (*layout_fn_t)(uint32_t);
-static layout_fn_t entries[26] = {
-    global_layout_A, global_layout_B, global_layout_C, global_layout_D,
-    global_layout_E, global_layout_F, global_layout_G, global_layout_H,
-    global_layout_I, global_layout_J, global_layout_K, global_layout_L,
-    global_layout_M, global_layout_N, global_layout_O, global_layout_P,
-    global_layout_Q, global_layout_R, global_layout_S, global_layout_T,
-    global_layout_U, global_layout_V, global_layout_W, global_layout_X,
-    global_layout_Y, global_layout_Z};
-extern uint32_t __ejit_funcidx_global_layout_A;
-extern uint32_t __ejit_funcidx_global_layout_B;
-extern uint32_t __ejit_funcidx_global_layout_C;
-extern uint32_t __ejit_funcidx_global_layout_D;
-extern uint32_t __ejit_funcidx_global_layout_E;
-extern uint32_t __ejit_funcidx_global_layout_F;
-extern uint32_t __ejit_funcidx_global_layout_G;
-extern uint32_t __ejit_funcidx_global_layout_H;
-extern uint32_t __ejit_funcidx_global_layout_I;
-extern uint32_t __ejit_funcidx_global_layout_J;
-extern uint32_t __ejit_funcidx_global_layout_K;
-extern uint32_t __ejit_funcidx_global_layout_L;
-extern uint32_t __ejit_funcidx_global_layout_M;
-extern uint32_t __ejit_funcidx_global_layout_N;
-extern uint32_t __ejit_funcidx_global_layout_O;
-extern uint32_t __ejit_funcidx_global_layout_P;
-extern uint32_t __ejit_funcidx_global_layout_Q;
-extern uint32_t __ejit_funcidx_global_layout_R;
-extern uint32_t __ejit_funcidx_global_layout_S;
-extern uint32_t __ejit_funcidx_global_layout_T;
-extern uint32_t __ejit_funcidx_global_layout_U;
-extern uint32_t __ejit_funcidx_global_layout_V;
-extern uint32_t __ejit_funcidx_global_layout_W;
-extern uint32_t __ejit_funcidx_global_layout_X;
-extern uint32_t __ejit_funcidx_global_layout_Y;
-extern uint32_t __ejit_funcidx_global_layout_Z;
-static uint32_t *indices[26] = {
-    &__ejit_funcidx_global_layout_A, &__ejit_funcidx_global_layout_B,
-    &__ejit_funcidx_global_layout_C, &__ejit_funcidx_global_layout_D,
-    &__ejit_funcidx_global_layout_E, &__ejit_funcidx_global_layout_F,
-    &__ejit_funcidx_global_layout_G, &__ejit_funcidx_global_layout_H,
-    &__ejit_funcidx_global_layout_I, &__ejit_funcidx_global_layout_J,
-    &__ejit_funcidx_global_layout_K, &__ejit_funcidx_global_layout_L,
-    &__ejit_funcidx_global_layout_M, &__ejit_funcidx_global_layout_N,
-    &__ejit_funcidx_global_layout_O, &__ejit_funcidx_global_layout_P,
-    &__ejit_funcidx_global_layout_Q, &__ejit_funcidx_global_layout_R,
-    &__ejit_funcidx_global_layout_S, &__ejit_funcidx_global_layout_T,
-    &__ejit_funcidx_global_layout_U, &__ejit_funcidx_global_layout_V,
-    &__ejit_funcidx_global_layout_W, &__ejit_funcidx_global_layout_X,
-    &__ejit_funcidx_global_layout_Y, &__ejit_funcidx_global_layout_Z};
-static const char *names[26] = {
-    "global_layout_A", "global_layout_B", "global_layout_C", "global_layout_D",
-    "global_layout_E", "global_layout_F", "global_layout_G", "global_layout_H",
-    "global_layout_I", "global_layout_J", "global_layout_K", "global_layout_L",
-    "global_layout_M", "global_layout_N", "global_layout_O", "global_layout_P",
-    "global_layout_Q", "global_layout_R", "global_layout_S", "global_layout_T",
-    "global_layout_U", "global_layout_V", "global_layout_W", "global_layout_X",
-    "global_layout_Y", "global_layout_Z"};
+#define LAYOUT_FN(NAME, TAG) global_layout_##NAME,
+// Volatile forces an actual call boundary to the generated AOT wrapper.
+static layout_fn_t volatile layout_entries[] = {LAYOUT_EACH(LAYOUT_FN)};
+#define LAYOUT_NAME(NAME, TAG) "global_layout_" #NAME,
+static const char *const layout_names[] = {LAYOUT_EACH(LAYOUT_NAME)};
+static uint32_t layout_indices[LAYOUT_COUNT];
+
+enum {
+  DEMO_RESET,
+  DEMO_STARTING,
+  DEMO_READY,
+  DEMO_RUNNING,
+  DEMO_DONE,
+  DEMO_FAILED
+};
+LAYOUT_SHARED uint32_t g_layout_stage;
+LAYOUT_SHARED uint64_t g_layout_checked, g_layout_deferred;
+LAYOUT_SHARED uint32_t g_layout_calls[LAYOUT_COUNT];
+LAYOUT_SHARED uintptr_t g_layout_final[LAYOUT_COUNT];
+LAYOUT_SHARED ejit_global_layout_status_t g_layout_result;
+
+static int layout_fail(const char *why) {
+  __atomic_store_n(&g_layout_stage, DEMO_FAILED, __ATOMIC_RELEASE);
+  SRE_printf("[LAYOUT248] FAIL core=%u: %s; reset before rerun\n",
+             g_ucLocalCoreID, why);
+  return -1;
+}
+static int layout_delay(void) {
+  return SRE_TaskDelay(1u) ? layout_fail("TaskDelay failed") : 0;
+}
+static int layout_status(ejit_global_layout_status_t *s,
+                         ejit_taskpool_stats_t *t) {
+  if (ejit_get_global_layout_status(s) != EJIT_OK ||
+      ejit_taskpool_get_stats(t) != EJIT_OK)
+    return layout_fail("status unavailable");
+  if (s->state == LAYOUT_FAILED || s->state == LAYOUT_CANCELLED || s->error ||
+      s->required != LAYOUT_COUNT || !s->generation || t->compileFailed ||
+      t->publishFailed || t->queueFull)
+    return layout_fail(
+        "layout/compile/publish/queue failure; core6 print details");
+  if (s->activeProfiles > 4u)
+    return layout_fail("more than four PGO admissions");
+  return 0;
+}
+static int layout_idle(void) {
+  ejit_global_layout_status_t s = {0};
+  ejit_taskpool_stats_t t = {0};
+  if (layout_status(&s, &t))
+    return -1;
+  if (s.state != LAYOUT_COLLECTING || s.ready || s.published ||
+      s.activeProfiles || t.asyncCompiles || t.readyEntries ||
+      t.pendingEntries || t.queueApproxSize || ejit_taskpool_pending_count())
+    return layout_fail("requires fresh idle image");
+  return 0;
+}
+
+// A successful lookup MUST execute before release, even if order is wrong.
+// Never inspect a T1 pointer and release without its real function return.
+static int layout_call(uint32_t rank, uint32_t x, uintptr_t *seen) {
+  void *body = 0;
+  uint32_t token = 0;
+  ejit_status_t rc =
+      ejit_taskpool_compile_or_get(layout_indices[rank], 0, 0, &body, &token);
+  *seen = 0;
+  uint32_t actual;
+  if (rc == EJIT_OK && body) {
+    actual = ((layout_fn_t)body)(x);
+    ejit_taskpool_release_read(token);
+    *seen = (uintptr_t)body;
+    ++g_layout_calls[rank];
+  } else if ((rc == EJIT_PENDING || rc == EJIT_ERR_QUEUE_FULL) && !body) {
+    ++g_layout_deferred;
+    actual = layout_entries[rank](x);
+  } else
+    return layout_fail("lookup returned invalid status/pointer");
+  if (actual != layout_business(x, rank))
+    return layout_fail("business mismatch");
+  ++g_layout_checked;
+  return 0;
+}
+
+static int layout_drive(void) {
+  ejit_global_layout_status_t s = {0};
+  ejit_taskpool_stats_t t = {0};
+  if (layout_status(&s, &t))
+    return -1;
+  uint32_t generation = s.generation;
+  for (uint32_t round = 0; round < LAYOUT_WAIT_ROUNDS; ++round) {
+    for (uint32_t j = 0; j < LAYOUT_COUNT; ++j) {
+      uintptr_t ignored;
+      if (layout_call((j + 7u) % LAYOUT_COUNT, round + 11u, &ignored))
+        return -1;
+    }
+    if (layout_status(&s, &t))
+      return -1;
+    if (s.generation != generation)
+      return layout_fail("unexpected generation change");
+    if (s.state == LAYOUT_COMPLETE) {
+      if (s.ready != LAYOUT_COUNT || s.published != LAYOUT_COUNT ||
+          s.activeProfiles || t.asyncCompiles != 2u * LAYOUT_COUNT ||
+          t.readyEntries != LAYOUT_COUNT) {
+        SRE_printf("[LAYOUT248] final counts ready=%u published=%u active=%u "
+                   "asyncCompiles=%llu (expected52) readyEntries=%u (expected26); "
+                   "runtime --stats / EJIT_STATS_ENABLE=ON required\n",
+                   s.ready, s.published, s.activeProfiles,
+                   (unsigned long long)t.asyncCompiles, t.readyEntries);
+        return layout_fail("incomplete T1/T2 final set");
+      }
+      // COMPLETE can precede draining obsolete queue/dedup tail requests.
+      // Still require idle acceptance, but let the worker drain within budget.
+      if (t.pendingEntries || t.queueApproxSize || ejit_taskpool_pending_count()) {
+        if (layout_delay())
+          return -1;
+        continue;
+      }
+      uintptr_t previous = 0;
+      for (uint32_t rank = 0; rank < LAYOUT_COUNT; ++rank) {
+        uintptr_t body;
+        if (layout_call(rank, 19u, &body))
+          return -1;
+        if (!body || body <= previous)
+          return layout_fail("final bodies not A..Z");
+        previous = g_layout_final[rank] = body;
+        SRE_printf("[LAYOUT248] rank=%u name=%s finalBody=%p calls=%u\n", rank,
+                   layout_names[rank], (void *)body, g_layout_calls[rank]);
+      }
+      if (layout_status(&s, &t))
+        return -1;
+      if (s.state != LAYOUT_COMPLETE || s.generation != generation ||
+          s.ready != LAYOUT_COUNT || s.published != LAYOUT_COUNT)
+        return layout_fail("layout changed during final execution");
+      g_layout_result = s;
+      return 0;
+    }
+    if (round % 100u == 0)
+      SRE_printf(
+          "[LAYOUT248] round=%u state=%u gen=%u ready=%u/%u published=%u "
+          "active=%u/4 checked=%llu\n",
+          round, s.state, s.generation, s.ready, s.required, s.published,
+          s.activeProfiles, (unsigned long long)g_layout_checked);
+    if (layout_delay())
+      return -1;
+  }
+  return layout_fail(
+      "bounded T2/idle convergence timeout; core6 print partial state");
+}
 
 int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
+  (void)a;
   (void)b;
   (void)c;
   (void)d;
-  uint32_t core = g_ucLocalCoreID;
-  if (core != 6 && core != 16)
+  if (g_ucLocalCoreID != 6u && g_ucLocalCoreID != 16u)
     return -1;
-  if (core == 6)
-    call_init_array_functions();
-  ejit_config_t config;
-  ejit_default_config(&config);
-  config.compileMode = EJIT_COMPILE_ASYNC;
-  config.forceStaticRegistry = true;
-  ejit_layout_target_t manifest[26] = {{0}};
-  for (uint32_t i = 0; i < 26; ++i)
-    manifest[i].entryName = names[i]; // Explicit A..Z rank, no dimensions.
-  if (ejit_init_global_layout(&config, manifest, 26, a != 0) != EJIT_OK) {
-    SRE_printf("[GLOBAL-LAYOUT] initialization failed core=%u\n", core);
-    return -2;
+  uint32_t stage = g_ucLocalCoreID == 6u ? DEMO_RESET : DEMO_READY;
+  uint32_t next = g_ucLocalCoreID == 6u ? DEMO_STARTING : DEMO_RUNNING;
+  if (!__atomic_compare_exchange_n(&g_layout_stage, &stage, next, 0,
+                                   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    SRE_printf("[LAYOUT248] rejected core=%u stage=%u; no reinit/rerun\n",
+               g_ucLocalCoreID, stage);
+    return -1;
   }
-  if (core == 6) {
-    SRE_printf("[GLOBAL-LAYOUT] worker ready core=6 targets=26 pgo=%u\n",
-               a != 0);
+#if LAYOUT_RUN_INIT_ARRAY
+  call_init_array_functions();
+#endif
+  // Core-local registration happens after each core's constructors, before
+  // init.
+  ejit_layout_target_t manifest[LAYOUT_COUNT] = {{0}};
+  for (uint32_t rank = 0; rank < LAYOUT_COUNT; ++rank) {
+    layout_indices[rank] = ~0u;
+    ejit_register_funcindex(layout_names[rank], &layout_indices[rank]);
+    if (layout_indices[rank] == ~0u)
+      return layout_fail("unresolved public funcIndex");
+    manifest[rank].entryName = layout_names[rank];
+  }
+  ejit_config_t cfg = {0};
+  cfg.compileMode = EJIT_COMPILE_ASYNC;
+  cfg.optLevel = EJIT_OPT_L2;
+  cfg.enableLogger = cfg.forceStaticRegistry = true;
+  // Always NORMAL online PGO, not audit-only and not argument-selected
+  // Baseline.
+  if (ejit_init_global_layout(&cfg, manifest, LAYOUT_COUNT, true) != EJIT_OK)
+    return layout_fail("global-layout init/attachment failed");
+  if (ejit_taskpool_get_worker_core() != 6u)
+    return layout_fail("worker is not core6");
+  if (layout_idle())
+    return -1;
+  if (g_ucLocalCoreID == 6u) {
+#if LAYOUT_DUMP_IR
+    ejit_dump_func("global_layout_H");
+#endif
+    __atomic_store_n(&g_layout_stage, DEMO_READY, __ATOMIC_RELEASE);
+    SRE_printf("[LAYOUT248] WORKER_READY A..Z=26 normalPGO quota=64 cap=4; "
+               "core16 test_ejit_period\n");
     return 0;
   }
-  ejit_global_layout_status_t status = {0};
-  for (uint32_t round = 0; round < 6000; ++round) {
-    // Arrival starts at H; the final allocation MUST still be A..Z.
-    for (uint32_t j = 0; j < 26; ++j) {
-      uint32_t rank = (j + 7) % 26;
-      uint32_t input = round + 11;
-      if (entries[rank](input) != layout_business(input, rank))
-        return -3;
-    }
-    if (ejit_get_global_layout_status(&status) != EJIT_OK)
-      return -4;
-    if (status.state == 7 || status.state == 8) {
-      SRE_printf("[GLOBAL-LAYOUT] FAILED state=%u rank=%u error=%u "
-                 "ready=%u/%u published=%u near=%llu far=%llu\n",
-                 status.state, status.errorRank, status.error, status.ready,
-                 status.required, status.published,
-                 (unsigned long long)status.retainedNearBytes,
-                 (unsigned long long)status.retainedFarBytes);
-      return -5;
-    }
-    if (status.state == 6)
-      break;
-    if ((round % 100) == 0)
-      SRE_printf("[GLOBAL-LAYOUT] collecting ready=%u/%u active=%u "
-                 "object=%llu finalReserved=%llu\n",
-                 status.ready, status.required, status.activeProfiles,
-                 (unsigned long long)status.artifactBytes,
-                 (unsigned long long)status.retainedNearBytes);
-    (void)SRE_TaskDelay(10);
-  }
-  if (status.state != 6 || status.required != 26 || status.published != 26)
-    return -6;
-  uintptr_t previous = 0;
-  for (uint32_t rank = 0; rank < 26; ++rank) {
-    void *body = 0;
-    uint32_t token = 0;
-    int rc = ejit_taskpool_compile_or_get(*indices[rank], 0, 0, &body, &token);
-    if (rc != EJIT_OK || !body || (uintptr_t)body <= previous) {
-      if (rc == EJIT_OK && body)
-        ejit_taskpool_release_read(token);
-      return -7;
-    }
-    previous = (uintptr_t)body;
-    uint32_t actual = ((layout_fn_t)body)(19);
-    ejit_taskpool_release_read(token);
-    if (actual != layout_business(19, rank))
-      return -8;
-    SRE_printf("[GLOBAL-LAYOUT] rank=%u name=%s realBody=%p\n", rank,
-               names[rank], body);
-  }
+  // The FIRST cold request must originate in the generated H wrapper, not a
+  // hand-written compile_or_get probe. Volatile prevents bypassing that entry.
+  if (layout_entries[7](11u) != layout_business(11u, 7u))
+    return layout_fail("cold H wrapper business mismatch");
+  ++g_layout_checked;
+  if (layout_drive())
+    return -1;
+  __atomic_store_n(&g_layout_stage, DEMO_DONE, __ATOMIC_RELEASE);
+  SRE_printf("[LAYOUT248] OWNER_DONE gen=%u checked=%llu deferred=%llu; "
+             "core6 test_ejit_global_layout_print\n",
+             g_layout_result.generation, (unsigned long long)g_layout_checked,
+             (unsigned long long)g_layout_deferred);
+  return 0;
+}
+
+// Read-only: no constructor/init/refresh/lookup/activation/shutdown call.
+int test_ejit_global_layout_print(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
+  (void)a;
+  (void)b;
+  (void)c;
+  (void)d;
+  if (g_ucLocalCoreID != 6u)
+    return -1;
+  uint32_t stage = __atomic_load_n(&g_layout_stage, __ATOMIC_ACQUIRE);
+  if (stage != DEMO_DONE && stage != DEMO_FAILED)
+    return -1;
+  ejit_taskpool_print_stats();
+  ejit_taskpool_print_compiled();
   ejit_print_code_pool_stats();
-  SRE_printf("[GLOBAL-LAYOUT] COMPLETE core16 business/order checks passed\n");
+#if LAYOUT_DUMP_IR
+  ejit_print_dumped("global_layout_H");
+  ejit_print_dumped_module("global_layout_H");
+#endif
+  ejit_global_layout_status_t s = {0};
+  ejit_taskpool_stats_t t = {0};
+  if (ejit_get_global_layout_status(&s) != EJIT_OK ||
+      ejit_taskpool_get_stats(&t) != EJIT_OK)
+    return -1;
+  SRE_printf("[LAYOUT248] state=%u gen=%u required=%u ready=%u published=%u "
+             "error=%u rank=%u active=%u near=%llu far=%llu\n",
+             s.state, s.generation, s.required, s.ready, s.published, s.error,
+             s.errorRank, s.activeProfiles,
+             (unsigned long long)s.retainedNearBytes,
+             (unsigned long long)s.retainedFarBytes);
+  if (stage != DEMO_DONE || s.state != LAYOUT_COMPLETE || s.error ||
+      s.generation != g_layout_result.generation ||
+      s.required != LAYOUT_COUNT || s.ready != LAYOUT_COUNT ||
+      s.published != LAYOUT_COUNT || s.activeProfiles || t.compileFailed ||
+      t.publishFailed || t.queueFull || t.pendingEntries || t.queueApproxSize ||
+      t.asyncCompiles != 2u * LAYOUT_COUNT || t.readyEntries != LAYOUT_COUNT ||
+      ejit_taskpool_pending_count())
+    return -1;
+  for (uint32_t rank = 0; rank < LAYOUT_COUNT; ++rank)
+    if (!g_layout_final[rank] || !g_layout_calls[rank] ||
+        (rank && g_layout_final[rank] <= g_layout_final[rank - 1]))
+      return -1;
+  SRE_printf("[LAYOUT248] RUNTIME_CHECKS_PASS business+26 final ordered bodies "
+             "T1+T2=52; NOT BOARD_ACCEPTED until worker PGO64/cap4/merge/"
+             "preparation evidence is checked\n");
   return 0;
 }
