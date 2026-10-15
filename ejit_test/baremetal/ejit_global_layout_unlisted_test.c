@@ -51,7 +51,13 @@
 #define UNLISTED_RUN_INIT_ARRAY 1
 #endif
 #ifndef UNLISTED_WAIT_ROUNDS
-#define UNLISTED_WAIT_ROUNDS 30000u
+// Board-measured (2026-10-15, 8+3 roots, quota 64, cap 4): the shared worker
+// paces roughly ONE significant item (Tier-1 compile, member artifact
+// prepare, park/stage pop) per ~1000 one-tick rounds, and the four
+// admissions serialize the 11 functions into three waves whose holds grow to
+// ~5000-9000 rounds; full convergence projects to ~55-60k rounds. 100000
+// leaves ~2x headroom. The bound is not a timing guarantee.
+#define UNLISTED_WAIT_ROUNDS 100000u
 #endif
 #ifndef UNLISTED_DUMP_IR
 #define UNLISTED_DUMP_IR 1
