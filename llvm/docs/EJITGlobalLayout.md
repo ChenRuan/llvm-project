@@ -1,7 +1,8 @@
 # EJIT Global Function Layout
 
 Issue #245, spec v0.4 (2026-10-13), baseline
-`e09df842062735ba9f6279ae7d1c5b43fd723bec`.
+`e09df842062735ba9f6279ae7d1c5b43fd723bec`, extended 2026-10-15 with
+unlisted-function support and the Failed-to-ordinary-fallback semantics.
 The former v0.3 pending-scope/dimension-major checkpoint is superseded.
 Production implementation and native tests are present. SDK final linking,
 cold core6/core16 board acceptance and performance acceptance remain pending.
@@ -28,22 +29,73 @@ and remains FAILED, never COMPLETE. A new explicit refresh command or actual
 lifecycle event can start a complete in-process generation; invalid identities
 are never reused or retried as an unordered subset.
 
+**Failed semantics (changed 2026-10-15):** a FAILED layout no longer switches
+misses to OffMode. Every function — manifest member or not — falls back to the
+ordinary shared-pool paths (batched deferral, immediate Tier-1, queue-drain
+Tier-2) and keeps compiling, publishing and dispatching normally. Parked
+unlisted requests and deferred batch markers are released on failure so fresh
+misses re-enqueue instead of wedging on AlreadyPending. The system keeps
+running; the status API is the only failure visibility and products must poll
+it as a health check to notice a lost layout.
+
+## Unlisted Functions (added 2026-10-15)
+
+The manifest no longer has to cover every registered entry. Functions that are
+registered but absent from the manifest ("unlisted") compile through the
+ordinary paths and append after the manifest bodies:
+
+- **Collecting phase.** An unlisted Baseline miss parks in the deferred batch
+  backlog (staged request marker, no near-pool allocation). An unlisted
+  Tier-1 compiles immediately into the far pool, unordered, as always. An
+  armed unlisted Tier-2 parks uncompiled in a bounded owner-private list
+  (queue capacity entries) and releases its sampling admission immediately, so
+  parked entries never starve the concurrent-profile slots; overflow discards
+  the request and the function stays on its live Tier-1 until a later re-arm.
+  The `unlistedReady` status field reports the parked count (Tier-2 parks plus
+  batch backlog) during collection.
+- **Freeze point.** The collective set freezes at the all-ready transition.
+  Requests still resident in the shared queue at that instant take the
+  ordinary post-freeze paths; only what is already parked or deferred joins
+  the collective window.
+- **Collective window.** After the manifest bodies link in rank order, the
+  parked unlisted Tier-2 entries compile (funcIndex ascending, re-arm
+  duplicates deduplicated to the latest), then the deferred batch requests
+  compile in the existing dims→funcIndex→tier order. One seal covers every
+  allocation made in the window. Manifest members publish in rank order;
+  the appended unlisted bodies publish through the ordinary auto/explicit
+  flush after COMPLETE. A saturated unlisted Tier-1 re-arms on every lookup;
+  each re-arm supersedes the identity's earlier park (latest wins), so one
+  hot function cannot fill the bounded park list. The `unlistedAppended`
+  status field reports how many unlisted bodies actually joined the window;
+  the COMPLETE diagnostic summary reports the member counts, the appended
+  set and the final address-order verdict (per-rank bodies appear in the
+  LINKED diagnostics).
+- **Precision kill retained.** A funcIndex the manifest declares with one
+  identity still FAILS the layout when a different identity of that funcIndex
+  arrives: naming a function makes every unlisted identity for it a
+  deployment error, not an append candidate. Entirely undeclared funcIndexes
+  never fail the layout.
+
 ## Manifest and Identity
 
 V1 requires the batched NO_RECLAIM shared SRE code pool.
-`Config::globalLayout` / `ejit_init_global_layout` freezes an explicit complete
-initialization list. The additive C API leaves `ejit_config_t` unchanged.
-Names resolve read-only through `EJitFuncRegistry`; every registered entry must
-be represented. Each declared specialization has its exact registered dimension
+`Config::globalLayout` / `ejit_init_global_layout` freezes an explicit
+initialization list; since 2026-10-15 the list does not have to cover every
+registered entry (see "Unlisted Functions"). The additive C API leaves
+`ejit_config_t` unchanged.
+Names resolve read-only through `EJitFuncRegistry`; a manifest entry that names
+an unregistered function is still rejected. Each declared specialization has
+its exact registered dimension
 shape, instance versions and bound argument/address/extent descriptors.
-`sharedOwnerElected` validates loader metadata, bound argument indices and full
-registry coverage. `configureGlobalLayout` rejects duplicates, unsupported
+`sharedOwnerElected` validates loader metadata and bound argument indices.
+`configureGlobalLayout` rejects duplicates, unsupported
 shapes, invalid descriptors, dispatch-key collisions and bucket capacity overflow
 as one initialization failure, with no partial installation.
 
 Completeness of instance expansion is caller-declared: V1 cannot infer which
-inactive cell/TRP/version combinations a product intends to require. The supplied
-list must be that complete expansion; every supplied member remains mandatory.
+inactive cell/TRP/version combinations a product intends to require. Every
+supplied member remains mandatory; unlisted registered functions are
+deliberately outside the collective contract.
 Different concurrent bindings or versions with the same legacy dispatch key are
 not representable and fail explicitly rather than sharing the wrong body.
 Registered dimension formal order is kept for legacy dispatch compatibility;
@@ -191,7 +243,10 @@ code. Caller rank and full binding identity are retained across automatic rebuil
 `ejit_refresh_global_layout` / `EJitCompileDriver::refreshGlobalLayout` copies a
 complete owner-side replacement manifest and returns PENDING/accepted. It can
 change explicit rank, instance expansion and bindings within the frozen registered
-catalog. Invalid input leaves the current legal layout installed. The worker
+catalog; like the initial manifest it may list any subset of the registered
+entries — parked unlisted requests and deferred batch markers of the retired
+generation are released (markers dropped before the generation bump) and the
+new generation collects from scratch. Invalid input leaves the current legal layout installed. The worker
 publishes a matching new registration fingerprint; attaching during REFRESHING
 is deferred. Opt-level/triple/mode/budgets and the registered source catalog are
 initialization settings, not silently changed by a manifest refresh. Their
@@ -232,7 +287,11 @@ so ABI20 requires all participating images and queue users rebuilt together.
 Native ABI probes of the actual published/current headers (32 buckets,16 slots,
 1024 queue entries) report a16-byte lookup result in both builds. Queue requests
 grow200->208 bytes, cache slots224->360, and the shared state358080->440000 bytes
-(+81920 bytes/80 KiB). This is real compatibility/space cost, not a speedup claim.
+(+81920 bytes/80 KiB). The unlisted-functions status fields
+(`globalLayoutUnlistedReady`/`globalLayoutUnlistedAppended`, mirrored into
+`ejit_global_layout_status_t` as `unlistedReady`/`unlistedAppended`) fit in
+existing blob padding within ABI20: the shared state stays 440000 bytes. This is
+real compatibility/space cost, not a speedup claim.
 Audit-only fixture coverage has zero new ICP observations; ordinary PGO preserves
 160 and the unmodified64-hit cold configuration preserves1280 across20 roots.
 Owner control commands and shutdown must be serialized with the existing runtime

@@ -3202,6 +3202,8 @@ void EJitSharedTaskPool::ownerShutdown() {
   if (layoutConfigured_) {
     clearGlobalArtifacts();
     layoutDraining_.clear();
+    layoutDeferredT2_.clear();
+    layoutAppendedPublishes_.clear();
     layoutMembers_.clear();
     layoutConfigured_ = false;
     state_->globalLayoutState.storeRelease(
@@ -3610,11 +3612,8 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     R.status = EJitCompileOrGetStatus::CompileFailed;
     return R;
   }
-  if (state_->globalLayoutState.loadAcquire() ==
-      static_cast<uint32_t>(EJitGlobalLayoutState::Failed)) {
-    R.status = EJitCompileOrGetStatus::OffMode;
-    return R;
-  }
+  // A Failed layout no longer forces OffMode here: every function, manifest
+  // member or not, re-enters the ordinary miss/enqueue/compile paths below.
   // Dedup + enqueue (§5.2 step 3) — Async path. Claim the per-function
   // in-flight slot BEFORE staged-PGO admission. Otherwise a request already in
   // the queue makes us log "profile start 0/N", only for dedupMark below to
@@ -3787,10 +3786,23 @@ void EJitSharedTaskPool::compilePendingBatchRequests() {
 
 bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests) {
   if (layoutConfigured_) {
-    serviceGlobalLayout();
-    // Request serviced is distinct from global COMPLETE. Do not seal/link a
-    // subset merely because publication was requested during collection.
-    return globalLayoutState() != EJitGlobalLayoutState::Failed;
+    switch (globalLayoutState()) {
+    case EJitGlobalLayoutState::Complete:
+    case EJitGlobalLayoutState::Failed:
+      // The collective is over (success or ordinary fallback). Everything
+      // parked for it — appended Tier-2 bodies and deferred batch requests —
+      // now publishes through the ordinary path below.
+      break;
+    default:
+      // Active collection/linking/publishing (and the shutdown-deferred
+      // Cancelled hold): the layout state machine owns ordering. Its
+      // collection front-loop publishes parked Tier-1 results one per call;
+      // batch compiles stay deferred until the collective point. Request
+      // serviced is distinct from global COMPLETE. Do not seal/link a subset
+      // merely because publication was requested during collection.
+      serviceGlobalLayout();
+      return globalLayoutState() != EJitGlobalLayoutState::Failed;
+    }
   }
   if (compileBatchRequests)
     compilePendingBatchRequests();
@@ -4227,41 +4239,85 @@ bool EJitSharedTaskPool::pollOne() {
       dedupClear(Req.funcIndex, Req.generation);
       return true;
     }
-    auto Phase = globalLayoutState();
-    if (Phase == EJitGlobalLayoutState::Failed ||
-        Phase == EJitGlobalLayoutState::Complete) {
-      if (decodeReqTier(Req.funcIndex) == kEJitTierInstrumented)
+    // Layout routing is effective only while Collecting: the collective set
+    // freezes at the all-ready transition. In every other phase — including
+    // the Failed/Complete ordinary-fallback semantics — requests take the
+    // ordinary paths below (batch deferral / immediate compile).
+    if (globalLayoutState() == EJitGlobalLayoutState::Collecting) {
+      size_t Rank = globalMemberFor(Req);
+      if (Rank != layoutMembers_.size()) {
+        uint32_t Tier = decodeReqTier(Req.funcIndex);
+        if (Tier == kEJitTierInstrumented) {
+          uint64_t Failures = state_->counters.compileFailed.loadRelaxed() +
+                              state_->counters.publishFailed.loadRelaxed();
+          runCompile(Req);
+          if (Failures != state_->counters.compileFailed.loadRelaxed() +
+                              state_->counters.publishFailed.loadRelaxed())
+            failGlobalLayout(EJitGlobalLayoutError::Preparation, Rank);
+        } else if (Tier == kEJitTierPgoUse && !samplingDrained(Req)) {
+          if (layoutDraining_.size() >= layoutMembers_.size())
+            failGlobalLayout(EJitGlobalLayoutError::Preparation, Rank);
+          else
+            layoutDraining_.push_back(Req);
+        } else {
+          stageGlobalArtifact(Req);
+        }
+        return true;
+      }
+      if (layoutDeclaresFunc(stripReqTier(Req.funcIndex))) {
+        // Declared funcIndex with a mismatched identity still fails the
+        // layout: the manifest named this function, so an unlisted identity
+        // for it is a deployment error, not an append candidate.
+        failGlobalLayout(EJitGlobalLayoutError::Manifest, Rank);
+        if (decodeReqTier(Req.funcIndex) == kEJitTierInstrumented)
+          finishPgoFunction(stripReqTier(Req.funcIndex), false,
+                            "undeclared-target");
+        dedupClear(Req.funcIndex, Req.generation);
+        return true;
+      }
+      // Entirely undeclared funcIndex during collection: Baseline and Tier-1
+      // keep their ordinary routing (batch deferral / immediate far-pool
+      // compile) by falling through; only Tier-2 parks for the collective
+      // append so its near-pool body lands after the manifest bodies.
+      if (decodeReqTier(Req.funcIndex) == kEJitTierPgoUse) {
+        // A saturated Tier-1 re-arms on every lookup, so the same identity
+        // can arrive repeatedly; supersede its earlier park (keeping the
+        // latest, exactly like the collective window's own rule) instead of
+        // letting one hot function fill the whole bounded list.
+        bool SupersededEarlier = false;
+        for (auto &Parked : layoutDeferredT2_)
+          if (sameIdentity(Parked, Req)) {
+            Parked = Req;
+            SupersededEarlier = true;
+            break;
+          }
+        if (!SupersededEarlier &&
+            layoutDeferredT2_.size() >= kEJitSharedQueueSlots) {
+          finishPgoFunction(stripReqTier(Req.funcIndex), false,
+                            "layout-unlisted-t2-overflow");
+          dedupClear(Req.funcIndex, Req.generation);
+          EJIT_STAT_INC(state_->counters.queueFull);
+          EJIT_DIAG("global layout unlisted T2 park overflow func=%u "
+                    "capacity=%u",
+                    stripReqTier(Req.funcIndex), kEJitSharedQueueSlots);
+          return true;
+        }
+        if (!SupersededEarlier)
+          layoutDeferredT2_.push_back(Req);
+        refreshLayoutUnlistedReady();
+        // Release the sampling admission and in-flight claim immediately: a
+        // parked entry must not hold one of the concurrent-profile slots
+        // hostage, and a re-armed duplicate can still enqueue meanwhile.
+        // The live Tier-1 keeps sampling; the collective compile publishes.
         finishPgoFunction(stripReqTier(Req.funcIndex), false,
-                          "layout-terminal-drop");
-      dedupClear(Req.funcIndex, Req.generation);
-      return true;
+                          "layout-unlisted-t2-parked");
+        dedupClear(Req.funcIndex, Req.generation);
+        EJIT_DIAG("global layout unlisted T2 parked func=%u pending=%zu",
+                  stripReqTier(Req.funcIndex), layoutDeferredT2_.size());
+        return true;
+      }
+      // Undeclared Baseline / Tier-1: ordinary paths below.
     }
-    size_t Rank = globalMemberFor(Req);
-    if (Rank == layoutMembers_.size()) {
-      failGlobalLayout(EJitGlobalLayoutError::Manifest, Rank);
-      if (decodeReqTier(Req.funcIndex) == kEJitTierInstrumented)
-        finishPgoFunction(stripReqTier(Req.funcIndex), false,
-                          "undeclared-target");
-      dedupClear(Req.funcIndex, Req.generation);
-      return true;
-    }
-    uint32_t Tier = decodeReqTier(Req.funcIndex);
-    if (Tier == kEJitTierInstrumented) {
-      uint64_t Failures = state_->counters.compileFailed.loadRelaxed() +
-                          state_->counters.publishFailed.loadRelaxed();
-      runCompile(Req);
-      if (Failures != state_->counters.compileFailed.loadRelaxed() +
-                          state_->counters.publishFailed.loadRelaxed())
-        failGlobalLayout(EJitGlobalLayoutError::Preparation, Rank);
-    } else if (Tier == kEJitTierPgoUse && !samplingDrained(Req)) {
-      if (layoutDraining_.size() >= layoutMembers_.size())
-        failGlobalLayout(EJitGlobalLayoutError::Preparation, Rank);
-      else
-        layoutDraining_.push_back(Req);
-    } else {
-      stageGlobalArtifact(Req);
-    }
-    return true;
   }
   if (codeReadyFn_ && codeBatchFlushFn_ &&
       decodeReqTier(Req.funcIndex) == kEJitTierBaseline) {
@@ -4275,6 +4331,7 @@ bool EJitSharedTaskPool::pollOne() {
     const bool Marked =
         cacheStageBatchRequest(Req) == EJitPublishStatus::Published;
     pendingBatchCompiles_.push_back({Req, Marked});
+    refreshLayoutUnlistedReady(); // No-op unless layout is collecting.
     if (Marked)
       dedupClear(Req.funcIndex, Req.generation);
     EJIT_DIAG_VERBOSE(
@@ -4478,6 +4535,10 @@ void EJitSharedTaskPool::getDiagnostics(EJitSharedDiagnostics &out) const {
   out.globalLayoutRequired = state_->globalLayoutRequired.loadRelaxed();
   out.globalLayoutReady = state_->globalLayoutReady.loadRelaxed();
   out.globalLayoutPublished = state_->globalLayoutPublished.loadRelaxed();
+  out.globalLayoutUnlistedReady =
+      state_->globalLayoutUnlistedReady.loadRelaxed();
+  out.globalLayoutUnlistedAppended =
+      state_->globalLayoutUnlistedAppended.loadRelaxed();
   out.globalLayoutError = state_->globalLayoutError.loadRelaxed();
   out.globalLayoutErrorRank = state_->globalLayoutErrorRank.loadRelaxed();
   out.globalLayoutArtifactBytes =

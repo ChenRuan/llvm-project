@@ -251,9 +251,110 @@ void runProductionLayout(bool pgo, unsigned start, bool permuted,
   Driver.stopSharedTaskPool();
 #endif
 }
+
+// Incomplete-manifest contract: functions that are registered but NOT listed
+// keep compiling through the ordinary paths. During collection their Baseline
+// misses park in the deferred batch backlog; at the collective point they
+// compile AFTER the manifest bodies, the single seal covers everything, and
+// they publish through the ordinary flush once Complete.
+void runUnlistedLayout(unsigned listed, unsigned registered) {
+#if !defined(__linux__) || !defined(EJIT_SRE_CODE_POOL) ||                     \
+    !defined(EJIT_CODE_POOL_BATCHED_PUBLISH) ||                                \
+    !defined(EJIT_SRE_SHARED_TASKPOOL)
+  GTEST_SKIP() << "requires Linux and production batched shared code pool";
+#else
+  ASSERT_EQ(mprotect(ejitLayoutTestNear, sizeof(ejitLayoutTestNear),
+                     PROT_READ | PROT_WRITE),
+            0);
+  EJitFuncRegistry::instance().reset();
+  Config config;
+  config.enablePgo = false;
+  config.globalLayoutBudgets.maxCollectionPolls = 40000;
+  for (unsigned I = 0; I < listed; ++I) {
+    EJitLayoutTarget Target;
+    Target.entryName = "layout_" + std::to_string(I);
+    config.globalLayout.push_back(Target);
+  }
+  auto Shared = std::make_unique<EJitSharedTaskPoolState>();
+  EJitRuntimeState Runtime;
+  EJitModuleLoader Loader;
+  std::string BC = realBusinessBitcode(registered, false);
+  for (unsigned I = 0; I < registered; ++I)
+    ASSERT_TRUE(Loader.registerBitcode(
+        "layout_" + std::to_string(I),
+        reinterpret_cast<const uint8_t *>(BC.data()), BC.size()));
+  EJitCompileDriver Driver(config, Runtime, Loader);
+  Driver.registerSymbol("layout_host_callback",
+                        reinterpret_cast<void *>(&layout_host_callback));
+  auto *Pool = Driver.sharedTaskPool();
+  Pool->bind(Shared.get());
+  Pool->setWorkerHooks(nullptr, nullptr, nullptr);
+  ASSERT_TRUE(Driver.startSharedTaskPool());
+  bool sawParkedUnlisted = false;
+  for (unsigned Step = 0;
+       Step < 12000 &&
+       Pool->globalLayoutState() != EJitGlobalLayoutState::Complete &&
+       Pool->globalLayoutState() != EJitGlobalLayoutState::Failed;
+       ++Step) {
+    // Reverse arrival: the unlisted functions miss FIRST, so their batch
+    // parks are deterministically in place before the manifest completes.
+    unsigned I = registered - 1 - (Step % registered);
+    Pool->compileOrGet(I, nullptr, 0, nullptr);
+    Pool->workerPollOnce();
+    if (Shared->globalLayoutReady.loadAcquire() < listed)
+      sawParkedUnlisted |=
+          Shared->globalLayoutUnlistedReady.loadAcquire() != 0;
+  }
+  ASSERT_EQ(Pool->globalLayoutState(), EJitGlobalLayoutState::Complete)
+      << "error=" << Shared->globalLayoutError.loadAcquire()
+      << "rank=" << Shared->globalLayoutErrorRank.loadAcquire();
+  EXPECT_TRUE(sawParkedUnlisted)
+      << "unlisted misses must park during collection";
+  EXPECT_EQ(Shared->globalLayoutPublished.loadAcquire(), listed);
+  EXPECT_EQ(Shared->globalLayoutUnlistedReady.loadAcquire(), 0u);
+  EXPECT_EQ(Shared->globalLayoutUnlistedAppended.loadAcquire(),
+            registered - listed);
+  // The collective appended the unlisted bodies owner-private; the ordinary
+  // flush publishes them now that the layout is Complete.
+  for (unsigned Step = 0; Step < 1000 && !Pool->flushCodeBatch(); ++Step)
+    Pool->workerPollOnce();
+  uintptr_t LastListed = 0;
+  for (unsigned I = 0; I < listed; ++I) {
+    auto R = Pool->compileOrGet(I, nullptr, 0, nullptr);
+    ASSERT_NE(R.fnPtr, nullptr);
+    uintptr_t Address = reinterpret_cast<uintptr_t>(R.fnPtr);
+    EXPECT_GT(Address, LastListed);
+    LastListed = Address;
+    EJitCompiledCodeInfo Range{};
+    ASSERT_TRUE(Driver.getJitEngine()->findCodeRange(R.fnPtr, Range));
+    EXPECT_EQ(Range.poolKind, EJitCodePoolKind::Near);
+    auto Fn = reinterpret_cast<int (*)(int, int (*)(int))>(R.fnPtr);
+    EXPECT_EQ(Fn(10, &layout_host_callback), 62 + static_cast<int>(I));
+    Pool->releaseRead(R.bucketIndex);
+  }
+  for (unsigned I = listed; I < registered; ++I) {
+    auto R = Pool->compileOrGet(I, nullptr, 0, nullptr);
+    ASSERT_NE(R.fnPtr, nullptr);
+    uintptr_t Address = reinterpret_cast<uintptr_t>(R.fnPtr);
+    EXPECT_GT(Address, LastListed)
+        << "unlisted layout_" << I << " must append after the manifest region";
+    EJitCompiledCodeInfo Range{};
+    ASSERT_TRUE(Driver.getJitEngine()->findCodeRange(R.fnPtr, Range));
+    EXPECT_EQ(Range.poolKind, EJitCodePoolKind::Near);
+    auto Fn = reinterpret_cast<int (*)(int, int (*)(int))>(R.fnPtr);
+    EXPECT_EQ(Fn(10, &layout_host_callback), 62 + static_cast<int>(I));
+    Pool->releaseRead(R.bucketIndex);
+  }
+  Driver.stopSharedTaskPool();
+#endif
+}
 } // namespace
 TEST(EJitGlobalLayoutIntegration, BaselineFromH) {
   runProductionLayout(false, 7, false);
+}
+TEST(EJitGlobalLayoutIntegration,
+     IncompleteManifestInitializesAndAppendsUnlisted) {
+  runUnlistedLayout(5, 8);
 }
 TEST(EJitGlobalLayoutIntegration, BaselineFromZ) {
   runProductionLayout(false, 25, false);

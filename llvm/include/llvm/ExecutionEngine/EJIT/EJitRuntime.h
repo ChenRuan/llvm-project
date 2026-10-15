@@ -277,6 +277,14 @@ typedef struct {
   uint64_t artifactBytes;
   uint64_t retainedNearBytes;
   uint64_t retainedFarBytes;
+  /* Unlisted (manifest-external) requests: parked count while collecting,
+   * and bodies actually appended after the manifest bodies at the collective
+   * point. Poll this API as the health check: after a Failed layout the
+   * system keeps running on ordinary fallback and this is the only failure
+   * visibility.
+   */
+  uint32_t unlistedReady;
+  uint32_t unlistedAppended;
 } ejit_global_layout_status_t;
 
 ejit_status_t ejit_get_global_layout_status(ejit_global_layout_status_t *out);

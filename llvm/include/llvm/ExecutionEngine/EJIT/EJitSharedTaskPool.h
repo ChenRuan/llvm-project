@@ -48,6 +48,39 @@ namespace ejit {
 
 class EJitModuleLoader;
 
+/// Structural request equality: same real funcIndex, dimension count,
+/// generation, dimension/version pairs and (unless \p bindings is false)
+/// the same bound-pointer set regardless of order. Shared by manifest
+/// validation and the unlisted-park supersede rule.
+inline bool sameIdentity(const EJitCompileRequest &A,
+                          const EJitCompileRequest &B, bool bindings = true) {
+  if (stripReqTier(A.funcIndex) != stripReqTier(B.funcIndex) ||
+      A.numDims != B.numDims || A.generation != B.generation)
+    return false;
+  // Dimension order is the registered entry's formal/legacy key order.
+  // This identifies a member; it does not determine the manifest's rank.
+  for (uint32_t I = 0; I < A.numDims; ++I)
+    if (A.dims[I].dimType != B.dims[I].dimType ||
+        A.dims[I].instanceId != B.dims[I].instanceId ||
+        A.versions[I] != B.versions[I])
+      return false;
+  if (!bindings)
+    return true;
+  if (A.boundCount != B.boundCount)
+    return false;
+  for (uint32_t I = 0; I < A.boundCount; ++I) {
+    bool found = false;
+    for (uint32_t J = 0; J < B.boundCount; ++J)
+      if (A.boundPointers[I].argIndex == B.boundPointers[J].argIndex &&
+          A.boundPointers[I].rawPtr == B.boundPointers[J].rawPtr &&
+          A.boundPointers[I].size == B.boundPointers[J].size)
+        found = true;
+    if (!found)
+      return false;
+  }
+  return true;
+}
+
 //===----------------------------------------------------------------------===//
 // Read-only diagnostics snapshot (spec §11 observability). Every field is a
 // plain copy of an atomic load; no field exposes a raw shared pointer.
@@ -86,6 +119,8 @@ struct EJitSharedDiagnostics {
   uint32_t globalLayoutRequired;
   uint32_t globalLayoutReady;
   uint32_t globalLayoutPublished;
+  uint32_t globalLayoutUnlistedReady;
+  uint32_t globalLayoutUnlistedAppended;
   uint32_t globalLayoutError;
   uint32_t globalLayoutErrorRank;
   uint64_t globalLayoutArtifactBytes;
@@ -1437,6 +1472,12 @@ private:
   };
   std::vector<LayoutMember> layoutMembers_;
   std::vector<EJitCompileRequest> layoutDraining_;
+  /// Collecting-phase Tier-2 requests for functions the manifest does not
+  /// declare. Held uncompiled (admission released, dedup cleared) so the
+  /// collective point can append them AFTER the manifest bodies in one near
+  /// pool region. Bounded by kEJitSharedQueueSlots; overflow discards the
+  /// request (the function keeps its live Tier-1 until a later re-arm).
+  std::vector<EJitCompileRequest> layoutDeferredT2_;
   EJitLayoutBudgets layoutBudgets_;
   PrepareArtifactCallback layoutPrepare_ = nullptr;
   LinkArtifactCallback layoutLink_ = nullptr;
@@ -1474,6 +1515,13 @@ private:
   void failGlobalLayout(EJitGlobalLayoutError error, uint32_t rank);
   void clearGlobalArtifacts();
   size_t globalMemberFor(const EJitCompileRequest &req) const;
+  /// True when some manifest member declares \p funcIndex (identity aside).
+  /// A declared-but-mismatched request still fails the layout (precision
+  /// intent); an entirely undeclared funcIndex takes the ordinary paths.
+  bool layoutDeclaresFunc(uint32_t funcIndex) const;
+  /// Mirror the collection-phase parked-unlisted gauge (parked Tier-2 plus
+  /// deferred batch backlog) into the shared blob. No-op outside Collecting.
+  void refreshLayoutUnlistedReady();
 
   /// Release staged-PGO ownership if \p funcIndex still owns it. Tier-2
   /// completion and terminal worker failures call this; transient queue-full
@@ -1555,6 +1603,10 @@ private:
   };
   std::vector<PendingBatchCompile> pendingBatchCompiles_;
   std::vector<PendingPublish> pendingPublishes_;
+  /// Snapshot of the collective-append slice (unlisted Tier-2 plus deferred
+  /// batch results parked during the collective window), kept for the
+  /// publish-result summary emitted at COMPLETE. Owner-private.
+  std::vector<PendingPublish> layoutAppendedPublishes_;
   /// Armed when Tier-2 links into the near RW/NX pool. Consumed only after the
   /// owner worker observes the shared compile queue empty.
   bool autoTier2PublishPending_ = false;

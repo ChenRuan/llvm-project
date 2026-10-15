@@ -438,12 +438,15 @@ bool EJitCompileDriver::buildGlobalLayoutManifest(
   if (targets.empty() ||
       targets.size() > config_.globalLayoutBudgets.maxMembers)
     return false;
-  std::vector<bool> covered(EJitFuncRegistry::instance().count(), false);
+  const uint32_t registered = EJitFuncRegistry::instance().count();
   for (const auto &target : targets) {
+    // A manifest entry must name a registered function, but the manifest no
+    // longer has to cover every registered function: unlisted functions keep
+    // compiling through the ordinary shared-pool paths and are appended after
+    // the manifest bodies at the collective allocation point.
     uint32_t index = EJitFuncRegistry::instance().lookup(target.entryName);
-    if (index == kEJitInvalidFuncIndex || index >= covered.size())
+    if (index == kEJitInvalidFuncIndex || index >= registered)
       return false;
-    covered[index] = true;
     const auto &Meta = getLoader().getOrCacheFuncMeta(index);
     if (target.identity.numDims != Meta.dimCount)
       return false;
@@ -463,9 +466,6 @@ bool EJitCompileDriver::buildGlobalLayoutManifest(
                                  : kEJitTierBaseline);
     manifest.push_back(req);
   }
-  for (bool member : covered)
-    if (!member)
-      return false;
   return true;
 }
 

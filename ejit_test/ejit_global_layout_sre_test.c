@@ -1,6 +1,15 @@
 // Standalone PR248 board smoke. Build with this revision's EJIT Clang/header.
 // Fresh isolated image: core6 test_ejit_period, core16 test_ejit_period,
 // core6 test_ejit_global_layout_print. All shell arguments are ignored.
+//
+// Manifest contract (2026-10-15): the manifest no longer has to cover every
+// registered entry — unlisted functions compile through the ordinary paths and
+// append after the manifest bodies at the collective point. This smoke
+// deliberately lists ALL 26 roots so the strict A..Z address-order assertion
+// stays exact; with a complete manifest unlistedReady/unlistedAppended must
+// both stay zero. A FAILED layout no longer switches misses to fallback-only:
+// every function keeps compiling normally, so poll
+// ejit_get_global_layout_status as the health check to notice a lost layout.
 #if !__has_attribute(ejit_entry)
 #error "Use the matching EJIT Clang; ignoring unknown attributes is not valid"
 #endif
@@ -43,7 +52,7 @@ enum {
 _Static_assert(LAYOUT_COMPLETE == 6 && LAYOUT_REFRESHING == 9,
                "Update local names if the public layout state ABI changes");
 _Static_assert(sizeof(void *) == 8 && sizeof(ejit_config_t) == 56 &&
-                   sizeof(ejit_global_layout_status_t) == 56 &&
+                   sizeof(ejit_global_layout_status_t) == 64 &&
                    sizeof(ejit_taskpool_stats_t) == 88,
                "Matching 64-bit ABI required");
 
@@ -307,15 +316,17 @@ int test_ejit_global_layout_print(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
       ejit_taskpool_get_stats(&t) != EJIT_OK)
     return -1;
   SRE_printf("[LAYOUT248] state=%u gen=%u required=%u ready=%u published=%u "
-             "error=%u rank=%u active=%u near=%llu far=%llu\n",
+             "error=%u rank=%u active=%u unlistedReady=%u unlistedAppended=%u "
+             "near=%llu far=%llu\n",
              s.state, s.generation, s.required, s.ready, s.published, s.error,
-             s.errorRank, s.activeProfiles,
+             s.errorRank, s.activeProfiles, s.unlistedReady, s.unlistedAppended,
              (unsigned long long)s.retainedNearBytes,
              (unsigned long long)s.retainedFarBytes);
   if (stage != DEMO_DONE || s.state != LAYOUT_COMPLETE || s.error ||
       s.generation != g_layout_result.generation ||
       s.required != LAYOUT_COUNT || s.ready != LAYOUT_COUNT ||
-      s.published != LAYOUT_COUNT || s.activeProfiles || t.compileFailed ||
+      s.published != LAYOUT_COUNT || s.activeProfiles || s.unlistedReady ||
+      s.unlistedAppended || t.compileFailed ||
       t.publishFailed || t.queueFull || t.pendingEntries || t.queueApproxSize ||
       t.asyncCompiles != 2u * LAYOUT_COUNT || t.readyEntries != LAYOUT_COUNT ||
       ejit_taskpool_pending_count())

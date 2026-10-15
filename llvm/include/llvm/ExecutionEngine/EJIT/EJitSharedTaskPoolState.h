@@ -432,6 +432,13 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU32 globalLayoutRequired;
   EJitAtomicU32 globalLayoutReady;
   EJitAtomicU32 globalLayoutPublished;
+  /// Collection-phase parked unlisted requests (parked Tier-2 plus the
+  /// deferred batch backlog). Zero once the collective point consumes them
+  /// or a terminal/refresh path releases them. Owner-written, peer-read.
+  EJitAtomicU32 globalLayoutUnlistedReady;
+  /// Unlisted bodies actually compiled into the collective append window
+  /// (manifest bodies first, unlisted appended after). Owner-written.
+  EJitAtomicU32 globalLayoutUnlistedAppended;
   EJitAtomicU32 globalLayoutError;
   EJitAtomicU32 globalLayoutErrorRank;
   EJitAtomicU64 globalLayoutArtifactBytes;

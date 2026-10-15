@@ -500,6 +500,8 @@ ejit_status_t ejit_get_global_layout_status(ejit_global_layout_status_t *out) {
   out->required = D.globalLayoutRequired;
   out->ready = D.globalLayoutReady;
   out->published = D.globalLayoutPublished;
+  out->unlistedReady = D.globalLayoutUnlistedReady;
+  out->unlistedAppended = D.globalLayoutUnlistedAppended;
   out->error = D.globalLayoutError;
   out->errorRank = D.globalLayoutErrorRank;
   out->activeProfiles = D.pgoActiveFunctionCount;

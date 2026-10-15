@@ -4,6 +4,14 @@ Use only `ejit_global_layout_sre_test.c` and the matching
 `llvm/ExecutionEngine/EJIT/EJitRuntime.h`. No test helper header is needed.
 This is a cold-image smoke, not a board acceptance result.
 
+A second smoke covers the 2026-10-15 unlisted-functions contract:
+`ejit_test/baremetal/ejit_global_layout_unlisted_test.c` (same three-step
+core6/core16 flow, PGO64, 8 manifest members A..H plus registered-but-unlisted
+X/Y/Z). Its authoritative spec is the file's header comment. Run it as a
+separate image; its PASS criteria are the append order (every unlisted body
+above the manifest region), `unlistedAppended == 3` and the park evidence
+during collection.
+
 Use this revision's `lipo.py gc-merge`, which retains the defined runtime exports
 `ejit_init_global_layout`, `ejit_get_global_layout_status`,
 `ejit_refresh_global_layout` and `ejit_shutdown_checked`. Older scripts discard
@@ -16,11 +24,21 @@ not acquire undefined roots from the optional retention list.
 ## Build The Image
 
 Replace the old `test_ejit_period` source. PR247, PR230 and PR248 demos define
-the same shell entry: use separate images, never link them together. The complete
-registered image must contain exactly these 26 `ejit_entry` roots, A through Z.
-Remove other example/application EJIT roots; do not silently leave targets outside
-the manifest. Internal helpers are not additional entry roots. Verify the final
+the same shell entry: use separate images, never link them together. Since the
+2026-10-15 unlisted-functions contract the manifest no longer has to cover every
+registered entry, but this smoke deliberately registers and lists exactly these
+26 `ejit_entry` roots, A through Z, so the strict A..Z address-order assertion
+stays exact and `unlistedReady`/`unlistedAppended` must both stay zero.
+Do not add extra entry roots to this image: they would compile as unlisted
+functions and break the exact 52-count checks below. Internal helpers are not
+additional entry roots. Verify the final
 package's static registration/root list as well as this C object's 26 roots.
+
+A FAILED layout no longer switches misses to a fallback-only mode: every
+function keeps compiling through the ordinary paths and the system keeps
+running. `ejit_get_global_layout_status` is therefore the health check that
+makes a lost layout visible — archive its output (including the new
+`unlistedReady`/`unlistedAppended` fields) with the worker log.
 
 Use this branch's EJIT Clang, not stock Clang with ignored attributes. The source
 fails compilation without `ejit_entry` support. Preserve generated AOT wrappers,

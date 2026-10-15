@@ -12,35 +12,6 @@
 using namespace llvm::ejit;
 
 namespace {
-bool sameIdentity(const EJitCompileRequest &A, const EJitCompileRequest &B,
-                  bool bindings = true) {
-  if (stripReqTier(A.funcIndex) != stripReqTier(B.funcIndex) ||
-      A.numDims != B.numDims || A.generation != B.generation)
-    return false;
-  // Dimension order is the registered entry's formal/legacy key order.
-  // This identifies a member; it does not determine the manifest's rank.
-  for (uint32_t I = 0; I < A.numDims; ++I)
-    if (A.dims[I].dimType != B.dims[I].dimType ||
-        A.dims[I].instanceId != B.dims[I].instanceId ||
-        A.versions[I] != B.versions[I])
-      return false;
-  if (!bindings)
-    return true;
-  if (A.boundCount != B.boundCount)
-    return false;
-  for (uint32_t I = 0; I < A.boundCount; ++I) {
-    bool found = false;
-    for (uint32_t J = 0; J < B.boundCount; ++J)
-      if (A.boundPointers[I].argIndex == B.boundPointers[J].argIndex &&
-          A.boundPointers[I].rawPtr == B.boundPointers[J].rawPtr &&
-          A.boundPointers[I].size == B.boundPointers[J].size)
-        found = true;
-    if (!found)
-      return false;
-  }
-  return true;
-}
-
 EJitCompileRequest slotRequest(const EJitSharedCacheSlot &S) {
   EJitCompileRequest R{};
   R.funcIndex = S.funcIndex;
@@ -185,8 +156,25 @@ bool EJitSharedTaskPool::serviceGlobalLayoutRefresh() {
                      // leaves.
       }
   clearGlobalArtifacts();
+  // Staged collective-window results (and any other staged entries) own
+  // Pending markers; drop them BEFORE the epoch changes — afterwards their
+  // generation can no longer match and the slot would linger forever.
+  for (const auto &P : pendingPublishes_)
+    cacheDropPending(P.req, P.fn);
   pendingPublishes_.clear();
   layoutDraining_.clear();
+  // Parked unlisted Tier-2 entries and deferred batch requests belong to the
+  // retired generation. Only their staged MARKERS must be dropped BEFORE the
+  // epoch changes — after the bump cacheDropPending can no longer match the
+  // marker's generation and the Pending slot would linger forever. The dedup
+  // claims need no per-entry handling here: the post-bump sweep below clears
+  // the whole previous generation.
+  for (const auto &P : pendingBatchCompiles_)
+    if (P.hasSharedMarker)
+      cacheDropPending(P.req, nullptr);
+  pendingBatchCompiles_.clear();
+  layoutDeferredT2_.clear();
+  layoutAppendedPublishes_.clear();
   // Drain old requests before the epoch changes. No new misses are admitted in
   // Refreshing; late producers retain the old generation and are dropped later.
   EJitCompileRequest old{};
@@ -236,6 +224,8 @@ bool EJitSharedTaskPool::serviceGlobalLayoutRefresh() {
   state_->globalLayoutRequired.storeRelaxed(layoutMembers_.size());
   state_->globalLayoutReady.storeRelaxed(0);
   state_->globalLayoutPublished.storeRelaxed(0);
+  state_->globalLayoutUnlistedReady.storeRelaxed(0);
+  state_->globalLayoutUnlistedAppended.storeRelaxed(0);
   state_->globalLayoutError.storeRelaxed(0);
   state_->globalLayoutErrorRank.storeRelaxed(0);
   if (replacement) {
@@ -289,7 +279,10 @@ bool EJitSharedTaskPool::configureGlobalLayout(
   layoutPolls_ = 0;
   layoutSamplingThreshold_ = state_->tier2Threshold.loadAcquire();
   layoutSamplingMax_ = state_->pgoMaxActiveFunctions.loadAcquire();
+  layoutAppendedPublishes_.clear();
   state_->globalLayoutRequired.storeRelaxed(layoutMembers_.size());
+  state_->globalLayoutUnlistedReady.storeRelaxed(0);
+  state_->globalLayoutUnlistedAppended.storeRelaxed(0);
   state_->globalLayoutState.storeRelease(
       static_cast<uint32_t>(EJitGlobalLayoutState::Collecting));
   return true;
@@ -300,6 +293,21 @@ size_t EJitSharedTaskPool::globalMemberFor(const EJitCompileRequest &R) const {
     if (sameIdentity(layoutMembers_[I].req, R))
       return I;
   return layoutMembers_.size();
+}
+
+bool EJitSharedTaskPool::layoutDeclaresFunc(uint32_t funcIndex) const {
+  for (const auto &M : layoutMembers_)
+    if (stripReqTier(M.req.funcIndex) == funcIndex)
+      return true;
+  return false;
+}
+
+void EJitSharedTaskPool::refreshLayoutUnlistedReady() {
+  if (!layoutConfigured_ ||
+      globalLayoutState() != EJitGlobalLayoutState::Collecting)
+    return;
+  state_->globalLayoutUnlistedReady.storeRelaxed(static_cast<uint32_t>(
+      layoutDeferredT2_.size() + pendingBatchCompiles_.size()));
 }
 
 bool EJitSharedTaskPool::samplingDrained(const EJitCompileRequest &R) const {
@@ -394,13 +402,20 @@ void EJitSharedTaskPool::failGlobalLayout(EJitGlobalLayoutError error,
   state_->globalLayoutErrorRank.storeRelaxed(rank);
   state_->globalLayoutState.storeRelease(
       static_cast<uint32_t>(EJitGlobalLayoutState::Failed));
+  const uint32_t UnlistedParked =
+      static_cast<uint32_t>(layoutDeferredT2_.size());
+  const uint32_t UnlistedBatch =
+      static_cast<uint32_t>(pendingBatchCompiles_.size());
   EJIT_DIAG("global layout FAILED gen=%u rank=%u reason=%u ready=%u/%u "
-            "published=%u artifactBytes=%llu; legal fallback retained",
+            "published=%u unlistedParked=%u unlistedBatch=%u "
+            "artifactBytes=%llu; legal fallback retained (unlisted released "
+            "to ordinary compilation)",
             state_->generation.loadAcquire(), rank,
             static_cast<unsigned>(error),
             state_->globalLayoutReady.loadRelaxed(),
             state_->globalLayoutRequired.loadRelaxed(),
-            state_->globalLayoutPublished.loadRelaxed(),
+            state_->globalLayoutPublished.loadRelaxed(), UnlistedParked,
+            UnlistedBatch,
             static_cast<unsigned long long>(
                 state_->globalLayoutArtifactBytes.loadRelaxed()));
   for (size_t I = 0; I < layoutMembers_.size(); ++I)
@@ -410,11 +425,36 @@ void EJitSharedTaskPool::failGlobalLayout(EJitGlobalLayoutError error,
   for (const auto &P : pendingPublishes_) {
     if (publishFn_)
       publishFn_(publishCtx_, P.req, false);
+    // A staged entry (collective-window batch result) owns a Pending slot
+    // with this exact fn pointer; dropping it lets a fresh miss re-enqueue on
+    // the ordinary fallback instead of wedging on AlreadyPending. Entries
+    // parked without staging (Tier-1 retries, codeReady Tier-2) carry no
+    // marker, and cacheDropPending no-ops for them.
+    cacheDropPending(P.req, P.fn);
     finishPgoFunction(stripReqTier(P.req.funcIndex), false,
                       "layout-pending-t1-abort");
     dedupClear(P.req.funcIndex, P.req.generation);
   }
   pendingPublishes_.clear();
+  // Parked unlisted Tier-2 entries: their admission and dedup claims were
+  // released at park time; clearing the list returns them to ordinary misses
+  // on the fallback paths (the dedupClear is an idempotent safety net for a
+  // re-armed duplicate that re-claimed after its park).
+  for (const auto &R : layoutDeferredT2_)
+    dedupClear(R.funcIndex, R.generation);
+  layoutDeferredT2_.clear();
+  // Deferred batch requests: drop every staged marker (and any retained
+  // coarse claim) so a fresh miss re-enqueues on the ordinary path instead of
+  // sticking on AlreadyPending.
+  for (const auto &P : pendingBatchCompiles_) {
+    if (P.hasSharedMarker)
+      cacheDropPending(P.req, nullptr);
+    dedupClear(P.req.funcIndex, P.req.generation);
+  }
+  pendingBatchCompiles_.clear();
+  layoutAppendedPublishes_.clear();
+  state_->globalLayoutUnlistedReady.storeRelaxed(0);
+  state_->globalLayoutUnlistedAppended.storeRelaxed(0);
   // Objects are not executable. Linked/published NO_RECLAIM bytes remain
   // charged to their pools and are NEVER freed or overwritten here.
   clearGlobalArtifacts();
@@ -642,6 +682,60 @@ bool EJitSharedTaskPool::serviceGlobalLayout() {
       failGlobalLayout(EJitGlobalLayoutError::StaleIdentity, 0);
       return true;
     }
+    // Collective append: unlisted functions join AFTER the manifest bodies.
+    // Parked Tier-2 entries first (funcIndex ascending), then the deferred
+    // batch requests (existing dims→funcIndex→tier order) — the single seal
+    // below then covers every allocation made in this window.
+    uint32_t Appended = 0;
+    const size_t PublishBase = pendingPublishes_.size();
+    std::vector<EJitCompileRequest> DeferredT2;
+    DeferredT2.swap(layoutDeferredT2_);
+    // A re-armed identity can park more than once while collection waited;
+    // compile only the latest request of each identity.
+    for (size_t I = 0; I < DeferredT2.size(); ++I) {
+      bool Superseded = false;
+      for (size_t J = I + 1; J < DeferredT2.size(); ++J)
+        if (sameIdentity(DeferredT2[J], DeferredT2[I])) {
+          Superseded = true;
+          break;
+        }
+      if (Superseded)
+        continue;
+      // Count only requests that actually produced an appended body: a
+      // compile/publish failure leaves the function to the ordinary retry
+      // paths and is not part of the collective window. Failure detection
+      // uses the global compile/publish counters (the same heuristic as the
+      // member Tier-1 check in pollOne); a concurrent unrelated failure can
+      // only undercount the diagnostic, never overcount it.
+      uint64_t Failures = state_->counters.compileFailed.loadRelaxed() +
+                          state_->counters.publishFailed.loadRelaxed();
+      runCompile(DeferredT2[I]);
+      workerThrottle();
+      if (Failures == state_->counters.compileFailed.loadRelaxed() +
+                          state_->counters.publishFailed.loadRelaxed())
+        ++Appended;
+    }
+    const uint32_t BatchCount =
+        static_cast<uint32_t>(pendingBatchCompiles_.size());
+    uint64_t BatchFailures = state_->counters.compileFailed.loadRelaxed() +
+                             state_->counters.publishFailed.loadRelaxed();
+    compilePendingBatchRequests();
+    BatchFailures = state_->counters.compileFailed.loadRelaxed() +
+                        state_->counters.publishFailed.loadRelaxed() -
+                    BatchFailures;
+    if (BatchFailures > BatchCount)
+      BatchFailures = BatchCount;
+    Appended += BatchCount - static_cast<uint32_t>(BatchFailures);
+    // Snapshot the appended slice (parked results pushed by the runCompiles
+    // above) so the COMPLETE summary can list it even after post-freeze
+    // ordinary arrivals mix into the pending list.
+    layoutAppendedPublishes_.assign(pendingPublishes_.begin() + PublishBase,
+                                    pendingPublishes_.end());
+    state_->globalLayoutUnlistedReady.storeRelaxed(0);
+    state_->globalLayoutUnlistedAppended.storeRelaxed(Appended);
+    EJIT_DIAG("global layout collective append: unlistedT2=%zu batch=%u "
+              "appended=%u",
+              DeferredT2.size(), BatchCount, Appended);
   }
   if (globalLayoutState() == EJitGlobalLayoutState::Linked ||
       globalLayoutState() == EJitGlobalLayoutState::Sealing) {
@@ -718,9 +812,31 @@ bool EJitSharedTaskPool::serviceGlobalLayout() {
       return true;
     }
     publishCodePoolStats();
-    EJIT_DIAG("global layout COMPLETE gen=%u members=%zu collectionPolls=%u",
-              state_->generation.loadAcquire(), layoutMembers_.size(),
-              layoutPolls_);
+    // Publish-result summary: rank order was enforced during linking; the
+    // verdict here additionally checks that every appended unlisted body
+    // landed above the manifest region (the collective append promise).
+    uintptr_t LastMember = 0;
+    for (const auto &M : layoutMembers_) {
+      const uintptr_t Body = reinterpret_cast<uintptr_t>(M.fn);
+      if (Body > LastMember)
+        LastMember = Body;
+    }
+    bool AppendedOrdered = true;
+    for (const auto &P : layoutAppendedPublishes_)
+      if (reinterpret_cast<uintptr_t>(P.fn) <= LastMember)
+        AppendedOrdered = false;
+    EJIT_DIAG("global layout COMPLETE gen=%u members=%u/%u "
+              "unlistedAppended=%u addressOrder=%s collectionPolls=%u "
+              "publishPolls=%u",
+              state_->generation.loadAcquire(),
+              state_->globalLayoutPublished.loadRelaxed(),
+              state_->globalLayoutRequired.loadRelaxed(),
+              state_->globalLayoutUnlistedAppended.loadRelaxed(),
+              AppendedOrdered ? "manifest-then-appended" : "crossed",
+              layoutPolls_, layoutPublishPolls_);
+    for (const auto &P : layoutAppendedPublishes_)
+      EJIT_DIAG("global layout appended unlisted func=%u body=%p",
+                stripReqTier(P.req.funcIndex), P.fn);
     return true;
   }
   return false;
