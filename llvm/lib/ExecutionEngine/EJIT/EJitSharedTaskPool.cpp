@@ -3817,9 +3817,35 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests) {
   [[maybe_unused]] size_t Published = 0;
   [[maybe_unused]] size_t Dropped = 0;
   std::vector<PendingPublish> Retry;
+  // A collective-append body itself always publishes; any OTHER parked
+  // Tier-2 whose identity the layout already delivered is an obsolete re-arm
+  // that parked during the (potentially long) collective window — dropping
+  // it keeps the delivered rank-ordered body. The snapshot exemption makes
+  // the rule order-independent when a re-arm parked ahead of the collective
+  // body.
+  auto isAppendSnapshotEntry = [this](const PendingPublish &P) {
+    for (const auto &Snap : layoutAppendedPublishes_)
+      if (P.fn == Snap.fn && sameIdentity(Snap.req, P.req))
+        return true;
+    return false;
+  };
   for (PendingPublish &P : pendingPublishes_) {
     const uint32_t Tier = decodeReqTier(P.req.funcIndex);
     const uint32_t FuncIndex = stripReqTier(P.req.funcIndex);
+    if (layoutConfigured_ && Tier == kEJitTierPgoUse &&
+        !isAppendSnapshotEntry(P) && layoutTier2AlreadyDelivered(P.req)) {
+      if (publishFn_)
+        publishFn_(publishCtx_, P.req, false);
+      cacheDropPending(P.req, P.fn);
+      finishPgoFunction(FuncIndex, false, "obsolete-tier2-rearm");
+      if (releaseFn_)
+        releaseFn_(releaseCtx_, P.fn);
+      dedupClear(P.req.funcIndex, P.req.generation);
+      EJIT_DIAG("global layout dropped parked obsolete Tier-2 re-arm "
+                "func=%u",
+                FuncIndex);
+      continue; // Not a failure: the delivered body stays authoritative.
+    }
     EJitCompiledCodeInfo Info{};
     bool Ready = !codeReadyFn_ || codeReadyFn_(codeBatchCtx_, P.fn);
     bool HasRange =
@@ -4317,6 +4343,21 @@ bool EJitSharedTaskPool::pollOne() {
         return true;
       }
       // Undeclared Baseline / Tier-1: ordinary paths below.
+    }
+    // Outside collection (the failed/complete ordinary fallback, the
+    // collective's own linking/sealing/publishing window, or a refresh), an
+    // armed Tier-2 re-arm whose identity the layout has already delivered is
+    // obsolete: it was armed from a saturated Tier-1 before publication, and
+    // compiling it would replace the delivered rank-ordered body with an
+    // unordered ordinary compile. Drop it instead.
+    if (decodeReqTier(Req.funcIndex) == kEJitTierPgoUse &&
+        layoutTier2AlreadyDelivered(Req)) {
+      finishPgoFunction(stripReqTier(Req.funcIndex), false,
+                        "obsolete-tier2-rearm");
+      dedupClear(Req.funcIndex, Req.generation);
+      EJIT_DIAG("global layout dropped obsolete Tier-2 re-arm func=%u",
+                stripReqTier(Req.funcIndex));
+      return true;
     }
   }
   if (codeReadyFn_ && codeBatchFlushFn_ &&

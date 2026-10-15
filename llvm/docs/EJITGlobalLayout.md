@@ -27,7 +27,11 @@ visibility. Mixed still-valid old/new dispatch is permitted during cutover.
 Partial failure retains published resources, reports published/unpublished ranks
 and remains FAILED, never COMPLETE. A new explicit refresh command or actual
 lifecycle event can start a complete in-process generation; invalid identities
-are never reused or retried as an unordered subset.
+are never reused or retried as an unordered subset. Residual Tier-2 re-arms
+that were armed from a saturated Tier-1 before publication are dropped once
+the layout has delivered that identity's Tier-2 (a published slot or a parked
+collective-append body): they never replace a delivered rank-ordered body
+after COMPLETE, neither at dequeue time nor at the pending flush.
 
 **Failed semantics (changed 2026-10-15):** a FAILED layout no longer switches
 misses to OffMode. Every function — manifest member or not — falls back to the

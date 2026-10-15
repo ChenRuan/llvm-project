@@ -1519,6 +1519,12 @@ private:
   /// A declared-but-mismatched request still fails the layout (precision
   /// intent); an entirely undeclared funcIndex takes the ordinary paths.
   bool layoutDeclaresFunc(uint32_t funcIndex) const;
+  /// True when the layout has already delivered this identity's Tier-2: a
+  /// published Ready/PgoUse slot, or a collective-append body parked for the
+  /// post-COMPLETE flush. An armed Tier-2 re-arm matching it is obsolete and
+  /// must be dropped, never compiled: an ordinary compile would replace the
+  /// delivered rank-ordered body with an unordered one.
+  bool layoutTier2AlreadyDelivered(const EJitCompileRequest &R) const;
   /// Mirror the collection-phase parked-unlisted gauge (parked Tier-2 plus
   /// deferred batch backlog) into the shared blob. No-op outside Collecting.
   void refreshLayoutUnlistedReady();

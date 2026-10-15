@@ -578,6 +578,39 @@ TEST(EJitGlobalLayoutState, RefreshReleasesParkedUnlistedRequests) {
 }
 
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+TEST(EJitGlobalLayoutState, PostCompleteResidualRearmDoesNotReplaceBody) {
+  Harness H;
+  H.pool.setPgoEnabled(true, 1, 4);
+  H.pool.setCompiler(
+      [](void *p, const EJitCompileRequest &, void **out) {
+        auto &H = *static_cast<Harness *>(p);
+        *out = reinterpret_cast<void *>(0x900000u + H.compiled++ * 32u);
+        return true;
+      },
+      &H);
+  auto M = manifest({0});
+  M[0].funcIndex = encodeReqTier(0, kEJitTierPgoUse);
+  ASSERT_TRUE(H.configure(M));
+  H.request(0);                              // Tier-1 published
+  auto s = H.pool.compileOrGet(0, nullptr, 0, nullptr);
+  ASSERT_NE(s.fnPtr, nullptr);
+  H.pool.releaseRead(s.bucketIndex);         // arms the member Tier-2
+  H.pool.workerPollOnce();                   // stages it: ready=1
+  // A saturated lookup that raced the collective: armed before COMPLETE and
+  // still queued when the layout publishes.
+  auto dup = H.pool.compileOrGet(0, nullptr, 0, nullptr);
+  EXPECT_EQ(dup.status, EJitCompileOrGetStatus::AlreadyPending);
+  H.pool.workerPollOnce(); // collective: link/seal/publish -> COMPLETE
+  ASSERT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Complete);
+  H.pool.workerPollOnce(); // pops the residual re-arm: dropped, not compiled
+  auto r0 = H.pool.compileOrGet(0, nullptr, 0, nullptr);
+  ASSERT_NE(r0.fnPtr, nullptr);
+  // The delivered rank-ordered body survives; the re-arm never recompiled.
+  EXPECT_EQ(r0.fnPtr, reinterpret_cast<void *>(0x100040u));
+  EXPECT_EQ(H.compiled, 1u);
+  EXPECT_EQ(H.state->counters.tier2Compiles.loadRelaxed(), 1u);
+  H.pool.releaseRead(r0.bucketIndex);
+}
 TEST(EJitGlobalLayoutState, UnlistedTier2ParksReleasesAdmissionAndAppends) {
   Harness H;
   H.pool.setPgoEnabled(true, 1, 4);
@@ -614,6 +647,13 @@ TEST(EJitGlobalLayoutState, UnlistedTier2ParksReleasesAdmissionAndAppends) {
                            // unsealed window; one seal; member publishes
   ASSERT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Complete);
   EXPECT_EQ(H.state->globalLayoutUnlistedAppended.loadAcquire(), 1u);
+  // A residual re-arm of the unlisted function raced the flush: its Tier-2
+  // is not published yet, but the collective-append body is parked for it,
+  // so the re-arm is obsolete and must be dropped without compiling.
+  auto dup = H.pool.compileOrGet(1, nullptr, 0, nullptr);
+  EXPECT_EQ(dup.status, EJitCompileOrGetStatus::AlreadyPending);
+  H.pool.workerPollOnce();
+  EXPECT_EQ(H.compiled, 3u); // no fourth compile for the dropped re-arm
   H.blockCodeReady = false;
   ASSERT_TRUE(H.pool.flushCodeBatch());
   auto r1 = H.pool.compileOrGet(1, nullptr, 0, nullptr);

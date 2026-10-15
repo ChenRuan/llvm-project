@@ -302,6 +302,25 @@ bool EJitSharedTaskPool::layoutDeclaresFunc(uint32_t funcIndex) const {
   return false;
 }
 
+bool EJitSharedTaskPool::layoutTier2AlreadyDelivered(
+    const EJitCompileRequest &R) const {
+  uint32_t bucket =
+      hashIdentity(stripReqTier(R.funcIndex), R.dims, R.numDims) %
+      kEJitSharedCacheBuckets;
+  for (const auto &S : state_->buckets[bucket].slots)
+    if (S.state.loadAcquire() ==
+            static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
+        S.tier.loadAcquire() == kEJitTierPgoUse &&
+        sameIdentity(slotRequest(S), R, false))
+      return true;
+  // A collective-append body parked for the post-COMPLETE flush counts as
+  // delivered: a re-arm raced against it must not win the slot.
+  for (const auto &P : layoutAppendedPublishes_)
+    if (sameIdentity(P.req, R))
+      return true;
+  return false;
+}
+
 void EJitSharedTaskPool::refreshLayoutUnlistedReady() {
   if (!layoutConfigured_ ||
       globalLayoutState() != EJitGlobalLayoutState::Collecting)
