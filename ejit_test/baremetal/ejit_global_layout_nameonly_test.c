@@ -42,9 +42,11 @@
 //   then activate cell instance 1 — the instance E1 specializes on) rebuilds
 //   the layout in a new generation; re-driving must COMPLETE again with E2
 //   STILL tolerated (same two legal routes as S3, member bodies strictly
-//   ordered within the new generation). The pre-fix semantics wiped the
-//   name-only declaration on refresh and FAILED the layout here with
-//   error=Manifest the moment E2 reappeared.
+//   ordered within the new generation). The flip parks a transient
+//   error=StaleIdentity marker while the state reads Refreshing — it is not
+//   a failure and clears at the new Collecting transition. The pre-fix
+//   semantics wiped the name-only declaration on refresh and FAILED the
+//   layout here with error=Manifest the moment E2 reappeared.
 // - Gates use ONLY API return values (status/stats); serial prints are
 //   evidence, never the verdict. Business results are checked against
 //   AOT-side recomputation over the same period arrays.
@@ -468,20 +470,28 @@ int test_ejit_nameonly_refresh(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
       ejit_activate("cell", 1u) != EJIT_OK)
     return nameonly_fail("lifecycle flip failed");
   // The worker observes the version bump and rebuilds autonomously; wait for
-  // the refreshed collection phase of the new generation.
+  // the refreshed collection phase of the new generation. The flip path
+  // parks a TRANSIENT error=StaleIdentity marker while the state reads
+  // Refreshing (invalidateMaterializedLayout on the Complete->Refreshing
+  // CAS); the worker clears it at the new Collecting transition — only a
+  // real failure (FAILED/CANCELLED, or an error outside Refreshing) aborts.
   ejit_global_layout_status_t s = {0};
   ejit_taskpool_stats_t t = {0};
   for (uint32_t wait = 0; wait < NAMEONLY_WAIT_ROUNDS; ++wait) {
-    if (nameonly_status(&s, &t))
-      return -1;
+    if (ejit_get_global_layout_status(&s) != EJIT_OK ||
+        ejit_taskpool_get_stats(&t) != EJIT_OK)
+      return nameonly_fail("status unavailable");
+    if (s.state == NAMEONLY_FAILED || s.state == NAMEONLY_CANCELLED ||
+        (s.state != NAMEONLY_REFRESHING && s.error))
+      return nameonly_fail("refresh failed the layout");
     if (s.generation == nextGen &&
         (s.state == NAMEONLY_COLLECTING || s.state == NAMEONLY_COMPLETE))
       break;
     if (s.generation > nextGen)
       return nameonly_fail("generation advanced too far");
     if (wait % 200u == 0u)
-      SRE_printf("[NAMEONLY] refresh wait=%u state=%u gen=%u\n", wait, s.state,
-                 s.generation);
+      SRE_printf("[NAMEONLY] refresh wait=%u state=%u gen=%u err=%u\n", wait,
+                 s.state, s.generation, s.error);
     if (nameonly_delay())
       return -1;
   }
@@ -489,6 +499,11 @@ int test_ejit_nameonly_refresh(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     return nameonly_fail("refresh never reached the new generation");
   if (s.state == NAMEONLY_COMPLETE)
     return nameonly_fail("refresh completed without any traffic");
+  // The Collecting store is release-ordered AFTER the error/required
+  // clears, so reaching here means the transient marker is gone.
+  if (s.error || s.required != NAMEONLY_MEMBERS || t.compileFailed ||
+      t.publishFailed || t.queueFull)
+    return nameonly_fail("refreshed generation is unhealthy");
   // No generation-2 compile can start before traffic; the retained
   // generation-1 count is this phase's baseline.
   const uint64_t asyncBase2 = t.asyncCompiles;
