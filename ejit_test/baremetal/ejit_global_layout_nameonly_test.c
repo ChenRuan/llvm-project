@@ -293,11 +293,20 @@ static int nameonly_drive(uint32_t generation, uint32_t phase,
         __atomic_store_n(&g_nameonly_sawParked2, 1u, __ATOMIC_RELEASE);
     }
     if (s.state == NAMEONLY_COMPLETE) {
-      // The manifest published; the appended unlisted body publishes through
-      // the ordinary auto/flush path after COMPLETE. Wait for the queue and
-      // dedup tail to drain and every publication to land: two compiles per
-      // identity in THIS generation.
+      // The manifest published; the second identity's Tier-2 arm usually
+      // only lands AFTER the window published the member bodies (the member
+      // slot flips to PgoUse and its re-arm churn stops) — and that window
+      // tail can be shorter than the rounds the drive loop still runs, so a
+      // status-only drain might never see the final compile. Keep
+      // DISPATCHING every identity through the drain: the arm then lands
+      // deterministically, the queue/dedup tail empties, and two compiles
+      // per identity in THIS generation is the settle condition.
       for (uint32_t wait = 0; wait < NAMEONLY_WAIT_ROUNDS; ++wait) {
+        for (uint32_t ident = 0; ident < NAMEONLY_IDENTS; ++ident) {
+          uintptr_t ignored;
+          if (nameonly_call(ident, wait + 23u, &ignored))
+            return -1;
+        }
         if (nameonly_status(&s, &t))
           return -1;
         if (s.state != NAMEONLY_COMPLETE || s.generation != generation)
