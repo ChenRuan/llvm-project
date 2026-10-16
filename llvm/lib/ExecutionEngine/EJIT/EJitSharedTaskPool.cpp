@@ -4271,6 +4271,8 @@ bool EJitSharedTaskPool::pollOne() {
     // ordinary paths below (batch deferral / immediate compile).
     if (globalLayoutState() == EJitGlobalLayoutState::Collecting) {
       size_t Rank = globalMemberFor(Req);
+      if (Rank == layoutMembers_.size())
+        Rank = captureDeferredLayoutIdentity(Req);
       if (Rank != layoutMembers_.size()) {
         uint32_t Tier = decodeReqTier(Req.funcIndex);
         if (Tier == kEJitTierInstrumented) {
@@ -4290,10 +4292,14 @@ bool EJitSharedTaskPool::pollOne() {
         }
         return true;
       }
-      if (layoutDeclaresFunc(stripReqTier(Req.funcIndex))) {
-        // Declared funcIndex with a mismatched identity still fails the
-        // layout: the manifest named this function, so an unlisted identity
-        // for it is a deployment error, not an append candidate.
+      if (layoutDeclaresFunc(stripReqTier(Req.funcIndex)) &&
+          !layoutToleratesUnlistedIdentity(stripReqTier(Req.funcIndex))) {
+        // An EXACT declaration keeps the precision kill: the manifest named
+        // this function with one identity, so a different identity of it is
+        // a deployment error, not an append candidate. A NAME-ONLY
+        // declaration exempts its function's other identities: they fall
+        // through to the unlisted routing below (ordinary compile, then the
+        // post-manifest collective append).
         failGlobalLayout(EJitGlobalLayoutError::Manifest, Rank);
         if (decodeReqTier(Req.funcIndex) == kEJitTierInstrumented)
           finishPgoFunction(stripReqTier(Req.funcIndex), false,

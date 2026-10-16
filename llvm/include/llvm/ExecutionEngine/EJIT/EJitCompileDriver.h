@@ -103,6 +103,21 @@ public:
   /// owner, start the ONE shared worker. Returns false on a clean init failure
   /// (owner worker-start failed / ABI mismatch). Idempotent across instances.
   bool startSharedTaskPool();
+
+  /// Why the most recent startSharedTaskPool() failed. A manifest rejected
+  /// BEFORE the pool's init()/election ever ran leaves the shared blob
+  /// untouched (generation 0 / Uninitialized); without this discriminator a
+  /// caller inspecting only the blob would misreport that as a worker-core
+  /// deployment failure.
+  enum class SharedStartError : uint8_t {
+    None,
+    ManifestRejected,
+    PoolInitFailed
+  };
+  SharedStartError lastSharedStartError() const {
+    return lastSharedStartError_;
+  }
+
   uint64_t
   globalLayoutFingerprint(const std::vector<EJitLayoutTarget> &targets);
   bool buildGlobalLayoutManifest(const std::vector<EJitLayoutTarget> &targets,
@@ -168,6 +183,7 @@ private:
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   EJitSharedTaskPool sharedPool_;
   EJitSreTask sharedWorkerTask_;
+  SharedStartError lastSharedStartError_ = SharedStartError::None;
   // Worker start/stop adapters bridging the shared pool to the platform task
   // abstraction (host std::thread / SRE platform task). Static so the shared
   // pool can call them through plain function pointers (never std::function).

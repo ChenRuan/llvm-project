@@ -319,19 +319,25 @@ EJit::EJit(const Config &config) : config_(config) {
         // Distinguish "the engine failed to build on the winner" from a genuine
         // election/ABI failure -- the pool records which in lastInitError, and
         // reporting "election failed" for an engine failure sends the next
-        // person debugging this to the wrong place. Under a fixed worker core
-        // build, generation==0 (the blob was NEVER claimed in any generation)
-        // with the state back at Uninitialized means the designated core never
-        // initialized within the wait budget -- a deployment contract
-        // violation. generation is monotonic across shutdowns, so a pool that
-        // was initialized and torn down (or is mid-init: Initializing with
-        // generation still 0) falls through to the generic message instead of
-        // misfiring here.
+        // person debugging this to the wrong place. A manifest rejected in
+        // startSharedTaskPool fails BEFORE init()/election ever runs, leaving
+        // the blob untouched; the driver records that class so it is not
+        // misread below as a worker-core deployment failure. Under a fixed
+        // worker core build, generation==0 (the blob was NEVER claimed in any
+        // generation) with the state back at Uninitialized means the
+        // designated core never initialized within the wait budget -- a
+        // deployment contract violation. generation is monotonic across
+        // shutdowns, so a pool that was initialized and torn down (or is
+        // mid-init: Initializing with generation still 0) falls through to the
+        // generic message instead of misfiring here.
         EJitSharedDiagnostics d{};
         compileDriver_->sharedTaskPool()->getDiagnostics(d);
         const char *msg = "shared taskpool init/election failed";
-        if (d.lastInitError ==
-            static_cast<uint32_t>(EJitSharedInitError::OwnerSetupFailed))
+        if (compileDriver_->lastSharedStartError() ==
+            EJitCompileDriver::SharedStartError::ManifestRejected)
+          msg = "global layout manifest rejected (see manifest diagnostics)";
+        else if (d.lastInitError ==
+                 static_cast<uint32_t>(EJitSharedInitError::OwnerSetupFailed))
           msg = "owner elected but ORC engine creation failed";
 #ifdef EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE
         else if (d.generation == 0 &&

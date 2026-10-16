@@ -1469,6 +1469,12 @@ private:
     bool published = false;
     bool samplingReleased = false;
     bool versionCaptured = false;
+    /// Declared with an empty identity (no dims, no bounds): the identity is
+    /// captured from the first admitted request of this funcIndex, and later
+    /// identities of the same function route as unlisted instead of failing
+    /// the layout.
+    bool nameOnly = false;
+    bool identityCaptured = false;
   };
   std::vector<LayoutMember> layoutMembers_;
   std::vector<EJitCompileRequest> layoutDraining_;
@@ -1515,6 +1521,17 @@ private:
   void failGlobalLayout(EJitGlobalLayoutError error, uint32_t rank);
   void clearGlobalArtifacts();
   size_t globalMemberFor(const EJitCompileRequest &req) const;
+  /// Name-only member capture: a member declared with an empty identity (no
+  /// dims, no bounds) adopts the identity of the FIRST admitted request of
+  /// its funcIndex. Only the identity payload is copied; the tier encoding,
+  /// generation and fallback pointer stay the member's own. Returns the
+  /// member's rank, or layoutMembers_.size() when no uncaptured name-only
+  /// member declares this request's funcIndex.
+  size_t captureDeferredLayoutIdentity(const EJitCompileRequest &req);
+  /// True when some name-only member declares \p funcIndex: another identity
+  /// of that function is an unlisted function (ordinary compile, post-
+  /// manifest append), NOT the exact-declaration precision kill.
+  bool layoutToleratesUnlistedIdentity(uint32_t funcIndex) const;
   /// True when some manifest member declares \p funcIndex (identity aside).
   /// A declared-but-mismatched request still fails the layout (precision
   /// intent); an entirely undeclared funcIndex takes the ordinary paths.

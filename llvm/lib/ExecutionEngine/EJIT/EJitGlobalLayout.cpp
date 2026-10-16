@@ -68,6 +68,13 @@ bool EJitSharedTaskPool::validateLayoutManifest(
       return false;
     LayoutMember M;
     M.req = R;
+    // An entry declared with no dims and no bounds is name-only: the pool
+    // captures its identity from the first admitted request (see
+    // captureDeferredLayoutIdentity). A registered 0-dim/0-bound function is
+    // indistinguishable from a deferred entry here, and never needs the
+    // distinction: its requests always carry an empty identity and match the
+    // member directly.
+    M.nameOnly = (R.numDims == 0 && R.boundCount == 0);
     if (R.layoutVersionPolicy > 1) {
       EJIT_DIAG("global layout invalid version policy rank=%zu policy=%u", I,
                 R.layoutVersionPolicy);
@@ -207,8 +214,19 @@ bool EJitSharedTaskPool::serviceGlobalLayoutRefresh() {
     // instruction to keep executing a stale version after lifecycle turnover.
     if (!replacement)
       req.layoutVersionPolicy = 0;
+    // nameOnly/identityCaptured are DECLARATION semantics, not generation-
+    // scoped staging state like ready/artifact/published: wiping them here
+    // would turn a name-only member back into an exact one, and a later
+    // identity of its function would then precision-kill the refreshed
+    // layout. The explicit-replacement path is safe by construction — its
+    // fresh members go through validateLayoutManifest, which re-marks the
+    // name-only entries.
+    const bool NameOnly = M.nameOnly;
+    const bool IdentityCaptured = M.identityCaptured;
     M = LayoutMember{};
     M.req = req;
+    M.nameOnly = NameOnly;
+    M.identityCaptured = IdentityCaptured;
     M.req.generation = generation;
     if (!captureLayoutVersions(M, replacement)) {
       failGlobalLayout(EJitGlobalLayoutError::Manifest,
@@ -293,6 +311,71 @@ size_t EJitSharedTaskPool::globalMemberFor(const EJitCompileRequest &R) const {
     if (sameIdentity(layoutMembers_[I].req, R))
       return I;
   return layoutMembers_.size();
+}
+
+size_t EJitSharedTaskPool::captureDeferredLayoutIdentity(
+    const EJitCompileRequest &R) {
+  // An empty request identity has nothing to capture: it can only ever match
+  // a member directly, exactly as before.
+  if (R.numDims == 0 && R.boundCount == 0)
+    return layoutMembers_.size();
+  // Same caps validateLayoutManifest enforces on declared dims; a request
+  // outside them is left unmatched and takes the ordinary routing.
+  for (uint32_t D = 0; D < R.numDims; ++D)
+    if (R.dims[D].dimType >= kEJitSharedDimTypes ||
+        R.dims[D].instanceId >= kEJitSharedInstances)
+      return layoutMembers_.size();
+  for (size_t I = 0; I < layoutMembers_.size(); ++I) {
+    LayoutMember &M = layoutMembers_[I];
+    if (!M.nameOnly || M.identityCaptured ||
+        stripReqTier(M.req.funcIndex) != stripReqTier(R.funcIndex))
+      continue;
+    // Mirror the manifest's dispatch-key collision rule: another member
+    // already holding this (funcIndex, dims) — regardless of versions or
+    // bindings — is the aliasing configuration validateLayoutManifest
+    // rejects. Leave the request unmatched so it takes the unlisted routing
+    // instead of creating two bodies that evict each other in one bucket.
+    bool Collides = false;
+    for (size_t J = 0; !Collides && J < layoutMembers_.size(); ++J) {
+      const auto &Other = layoutMembers_[J];
+      if (J == I || Other.req.numDims != R.numDims ||
+          stripReqTier(Other.req.funcIndex) != stripReqTier(R.funcIndex))
+        continue;
+      Collides = true;
+      for (uint32_t D = 0; D < R.numDims; ++D)
+        if (Other.req.dims[D].dimType != R.dims[D].dimType ||
+            Other.req.dims[D].instanceId != R.dims[D].instanceId) {
+          Collides = false;
+          break;
+        }
+    }
+    if (Collides)
+      return layoutMembers_.size();
+    // Copy ONLY the identity payload: the tier encoding, generation and
+    // fallback pointer stay the member's own.
+    M.req.numDims = R.numDims;
+    for (uint32_t D = 0; D < R.numDims; ++D) {
+      M.req.dims[D] = R.dims[D];
+      M.req.versions[D] = R.versions[D];
+    }
+    M.req.boundCount = R.boundCount;
+    for (uint32_t B = 0; B < R.boundCount; ++B)
+      M.req.boundPointers[B] = R.boundPointers[B];
+    M.identityCaptured = true;
+    EJIT_DIAG("global layout captured name-only member rank=%zu func=%u "
+              "dims=%u bounds=%u",
+              I, stripReqTier(R.funcIndex), R.numDims, R.boundCount);
+    return I;
+  }
+  return layoutMembers_.size();
+}
+
+bool EJitSharedTaskPool::layoutToleratesUnlistedIdentity(
+    uint32_t funcIndex) const {
+  for (const auto &M : layoutMembers_)
+    if (M.nameOnly && stripReqTier(M.req.funcIndex) == funcIndex)
+      return true;
+  return false;
 }
 
 bool EJitSharedTaskPool::layoutDeclaresFunc(uint32_t funcIndex) const {

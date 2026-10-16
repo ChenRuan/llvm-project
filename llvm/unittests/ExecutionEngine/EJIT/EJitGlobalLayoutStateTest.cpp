@@ -250,6 +250,134 @@ TEST(EJitGlobalLayoutState, DeclaredFuncWithMismatchedIdentityStillFails) {
             static_cast<uint32_t>(EJitGlobalLayoutError::Manifest));
   EXPECT_EQ(H.state->globalLayoutRequired.loadRelaxed(), 1u);
 }
+TEST(EJitGlobalLayoutState, NameOnlyMemberCapturesFirstAdmittedIdentity) {
+  Harness H;
+  for (uint32_t I = 0; I < 2; ++I)
+    H.pool.setInstanceEnabled(0, I, true);
+  // Empty identities are name-only declarations: each member adopts the
+  // identity of the first admitted request of its function, whatever dims
+  // and bounds that request carries.
+  ASSERT_TRUE(H.configure(manifest({0, 1})));
+  EJitDimPair A{0, 1}, B{0, 0};
+  H.pool.compileOrGet(1, &B, 1, nullptr);
+  H.pool.compileOrGet(0, &A, 1, nullptr);
+  for (int I = 0; I < 4; ++I)
+    H.pool.workerPollOnce();
+  ASSERT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Complete);
+  auto a = H.pool.compileOrGet(0, &A, 1, nullptr);
+  auto b = H.pool.compileOrGet(1, &B, 1, nullptr);
+  ASSERT_NE(a.fnPtr, nullptr);
+  ASSERT_NE(b.fnPtr, nullptr);
+  EXPECT_LT(reinterpret_cast<uintptr_t>(a.fnPtr),
+            reinterpret_cast<uintptr_t>(b.fnPtr)); // rank 0 before rank 1
+  H.pool.releaseRead(a.bucketIndex);
+  H.pool.releaseRead(b.bucketIndex);
+}
+
+TEST(EJitGlobalLayoutState, NameOnlyMemberOtherIdentityRoutesUnlisted) {
+  Harness H;
+  H.pool.setPgoEnabled(true, 1, 4);
+  H.pool.setCompiler(
+      [](void *p, const EJitCompileRequest &, void **out) {
+        auto &H = *static_cast<Harness *>(p);
+        *out = reinterpret_cast<void *>(0x900000u + H.compiled++ * 32u);
+        return true;
+      },
+      &H);
+  H.pool.setInstanceEnabled(0, 0, true);
+  H.pool.setInstanceEnabled(1, 0, true);
+  auto M = manifest({0, 1});
+  M[0].funcIndex = encodeReqTier(0, kEJitTierPgoUse);
+  M[1].funcIndex = encodeReqTier(1, kEJitTierPgoUse);
+  ASSERT_TRUE(H.configure(M));
+  EJitDimPair A{0, 0}, B{1, 0};
+  // Identity A of declared func 0: its Tier-1 captures the name-only member
+  // and compiles immediately; the armed Tier-2 stages as the member body.
+  H.pool.compileOrGet(0, &A, 1, nullptr);
+  H.pool.workerPollOnce();
+  auto sA = H.pool.compileOrGet(0, &A, 1, nullptr);
+  ASSERT_NE(sA.fnPtr, nullptr);
+  H.pool.releaseRead(sA.bucketIndex);
+  H.pool.workerPollOnce();
+  ASSERT_EQ(H.state->globalLayoutReady.loadAcquire(), 1u);
+  // Identity B of the SAME declared function: an exact declaration would
+  // precision-kill the layout here; a name-only one routes it as unlisted.
+  H.pool.compileOrGet(0, &B, 1, nullptr);
+  H.pool.workerPollOnce();
+  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Collecting);
+  auto sB = H.pool.compileOrGet(0, &B, 1, nullptr);
+  ASSERT_NE(sB.fnPtr, nullptr);
+  H.pool.releaseRead(sB.bucketIndex);
+  H.pool.workerPollOnce(); // armed Tier-2 of identity B parks as unlisted
+  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Collecting);
+  EXPECT_EQ(H.state->globalLayoutUnlistedReady.loadAcquire(), 1u);
+  // Member func 1 captures and stages, closing the collective set.
+  H.pool.compileOrGet(1, &B, 1, nullptr);
+  H.pool.workerPollOnce();
+  auto s1 = H.pool.compileOrGet(1, &B, 1, nullptr);
+  ASSERT_NE(s1.fnPtr, nullptr);
+  H.pool.releaseRead(s1.bucketIndex);
+  H.pool.workerPollOnce();
+  ASSERT_EQ(H.state->globalLayoutReady.loadAcquire(), 2u);
+  H.blockCodeReady = true;
+  H.blockAbove = 0x800000u;
+  H.pool.workerPollOnce(); // collective window: member bodies + parked append
+  ASSERT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Complete);
+  EXPECT_EQ(H.state->globalLayoutError.loadAcquire(),
+            static_cast<uint32_t>(EJitGlobalLayoutError::None));
+  EXPECT_EQ(H.state->globalLayoutUnlistedAppended.loadAcquire(), 1u);
+  EXPECT_EQ(H.state->globalLayoutUnlistedReady.loadAcquire(), 0u);
+  H.blockCodeReady = false;
+  ASSERT_TRUE(H.pool.flushCodeBatch());
+  auto r0 = H.pool.compileOrGet(0, &A, 1, nullptr);
+  auto rB = H.pool.compileOrGet(0, &B, 1, nullptr);
+  auto r1 = H.pool.compileOrGet(1, &B, 1, nullptr);
+  ASSERT_NE(r0.fnPtr, nullptr);
+  ASSERT_NE(rB.fnPtr, nullptr);
+  ASSERT_NE(r1.fnPtr, nullptr);
+  EXPECT_LT(reinterpret_cast<uintptr_t>(r0.fnPtr),
+            reinterpret_cast<uintptr_t>(r1.fnPtr)); // rank order kept
+  EXPECT_LT(reinterpret_cast<uintptr_t>(r1.fnPtr),
+            reinterpret_cast<uintptr_t>(rB.fnPtr)); // append after bodies
+  H.pool.releaseRead(r0.bucketIndex);
+  H.pool.releaseRead(rB.bucketIndex);
+  H.pool.releaseRead(r1.bucketIndex);
+}
+
+TEST(EJitGlobalLayoutState, NameOnlyToleranceSurvivesLifecycleRefresh) {
+  Harness H;
+  for (uint32_t I = 0; I < 2; ++I)
+    H.pool.setInstanceEnabled(0, I, true);
+  ASSERT_TRUE(H.configure(manifest({0})));
+  EJitDimPair A{0, 0}, B{0, 1};
+  H.pool.compileOrGet(0, &A, 1, nullptr);
+  for (int I = 0; I < 3; ++I)
+    H.pool.workerPollOnce();
+  ASSERT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Complete);
+  // Lifecycle turnover: a real instance flip invalidates the materialized
+  // layout and the worker rebuilds the SAME members in a new generation
+  // (with nothing sampling, the whole refresh completes within one poll).
+  H.pool.setInstanceEnabled(0, 0, false);
+  H.pool.setInstanceEnabled(0, 0, true);
+  for (int I = 0; I < 3; ++I)
+    H.pool.workerPollOnce();
+  ASSERT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Collecting);
+  ASSERT_EQ(H.state->generation.loadAcquire(), 2u);
+  // A different identity of the name-only function arriving during the NEW
+  // collection must still route as unlisted — the declaration semantics
+  // survive the member rebuild — not precision-kill the refreshed layout.
+  H.pool.compileOrGet(0, &B, 1, nullptr);
+  H.pool.workerPollOnce();
+  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Collecting);
+  // The captured identity re-stages and completes the new generation.
+  H.pool.compileOrGet(0, &A, 1, nullptr);
+  for (int I = 0; I < 3; ++I)
+    H.pool.workerPollOnce();
+  ASSERT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Complete);
+  EXPECT_EQ(H.state->globalLayoutError.loadAcquire(),
+            static_cast<uint32_t>(EJitGlobalLayoutError::None));
+}
+
 TEST(EJitGlobalLayoutState,
      RetainedReservationIsBoundedAcrossOwnerGenerations) {
   Harness H;

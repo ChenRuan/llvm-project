@@ -74,11 +74,15 @@ ordinary paths and append after the manifest bodies:
   the COMPLETE diagnostic summary reports the member counts, the appended
   set and the final address-order verdict (per-rank bodies appear in the
   LINKED diagnostics).
-- **Precision kill retained.** A funcIndex the manifest declares with one
-  identity still FAILS the layout when a different identity of that funcIndex
-  arrives: naming a function makes every unlisted identity for it a
-  deployment error, not an append candidate. Entirely undeclared funcIndexes
-  never fail the layout.
+- **Precision kill retained for exact declarations.** A funcIndex the
+  manifest declares with one exact identity still FAILS the layout when a
+  different identity of that funcIndex arrives: naming a function with an
+  exact identity makes every other identity for it a deployment error, not an
+  append candidate. A name-only declaration (empty identity) exempts its
+  function instead: the first admitted identity is captured as the member
+  body and every later identity of that function routes as unlisted —
+  ordinary compile, post-manifest collective append, layout unaffected.
+  Entirely undeclared funcIndexes never fail the layout.
 
 ## Manifest and Identity
 
@@ -88,9 +92,18 @@ initialization list; since 2026-10-15 the list does not have to cover every
 registered entry (see "Unlisted Functions"). The additive C API leaves
 `ejit_config_t` unchanged.
 Names resolve read-only through `EJitFuncRegistry`; a manifest entry that names
-an unregistered function is still rejected. Each declared specialization has
-its exact registered dimension
-shape, instance versions and bound argument/address/extent descriptors.
+an unregistered function is still rejected. A declaration carries either the
+exact registered dimension shape, instance versions and bound
+argument/address/extent descriptors, or nothing but the name: a **name-only
+entry** (no dims, no bounds) captures the identity of the first admitted
+compile request of that function at collection time and makes it that rank's
+body. Name-only entries exist for one-version-per-function deployments whose
+instance choice is a runtime fact (which cell/TRP combination actually
+dispatches); the version policy rule is unchanged (policy0 captures live
+versions at first active admission). An exact entry keeps the precision
+contract — another identity of that function is a deployment error — while a
+name-only entry exempts its function: later identities of it route as
+unlisted (see below) and never fail the layout.
 `sharedOwnerElected` validates loader metadata and bound argument indices.
 `configureGlobalLayout` rejects duplicates, unsupported
 shapes, invalid descriptors, dispatch-key collisions and bucket capacity overflow

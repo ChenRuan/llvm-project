@@ -436,29 +436,66 @@ bool EJitCompileDriver::buildGlobalLayoutManifest(
     const std::vector<EJitLayoutTarget> &targets,
     std::vector<EJitCompileRequest> &manifest) {
   if (targets.empty() ||
-      targets.size() > config_.globalLayoutBudgets.maxMembers)
+      targets.size() > config_.globalLayoutBudgets.maxMembers) {
+    EJIT_DIAG("global layout manifest rejected: count=%zu maxMembers=%u",
+              targets.size(), config_.globalLayoutBudgets.maxMembers);
     return false;
+  }
   const uint32_t registered = EJitFuncRegistry::instance().count();
-  for (const auto &target : targets) {
+  for (size_t I = 0; I < targets.size(); ++I) {
+    const auto &target = targets[I];
     // A manifest entry must name a registered function, but the manifest no
     // longer has to cover every registered function: unlisted functions keep
     // compiling through the ordinary shared-pool paths and are appended after
     // the manifest bodies at the collective allocation point.
     uint32_t index = EJitFuncRegistry::instance().lookup(target.entryName);
-    if (index == kEJitInvalidFuncIndex || index >= registered)
+    if (index == kEJitInvalidFuncIndex || index >= registered) {
+      EJIT_DIAG("global layout manifest rejected: rank=%zu name=%s not "
+                "registered",
+                I, target.entryName.c_str());
       return false;
+    }
     const auto &Meta = getLoader().getOrCacheFuncMeta(index);
-    if (target.identity.numDims != Meta.dimCount)
-      return false;
-    for (uint32_t D = 0; D < Meta.dimCount; ++D)
-      if (target.identity.dims[D].dimType != Meta.dimTypes[D])
+    // A name-only entry (no dims, no bounds) needs no shape check: the pool
+    // captures the identity of the first admitted request of this function,
+    // and the function's other identities then route as unlisted. An entry
+    // that declares ANY identity must match the registered shape exactly.
+    const bool NameOnly =
+        target.identity.numDims == 0 && target.identity.boundCount == 0;
+    if (!NameOnly) {
+      if (target.identity.numDims != Meta.dimCount) {
+        EJIT_DIAG("global layout manifest rejected: rank=%zu name=%s dim "
+                  "count mismatch declared=%u registered=%u",
+                  I, target.entryName.c_str(), target.identity.numDims,
+                  Meta.dimCount);
         return false;
-    if (target.identity.boundCount != Meta.boundPointerArgIndices.size())
-      return false;
-    for (uint32_t B = 0; B < target.identity.boundCount; ++B)
-      if (target.identity.boundPointers[B].argIndex !=
-          Meta.boundPointerArgIndices[B])
+      }
+      for (uint32_t D = 0; D < Meta.dimCount; ++D)
+        if (target.identity.dims[D].dimType != Meta.dimTypes[D]) {
+          EJIT_DIAG("global layout manifest rejected: rank=%zu name=%s dim=%u "
+                    "type mismatch declared=%u registered=%u",
+                    I, target.entryName.c_str(), D,
+                    target.identity.dims[D].dimType, Meta.dimTypes[D]);
+          return false;
+        }
+      if (target.identity.boundCount != Meta.boundPointerArgIndices.size()) {
+        EJIT_DIAG("global layout manifest rejected: rank=%zu name=%s bound "
+                  "count mismatch declared=%u registered=%u",
+                  I, target.entryName.c_str(), target.identity.boundCount,
+                  static_cast<unsigned>(Meta.boundPointerArgIndices.size()));
         return false;
+      }
+      for (uint32_t B = 0; B < target.identity.boundCount; ++B)
+        if (target.identity.boundPointers[B].argIndex !=
+            Meta.boundPointerArgIndices[B]) {
+          EJIT_DIAG("global layout manifest rejected: rank=%zu name=%s "
+                    "bound=%u arg index mismatch declared=%u registered=%u",
+                    I, target.entryName.c_str(), B,
+                    target.identity.boundPointers[B].argIndex,
+                    Meta.boundPointerArgIndices[B]);
+          return false;
+        }
+    }
     EJitCompileRequest req = target.identity;
     req.funcIndex =
         encodeReqTier(index, (config_.enablePgo || config_.enableProfileAudit)
@@ -558,13 +595,25 @@ bool EJitCompileDriver::startSharedTaskPool() {
   // Publish this core's funcIndex/dimType registration digest so a peer with a
   // divergent mapping is cleanly rejected at attach (spec §11), never silently
   // running against mismatched indices.
+  lastSharedStartError_ = SharedStartError::None;
   std::vector<EJitCompileRequest> declaredManifest;
   if (!config_.globalLayout.empty() &&
-      !buildGlobalLayoutManifest(config_.globalLayout, declaredManifest))
+      !buildGlobalLayoutManifest(config_.globalLayout, declaredManifest)) {
+    // The manifest was rejected before the pool's init()/election ever ran:
+    // the shared blob stays untouched (generation 0 / Uninitialized). Record
+    // the class so the caller does not misread that blob state as a
+    // worker-core deployment failure.
+    lastSharedStartError_ = SharedStartError::ManifestRejected;
     return false;
+  }
   uint64_t Fingerprint = globalLayoutFingerprint(config_.globalLayout);
   sharedPool_.setRegistrationFingerprint(Fingerprint);
   EJitSharedTaskPool::InitResult r = sharedPool_.init();
+  // Every result except the two attach/own successes failed inside the
+  // pool's init()/election; classify once instead of per case.
+  if (r != EJitSharedTaskPool::InitResult::BecameOwner &&
+      r != EJitSharedTaskPool::InitResult::AttachedReady)
+    lastSharedStartError_ = SharedStartError::PoolInitFailed;
   switch (r) {
   case EJitSharedTaskPool::InitResult::BecameOwner:
     EJIT_DIAG("shared taskpool init: became owner");
@@ -573,8 +622,10 @@ bool EJitCompileDriver::startSharedTaskPool() {
     // init() has validated magic/version/size before any new-layout fields
     // are inspected. A rejected peer cannot change the installed manifest.
     if (!declaredManifest.empty() &&
-        !sharedPool_.validateGlobalLayoutAttachment(declaredManifest))
+        !sharedPool_.validateGlobalLayoutAttachment(declaredManifest)) {
+      lastSharedStartError_ = SharedStartError::PoolInitFailed;
       return false;
+    }
     EJIT_DIAG("shared taskpool init: attached ready");
     return true;
   case EJitSharedTaskPool::InitResult::OwnerFailed:
