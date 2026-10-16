@@ -600,6 +600,23 @@ int test_ejit_nameonly_print(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   if (ejit_get_global_layout_status(&s) != EJIT_OK ||
       ejit_taskpool_get_stats(&t) != EJIT_OK)
     return -1;
+  // Bounded quiescence wait (read-only): the second identity's LAST Tier-1 —
+  // enqueued by the diagnostic burst or the sweep mere moments before the
+  // shell reaches this entry — can still be compiling. The sixth board run
+  // failed ONLY this gate: the worker was publishing that Tier-1 while this
+  // entry read a non-zero pending count. Let the pipeline drain first.
+  for (uint32_t wait = 0; wait < NAMEONLY_WAIT_ROUNDS; ++wait) {
+    if (!t.pendingEntries && !t.queueApproxSize &&
+        !ejit_taskpool_pending_count())
+      break;
+    if (wait % 1000u == 0u)
+      SRE_printf("[NAMEONLY] print quiescence wait=%u pending=%u queue=%u\n",
+                 wait, t.pendingEntries, t.queueApproxSize);
+    if (SRE_TaskDelay(1u))
+      return -1;
+    if (ejit_taskpool_get_stats(&t) != EJIT_OK)
+      return -1;
+  }
   SRE_printf("[NAMEONLY] state=%u gen=%u required=%u ready=%u published=%u "
              "error=%u rank=%u active=%u unlistedReady=%u unlistedAppended=%u "
              "near=%llu far=%llu\n",
