@@ -33,11 +33,14 @@
 //   as evidence: parked for the collective append (unlistedAppended==1,
 //   unlistedReady observed during collection), or — the observed common
 //   case while BOTH identities stay hot — compiled through the ordinary
-//   post-COMPLETE path into the same near pool: the member identity's
-//   saturated re-arms hold the function's single per-funcIndex dedup claim
-//   (queue residence ~1000 rounds per worker item) until the freeze, so
-//   E2's arm only lands after the member's Tier-2 publish flips the slot
-//   to PgoUse and stops the churn.
+//   post-COMPLETE path into the same near pool: a saturated identity's
+//   re-arms hold the function's single per-funcIndex dedup claim (queue
+//   residence ~1000 rounds per worker item), so whichever identity's
+//   callers LEAD each round starves the other's arms. THE DRIVE ORDER IS
+//   LOAD-BEARING for the same reason: the member identities MUST be called
+//   before E2 every round, or E2's re-arm churn starves the member's own
+//   Tier-1 and the layout never converges (observed: ready frozen 4/5 for
+//   90000+ rounds after a refresh).
 // - S4 (refresh survival): after COMPLETE, a real lifecycle flip (deactivate
 //   then activate cell instance 1 — the instance E1 specializes on) rebuilds
 //   the layout in a new generation; re-driving must COMPLETE again with E2
@@ -254,13 +257,17 @@ static int nameonly_call(uint32_t ident, uint32_t x, uintptr_t *seen) {
   return 0;
 }
 
-// One convergence cycle for \p generation. E2 leads every round and E1
-// rides last so E2 never wins E's capture; note the per-funcIndex dedup
-// slot means E2's Tier-2 arm usually only lands AFTER the member's Tier-2
-// publish stops the re-arm churn (see S3 above) — both routes are legal.
-// \p asyncBase is the asyncCompiles reading BEFORE this phase's first
-// compile (phase 1: 0, guaranteed by the idle gate; phase 2: captured at
-// the refreshed collection entry).
+// One convergence cycle for \p generation. The MEMBER identities lead every
+// round and E2 rides LAST: with per-funcIndex dedup, the round's first func4
+// caller wins the claim, and a hot tolerated identity's re-arm churn (one
+// ~1000-round queue residence per re-arm) can otherwise starve the member's
+// Tier-1 for the WHOLE collection — the fourth board run's phase 2 froze at
+// ready=4/5 exactly this way after the refresh dropped the cold-call seed.
+// Member-first keeps E1's Tier-1/Tier-2 pipeline unstarved; E2 then takes
+// whichever legal route wins the race (see S3). \p asyncBase is the
+// asyncCompiles reading BEFORE this phase's first compile (phase 1: 0,
+// guaranteed by the idle gate; phase 2: captured at the refreshed
+// collection entry).
 static int nameonly_drive(uint32_t generation, uint32_t phase,
                           uint64_t asyncBase) {
   ejit_global_layout_status_t s = {0};
@@ -269,12 +276,12 @@ static int nameonly_drive(uint32_t generation, uint32_t phase,
     return -1;
   for (uint32_t round = 0; round < NAMEONLY_WAIT_ROUNDS; ++round) {
     uintptr_t ignored;
-    if (nameonly_call(NAMEONLY_IDENTS - 1u, round + 11u, &ignored))
-      return -1;
     for (uint32_t ident = 0; ident < NAMEONLY_IDENTS - 1u; ++ident) {
       if (nameonly_call(ident, round + 11u, &ignored))
         return -1;
     }
+    if (nameonly_call(NAMEONLY_IDENTS - 1u, round + 11u, &ignored))
+      return -1;
     if (nameonly_status(&s, &t))
       return -1;
     if (s.generation != generation)
