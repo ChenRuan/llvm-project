@@ -363,6 +363,17 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
 #if NAMEONLY_RUN_INIT_ARRAY
   call_init_array_functions();
 #endif
+  // Resolve the numeric dim types BEFORE init: ejit_register_lifecycle is
+  // the AOT registration-time API (idempotent — the constructors already
+  // claimed the "cell"/"trp" slots, and a repeat call returns the same
+  // slots), and it is REJECTED once init freezes registration. Both cores
+  // resolve the identical process-global slots.
+  g_nameonly_cellDim = g_nameonly_trpDim = ~0u;
+  ejit_register_lifecycle("cell", &g_nameonly_cellDim);
+  ejit_register_lifecycle("trp", &g_nameonly_trpDim);
+  if (g_nameonly_cellDim == ~0u || g_nameonly_trpDim == ~0u ||
+      g_nameonly_cellDim == g_nameonly_trpDim)
+    return nameonly_fail("lifecycle dim types unresolved");
   // Core-local registration happens after each core's constructors, before
   // init. The manifest is NAME-ONLY: five entryNames, no dims, no bounds —
   // for DIMENSIONAL (cell x trp) functions.
@@ -398,15 +409,9 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
                "normalPGO quota=64 cap=4; producer test_ejit_period\n");
     return 0;
   }
-  // Producer: resolve the numeric dim types, activate every instance, then
-  // push E's FIRST identity through the generated wrapper BEFORE anything
-  // else can request E — that fixes the capture identity deterministically.
-  g_nameonly_cellDim = g_nameonly_trpDim = ~0u;
-  ejit_register_lifecycle("cell", &g_nameonly_cellDim);
-  ejit_register_lifecycle("trp", &g_nameonly_trpDim);
-  if (g_nameonly_cellDim == ~0u || g_nameonly_trpDim == ~0u ||
-      g_nameonly_cellDim == g_nameonly_trpDim)
-    return nameonly_fail("lifecycle dim types unresolved");
+  // Producer: activate every instance, then push E's FIRST identity through
+  // the generated wrapper BEFORE anything else can request E — that fixes
+  // the capture identity deterministically.
   if (ejit_activate_all("cell") != EJIT_OK ||
       ejit_activate_all("trp") != EJIT_OK)
     return nameonly_fail("instance activation failed");
