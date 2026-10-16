@@ -1348,6 +1348,8 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
   const EJitDimPair dims[2] = {{dim0, inst0}, {dim1, inst1}};
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, dims, 2, &l0Fn)) {
+    EJIT_DIAG_VERBOSE("2d l0 hit func=%u dims=[%u:%u,%u:%u] fn=%p", funcIndex,
+                      dim0, inst0, dim1, inst1, l0Fn);
     if (outFn)
       *outFn = l0Fn;
     if (outBucket)
@@ -1356,6 +1358,9 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
   }
   auto fast = tp->tryCacheHit2D(funcIndex, dim0, inst0, dim1, inst1);
   if (fast.fastPathTerminal) {
+    EJIT_DIAG_VERBOSE("2d fast func=%u dims=[%u:%u,%u:%u] status=%u fn=%p",
+                      funcIndex, dim0, inst0, dim1, inst1,
+                      static_cast<unsigned>(fast.status), fast.fnPtr);
     if (outFn)
       *outFn = fast.fnPtr;
     if (outBucket)
@@ -1366,6 +1371,9 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, dims, 2, /*fallback=*/nullptr);
+  EJIT_DIAG_VERBOSE("2d slow func=%u dims=[%u:%u,%u:%u] status=%u fn=%p",
+                    funcIndex, dim0, inst0, dim1, inst1,
+                    static_cast<unsigned>(r.status), r.fnPtr);
   if (outFn)
     *outFn = r.fnPtr;
   if (outBucket)

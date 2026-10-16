@@ -258,6 +258,29 @@ static int nameonly_call(uint32_t ident, uint32_t x, uintptr_t *seen) {
   return 0;
 }
 
+// VERBOSE burst for the open post-COMPLETE second-identity stall: a bounded
+// run of second-identity lookups (with a member hit interleaved as the
+// working control) at EJIT_LOG_VERBOSE, so one board run names the exact
+// branch that eats the lookup (2d l0 hit / 2d scan not-ready|gen|stale /
+// 2d fast status / 2d slow status / prepareExec). The level is restored on
+// every exit; the burst only ever runs when a second-identity compile is
+// missing after the drain settled.
+static int nameonly_diag_burst(void) {
+  const ejit_log_level_t saved = ejit_get_log_level();
+  int rc = 0;
+  SRE_printf("[NAMEONLY] VERBOSE DIAG BEGIN second-identity stall\n");
+  ejit_set_log_level(EJIT_LOG_VERBOSE);
+  for (uint32_t i = 0; i < 8u && !rc; ++i) {
+    uintptr_t ignored;
+    rc = nameonly_call(NAMEONLY_IDENTS - 1u, 101u + i, &ignored);
+    if (!rc)
+      rc = nameonly_call(i & 1u, 201u + i, &ignored);
+  }
+  ejit_set_log_level(saved);
+  SRE_printf("[NAMEONLY] VERBOSE DIAG END\n");
+  return rc;
+}
+
 // One convergence cycle for \p generation. The MEMBER identities lead every
 // round and E2 rides LAST: with per-funcIndex dedup, the round's first func4
 // caller wins the claim, and a hot tolerated identity's re-arm churn (one
@@ -336,6 +359,9 @@ static int nameonly_drive(uint32_t generation, uint32_t phase,
       }
       if (s.unlistedReady)
         return nameonly_fail("second-identity park gauge did not settle");
+      if (t.asyncCompiles < asyncBase + 2u * NAMEONLY_IDENTS)
+        if (nameonly_diag_burst())
+          return -1;
       SRE_printf("[NAMEONLY] phase=%u second-identity route: "
                  "unlistedAppended=%u sawParked=%u\n",
                  phase, s.unlistedAppended,

@@ -1397,21 +1397,36 @@ EJitSharedTaskPool::cacheLookupSeq2D(uint32_t funcIndex, uint32_t dim0,
       EJitSharedCacheSlot &Slot = B.slots[s];
       if (Slot.identityHash != key)
         continue;
+      // VERBOSE-only rejection naming (a hash-matched slot that still did not
+      // hit): the board diagnosis of the post-COMPLETE second-identity stall
+      // needs the exact branch that eats the lookup.
       if (Slot.state.loadAcquire() !=
-          static_cast<uint32_t>(EJitSharedSlotState::Ready))
+          static_cast<uint32_t>(EJitSharedSlotState::Ready)) {
+        EJIT_DIAG_VERBOSE("2d scan not ready func=%u state=%u", funcIndex,
+                          Slot.state.loadAcquire());
         continue;
-      if (Slot.generation != curGen)
+      }
+      if (Slot.generation != curGen) {
+        EJIT_DIAG_VERBOSE("2d scan gen func=%u slotGen=%u curGen=%u",
+                          funcIndex, Slot.generation, curGen);
         continue;
+      }
       if (Slot.funcIndex != funcIndex || Slot.numDims != 2)
         continue;
       if (Slot.dims[0].dimType != dim0 || Slot.dims[0].instanceId != inst0)
         continue;
       if (Slot.dims[1].dimType != dim1 || Slot.dims[1].instanceId != inst1)
         continue;
-      if (Slot.versions[0] != instanceVersion(dim0, inst0))
+      if (Slot.versions[0] != instanceVersion(dim0, inst0)) {
+        EJIT_DIAG_VERBOSE("2d scan stale v0 func=%u slot=%u live=%u",
+                          funcIndex, Slot.versions[0], instanceVersion(dim0, inst0));
         break;
-      if (Slot.versions[1] != instanceVersion(dim1, inst1))
+      }
+      if (Slot.versions[1] != instanceVersion(dim1, inst1)) {
+        EJIT_DIAG_VERBOSE("2d scan stale v1 func=%u slot=%u live=%u",
+                          funcIndex, Slot.versions[1], instanceVersion(dim1, inst1));
         break;
+      }
       hit = resolveMatchedSlot(B, bucket, s);
       break;
     }
