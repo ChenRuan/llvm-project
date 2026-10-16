@@ -12,6 +12,18 @@ separate image; its PASS criteria are the append order (every unlisted body
 above the manifest region), `unlistedAppended == 3` and the park evidence
 during collection.
 
+A third smoke covers the 2026-10-16 name-only contract:
+`ejit_test/baremetal/ejit_global_layout_nameonly_test.c` — five 2-dim
+(cell x trp) roots listed as NAME-ONLY entries (entryName only, no dims, no
+bounds), one of them dispatching two identities. Its authoritative spec is
+the file's header comment; it needs four shell steps (worker boot, producer
+phase-1 drive, producer refresh drive, worker print). PASS criteria: init
+accepts a name-only manifest for dimensional functions, the five
+first-identity member bodies are strictly rank ordered, the function's second
+identity appends above them WITHOUT failing the layout
+(`unlistedAppended == 1`, park evidence during collection), and both
+properties survive a lifecycle refresh into a second generation.
+
 Use this revision's `lipo.py gc-merge`, which retains the defined runtime exports
 `ejit_init_global_layout`, `ejit_get_global_layout_status`,
 `ejit_refresh_global_layout` and `ejit_shutdown_checked`. Older scripts discard
