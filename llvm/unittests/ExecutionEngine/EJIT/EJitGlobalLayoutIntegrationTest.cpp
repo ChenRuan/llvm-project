@@ -51,7 +51,8 @@ extern "C" int layout_host_callback(int x) { return x * 3 + 1; }
 using namespace llvm;
 using namespace llvm::ejit;
 namespace {
-std::string realBusinessBitcode(unsigned count, bool helperLoop) {
+std::string realBusinessBitcode(unsigned count, bool helperLoop,
+                                bool boundConfig = false) {
   LLVMContext C;
   Module M("global-layout-business", C);
   M.setTargetTriple(Triple("aarch64-unknown-linux-gnu"));
@@ -78,16 +79,22 @@ std::string realBusinessBitcode(unsigned count, bool helperLoop) {
   }
   H.CreateRet(H.CreateAdd(H.CreateMul(Helper->getArg(0), H.getInt32(3)),
                           H.getInt32(1)));
-  auto *RootTy = FunctionType::get(
-      Type::getInt32Ty(C), {Type::getInt32Ty(C), PointerType::getUnqual(C)},
-      false);
+  SmallVector<Type *, 3> Args{Type::getInt32Ty(C), PointerType::getUnqual(C)};
+  if (boundConfig)
+    Args.push_back(PointerType::getUnqual(C));
+  auto *RootTy = FunctionType::get(Type::getInt32Ty(C), Args, false);
   auto *Host = Function::Create(Ty, GlobalValue::ExternalLinkage,
                                 "layout_host_callback", M);
   for (unsigned I = 0; I < count; ++I) {
     auto *F = Function::Create(RootTy, GlobalValue::ExternalLinkage,
                                "layout_" + std::to_string(I), M);
     auto *Entry = MDNode::get(C, {MDString::get(C, TAG_EJIT_ENTRY)});
-    F->setMetadata(MD_EJIT_METADATA, MDNode::get(C, {Entry}));
+    SmallVector<Metadata *, 2> Meta{Entry};
+    if (boundConfig)
+      Meta.push_back(MDNode::get(C, {
+          MDString::get(C, TAG_EJIT_BOUND_PTR), MDString::get(C, "cfg"),
+          ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(C), 2))}));
+    F->setMetadata(MD_EJIT_METADATA, MDNode::get(C, Meta));
     auto *Start = BasicBlock::Create(C, "entry", F);
     auto *Positive = BasicBlock::Create(C, "positive", F);
     auto *Negative = BasicBlock::Create(C, "negative", F);
@@ -97,7 +104,10 @@ std::string realBusinessBitcode(unsigned count, bool helperLoop) {
     B.SetInsertPoint(Positive);
     auto *Indirect = B.CreateCall(Ty, F->getArg(1), {F->getArg(0)});
     auto *Sum = B.CreateAdd(B.CreateCall(Helper, {F->getArg(0)}), Indirect);
-    B.CreateRet(B.CreateAdd(Sum, B.getInt32(I)));
+    auto *Result = B.CreateAdd(Sum, B.getInt32(I));
+    if (boundConfig)
+      Result = B.CreateAdd(Result, B.CreateLoad(B.getInt32Ty(), F->getArg(2)));
+    B.CreateRet(Result);
     B.SetInsertPoint(Negative);
     auto *Cold = B.CreateAdd(B.CreateCall(Helper, {F->getArg(0)}),
                              B.CreateCall(Host, {F->getArg(0)}));
@@ -269,6 +279,7 @@ void runUnlistedLayout(unsigned listed, unsigned registered) {
   EJitFuncRegistry::instance().reset();
   Config config;
   config.enablePgo = false;
+  config.enableProfileAudit = false;
   config.globalLayoutBudgets.maxCollectionPolls = 40000;
   for (unsigned I = 0; I < listed; ++I) {
     EJitLayoutTarget Target;
@@ -355,6 +366,195 @@ TEST(EJitGlobalLayoutIntegration, BaselineFromH) {
 TEST(EJitGlobalLayoutIntegration,
      IncompleteManifestInitializesAndAppendsUnlisted) {
   runUnlistedLayout(5, 8);
+}
+
+static void runOrdinaryLayoutPgo(unsigned Arrival, bool ExhaustProfileBudget = false) {
+#if !defined(__linux__) || !defined(EJIT_SRE_CODE_POOL) || \
+    !defined(EJIT_CODE_POOL_BATCHED_PUBLISH) || !defined(EJIT_SRE_SHARED_TASKPOOL)
+  GTEST_SKIP() << "requires Linux and production batched shared code pool";
+#else
+  ASSERT_EQ(mprotect(ejitLayoutTestNear, sizeof(ejitLayoutTestNear),
+                     PROT_READ | PROT_WRITE), 0);
+  EJitFuncRegistry::instance().reset();
+  Config Config;
+  Config.enablePgo = true;
+  Config.enableProfileAudit = false;
+  Config.globalLayoutBudgets.maxCollectionPolls = Arrival == 2 ? 180 : 20000;
+  if (ExhaustProfileBudget)
+    Config.globalLayoutBudgets.maxProfileBytes = 1;
+  for (unsigned I = 0; I < 2; ++I) {
+    EJitLayoutTarget Target;
+    Target.entryName = "layout_" + std::to_string(I);
+    Config.globalLayout.push_back(Target);
+  }
+  auto Shared = std::make_unique<EJitSharedTaskPoolState>();
+  EJitRuntimeState Runtime;
+  EJitModuleLoader Loader;
+  std::string BC = realBusinessBitcode(4, false);
+  for (unsigned I = 0; I < 4; ++I)
+    ASSERT_TRUE(Loader.registerBitcode("layout_" + std::to_string(I),
+        reinterpret_cast<const uint8_t *>(BC.data()), BC.size()));
+  EJitCompileDriver Driver(Config, Runtime, Loader);
+  Driver.registerSymbol("layout_host_callback",
+                        reinterpret_cast<void *>(&layout_host_callback));
+  auto *Pool = Driver.sharedTaskPool();
+  Pool->bind(Shared.get());
+  Pool->setWorkerHooks(nullptr, nullptr, nullptr);
+  Pool->setPgoEnabled(true, 64, 4);
+  ASSERT_TRUE(Driver.startSharedTaskPool());
+  unsigned Samples[4] = {};
+  uintptr_t Bodies[4] = {};
+  for (unsigned Step = 0; Step < (ExhaustProfileBudget ? 1600u : 12000u); ++Step) {
+    const auto Phase = Pool->globalLayoutState();
+    const bool Terminal = Phase == EJitGlobalLayoutState::Complete ||
+                          Phase == EJitGlobalLayoutState::Failed;
+    unsigned I = Terminal ? Step % 4 : Arrival == 0 ? (Step + 2) % 3
+                                     : Arrival == 1 ? Step % 2 : 0;
+    auto R = Pool->compileOrGet(I, nullptr, 0, nullptr);
+    if (R.fnPtr) {
+      const bool Sample = R.hasReadToken && (R.bucketIndex & 0x8000u);
+      Pool->workerPollOnce(); // Last sample deliberately has not executed yet.
+      auto Fn = reinterpret_cast<int (*)(int, int (*)(int))>(R.fnPtr);
+      EXPECT_EQ(Fn(10, &layout_host_callback), 62 + static_cast<int>(I));
+      if (Sample)
+        ++Samples[I];
+      else
+        Bodies[I] = reinterpret_cast<uintptr_t>(R.fnPtr);
+      Pool->releaseRead(R.bucketIndex);
+    }
+    Pool->workerPollOnce();
+    ASSERT_LE(Shared->pgoActiveFunctionCount.loadAcquire(), 4u);
+    if (Bodies[0] && Bodies[1] && Bodies[2] && Bodies[3] &&
+        Shared->pgoActiveFunctionCount.loadAcquire() == 0 &&
+        Pool->pendingCount() == 0)
+      break;
+  }
+  if (ExhaustProfileBudget) {
+    EXPECT_EQ(Pool->globalLayoutState(), EJitGlobalLayoutState::Failed);
+    EXPECT_EQ(Shared->counters.tier2Compiles.loadRelaxed(), 0u);
+    EXPECT_EQ(Shared->pgoCompletedFunctions.loadAcquire(), 0u);
+    EXPECT_EQ(Samples[0], 64u);
+    for (auto Body : Bodies)
+      EXPECT_EQ(Body, 0u) << "a consumed snapshot cannot become partial T2";
+    Driver.stopSharedTaskPool();
+    return;
+  }
+  EXPECT_EQ(Pool->globalLayoutState(), Arrival == 2
+      ? EJitGlobalLayoutState::Failed : EJitGlobalLayoutState::Complete);
+  for (unsigned I = 0; I < 4; ++I) {
+    EXPECT_EQ(Samples[I], 64u) << "root=" << I;
+    EXPECT_NE(Bodies[I], 0u) << "root=" << I;
+  }
+  if (Arrival != 2) {
+    EXPECT_LT(Bodies[0], Bodies[1]);
+    EXPECT_LT(Bodies[1], Bodies[2]);
+    EXPECT_LT(Bodies[1], Bodies[3]);
+  }
+  EXPECT_EQ(Shared->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(Shared->counters.tier2Compiles.loadRelaxed(), 4u);
+  EXPECT_EQ(Shared->pgoCompletedFunctions.loadAcquire(), 4u);
+  EXPECT_EQ(Shared->counters.compileFailed.loadRelaxed(), 0u);
+  EXPECT_EQ(Shared->counters.publishFailed.loadRelaxed(), 0u);
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  EXPECT_FALSE(ejitVpIsArmed()) << "every layout and ordinary round must close";
+  EXPECT_EQ(Driver.layoutPreparedValueSamples(), 4u * 64u)
+      << "all sibling VP snapshots and failed-layout retries retain full samples";
+#endif
+  Driver.stopSharedTaskPool();
+#endif
+}
+
+TEST(EJitGlobalLayoutIntegration, UnlistedPgo64WithRealReturnLeases) {
+  runOrdinaryLayoutPgo(0);
+}
+TEST(EJitGlobalLayoutIntegration, LateUnlistedPgo64AfterComplete) {
+  runOrdinaryLayoutPgo(1);
+}
+TEST(EJitGlobalLayoutIntegration, OrdinaryPgo64AfterMissingMemberFailure) {
+  runOrdinaryLayoutPgo(2);
+}
+TEST(EJitGlobalLayoutIntegration, ProfileBudgetFailureNeverPublishesPartialT2) {
+  runOrdinaryLayoutPgo(1, true);
+}
+
+TEST(EJitGlobalLayoutIntegration, ParkedBoundIdentitiesKeepSeparateProfiles) {
+#if !defined(__linux__) || !defined(EJIT_SRE_CODE_POOL) || \
+    !defined(EJIT_CODE_POOL_BATCHED_PUBLISH) || !defined(EJIT_SRE_SHARED_TASKPOOL)
+  GTEST_SKIP();
+#else
+  ASSERT_EQ(mprotect(ejitLayoutTestNear, sizeof(ejitLayoutTestNear),
+                     PROT_READ | PROT_WRITE), 0);
+  EJitFuncRegistry::instance().reset();
+  Config Config;
+  Config.enablePgo = true;
+  Config.enableProfileAudit = false;
+  EJitLayoutTarget Target;
+  Target.entryName = "layout_0";
+  Config.globalLayout.push_back(Target);
+  auto Shared = std::make_unique<EJitSharedTaskPoolState>();
+  EJitRuntimeState Runtime;
+  EJitModuleLoader Loader;
+  std::string BC = realBusinessBitcode(2, false, true);
+  for (unsigned I = 0; I < 2; ++I)
+    ASSERT_TRUE(Loader.registerBitcode("layout_" + std::to_string(I),
+        reinterpret_cast<const uint8_t *>(BC.data()), BC.size()));
+  EJitCompileDriver Driver(Config, Runtime, Loader);
+  Driver.registerSymbol("layout_host_callback",
+                        reinterpret_cast<void *>(&layout_host_callback));
+  auto *Pool = Driver.sharedTaskPool();
+  Pool->bind(Shared.get());
+  Pool->setWorkerHooks(nullptr, nullptr, nullptr);
+  Pool->setPgoEnabled(true, 64, 4);
+  ASSERT_TRUE(Driver.startSharedTaskPool());
+  int Backing[4] = {100, 200, 300, 400};
+  unsigned Samples[4] = {};
+  uintptr_t Bodies[4] = {};
+  auto Call = [&](unsigned I) {
+    unsigned F = I == 3 ? 0 : 1;
+    EJitBoundPtrDescriptor Bound{&Backing[I], sizeof(int), 2};
+    auto R = Pool->compileOrGet(F, nullptr, 0, nullptr, &Bound, 1);
+    if (R.fnPtr) {
+      EXPECT_EQ(reinterpret_cast<int (*)(int, int (*)(int), int *)>(R.fnPtr)(
+                    10, &layout_host_callback, &Backing[I]),
+                62 + static_cast<int>(F) + Backing[I]);
+      if (R.hasReadToken && (R.bucketIndex & 0x8000u))
+        ++Samples[I];
+      else
+        Bodies[I] = reinterpret_cast<uintptr_t>(R.fnPtr);
+      Pool->releaseRead(R.bucketIndex);
+    }
+    Pool->workerPollOnce();
+  };
+  // Three drained identities share funcIndex/dims but not bound backing. They
+  // all wait for the still-cold manifest member before any T2 consumes profiles.
+  for (unsigned I = 0; I < 3; ++I) {
+    for (unsigned Step = 0; Step < 200; ++Step)
+      Call(I);
+    ASSERT_EQ(Samples[I], 64u);
+    ASSERT_EQ(Shared->globalLayoutUnlistedReady.loadAcquire(), I + 1);
+  }
+  for (unsigned Step = 0; Step < 1000; ++Step) {
+    Call(Step % 4);
+    if (Bodies[0] && Bodies[1] && Bodies[2] && Bodies[3])
+      break;
+  }
+  EXPECT_EQ(Pool->globalLayoutState(), EJitGlobalLayoutState::Complete);
+  EXPECT_EQ(Shared->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(Shared->pgoCompletedFunctions.loadAcquire(), 4u);
+  for (unsigned I = 0; I < 4; ++I) {
+    EXPECT_EQ(Samples[I], 64u);
+    EXPECT_NE(Bodies[I], 0u);
+    if (I != 3)
+      EXPECT_GT(Bodies[I], Bodies[3]);
+  }
+  EXPECT_EQ(Shared->counters.compileFailed.loadRelaxed(), 0u);
+  EXPECT_EQ(Shared->counters.publishFailed.loadRelaxed(), 0u);
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  EXPECT_EQ(Driver.layoutPreparedValueSamples(), 256u);
+  EXPECT_FALSE(ejitVpIsArmed());
+#endif
+  Driver.stopSharedTaskPool();
+#endif
 }
 TEST(EJitGlobalLayoutIntegration, BaselineFromZ) {
   runProductionLayout(false, 25, false);

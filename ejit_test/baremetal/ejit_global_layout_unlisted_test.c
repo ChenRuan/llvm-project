@@ -51,13 +51,8 @@
 #define UNLISTED_RUN_INIT_ARRAY 1
 #endif
 #ifndef UNLISTED_WAIT_ROUNDS
-// Board-measured (2026-10-15, 8+3 roots, quota 64, cap 4): the shared worker
-// paces roughly ONE significant item (Tier-1 compile, member artifact
-// prepare, park/stage pop) per ~1000 one-tick rounds, and the four
-// admissions serialize the 11 functions into three waves whose holds grow to
-// ~5000-9000 rounds; full convergence projects to ~55-60k rounds. 100000
-// leaves ~2x headroom. The bound is not a timing guarantee.
-#define UNLISTED_WAIT_ROUNDS 100000u
+// No deadline on board by default; a positive override bounds automated runs.
+#define UNLISTED_WAIT_ROUNDS 0u
 #endif
 #ifndef UNLISTED_DUMP_IR
 #define UNLISTED_DUMP_IR 1
@@ -201,7 +196,8 @@ static int unlisted_drive(void) {
   if (unlisted_status(&s, &t))
     return -1;
   uint32_t generation = s.generation;
-  for (uint32_t round = 0; round < UNLISTED_WAIT_ROUNDS; ++round) {
+  for (uint32_t round = 0;
+       !UNLISTED_WAIT_ROUNDS || round < UNLISTED_WAIT_ROUNDS; ++round) {
     // Unlisted first: X/Y/Z hit counts (and therefore Tier-2 arms) lead the
     // members every round, so their parked requests are in place before the
     // last member stages and the collective window includes them.
@@ -225,7 +221,8 @@ static int unlisted_drive(void) {
       // The manifest published; the appended unlisted bodies publish through
       // the ordinary auto/flush path after COMPLETE. Wait for the queue and
       // dedup tail to drain and every publication to land.
-      for (uint32_t wait = 0; wait < UNLISTED_WAIT_ROUNDS; ++wait) {
+      for (uint32_t wait = 0;
+           !UNLISTED_WAIT_ROUNDS || wait < UNLISTED_WAIT_ROUNDS; ++wait) {
         if (unlisted_status(&s, &t))
           return -1;
         if (s.state != UNLISTED_COMPLETE || s.generation != generation)

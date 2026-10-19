@@ -6,6 +6,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include <algorithm>
 #include <cassert>
 #ifndef EJIT_FREESTANDING
 #include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
@@ -30,6 +31,25 @@ using namespace llvm::ejit;
 
 #ifdef EJIT_SRE_TASKPOOL
 namespace {
+std::string layoutProfileIdentity(const EJitCompileRequest &R) {
+  std::string Identity = std::to_string(R.generation) + "_" +
+      std::to_string(stripReqTier(R.funcIndex)) + "_d" + std::to_string(R.numDims);
+  for (uint32_t I = 0; I < R.numDims; ++I)
+    Identity += "_" + std::to_string(R.dims[I].dimType) + "_" +
+        std::to_string(R.dims[I].instanceId) + "_" + std::to_string(R.versions[I]);
+  Identity += "_b" + std::to_string(R.boundCount);
+  SmallVector<EJitBoundPtrDescriptor, 4> Bounds(
+      R.boundPointers, R.boundPointers + R.boundCount);
+  std::sort(Bounds.begin(), Bounds.end(), [](const auto &A, const auto &B) {
+    return A.argIndex < B.argIndex;
+  });
+  for (const auto &B : Bounds)
+    Identity += "_" + std::to_string(B.argIndex) + "_" +
+        std::to_string(reinterpret_cast<uintptr_t>(B.rawPtr)) +
+        "_" + std::to_string(B.size);
+  return Identity;
+}
+
 /// Adapter so the taskpool can call back into the driver's cold compile path
 /// through a plain function pointer (never std::function). The produced JIT
 /// pointer still comes from the OrcJIT engine (SRE code pool when enabled).
@@ -519,6 +539,9 @@ bool EJitCompileDriver::refreshGlobalLayout(
 bool EJitCompileDriver::resetGlobalLayoutProfiles() {
   // Worker only, after every real T1 return. Keep the engine/JDs/pools alive.
   tier1Counters_.clear();
+  layoutProfiles_.clear();
+  layoutProfileBytes_ = 0;
+  layoutProfileCaptureFailed_ = false;
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
   tier1MayConst_.clear();
 #endif
@@ -526,6 +549,7 @@ bool EJitCompileDriver::resetGlobalLayoutProfiles() {
   tier1Vp_.clear();
   std::vector<EJitVpSiteSample>().swap(layoutVpPending_);
   vpRoundsActive_ = 0;
+  layoutVpRounds_.clear();
   ejitVpSetArmed(false);
   ejitVpSetLosslessMode(config_.enablePgo || config_.enableProfileAudit);
   layoutPreparedValueSamples_ = 0;
@@ -781,23 +805,16 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   ctx.cacheKey = cacheKey;
   ctx.optLevel = config_.optLevel;
   ctx.globalLayoutCompilation = !config_.globalLayout.empty();
+#ifdef EJIT_SRE_TASKPOOL
   if (ctx.globalLayoutCompilation &&
-      (config_.enablePgo || config_.enableProfileAudit) && request) {
-    ctx.profileIdentity = std::to_string(request->generation) + "_" +
-                          std::to_string(stripReqTier(request->funcIndex)) +
-                          "_d" + std::to_string(request->numDims);
-    for (uint32_t I = 0; I < request->numDims; ++I)
-      ctx.profileIdentity += "_" + std::to_string(request->dims[I].dimType) +
-                             "_" + std::to_string(request->dims[I].instanceId) +
-                             "_" + std::to_string(request->versions[I]);
-    ctx.profileIdentity += "_b" + std::to_string(request->boundCount);
-    for (uint32_t I = 0; I < request->boundCount; ++I)
-      ctx.profileIdentity +=
-          "_" + std::to_string(request->boundPointers[I].argIndex) + "_" +
-          std::to_string(
-              reinterpret_cast<uintptr_t>(request->boundPointers[I].rawPtr)) +
-          "_" + std::to_string(request->boundPointers[I].size);
-  }
+      (config_.enablePgo || config_.enableProfileAudit) && request)
+    ctx.profileIdentity = layoutProfileIdentity(*request);
+#endif
+  // The legacy code key omits bindings. Drained unlisted identities can coexist
+  // until collective compilation, so their counter/VP inventories cannot use it.
+  const std::string ProfileKey = ctx.globalLayoutCompilation
+                                     ? ctx.profileIdentity
+                                     : std::to_string(cacheKey);
   for (unsigned i = 0; i < dimCount; ++i)
     ctx.dimensions.push_back({periodNames[i], dims[i]});
   if (request && request->boundCount) {
@@ -844,7 +861,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       ctx.tier = CompileTier::PGOUse;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
       ctx.profileAuditOnly = !config_.enablePgo;
-      auto mayConstIt = tier1MayConst_.find(cacheKey);
+      auto mayConstIt = tier1MayConst_.find(ProfileKey);
       if (mayConstIt != tier1MayConst_.end()) {
         ctx.mayConstLoadSites = mayConstIt->second.sites;
         const uint64_t SampleEnd = ejit_taskpool_trace_now();
@@ -861,14 +878,25 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         }
       }
 #endif
-      auto it = tier1Counters_.find(cacheKey);
-      if (it != tier1Counters_.end() && !it->second.empty()) {
+      auto it = tier1Counters_.find(ProfileKey);
+      auto Cached = layoutProfiles_.find(ctx.profileIdentity);
+      if (ctx.globalLayoutCompilation && Cached == layoutProfiles_.end()) {
+        if (layoutProfileCaptureFailed_)
+          return nullptr;
+        // Snapshotting consumes collector data. A failed capture cannot be
+        // retried as a partial profile; only a fresh generation may restart it.
+        layoutProfileCaptureFailed_ = true;
+      }
+      if (ctx.globalLayoutCompilation && Cached != layoutProfiles_.end()) {
+        ctx.profileData = Cached->second.data;
+        ctx.scalarValueSites = Cached->second.scalars;
+      } else if (it != tier1Counters_.end() && !it->second.empty()) {
         std::vector<PgoCounterRef> refs;
         refs.reserve(it->second.size());
         for (const auto &c : it->second)
           refs.push_back({c.pgoName.c_str(), c.profcAddr, c.profdAddr});
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
-        if (prepareOnly && ejitVpLosslessFailed()) {
+        if (ctx.globalLayoutCompilation && ejitVpLosslessFailed()) {
           EJIT_DIAG("global layout VP capacity or preempting-writer failure");
           return nullptr;
         }
@@ -881,7 +909,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         SmallVector<PgoValueSite, 8> valueSites;
         SmallVector<PgoValueFunction, 8> vpFuncs;
         SmallVector<PgoScalarSite, 8> scalarSites;
-        auto vpIt = tier1Vp_.find(cacheKey);
+        auto vpIt = tier1Vp_.find(ProfileKey);
         bool haveVp =
             vpIt != tier1Vp_.end() && readValueSiteInventory(refs, vpFuncs);
         if (haveVp) {
@@ -897,9 +925,10 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
           std::vector<EJitVpSiteSample> samples;
           haveVp = ejitVpTakeSnapshot(samples);
           if (haveVp) {
-            if (prepareOnly) {
+            if (ctx.globalLayoutCompilation) {
               const size_t MaxRecords =
-                  config_.globalLayoutBudgets.maxProfileBytes /
+                  (config_.globalLayoutBudgets.maxProfileBytes -
+                   layoutProfileBytes_) /
                   (4 * sizeof(EJitVpSiteSample));
               if (samples.size() > MaxRecords ||
                   layoutVpPending_.size() > MaxRecords - samples.size())
@@ -967,7 +996,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
           }
         }
         if (!haveVp) {
-          if (prepareOnly)
+          if (ctx.globalLayoutCompilation)
             return nullptr; // Required VP data must not silently become
                             // edge-only.
           // Edge-only profile: value data unavailable (no snapshot / no
@@ -987,6 +1016,31 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         EJIT_DIAG(
             "compileCold Tier-2 key=0x%016lx: no Tier-1 counters captured",
             cacheKey);
+      }
+      if (ctx.globalLayoutCompilation) {
+        if (ctx.profileData.empty())
+          return nullptr;
+        if (Cached == layoutProfiles_.end()) {
+          const uint64_t Bytes = ctx.profileData.size() +
+              ctx.scalarValueSites.size() * sizeof(PgoScalarSite) +
+              ctx.profileIdentity.size() + sizeof(LayoutProfile);
+          uint64_t RetainedBytes = layoutProfileBytes_;
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+          RetainedBytes +=
+              layoutVpPending_.capacity() * sizeof(EJitVpSiteSample);
+#endif
+          if (Bytes > config_.globalLayoutBudgets.maxProfileBytes ||
+              RetainedBytes >
+                  config_.globalLayoutBudgets.maxProfileBytes - Bytes)
+            return nullptr;
+          layoutProfiles_.emplace(ctx.profileIdentity,
+              LayoutProfile{ctx.profileData, ctx.scalarValueSites, Bytes});
+          layoutProfileBytes_ += Bytes;
+          layoutProfileCaptureFailed_ = false;
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+          layoutPreparedValueSamples_ += CapturedValueSamples;
+#endif
+        }
       }
     } else {
       ctx.tier = CompileTier::Instrumented;
@@ -1029,10 +1083,9 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       return nullptr;
     }
     if (ctx.tier == CompileTier::PGOUse) {
-      tier1Counters_.erase(cacheKey);
+      tier1Counters_.erase(ProfileKey);
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
-      tier1Vp_.erase(cacheKey);
-      layoutPreparedValueSamples_ += CapturedValueSamples;
+      tier1Vp_.erase(ProfileKey);
 #endif
     }
     EJIT_DIAG("global layout prepared func=%s key=0x%016lx ticks=%llu "
@@ -1085,7 +1138,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   // captureCounterGlobals during the transform; resolve them by name in the
   // specialization JITDylib.
   if (ctx.tier == CompileTier::Instrumented) {
-    auto &counters = tier1Counters_[cacheKey];
+    auto &counters = tier1Counters_[ProfileKey];
     counters.clear();
     for (const std::string &name : jitEngine_->getLastCounterNames()) {
       auto profc = jitEngine_->lookup(cacheKey, "__profc_" + name);
@@ -1110,7 +1163,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
               cacheKey, counters.size());
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-    Tier1MayConstState &MayConst = tier1MayConst_[cacheKey];
+    Tier1MayConstState &MayConst = tier1MayConst_[ProfileKey];
     MayConst.counterBase = 0;
     MayConst.sampleStart = 0;
     MayConst.sites.assign(jitEngine_->getLastMayConstLoadSites().begin(),
@@ -1123,7 +1176,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     }
     EJIT_DIAG("mayconst T0 published key=0x%016lx func=%s sites=%zu", cacheKey,
               funcName.c_str(), MayConst.sites.size());
-    pendingTier1MayConstKey_ = cacheKey;
+    pendingTier1MayConstKey_ = ProfileKey;
     hasPendingTier1MayConstKey_ = true;
 #endif
 
@@ -1134,7 +1187,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     // externals) mapped to the MD5 of its IR-level PGO name. Addresses that
     // resolve to nothing are simply absent from the table, so the merge can
     // never pass an unverified raw address as a profile value.
-    Tier1VpState &vp = tier1Vp_[cacheKey];
+    Tier1VpState &vp = tier1Vp_[ProfileKey];
     vp.targets.clear();
     vp.functions.clear();
     for (const EJitVpFunctionInfo &f : jitEngine_->getLastVpFunctions()) {
@@ -1176,7 +1229,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
           // Refuse that generation instead of mixing private specialization
           // data.
           for (const auto &Other : tier1Vp_) {
-            if (Other.first == cacheKey)
+            if (Other.first == ProfileKey)
               continue;
             for (const auto &F : inv)
               for (const auto &G : Other.second.functions)
@@ -1202,7 +1255,9 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     if (config_.enablePgo) {
       ejitVpEnsureInitialized();
       ejitVpSetArmed(true);
-      ++vpRoundsActive_;
+      if (config_.globalLayout.empty() ||
+          layoutVpRounds_.insert(ctx.profileIdentity).second)
+        ++vpRoundsActive_;
     }
     EJIT_DIAG_DEBUG("VP capture key=0x%016lx: %zu function(s), %zu verified "
                     "target(s)",
@@ -1212,7 +1267,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
 
   // PGO Tier-2: profile consumed; drop the captured counters (§7.1).
   if (ctx.tier == CompileTier::PGOUse)
-    tier1Counters_.erase(cacheKey);
+    tier1Counters_.erase(ProfileKey);
 
   EJIT_DIAG("compile OK key=0x%016lx func=%s → pfn=%p", cacheKey,
             funcName.c_str(), funcPtr);
@@ -1310,7 +1365,8 @@ void *EJitCompileDriver::compileRequest(const EJitCompileRequest &req,
 void EJitCompileDriver::notifyTaskpoolPrepared(const EJitCompileRequest &req) {
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
   // This is a drained sampling round, not a T2 publication notification.
-  if (decodeReqTier(req.funcIndex) == kEJitTierPgoUse && vpRoundsActive_ > 0 &&
+  if (decodeReqTier(req.funcIndex) == kEJitTierPgoUse &&
+      layoutVpRounds_.erase(layoutProfileIdentity(req)) && vpRoundsActive_ > 0 &&
       --vpRoundsActive_ == 0) {
     ejitVpSetArmed(false);
     std::vector<EJitVpSiteSample>().swap(layoutVpPending_);
@@ -1322,15 +1378,35 @@ void EJitCompileDriver::notifyTaskpoolPrepared(const EJitCompileRequest &req) {
 
 void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
                                                 bool published) {
+  if (!config_.globalLayout.empty() && published &&
+      decodeReqTier(req.funcIndex) == kEJitTierPgoUse) {
+    const std::string Identity = layoutProfileIdentity(req);
+    auto It = layoutProfiles_.find(Identity);
+    if (It != layoutProfiles_.end()) {
+      layoutProfileBytes_ -= It->second.bytes;
+      layoutProfiles_.erase(It);
+    }
+    tier1Counters_.erase(Identity);
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+    tier1Vp_.erase(Identity);
+#endif
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+    tier1MayConst_.erase(Identity);
+#endif
+    notifyTaskpoolPrepared(req); // Idempotent for a manifest's prepared round.
+  }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   const uint32_t AuditTier = decodeReqTier(req.funcIndex);
   if (AuditTier == kEJitTierInstrumented) {
-    if (published && hasPendingTier1MayConstKey_) {
-      auto It = tier1MayConst_.find(pendingTier1MayConstKey_);
+    if (published &&
+        (!config_.globalLayout.empty() || hasPendingTier1MayConstKey_)) {
+      auto It = tier1MayConst_.find(config_.globalLayout.empty()
+                                      ? pendingTier1MayConstKey_
+                                      : layoutProfileIdentity(req));
       if (It != tier1MayConst_.end())
         It->second.sampleStart = ejit_taskpool_trace_now();
     }
-    pendingTier1MayConstKey_ = 0;
+    pendingTier1MayConstKey_.clear();
     hasPendingTier1MayConstKey_ = false;
   }
 #endif
@@ -1338,7 +1414,9 @@ void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
   const uint32_t tier = decodeReqTier(req.funcIndex);
   const bool consumesRound =
       (tier == kEJitTierPgoUse && published && config_.globalLayout.empty()) ||
-      (tier == kEJitTierInstrumented && !published);
+      (tier == kEJitTierInstrumented && !published &&
+       (config_.globalLayout.empty() ||
+        layoutVpRounds_.erase(layoutProfileIdentity(req))));
   if (consumesRound && vpRoundsActive_ > 0 && --vpRoundsActive_ == 0)
     ejitVpSetArmed(false);
 #else

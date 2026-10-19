@@ -29,6 +29,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -222,17 +223,27 @@ private:
     uintptr_t profcAddr = 0;
     uintptr_t profdAddr = 0;
   };
-  std::unordered_map<uint64_t, std::vector<Tier1CounterInfo>> tier1Counters_;
+  std::unordered_map<std::string, std::vector<Tier1CounterInfo>> tier1Counters_;
+  // A drained profile survives artifact/link/publication failure until its
+  // exact identity publishes T2 or the generation retires.
+  struct LayoutProfile {
+    std::string data;
+    std::vector<PgoScalarSite> scalars;
+    uint64_t bytes = 0;
+  };
+  std::unordered_map<std::string, LayoutProfile> layoutProfiles_;
+  uint64_t layoutProfileBytes_ = 0;
+  bool layoutProfileCaptureFailed_ = false;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   struct Tier1MayConstState {
     uintptr_t counterBase = 0;
     uint64_t sampleStart = 0;
     std::vector<EJitMayConstLoadSite> sites;
   };
-  std::unordered_map<uint64_t, Tier1MayConstState> tier1MayConst_;
+  std::unordered_map<std::string, Tier1MayConstState> tier1MayConst_;
   /// The owner worker compiles and publishes serially, so the publish callback
   /// can use this key to timestamp the Tier-1 sample window exactly at publish.
-  uint64_t pendingTier1MayConstKey_ = 0;
+  std::string pendingTier1MayConstKey_;
   bool hasPendingTier1MayConstKey_ = false;
 #endif
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
@@ -246,11 +257,12 @@ private:
     std::vector<PgoValueTarget> targets;
     std::vector<PgoValueFunction> functions;
   };
-  std::unordered_map<uint64_t, Tier1VpState> tier1Vp_;
+  std::unordered_map<std::string, Tier1VpState> tier1Vp_;
   /// Active collection rounds (Tier-1 publishes not yet consumed by a Tier-2
   /// merge), touched only by the single owner worker: the collector is armed
   /// at the first Tier-1 capture and disarmed once the last round merged.
   uint32_t vpRoundsActive_ = 0;
+  std::unordered_set<std::string> layoutVpRounds_;
   /// Whole-collector snapshots contain sibling rounds. Preserve, then consume
   /// only the current complete inventory. Bounded by the layout profile budget.
   std::vector<EJitVpSiteSample> layoutVpPending_;

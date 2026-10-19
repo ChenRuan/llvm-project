@@ -7,6 +7,7 @@
 //
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#include <algorithm>
 #include <limits>
 
 using namespace llvm::ejit;
@@ -21,6 +22,9 @@ EJitCompileRequest slotRequest(const EJitSharedCacheSlot &S) {
     R.dims[I] = S.dims[I];
     R.versions[I] = S.versions[I];
   }
+  R.boundCount = S.layoutBoundCount ? S.layoutBoundCount - 1 : 0;
+  for (uint32_t I = 0; I < R.boundCount; ++I)
+    R.boundPointers[I] = S.layoutBounds[I];
   return R;
 }
 } // namespace
@@ -181,6 +185,8 @@ bool EJitSharedTaskPool::serviceGlobalLayoutRefresh() {
       cacheDropPending(P.req, nullptr);
   pendingBatchCompiles_.clear();
   layoutDeferredT2_.clear();
+  layoutUnlistedDraining_.clear();
+  layoutReleasedSampling_.clear();
   layoutAppendedPublishes_.clear();
   // Drain old requests before the epoch changes. No new misses are admitted in
   // Refreshing; late producers retain the old generation and are dropped later.
@@ -394,7 +400,7 @@ bool EJitSharedTaskPool::layoutTier2AlreadyDelivered(
     if (S.state.loadAcquire() ==
             static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
         S.tier.loadAcquire() == kEJitTierPgoUse &&
-        sameIdentity(slotRequest(S), R, false))
+        sameIdentity(slotRequest(S), R))
       return true;
   // A collective-append body parked for the post-COMPLETE flush counts as
   // delivered: a re-arm raced against it must not win the slot.
@@ -419,7 +425,7 @@ bool EJitSharedTaskPool::samplingDrained(const EJitCompileRequest &R) const {
     if (S.state.loadAcquire() ==
             static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
         S.tier.loadAcquire() == kEJitTierInstrumented &&
-        sameIdentity(slotRequest(S), R, false))
+        sameIdentity(slotRequest(S), R))
       return S.hitCount.loadAcquire() >= state_->tier2Threshold.loadAcquire() &&
              S.samplingExecutions.loadAcquire() == 0 &&
              S.samplingReturns.loadAcquire() >=
@@ -430,6 +436,12 @@ bool EJitSharedTaskPool::samplingDrained(const EJitCompileRequest &R) const {
 void EJitSharedTaskPool::releaseSamplingAdmission(const EJitCompileRequest &R) {
   if (!samplingDrained(R))
     return;
+  for (const auto &Released : layoutReleasedSampling_)
+    if (sameIdentity(Released, R))
+      return;
+  // At most maxMembers plus kEJitSharedQueueSlots drained append requests
+  // can be waiting for publication in this generation.
+  layoutReleasedSampling_.push_back(R);
   uint32_t expected = 0;
   while (!state_->pgoAdmissionLock.compareExchange(expected, 1))
     expected = 0;
@@ -533,8 +545,7 @@ void EJitSharedTaskPool::failGlobalLayout(EJitGlobalLayoutError error,
     // parked without staging (Tier-1 retries, codeReady Tier-2) carry no
     // marker, and cacheDropPending no-ops for them.
     cacheDropPending(P.req, P.fn);
-    finishPgoFunction(stripReqTier(P.req.funcIndex), false,
-                      "layout-pending-t1-abort");
+    finishPgoRequest(P.req, false, "layout-pending-t1-abort");
     dedupClear(P.req.funcIndex, P.req.generation);
   }
   pendingPublishes_.clear();
@@ -661,31 +672,8 @@ bool EJitSharedTaskPool::serviceGlobalLayout() {
   if (globalLayoutState() == EJitGlobalLayoutState::Failed) {
     if (!layoutFailureRecorded_)
       failGlobalLayout(EJitGlobalLayoutError::StaleIdentity, 0);
-    // Close and drain any remaining T1 rounds; never take fresh samples.
-    for (auto &M : layoutMembers_) {
-      if (M.samplingReleased)
-        continue;
-      bool DrainedRound = false;
-      for (const auto &B : state_->buckets)
-        for (const auto &S : B.slots)
-          if (S.state.loadAcquire() ==
-                  static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
-              S.tier.loadAcquire() == kEJitTierInstrumented &&
-              sameIdentity(slotRequest(S), M.req, false) &&
-              S.samplingExecutions.loadAcquire() == 0)
-            DrainedRound = true;
-      if (DrainedRound) {
-        finishPgoFunction(stripReqTier(M.req.funcIndex), false,
-                          "global-layout-failed-after-drain");
-        if (publishFn_) {
-          auto Abort = M.req;
-          Abort.funcIndex = encodeReqTier(stripReqTier(Abort.funcIndex),
-                                          kEJitTierInstrumented);
-          publishFn_(publishCtx_, Abort, false);
-        }
-        M.samplingReleased = true;
-      }
-    }
+    // A layout failure relinquishes ordering, not the live T1 round. Ordinary
+    // fallback must finish its remaining samples and consume that same profile.
     return false;
   }
   // Capture live versions on the first active admission, not cold init's zero.
@@ -792,6 +780,10 @@ bool EJitSharedTaskPool::serviceGlobalLayout() {
     const size_t PublishBase = pendingPublishes_.size();
     std::vector<EJitCompileRequest> DeferredT2;
     DeferredT2.swap(layoutDeferredT2_);
+    std::stable_sort(DeferredT2.begin(), DeferredT2.end(),
+                     [](const auto &A, const auto &B) {
+                       return stripReqTier(A.funcIndex) < stripReqTier(B.funcIndex);
+                     });
     // A re-armed identity can park more than once while collection waited;
     // compile only the latest request of each identity.
     for (size_t I = 0; I < DeferredT2.size(); ++I) {
@@ -898,7 +890,7 @@ bool EJitSharedTaskPool::serviceGlobalLayout() {
       EJIT_STAT_INC(state_->counters.asyncCompiles);
       if (decodeReqTier(M.req.funcIndex) == kEJitTierPgoUse) {
         EJIT_STAT_INC(state_->counters.tier2Compiles);
-        state_->pgoCompletedFunctions.fetchAdd(1);
+        finishPgoRequest(M.req, true);
       }
       if (publishFn_)
         publishFn_(publishCtx_, M.req, true);

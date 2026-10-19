@@ -1122,6 +1122,25 @@ static bool slotIdentityMatches(const EJitSharedCacheSlot &s,
   return true;
 }
 
+static bool slotBoundsMatch(const EJitSharedCacheSlot &S,
+                            const EJitBoundPtrDescriptor *Bounds,
+                            uint32_t Count) {
+  if (!S.layoutBoundCount)
+    return true; // Preserve the legacy non-layout cache contract.
+  if (S.layoutBoundCount != Count + 1 || (Count && !Bounds))
+    return false;
+  for (uint32_t I = 0; I < Count; ++I) {
+    bool Found = false;
+    for (uint32_t J = 0; J < Count; ++J)
+      Found |= S.layoutBounds[I].argIndex == Bounds[J].argIndex &&
+               S.layoutBounds[I].rawPtr == Bounds[J].rawPtr &&
+               S.layoutBounds[I].size == Bounds[J].size;
+    if (!Found)
+      return false;
+  }
+  return true;
+}
+
 bool EJitSharedTaskPool::isPublishedTier2(uint32_t funcIndex, void *fnPtr,
                                           const EJitDimPair *dims,
                                           uint32_t numDims) {
@@ -1142,7 +1161,8 @@ bool EJitSharedTaskPool::isPublishedTier2(uint32_t funcIndex, void *fnPtr,
           static_cast<uint32_t>(EJitSharedSlotState::Ready))
         continue;
       if (Slot.generation != curGen ||
-          !slotIdentityMatches(Slot, funcIndex, dims, numDims))
+          !slotIdentityMatches(Slot, funcIndex, dims, numDims) ||
+          reinterpret_cast<void *>(Slot.fnPtr.loadAcquire()) != fnPtr)
         continue;
       for (uint32_t i = 0; i < numDims; ++i)
         if (Slot.versions[i] !=
@@ -1198,7 +1218,8 @@ EJitSharedTaskPool::SharedLookup EJitSharedTaskPool::cacheLookup(
       continue;
     if (Slot.generation != curGen) // stale across an owner re-init: ignore.
       continue;
-    if (!slotIdentityMatches(Slot, funcIndex, dims, numDims))
+    if (!slotIdentityMatches(Slot, funcIndex, dims, numDims) ||
+        !slotBoundsMatch(Slot, bounds, boundCount))
       continue;
     bool versionsOk = true;
     for (uint32_t i = 0; i < numDims; ++i)
@@ -1255,7 +1276,8 @@ EJitSharedTaskPool::SharedLookup EJitSharedTaskPool::cacheLookupSeq(
         continue;
       if (Slot.generation != curGen)
         continue;
-      if (!slotIdentityMatches(Slot, funcIndex, dims, numDims))
+      if (!slotIdentityMatches(Slot, funcIndex, dims, numDims) ||
+          !slotBoundsMatch(Slot, bounds, boundCount))
         continue;
       bool versionsOk = true;
       for (uint32_t i = 0; i < numDims; ++i)
@@ -1453,16 +1475,9 @@ EJitSharedTaskPool::SharedLookup EJitSharedTaskPool::resolveMatchedSlot(
     EJitSharedCacheBucket &B, uint32_t bucket, uint32_t slotIndex,
     const EJitBoundPtrDescriptor *bounds, uint32_t boundCount) {
   auto &S = B.slots[slotIndex];
-  if (S.layoutBoundCount) {
-    bool same = S.layoutBoundCount == boundCount + 1;
-    for (uint32_t I = 0; same && I < boundCount; ++I)
-      same = bounds && S.layoutBounds[I].argIndex == bounds[I].argIndex &&
-             S.layoutBounds[I].rawPtr == bounds[I].rawPtr &&
-             S.layoutBounds[I].size == bounds[I].size;
-    if (!same) {
-      bucketReadRelease(B);
-      return {};
-    }
+  if (!slotBoundsMatch(S, bounds, boundCount)) {
+    bucketReadRelease(B);
+    return {};
   }
   bool Lease = S.tier.loadAcquire() == kEJitTierInstrumented &&
                state_->globalLayoutState.loadAcquire() !=
@@ -1470,7 +1485,10 @@ EJitSharedTaskPool::SharedLookup EJitSharedTaskPool::resolveMatchedSlot(
   if (!Lease)
     return resolveMatchedSlotImpl(B, bucket, slotIndex);
   auto SamplingOpen = [&] {
-    return globalLayoutState() == EJitGlobalLayoutState::Collecting;
+    const auto Phase = globalLayoutState();
+    return Phase == EJitGlobalLayoutState::Collecting ||
+           Phase == EJitGlobalLayoutState::Complete ||
+           Phase == EJitGlobalLayoutState::Failed;
   };
   if (!SamplingOpen()) {
     bucketReadRelease(B);
@@ -2366,7 +2384,9 @@ bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
 
 bool EJitSharedTaskPool::cacheHasPending(uint32_t funcIndex,
                                          const EJitDimPair *dims,
-                                         uint32_t numDims) {
+                                         uint32_t numDims,
+                                         const EJitBoundPtrDescriptor *bounds,
+                                         uint32_t boundCount) {
   if (!state_ || numDims > 4)
     return false;
   const uint64_t Key = hashIdentity(funcIndex, dims, numDims);
@@ -2385,7 +2405,8 @@ bool EJitSharedTaskPool::cacheHasPending(uint32_t funcIndex,
           Slot.state.loadAcquire() !=
               static_cast<uint32_t>(EJitSharedSlotState::Pending) ||
           Slot.generation != Gen ||
-          !slotIdentityMatches(Slot, funcIndex, dims, numDims))
+          !slotIdentityMatches(Slot, funcIndex, dims, numDims) ||
+          !slotBoundsMatch(Slot, bounds, boundCount))
         continue;
       Found = true;
       for (uint32_t I = 0; I < numDims; ++I)
@@ -2424,7 +2445,8 @@ EJitSharedTaskPool::cacheStageBatchRequest(const EJitCompileRequest &req) {
     const uint32_t State = Slot.state.loadAcquire();
     if (State != static_cast<uint32_t>(EJitSharedSlotState::Empty) &&
         Slot.generation == req.generation &&
-        slotIdentityMatches(Slot, FuncIndex, req.dims, req.numDims)) {
+        slotIdentityMatches(Slot, FuncIndex, req.dims, req.numDims) &&
+        slotBoundsMatch(Slot, req.boundPointers, req.boundCount)) {
       if (State == static_cast<uint32_t>(EJitSharedSlotState::Pending)) {
         Target = &Slot;
         break;
@@ -2450,6 +2472,9 @@ EJitSharedTaskPool::cacheStageBatchRequest(const EJitCompileRequest &req) {
   Target->numDims = req.numDims;
   Target->generation = req.generation;
   Target->identityHash = Key;
+  Target->layoutBoundCount = layoutConfigured_ ? req.boundCount + 1 : 0;
+  for (uint32_t I = 0; I < req.boundCount; ++I)
+    Target->layoutBounds[I] = req.boundPointers[I];
   for (uint32_t I = 0; I < 4; ++I) {
     Target->dims[I] = I < req.numDims ? req.dims[I] : EJitDimPair{0, 0};
     Target->versions[I] = I < req.numDims ? req.versions[I] : 0;
@@ -2492,7 +2517,8 @@ EJitSharedTaskPool::cacheStagePending(const EJitCompileRequest &req,
     const uint32_t State = Slot.state.loadAcquire();
     if (State != static_cast<uint32_t>(EJitSharedSlotState::Empty) &&
         Slot.generation == req.generation &&
-        slotIdentityMatches(Slot, FuncIndex, req.dims, req.numDims)) {
+        slotIdentityMatches(Slot, FuncIndex, req.dims, req.numDims) &&
+        slotBoundsMatch(Slot, req.boundPointers, req.boundCount)) {
       Target = &Slot;
       break;
     }
@@ -2519,6 +2545,9 @@ EJitSharedTaskPool::cacheStagePending(const EJitCompileRequest &req,
   Target->numDims = req.numDims;
   Target->generation = req.generation;
   Target->identityHash = Key;
+  Target->layoutBoundCount = layoutConfigured_ ? req.boundCount + 1 : 0;
+  for (uint32_t I = 0; I < req.boundCount; ++I)
+    Target->layoutBounds[I] = req.boundPointers[I];
   for (uint32_t I = 0; I < req.numDims; ++I) {
     Target->dims[I] = req.dims[I];
     Target->versions[I] = req.versions[I];
@@ -2553,7 +2582,8 @@ void EJitSharedTaskPool::cacheDropPending(const EJitCompileRequest &req,
             static_cast<uint32_t>(EJitSharedSlotState::Pending) ||
         Slot.generation != req.generation ||
         Slot.fnPtr.loadAcquire() != reinterpret_cast<uintptr_t>(fnPtr) ||
-        !slotIdentityMatches(Slot, FuncIndex, req.dims, req.numDims))
+        !slotIdentityMatches(Slot, FuncIndex, req.dims, req.numDims) ||
+        !slotBoundsMatch(Slot, req.boundPointers, req.boundCount))
       continue;
     Slot.state.storeRelease(
         static_cast<uint32_t>(EJitSharedSlotState::Publishing));
@@ -2619,7 +2649,8 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
     uint32_t st = Slot.state.loadAcquire();
     if (st != static_cast<uint32_t>(EJitSharedSlotState::Empty) &&
         Slot.generation == req.generation &&
-        slotIdentityMatches(Slot, fidx, req.dims, req.numDims)) {
+        slotIdentityMatches(Slot, fidx, req.dims, req.numDims) &&
+        slotBoundsMatch(Slot, req.boundPointers, req.boundCount)) {
       target = &Slot; // overwrite same identity in place
       break;
     }
@@ -3218,6 +3249,8 @@ void EJitSharedTaskPool::ownerShutdown() {
     clearGlobalArtifacts();
     layoutDraining_.clear();
     layoutDeferredT2_.clear();
+    layoutUnlistedDraining_.clear();
+    layoutReleasedSampling_.clear();
     layoutAppendedPublishes_.clear();
     layoutMembers_.clear();
     layoutConfigured_ = false;
@@ -3484,6 +3517,13 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     R.fnPtr = fallback;
     return R;
   }
+  if (boundCount && funcIndex < kEJitSharedMaxFuncIndex && state_ &&
+      globalLayoutState() != EJitGlobalLayoutState::Disabled) {
+    uint8_t Expected = 0;
+    if (state_->globalLayoutBoundFunctions[funcIndex].compareExchange(Expected,
+                                                                    1))
+      retireDispatchCache();
+  }
   R = tryCacheHit(funcIndex, dims, numDims, boundPointers, boundCount);
   if (R.fastPathTerminal) {
     // Non-hit terminals surface the caller's fallback pointer (a hit already
@@ -3498,7 +3538,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   // claim after installing an exact-identity Pending marker. Coalesce only an
   // identical request here so another cell/TRP version of the same function
   // can still enter the batch.
-  if (cacheHasPending(funcIndex, dims, numDims)) {
+  if (cacheHasPending(funcIndex, dims, numDims, boundPointers, boundCount)) {
     EJIT_STAT_INC(state_->counters.alreadyPending);
     R.status = EJitCompileOrGetStatus::AlreadyPending;
     return R;
@@ -3852,7 +3892,6 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests) {
       if (publishFn_)
         publishFn_(publishCtx_, P.req, false);
       cacheDropPending(P.req, P.fn);
-      finishPgoFunction(FuncIndex, false, "obsolete-tier2-rearm");
       if (releaseFn_)
         releaseFn_(releaseCtx_, P.fn);
       dedupClear(P.req.funcIndex, P.req.generation);
@@ -3880,7 +3919,7 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests) {
                   FuncIndex, state_->tier2Threshold.loadAcquire());
       } else if (Tier == kEJitTierPgoUse) {
         EJIT_STAT_INC(state_->counters.tier2Compiles);
-        finishPgoFunction(FuncIndex, /*completed=*/true);
+        finishPgoRequest(P.req, /*completed=*/true);
       }
     } else if (Tier == kEJitTierPgoUse && PS == EJitPublishStatus::Failed) {
       // The linked Tier-2 code is already executable, but publishing the
@@ -3899,7 +3938,7 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests) {
         publishFn_(publishCtx_, P.req, false);
       if (P.req.generation == state_->generation.loadAcquire() &&
           (Tier == kEJitTierInstrumented || Tier == kEJitTierPgoUse))
-        finishPgoFunction(FuncIndex, /*completed=*/false);
+        finishPgoRequest(P.req, /*completed=*/false);
       if (releaseFn_)
         releaseFn_(releaseCtx_, P.fn);
       if (PS == EJitPublishStatus::VersionMismatch)
@@ -4078,7 +4117,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
   };
   auto finishPgoOnFailure = [&]() {
     if (tier == kEJitTierInstrumented) {
-      finishPgoFunction(realFuncIndex, /*completed=*/false,
+      finishPgoRequest(req, /*completed=*/false,
                         "tier1-compile-or-publish-failed");
     } else if (tier == kEJitTierPgoUse) {
       // Tier-1 is still published and instrumented. Retain admission so a
@@ -4107,7 +4146,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     dropBatchRequestMarker();
     dedupClear(req.funcIndex, req.generation);
     if (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse)
-      finishPgoFunction(realFuncIndex, /*completed=*/false,
+      finishPgoRequest(req, /*completed=*/false,
                         "version-changed-before-compile");
     EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG(
@@ -4149,7 +4188,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     dedupClear(req.funcIndex, req.generation);
     if (req.generation == state_->generation.loadAcquire() &&
         (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse))
-      finishPgoFunction(realFuncIndex, /*completed=*/false,
+      finishPgoRequest(req, /*completed=*/false,
                         "version-changed-after-compile");
     if (releaseFn_)
       releaseFn_(releaseCtx_, fn);
@@ -4222,7 +4261,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
                 realFuncIndex, state_->tier2Threshold.loadAcquire());
     } else if (tier == kEJitTierPgoUse) {
       EJIT_STAT_INC(state_->counters.tier2Compiles);
-      finishPgoFunction(realFuncIndex, /*completed=*/true);
+      finishPgoRequest(req, /*completed=*/true);
     }
     publishCodePoolStats();
     EJIT_DIAG_VERBOSE("shared worker publish ok func=%u fn=%p", req.funcIndex,
@@ -4234,7 +4273,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     dedupClear(req.funcIndex, req.generation);
     if (req.generation == state_->generation.loadAcquire() &&
         (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse))
-      finishPgoFunction(realFuncIndex, /*completed=*/false,
+      finishPgoRequest(req, /*completed=*/false,
                         "version-mismatch-at-publish");
     if (releaseFn_)
       releaseFn_(releaseCtx_, fn);
@@ -4317,8 +4356,7 @@ bool EJitSharedTaskPool::pollOne() {
         // post-manifest collective append).
         failGlobalLayout(EJitGlobalLayoutError::Manifest, Rank);
         if (decodeReqTier(Req.funcIndex) == kEJitTierInstrumented)
-          finishPgoFunction(stripReqTier(Req.funcIndex), false,
-                            "undeclared-target");
+          finishPgoRequest(Req, false, "undeclared-target");
         dedupClear(Req.funcIndex, Req.generation);
         return true;
       }
@@ -4327,6 +4365,13 @@ bool EJitSharedTaskPool::pollOne() {
       // compile) by falling through; only Tier-2 parks for the collective
       // append so its near-pool body lands after the manifest bodies.
       if (decodeReqTier(Req.funcIndex) == kEJitTierPgoUse) {
+        if (!samplingDrained(Req)) {
+          if (layoutUnlistedDraining_.size() < kEJitSharedQueueSlots)
+            layoutUnlistedDraining_.push_back(Req);
+          else
+            dedupClear(Req.funcIndex, Req.generation);
+          return true;
+        }
         // A saturated Tier-1 re-arms on every lookup, so the same identity
         // can arrive repeatedly; supersede its earlier park (keeping the
         // latest, exactly like the collective window's own rule) instead of
@@ -4340,8 +4385,7 @@ bool EJitSharedTaskPool::pollOne() {
           }
         if (!SupersededEarlier &&
             layoutDeferredT2_.size() >= kEJitSharedQueueSlots) {
-          finishPgoFunction(stripReqTier(Req.funcIndex), false,
-                            "layout-unlisted-t2-overflow");
+          finishPgoRequest(Req, false, "layout-unlisted-t2-overflow");
           dedupClear(Req.funcIndex, Req.generation);
           EJIT_STAT_INC(state_->counters.queueFull);
           EJIT_DIAG("global layout unlisted T2 park overflow func=%u "
@@ -4356,8 +4400,8 @@ bool EJitSharedTaskPool::pollOne() {
         // parked entry must not hold one of the concurrent-profile slots
         // hostage, and a re-armed duplicate can still enqueue meanwhile.
         // The live Tier-1 keeps sampling; the collective compile publishes.
-        finishPgoFunction(stripReqTier(Req.funcIndex), false,
-                          "layout-unlisted-t2-parked");
+        if (!SupersededEarlier)
+          releaseSamplingAdmission(Req);
         dedupClear(Req.funcIndex, Req.generation);
         EJIT_DIAG("global layout unlisted T2 parked func=%u pending=%zu",
                   stripReqTier(Req.funcIndex), layoutDeferredT2_.size());
@@ -4373,11 +4417,17 @@ bool EJitSharedTaskPool::pollOne() {
     // unordered ordinary compile. Drop it instead.
     if (decodeReqTier(Req.funcIndex) == kEJitTierPgoUse &&
         layoutTier2AlreadyDelivered(Req)) {
-      finishPgoFunction(stripReqTier(Req.funcIndex), false,
-                        "obsolete-tier2-rearm");
       dedupClear(Req.funcIndex, Req.generation);
       EJIT_DIAG("global layout dropped obsolete Tier-2 re-arm func=%u",
                 stripReqTier(Req.funcIndex));
+      return true;
+    }
+    if (decodeReqTier(Req.funcIndex) == kEJitTierPgoUse &&
+        !samplingDrained(Req)) {
+      if (layoutUnlistedDraining_.size() < kEJitSharedQueueSlots)
+        layoutUnlistedDraining_.push_back(Req);
+      else
+        dedupClear(Req.funcIndex, Req.generation);
       return true;
     }
   }
@@ -4404,6 +4454,43 @@ bool EJitSharedTaskPool::pollOne() {
   }
   runCompile(Req);
   return true;
+}
+
+void EJitSharedTaskPool::finishPgoRequest(const EJitCompileRequest &R,
+                                         bool completed, const char *reason) {
+  for (size_t I = 0; I < layoutReleasedSampling_.size(); ++I)
+    if (sameIdentity(layoutReleasedSampling_[I], R)) {
+      if (completed) {
+        state_->pgoCompletedFunctions.fetchAdd(1);
+        layoutReleasedSampling_.erase(layoutReleasedSampling_.begin() + I);
+      }
+      return; // Any current per-function admission belongs to another identity.
+    }
+  finishPgoFunction(stripReqTier(R.funcIndex), completed, reason, R.generation);
+}
+
+bool EJitSharedTaskPool::serviceLayoutUnlistedDraining() {
+  auto Drain = [this](std::vector<EJitCompileRequest> &Pending) {
+    for (size_t I = 0; I < Pending.size(); ++I) {
+      const auto R = Pending[I];
+      if (R.generation != state_->generation.loadAcquire() ||
+          !versionsCurrent(R)) {
+        dedupClear(R.funcIndex, R.generation);
+        if (R.generation == state_->generation.loadAcquire())
+          finishPgoRequest(R, false, "layout-drain-stale");
+      } else if (!samplingDrained(R) || !queuePush(R)) {
+        continue;
+      }
+      Pending.erase(Pending.begin() + I);
+      return true;
+    }
+    return false;
+  };
+  // Failed collections must also finish members already waiting on real leave.
+  if (globalLayoutState() == EJitGlobalLayoutState::Failed &&
+      Drain(layoutDraining_))
+    return true;
+  return Drain(layoutUnlistedDraining_);
 }
 
 bool EJitSharedTaskPool::serviceMayConstRankingRequest() {
@@ -4437,6 +4524,8 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
     // compile queue or diagnostics. serviceCodeBatchRequest() snapshots and
     // drains the work that predates the request before publishing it.
     if (serviceGlobalLayout())
+      return EJitWorkerStep::Consumed;
+    if (serviceLayoutUnlistedDraining())
       return EJitWorkerStep::Consumed;
     if (serviceCodeBatchRequest())
       return EJitWorkerStep::Consumed;

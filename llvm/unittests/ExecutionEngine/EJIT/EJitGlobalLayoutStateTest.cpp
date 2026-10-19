@@ -828,4 +828,235 @@ TEST(EJitGlobalLayoutState, UnlistedTier2RearmsSupersedeTheirPark) {
   auto Rearm = H.pool.compileOrGet(1, nullptr, 0, nullptr);
   EXPECT_EQ(Rearm.status, EJitCompileOrGetStatus::AlreadyPending);
 }
+
 #endif
+
+TEST(EJitGlobalLayoutState, OrdinaryPgoContinuesAfterCompleteAndFailed) {
+  for (bool Fail : {false, true}) {
+    Harness H;
+    H.pool.setPgoEnabled(true, 1, 4);
+    H.pool.setCompiler([](void *P, const EJitCompileRequest &, void **Out) {
+      auto &H = *static_cast<Harness *>(P);
+      *Out = reinterpret_cast<void *>(0x200000u + H.compiled++ * 32u);
+      return true;
+    }, &H);
+    auto M = manifest({0});
+    M[0].funcIndex = encodeReqTier(0, kEJitTierPgoUse);
+    EJitLayoutBudgets Budgets;
+    if (Fail)
+      Budgets.maxCollectionPolls = 2;
+    ASSERT_TRUE(H.configure(M, Budgets));
+    if (!Fail) {
+      H.request(0);
+      auto Hit = H.pool.compileOrGet(0, nullptr, 0, nullptr);
+      ASSERT_NE(Hit.fnPtr, nullptr);
+      H.pool.releaseRead(Hit.bucketIndex);
+    }
+    for (unsigned I = 0; I < 8; ++I)
+      H.pool.workerPollOnce();
+    ASSERT_EQ(H.pool.globalLayoutState(),
+              Fail ? EJitGlobalLayoutState::Failed
+                   : EJitGlobalLayoutState::Complete);
+    for (uint32_t F = 1; F < 7; ++F) {
+      H.request(F);
+      auto Hit = H.pool.compileOrGet(F, nullptr, 0, nullptr);
+      ASSERT_NE(Hit.fnPtr, nullptr);
+      H.pool.releaseRead(Hit.bucketIndex);
+      for (unsigned I = 0; I < 8; ++I)
+        H.pool.workerPollOnce();
+    }
+    EXPECT_EQ(H.state->counters.tier2Compiles.loadRelaxed(), Fail ? 6u : 7u);
+    EXPECT_EQ(H.state->pgoActiveFunctionCount.loadAcquire(), 0u);
+    EXPECT_EQ(H.state->counters.compileFailed.loadRelaxed(), 0u);
+    EXPECT_EQ(H.state->counters.publishFailed.loadRelaxed(), 0u);
+  }
+}
+
+TEST(EJitGlobalLayoutState, UnlistedTier2WaitsForRealReturnAcrossFreeze) {
+  Harness H;
+  H.pool.setPgoEnabled(true, 1, 4);
+  struct Context { Harness *h; unsigned unlistedT2 = 0; } C{&H};
+  H.pool.setCompiler([](void *P, const EJitCompileRequest &R, void **Out) {
+    auto &C = *static_cast<Context *>(P);
+    if (stripReqTier(R.funcIndex) == 1 &&
+        decodeReqTier(R.funcIndex) == kEJitTierPgoUse) {
+      ++C.unlistedT2;
+      for (const auto &B : C.h->state->buckets)
+        for (const auto &S : B.slots)
+          if (S.funcIndex == 1)
+            EXPECT_EQ(S.samplingExecutions.loadAcquire(), 0u);
+    }
+    *Out = reinterpret_cast<void *>(0x200000u + C.h->compiled++ * 32u);
+    return true;
+  }, &C);
+  auto M = manifest({0});
+  M[0].funcIndex = encodeReqTier(0, kEJitTierPgoUse);
+  ASSERT_TRUE(H.configure(M));
+  H.request(1);
+  auto Held = H.pool.compileOrGet(1, nullptr, 0, nullptr);
+  ASSERT_NE(Held.fnPtr, nullptr);
+  H.pool.workerPollOnce();
+  EXPECT_EQ(H.state->pgoActiveFunctionCount.loadAcquire(), 1u);
+  H.request(0);
+  auto Member = H.pool.compileOrGet(0, nullptr, 0, nullptr);
+  ASSERT_NE(Member.fnPtr, nullptr);
+  H.pool.releaseRead(Member.bucketIndex);
+  for (unsigned I = 0; I < 8; ++I)
+    H.pool.workerPollOnce();
+  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Complete);
+  EXPECT_EQ(C.unlistedT2, 0u);
+  H.pool.releaseRead(Held.bucketIndex);
+  // No fresh lookup is required after the final real return.
+  for (unsigned I = 0; I < 8; ++I)
+    H.pool.workerPollOnce();
+  EXPECT_EQ(C.unlistedT2, 1u);
+  EXPECT_EQ(H.state->pgoActiveFunctionCount.loadAcquire(), 0u);
+}
+
+TEST(EJitGlobalLayoutState, NameOnlyAndUnlistedBoundsDisableFastCaches) {
+  for (bool Listed : {true, false}) {
+    Harness H;
+    int A = 7, B = 19;
+    EJitBoundPtrDescriptor Bound{&A, sizeof(A), 0};
+    EJitBoundPtrDescriptor Other{&B, sizeof(B), 0};
+    H.pool.setCompiler([](void *, const EJitCompileRequest &, void **Out) {
+      *Out = reinterpret_cast<void *>(0x200000u);
+      return true;
+    }, nullptr);
+    ASSERT_TRUE(H.configure(manifest({0})));
+    if (!Listed) {
+      H.request(0);
+      H.pool.workerPollOnce();
+    }
+    const uint32_t F = Listed ? 0 : 1;
+    H.pool.compileOrGet(F, nullptr, 0, nullptr, &Bound, 1);
+    for (unsigned I = 0; I < 4; ++I)
+      H.pool.workerPollOnce();
+    ASSERT_TRUE(H.pool.flushCodeBatch());
+    auto Hit = H.pool.compileOrGet(F, nullptr, 0, nullptr, &Bound, 1);
+    ASSERT_NE(Hit.fnPtr, nullptr);
+    H.pool.releaseRead(Hit.bucketIndex);
+    H.pool.l0Fill(F, Hit.fnPtr, nullptr, 0);
+    void *Cached = nullptr;
+    EXPECT_FALSE(H.pool.l0Try(F, nullptr, 0, &Cached));
+    EXPECT_EQ(H.state->globalLayoutBoundFunctions[F].loadAcquire(), 1u);
+    EXPECT_NE(H.pool.tryCacheHit(F, nullptr, 0, &Other, 1).status,
+              EJitCompileOrGetStatus::CacheHit);
+  }
+}
+
+TEST(EJitGlobalLayoutState, PublishedMemberCannotReleaseOtherIdentityAdmission) {
+  Harness H;
+  H.pool.setPgoEnabled(true, 2, 4);
+  H.pool.setCompiler([](void *P, const EJitCompileRequest &, void **Out) {
+    auto &H = *static_cast<Harness *>(P);
+    *Out = reinterpret_cast<void *>(0x200000u + H.compiled++ * 32u);
+    return true;
+  }, &H);
+  auto M = manifest({0, 1});
+  for (auto &R : M)
+    R.funcIndex = encodeReqTier(R.funcIndex, kEJitTierPgoUse);
+  ASSERT_TRUE(H.configure(M));
+  int A = 7, B = 19;
+  EJitBoundPtrDescriptor First{&A, sizeof(A), 0};
+  EJitBoundPtrDescriptor Other{&B, sizeof(B), 0};
+  H.pool.compileOrGet(0, nullptr, 0, nullptr, &First, 1);
+  H.pool.workerPollOnce();
+  for (unsigned I = 0; I < 2; ++I) {
+    auto Member = H.pool.compileOrGet(0, nullptr, 0, nullptr, &First, 1);
+    ASSERT_NE(Member.fnPtr, nullptr);
+    H.pool.releaseRead(Member.bucketIndex);
+  }
+  H.pool.workerPollOnce();
+  ASSERT_EQ(H.state->globalLayoutReady.loadAcquire(), 1u);
+  ASSERT_EQ(H.state->pgoActiveFunctionCount.loadAcquire(), 0u);
+  H.pool.compileOrGet(0, nullptr, 0, nullptr, &Other, 1);
+  H.pool.workerPollOnce();
+  auto Held = H.pool.compileOrGet(0, nullptr, 0, nullptr, &Other, 1);
+  ASSERT_NE(Held.fnPtr, nullptr);
+  H.pool.releaseRead(Held.bucketIndex); // Other still needs its second sample.
+  H.pool.workerPollOnce();
+  ASSERT_EQ(H.state->pgoActiveFunctionCount.loadAcquire(), 1u);
+  // A residual rearm and the eventual member publication both refer to First,
+  // not to the admission now held by Other on the same function.
+  H.pool.compileOrGet(0, nullptr, 0, nullptr, &First, 1);
+  H.pool.workerPollOnce();
+  H.request(1);
+  for (unsigned I = 0; I < 2; ++I) {
+    auto Last = H.pool.compileOrGet(1, nullptr, 0, nullptr);
+    ASSERT_NE(Last.fnPtr, nullptr);
+    H.pool.releaseRead(Last.bucketIndex);
+  }
+  for (unsigned I = 0; I < 8; ++I)
+    H.pool.workerPollOnce();
+  EXPECT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Complete);
+  EXPECT_EQ(H.state->pgoActiveFunctionCount.loadAcquire(), 1u);
+  auto Final = H.pool.compileOrGet(0, nullptr, 0, nullptr, &Other, 1);
+  ASSERT_NE(Final.fnPtr, nullptr);
+  H.pool.releaseRead(Final.bucketIndex);
+  for (unsigned I = 0; I < 8; ++I)
+    H.pool.workerPollOnce();
+  EXPECT_EQ(H.state->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(H.state->pgoCompletedFunctions.loadAcquire(), 3u);
+}
+
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+TEST(EJitGlobalLayoutState, FailedLayoutDrainsMemberWithoutFreshLookup) {
+  Harness H;
+  H.pool.setPgoEnabled(true, 1, 4);
+  H.pool.setCompiler([](void *P, const EJitCompileRequest &, void **Out) {
+    auto &H = *static_cast<Harness *>(P);
+    *Out = reinterpret_cast<void *>(0x200000u + H.compiled++ * 32u);
+    return true;
+  }, &H);
+  auto M = manifest({0, 1});
+  for (auto &R : M)
+    R.funcIndex = encodeReqTier(R.funcIndex, kEJitTierPgoUse);
+  EJitLayoutBudgets Budgets;
+  Budgets.maxCollectionPolls = 8;
+  ASSERT_TRUE(H.configure(M, Budgets));
+  H.request(0);
+  auto Held = H.pool.compileOrGet(0, nullptr, 0, nullptr);
+  ASSERT_NE(Held.fnPtr, nullptr);
+  for (unsigned I = 0; I < 16; ++I)
+    H.pool.workerPollOnce();
+  ASSERT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Failed);
+  EXPECT_EQ(H.state->counters.tier2Compiles.loadRelaxed(), 0u);
+  H.pool.releaseRead(Held.bucketIndex);
+  for (unsigned I = 0; I < 8; ++I)
+    H.pool.workerPollOnce();
+  EXPECT_EQ(H.state->counters.tier2Compiles.loadRelaxed(), 1u);
+  EXPECT_EQ(H.state->pgoActiveFunctionCount.loadAcquire(), 0u);
+}
+#endif
+
+TEST(EJitGlobalLayoutState, BoundPendingMarkersAndBodiesKeepCompleteIdentity) {
+  Harness H;
+  H.pool.setCompiler([](void *P, const EJitCompileRequest &, void **Out) {
+    auto &H = *static_cast<Harness *>(P);
+    *Out = reinterpret_cast<void *>(0x200000u + H.compiled++ * 32u);
+    return true;
+  }, &H);
+  ASSERT_TRUE(H.configure(manifest({0, 1})));
+  int A = 7, B = 19;
+  EJitBoundPtrDescriptor First{&A, sizeof(A), 0};
+  EJitBoundPtrDescriptor Other{&B, sizeof(B), 0};
+  H.pool.compileOrGet(0, nullptr, 0, nullptr, &First, 1);
+  H.pool.workerPollOnce(); // First owns a Pending marker until the collective.
+  auto Miss = H.pool.compileOrGet(0, nullptr, 0, nullptr, &Other, 1);
+  EXPECT_EQ(Miss.status, EJitCompileOrGetStatus::EnqueuedPending);
+  H.pool.workerPollOnce();
+  EXPECT_EQ(H.state->globalLayoutUnlistedReady.loadAcquire(), 1u);
+  H.request(1);
+  for (unsigned I = 0; I < 8; ++I)
+    H.pool.workerPollOnce();
+  ASSERT_EQ(H.pool.globalLayoutState(), EJitGlobalLayoutState::Complete);
+  auto Member = H.pool.compileOrGet(0, nullptr, 0, nullptr, &First, 1);
+  ASSERT_NE(Member.fnPtr, nullptr);
+  H.pool.releaseRead(Member.bucketIndex);
+  auto Appended = H.pool.compileOrGet(0, nullptr, 0, nullptr, &Other, 1);
+  ASSERT_NE(Appended.fnPtr, nullptr);
+  H.pool.releaseRead(Appended.bucketIndex);
+  EXPECT_LT(Member.fnPtr, Appended.fnPtr);
+  EXPECT_EQ(H.compiled, 1u);
+}

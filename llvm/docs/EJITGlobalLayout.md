@@ -3,6 +3,8 @@
 Issue #245, spec v0.4 (2026-10-13), baseline
 `e09df842062735ba9f6279ae7d1c5b43fd723bec`, extended 2026-10-15 with
 unlisted-function support and the Failed-to-ordinary-fallback semantics.
+The 2026-10-19 integration fixes terminal-state PGO, real-return draining,
+complete bound-cache identity and retained profile ownership.
 The former v0.3 pending-scope/dimension-major checkpoint is superseded.
 Production implementation and native tests are present. SDK final linking,
 cold core6/core16 board acceptance and performance acceptance remain pending.
@@ -51,16 +53,18 @@ ordinary paths and append after the manifest bodies:
 - **Collecting phase.** An unlisted Baseline miss parks in the deferred batch
   backlog (staged request marker, no near-pool allocation). An unlisted
   Tier-1 compiles immediately into the far pool, unordered, as always. An
-  armed unlisted Tier-2 parks uncompiled in a bounded owner-private list
-  (queue capacity entries) and releases its sampling admission immediately, so
+  armed unlisted Tier-2 first waits for all real T1 returns, then parks
+  uncompiled in a bounded owner-private list (queue capacity entries) and
+  releases its sampling admission, so
   parked entries never starve the concurrent-profile slots; overflow discards
   the request and the function stays on its live Tier-1 until a later re-arm.
   The `unlistedReady` status field reports the parked count (Tier-2 parks plus
   batch backlog) during collection.
 - **Freeze point.** The collective set freezes at the all-ready transition.
-  Requests still resident in the shared queue at that instant take the
-  ordinary post-freeze paths; only what is already parked or deferred joins
-  the collective window.
+  Requests still resident in the shared queue or waiting for a real T1 return
+  at that instant take the ordinary post-freeze paths; only what is already
+  drained and parked or deferred joins the collective window. A held call is
+  never counted as a completed sample merely because its hit count saturated.
 - **Collective window.** After the manifest bodies link in rank order, the
   parked unlisted Tier-2 entries compile (funcIndex ascending, re-arm
   duplicates deduplicated to the latest), then the deferred batch requests
@@ -113,8 +117,12 @@ Completeness of instance expansion is caller-declared: V1 cannot infer which
 inactive cell/TRP/version combinations a product intends to require. Every
 supplied member remains mandatory; unlisted registered functions are
 deliberately outside the collective contract.
-Different concurrent bindings or versions with the same legacy dispatch key are
-not representable and fail explicitly rather than sharing the wrong body.
+Explicit manifest members with colliding legacy dispatch keys still reject
+initialization. For name-only/unlisted requests, distinct bound identities can
+coexist in the bounded full cache: lookup, pending markers, final publication,
+drain checks and obsolete-T2 detection all compare argument/address/extent.
+They neither overwrite nor suppress another bound identity. Bound roots bypass
+descriptor-blind fast caches from their first bound admission.
 Registered dimension formal order is kept for legacy dispatch compatibility;
 it is not layout rank. Manifest/source-bitcode/configuration/budget/bound identity
 participates in the shared peer fingerprint. Request equality is structural,
@@ -152,8 +160,19 @@ The complete counters/helper inventory, verified ICP/memop and scalar/audit
 metadata are frozen through existing snapshot protocols. Sibling VP snapshots
 remain owned and charged until their own identity is prepared. Helper profile
 names include full specialization identity to prevent cross-root conflation.
+Root Gen/Use/VP names use that same identity during profiling and restore the
+exported entry name before code emission. Counter, audit and VP inventories
+also use the full identity, not the legacy function/dimension-only code key;
+several drained bound versions can wait without replacing each other's data.
 Missing/inconsistent profiles and failed snapshots cannot fall back to an
 edge-only pretend success in global mode.
+This applies to ordinary unlisted and FAILED-layout T2 as well as manifest
+preparation. Complete synthesized profiles remain owned until their exact T2
+publishes or the generation retires, so discarded artifacts can fall back
+without losing counters or sibling VP. VP collection closes exactly once per
+identity. A failed, consuming capture cannot be retried as a partial profile;
+a fresh generation is required to restart collection, with legal fallback in
+the meantime. Cached complete profiles remain usable.
 
 Global-layout VP uses bounded site probing (same existing capacity), not
 direct-map sibling displacement. Full tables, out-of-range cores or preempting
@@ -168,6 +187,12 @@ it neither claims T2 publication nor fabricates samples. Ready markers prevent
 resampling while final layout waits. T1 counters/side metadata can then be released;
 the emitted object no longer borrows them. Admission remains funcIndex-based as
 in the existing pool, so instances of one entry advance sequentially.
+Publication of an already-released identity must not release the admission of
+a newer identity of the same function. Sampling is open in COLLECTING,
+COMPLETE and FAILED, and closed during collective linking/publication and
+refresh. Ordinary late arrivals can therefore finish their full sampling
+quota. A member waiting for its final real leave when layout fails is requeued
+after return without requiring another business lookup.
 
 ## Ordered Linking and Cutover
 
@@ -195,7 +220,8 @@ integration with unmerged #230/#231 common-profile/shared-body mechanisms.
 Defaults: 1024 members (also queue/bucket capacity constrained), 64 MiB objects
 and import metadata, 32 MiB frozen profile/side metadata, 16 MiB each Near/Far
 retained reservation, and 1,048,576 collection worker polls including drain wait.
-The pending sibling VP record cap uses a quarter of the profile byte budget.
+Retained synthesized profiles and pending sibling VP storage share the profile
+budget. The pending VP record cap uses a quarter of the remaining budget.
 Poll budgets are not wall-clock or hard-real-time compiler deadlines.
 
 Persistent shared Near/Far reservation ledgers charge complete pools, raw alignment
@@ -215,7 +241,7 @@ remain, retaining its runtime for a later retry. Direct C++ destruction with an
 unreturned T1 retains one compiler and leaves the shared domain Stopping: this
 conservative terminal retention is preferable to UAF, not a successful shutdown.
 Platform obligations for stable NO_RECLAIM code/registered data remain unchanged.
-Shared ABI is 20 and VP ABI is 3: rebuild every participating image together.
+Shared ABI is 21 and VP ABI is 3: rebuild every participating image together.
 
 ## Verification Boundaries
 
@@ -280,7 +306,8 @@ A transient sampled-slot lease returns Retry, not Failed. The worker retains
 linked/sealed addresses and the published subset, checks identity again, and
 retries boundedly without recompiling, reallocating or resealing. T1 publication
 uses the same retention rule during a refresh. Real T1 execution is closed once
-collection freezes; a preempted acquisition that later rejects cannot execute T1.
+collection freezes and reopens for ordinary rounds after COMPLETE/FAILED;
+a preempted acquisition that later rejects cannot execute T1.
 Retry and refresh-drain budgets use maxCollectionPolls; exhaustion stays terminal
 until a NEW lifecycle event or explicit command, never a self-renewing budget.
 
@@ -299,7 +326,8 @@ bounded terminal recovery, and paused lookup/publish retry in NO_RECLAIM builds.
 These do not establish SDK/board/performance acceptance. The hot result remains
 16 bytes on tested LE/BE compilation; packed flag masks have no measured target
 cycle guarantee. Shared queue requests are now208 bytes on64-bit (168 on32-bit),
-so ABI20 requires all participating images and queue users rebuilt together.
+so the current ABI21 requires all participating images and queue users rebuilt
+together.
 
 Native ABI probes of the actual published/current headers (32 buckets,16 slots,
 1024 queue entries) report a16-byte lookup result in both builds. Queue requests
@@ -307,8 +335,11 @@ grow200->208 bytes, cache slots224->360, and the shared state358080->440000 byte
 (+81920 bytes/80 KiB). The unlisted-functions status fields
 (`globalLayoutUnlistedReady`/`globalLayoutUnlistedAppended`, mirrored into
 `ejit_global_layout_status_t` as `unlistedReady`/`unlistedAppended`) fit in
-existing blob padding within ABI20: the shared state stays 440000 bytes. This is
-real compatibility/space cost, not a speedup claim.
+the old blob's total allocation: the shared state stays 440000 bytes, but fields
+after the inserted counters move. Equal total size does NOT make the layouts
+compatible; ABI21 rejects ABI20 peers. `ejit_global_layout_status_t` is now 64
+bytes, so its callers must also rebuild with the matching header. This is real
+compatibility/space cost, not a speedup claim.
 Audit-only fixture coverage has zero new ICP observations; ordinary PGO preserves
 160 and the unmodified64-hit cold configuration preserves1280 across20 roots.
 Owner control commands and shutdown must be serialized with the existing runtime
@@ -323,3 +354,15 @@ NO_RECLAIM is still intentional: repeated successful refreshes consume retained
 Near/Far capacity. They are not an unlimited-cycle reclamation promise. Once
 those bounded reserves exhaust, the generation fails with legal fallback;
 safe region reclamation requires a separate lifetime/platform contract.
+
+## Additional Board Fixtures
+
+`ejit_test/baremetal/ejit_global_layout_unlisted_test.c` covers a partial
+manifest with ordinary PGO. `ejit_global_layout_nameonly_test.c` covers first
+identity capture, a second identity and lifecycle refresh. They are separate
+images, not sources to link together. The name-only fixture requires all six
+identities to reach T2, the second identity above all manifest bodies, and zero
+remaining sampling admissions before PASS; perpetual AOT service is not success.
+Both fixtures default to no round deadline (`*_WAIT_ROUNDS=0`). Positive
+overrides bound automated runs; real API errors and incorrect results still
+fail immediately. Native/BE compilation is not a new board acceptance result.

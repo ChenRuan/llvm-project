@@ -1386,7 +1386,9 @@ private:
   EJitPublishStatus cacheStageBatchRequest(const EJitCompileRequest &req);
   void cacheDropPending(const EJitCompileRequest &req, void *fnPtr);
   bool cacheHasPending(uint32_t funcIndex, const EJitDimPair *dims,
-                       uint32_t numDims);
+                       uint32_t numDims,
+                       const EJitBoundPtrDescriptor *bounds,
+                       uint32_t boundCount);
 
   /// Snapshot of one Ready cache slot taken under the bucket read lock, so the
   /// expensive per-core execute-permission preparation (split + enable_ex)
@@ -1484,6 +1486,15 @@ private:
   /// pool region. Bounded by kEJitSharedQueueSlots; overflow discards the
   /// request (the function keeps its live Tier-1 until a later re-arm).
   std::vector<EJitCompileRequest> layoutDeferredT2_;
+  // Armed ordinary/unlisted T2 requests whose final T1 invocation has not
+  // returned. Keep their admission and in-flight claim until the real leave.
+  std::vector<EJitCompileRequest> layoutUnlistedDraining_;
+  bool serviceLayoutUnlistedDraining();
+  // Early release is identity-scoped: a later version of the same function
+  // may own a new admission before this request publishes.
+  std::vector<EJitCompileRequest> layoutReleasedSampling_;
+  void finishPgoRequest(const EJitCompileRequest &req, bool completed,
+                        const char *reason = nullptr);
   EJitLayoutBudgets layoutBudgets_;
   PrepareArtifactCallback layoutPrepare_ = nullptr;
   LinkArtifactCallback layoutLink_ = nullptr;

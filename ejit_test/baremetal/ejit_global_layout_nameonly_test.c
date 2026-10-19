@@ -29,23 +29,18 @@
 //   increasing A..E.
 // - S3 (second identity never fails the layout): the layout must reach
 //   COMPLETE with error==0 and E2's dispatches must stay business-correct.
-//   E2's final JIT body is EVIDENCE, not a hard gate, because its Tier-2
-//   takes one of three routes: parked for the collective append
+//   E2 must reach its final Tier-2 through one of two routes: collective append
 //   (unlistedAppended==1, unlistedReady observed during collection);
 //   compiled through the ordinary post-COMPLETE path into the same near
-//   pool, above every member body; or — when its Tier-1 publishes only
-//   after COMPLETE — AOT-served indefinitely: the runtime's post-COMPLETE
-//   second-identity pipeline stalls (its slot takes no hits, its Tier-2
-//   never arms, one PGO admission stays retained; an OPEN RUNTIME ISSUE,
-//   fifth board run). Whenever a body exists it MUST be above all member
-//   bodies. THE DRIVE ORDER IS LOAD-BEARING under per-funcIndex dedup: the
+//   pool, above every member body. AOT-only service or a retained sampling
+//   admission is NOT a passing result. THE DRIVE ORDER IS LOAD-BEARING: the
 //   member identities MUST be called before E2 every round, or E2's re-arm
 //   churn starves the member's own Tier-1 and the layout never converges
 //   (observed: ready frozen 4/5 for 90000+ rounds after a refresh).
 // - S4 (refresh survival): after COMPLETE, a real lifecycle flip (deactivate
 //   then activate cell instance 1 — the instance E1 specializes on) rebuilds
 //   the layout in a new generation; re-driving must COMPLETE again with E2
-//   STILL tolerated (same two legal routes as S3, member bodies strictly
+//   completing its T2 (same two legal routes as S3, member bodies strictly
 //   ordered within the new generation). The flip parks a transient
 //   error=StaleIdentity marker while the state reads Refreshing — it is not
 //   a failure and clears at the new Collecting transition. The pre-fix
@@ -75,12 +70,9 @@
 #define NAMEONLY_RUN_INIT_ARRAY 1
 #endif
 #ifndef NAMEONLY_WAIT_ROUNDS
-// Board-measured family bound (2026-10-15, quota 64, cap 4): the shared worker
-// paces roughly ONE significant item (Tier-1 compile, member artifact prepare,
-// park/stage pop) per ~1000 one-tick rounds; 6 identities serialize into two
-// admission waves per phase, projecting to ~30-40k rounds per convergence.
-// 100000 leaves ample headroom for both phases. Not a timing guarantee.
-#define NAMEONLY_WAIT_ROUNDS 100000u
+// No wall-clock/round deadline on board by default. A positive override bounds
+// automated runs; API errors and incorrect results still fail immediately.
+#define NAMEONLY_WAIT_ROUNDS 0u
 #endif
 #ifndef NAMEONLY_DUMP_IR
 #define NAMEONLY_DUMP_IR 1
@@ -298,7 +290,8 @@ static int nameonly_drive(uint32_t generation, uint32_t phase,
   ejit_taskpool_stats_t t = {0};
   if (nameonly_status(&s, &t))
     return -1;
-  for (uint32_t round = 0; round < NAMEONLY_WAIT_ROUNDS; ++round) {
+  for (uint32_t round = 0;
+       !NAMEONLY_WAIT_ROUNDS || round < NAMEONLY_WAIT_ROUNDS; ++round) {
     uintptr_t ignored;
     for (uint32_t ident = 0; ident < NAMEONLY_IDENTS - 1u; ++ident) {
       if (nameonly_call(ident, round + 11u, &ignored))
@@ -325,7 +318,8 @@ static int nameonly_drive(uint32_t generation, uint32_t phase,
       // DISPATCHING every identity through the drain: the arm then lands
       // deterministically, the queue/dedup tail empties, and two compiles
       // per identity in THIS generation is the settle condition.
-      for (uint32_t wait = 0; wait < NAMEONLY_WAIT_ROUNDS; ++wait) {
+      for (uint32_t wait = 0;
+           !NAMEONLY_WAIT_ROUNDS || wait < NAMEONLY_WAIT_ROUNDS; ++wait) {
         for (uint32_t ident = 0; ident < NAMEONLY_IDENTS; ++ident) {
           uintptr_t ignored;
           if (nameonly_call(ident, wait + 23u, &ignored))
@@ -335,20 +329,13 @@ static int nameonly_drive(uint32_t generation, uint32_t phase,
           return -1;
         if (s.state != NAMEONLY_COMPLETE || s.generation != generation)
           return nameonly_fail("layout changed after completion");
-        // Settle on the MEMBER compiles (two per member in this generation).
-        // The second identity's Tier-2 is NOT required: when its Tier-1
-        // publishes only after COMPLETE (the member-first drive order can
-        // delay it past the freeze), the runtime's post-COMPLETE pipeline
-        // for a second identity stalls — its slot takes no further hits,
-        // its Tier-2 never arms, and its PGO admission stays held (an open
-        // runtime issue; fifth board run evidence: post_publish_seen=no,
-        // active=1/4 retained, asyncCompiles frozen at 11). Its dispatches
-        // stay business-correct on the AOT fallback, so the ORDER contract
-        // is unaffected either way.
+        // Every identity must finish normal PGO, including a second identity
+        // that first publishes T1 after the manifest reached COMPLETE.
         if (!t.pendingEntries && !t.queueApproxSize &&
             !ejit_taskpool_pending_count() &&
-            t.asyncCompiles >= asyncBase + 2u * NAMEONLY_MEMBERS &&
-            t.readyEntries >= NAMEONLY_MEMBERS)
+            !s.activeProfiles &&
+            t.asyncCompiles >= asyncBase + 2u * NAMEONLY_IDENTS &&
+            t.readyEntries >= NAMEONLY_IDENTS)
           break;
         if (wait % 500u == 0u)
           SRE_printf("[NAMEONLY] phase=%u drain wait=%u async=%llu ready=%u\n",
@@ -359,9 +346,12 @@ static int nameonly_drive(uint32_t generation, uint32_t phase,
       }
       if (s.unlistedReady)
         return nameonly_fail("second-identity park gauge did not settle");
-      if (t.asyncCompiles < asyncBase + 2u * NAMEONLY_IDENTS)
-        if (nameonly_diag_burst())
-          return -1;
+      if (t.asyncCompiles < asyncBase + 2u * NAMEONLY_IDENTS ||
+          s.activeProfiles || t.pendingEntries || t.queueApproxSize ||
+          ejit_taskpool_pending_count()) {
+        (void)nameonly_diag_burst();
+        return nameonly_fail("ordinary PGO did not settle for every identity");
+      }
       SRE_printf("[NAMEONLY] phase=%u second-identity route: "
                  "unlistedAppended=%u sawParked=%u\n",
                  phase, s.unlistedAppended,
@@ -384,17 +374,10 @@ static int nameonly_drive(uint32_t generation, uint32_t phase,
       if (nameonly_call(NAMEONLY_IDENTS - 1u, 19u, &body))
         return -1;
       g_nameonly_final[NAMEONLY_IDENTS - 1u] = body;
-      if (body) {
-        if (body <= previous)
-          return nameonly_fail("second-identity body not above members");
-        SRE_printf("[NAMEONLY] phase=%u second-identity body=%p (above "
-                   "members)\n",
-                   phase, (void *)body);
-      } else {
-        SRE_printf("[NAMEONLY] phase=%u second-identity still AOT-served "
-                   "(post-COMPLETE Tier-2 stall; layout unaffected)\n",
-                   phase);
-      }
+      if (!body || body <= previous)
+        return nameonly_fail("second-identity T2 missing or not above members");
+      SRE_printf("[NAMEONLY] phase=%u second-identity body=%p (above "
+                 "members)\n", phase, (void *)body);
       if (nameonly_status(&s, &t))
         return -1;
       if (s.state != NAMEONLY_COMPLETE || s.generation != generation ||
@@ -537,7 +520,8 @@ int test_ejit_nameonly_refresh(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   // real failure (FAILED/CANCELLED, or an error outside Refreshing) aborts.
   ejit_global_layout_status_t s = {0};
   ejit_taskpool_stats_t t = {0};
-  for (uint32_t wait = 0; wait < NAMEONLY_WAIT_ROUNDS; ++wait) {
+  for (uint32_t wait = 0;
+       !NAMEONLY_WAIT_ROUNDS || wait < NAMEONLY_WAIT_ROUNDS; ++wait) {
     if (ejit_get_global_layout_status(&s) != EJIT_OK ||
         ejit_taskpool_get_stats(&t) != EJIT_OK)
       return nameonly_fail("status unavailable");
@@ -605,7 +589,8 @@ int test_ejit_nameonly_print(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   // shell reaches this entry — can still be compiling. The sixth board run
   // failed ONLY this gate: the worker was publishing that Tier-1 while this
   // entry read a non-zero pending count. Let the pipeline drain first.
-  for (uint32_t wait = 0; wait < NAMEONLY_WAIT_ROUNDS; ++wait) {
+  for (uint32_t wait = 0;
+       !NAMEONLY_WAIT_ROUNDS || wait < NAMEONLY_WAIT_ROUNDS; ++wait) {
     if (!t.pendingEntries && !t.queueApproxSize &&
         !ejit_taskpool_pending_count())
       break;
@@ -627,15 +612,14 @@ int test_ejit_nameonly_print(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   if (stage != DEMO_DONE || s.state != NAMEONLY_COMPLETE || s.error ||
       s.generation != g_nameonly_phase2.generation ||
       s.required != NAMEONLY_MEMBERS || s.ready != NAMEONLY_MEMBERS ||
-      s.published != NAMEONLY_MEMBERS || s.activeProfiles > 1u ||
+      s.published != NAMEONLY_MEMBERS || s.activeProfiles ||
       s.unlistedReady || s.unlistedAppended > 1u ||
       t.compileFailed || t.publishFailed || t.queueFull ||
       ejit_taskpool_pending_count())
     return -1;
   // Both phases' captures stay pinned: every dispatched identity executed,
-  // member bodies rank-ordered within each generation. E2's final body is
-  // evidence when the runtime delivered it (the post-COMPLETE Tier-2 stall
-  // may leave it AOT-served with one retained admission — see S3).
+  // member bodies rank-ordered within each generation. E2 must also have an
+  // executed final T2 body; an AOT-only second identity is not a passing test.
   uintptr_t previous = 0;
   for (uint32_t rank = 0; rank < NAMEONLY_MEMBERS; ++rank) {
     if (!g_nameonly_final[rank] || !g_nameonly_calls[rank] ||
@@ -644,8 +628,8 @@ int test_ejit_nameonly_print(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     previous = g_nameonly_final[rank];
   }
   if (!g_nameonly_calls[NAMEONLY_IDENTS - 1u] ||
-      (g_nameonly_final[NAMEONLY_IDENTS - 1u] &&
-       g_nameonly_final[NAMEONLY_IDENTS - 1u] <= previous))
+      !g_nameonly_final[NAMEONLY_IDENTS - 1u] ||
+      g_nameonly_final[NAMEONLY_IDENTS - 1u] <= previous)
     return -1;
   SRE_printf("[NAMEONLY] RUNTIME_CHECKS_PASS 5 name-only 2-dim members "
              "captured + rank-ordered, second identity above them (collective append or post-COMPLETE near pool), "

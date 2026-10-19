@@ -3180,7 +3180,7 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // v17 adds explicit batch publish state.
   // v18 replaces the inline bound-pointer payload with borrowed descriptors.
   // v19 adds complete layout status, retained budgets and real T1 leases.
-  EXPECT_EQ(kEJitSharedAbiVersion, 20u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 21u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
