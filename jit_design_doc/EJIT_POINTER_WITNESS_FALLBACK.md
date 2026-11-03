@@ -125,6 +125,14 @@ than assuming that only previously reported sites will change.
 
 ## C-source reproduction
 
+For the dedicated **core6 -> core16 -> core6** board test, use
+[`EJIT_POINTER_WITNESS_BOARD.md`](EJIT_POINTER_WITNESS_BOARD.md) and its single
+C `ejit_test/ejit_pointer_witness_sre_test.c`. It exercises unknown bounds at
+cell1, six marked fields, full-width i64, `%5/%10`, offsets and strides,
+normal 64-entry online PGO, live slot reads/writes and two generations. It
+does not install the exact allocation-size callback used by the older
+pointer-period board demo. Default board waits are unlimited.
+
 `ejit_test/ejit_pointer_witness_source_repro.c` is compiler-only input, not an
 SRE shell test. It deliberately declares, rather than supplies, the external
 storage and sink. It has no `main` or board initialization entry. The three
