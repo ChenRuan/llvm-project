@@ -1,4 +1,4 @@
-# Pointer-period element-zero witness folding
+# Pointer-period anchored witness folding
 
 Implementation follow-up to [PR254](https://github.com/dongjianqiang2/llvm-project/pull/254),
 on top of PR252. This is independent of PR255's frontend nested-array metadata fix.
@@ -6,7 +6,9 @@ on top of PR252. This is independent of PR255's frontend nested-array metadata f
 ## Purpose and usage
 
 Permit a marked load such as `p[slot % 5].flag` or
-`p->slots[slot % 10].flag` to fold when the pointer's allocation size is unknown.
+`p[cell].slots[slot % 10].flag` to fold when the pointer's allocation size is
+unknown and cell is already specialized. Nonzero cells are included under the
+extended deployment contract approved on 2026-11-03.
 The slot must already be an `ejit_free_dim`, and the load/field must already
 carry the existing `may_const` authorization. The compiler evaluates the
 address with the free dimension set to zero, reads that representative field,
@@ -24,9 +26,11 @@ runtime fallback.
 The application explicitly guarantees all of the following, including for
 marked loads in branches not taken by the call that triggered compilation:
 
-1. The registered pointer slot and the entire first pointee element are live,
-   initialized, coherent and readable by the compiler worker throughout its
-   read. A non-null pointer alone is not proof of this property.
+1. The registered pointer slot and the contiguous allocation prefix through
+   the entire selected witness element are live, initialized, coherent and
+   readable by the compiler worker throughout its read. For `p[1]`, this
+   includes the second element, not just `p[0]`. There is no inferred element
+   count or new memory probe. A non-null pointer is not proof of this property.
 2. The marked values are equal for all supported free-dimension values in the
    active configuration. The representative value is not a guess at the most
    frequent slot.
@@ -51,14 +55,29 @@ automatic lifetime tracking or runtime equality test.
 - Only an unknown-bounds, witness-derived pointer candidate can use this path.
   A size-lookup callback returning zero means unknown; installing such a
   callback does not prevent fallback for static buffers it cannot describe.
-- With `ejit_pointer_layout`, the complete access must lie within element zero
-  and within one authorized field interval. Do not normalize the address by
-  the element stride. Nonzero outer elements, including `p[free + K]` for
-  nonzero K, remain unsupported without bounds.
+- With `ejit_pointer_layout`, the complete access must lie in one authorized
+  field interval of the selected element. Nonnegative witness offsets are
+  split into an element offset and an element-relative field offset. Reads
+  use the selected element's actual address, never element zero's value.
+- Nonzero elements require an address-chain root inside the registered
+  pointer's first element. A bare absolute root already advanced beyond that
+  element is not enough to identify which unknown-sized registration owns it;
+  it remains unsupported. In particular, normalizing arbitrary unrelated
+  addresses by the stride must not create eligible matches.
+- The nonzero outer element must also be selected by a retained constant
+  typed index or a separate constant address step. A dynamic outer index
+  such as `slot+1` or wrapped `slot-1` is not granted a larger readable extent
+  merely because its zero-valued witness evaluates to a positive number.
+- After trying existing legacy/strict paths, the pass materializes registered
+  roots and retries unresolved field loads in the same round. This preserves
+  the anchor before InstCombine folds the nonzero cell offset into the root.
+  It supports normal source `g_1[cell].slots[slot % N]`, including cell 1,
+  without changing business source or requiring another SDK registration.
 - Integer poison/wrap checks and every intermediate flagged `inbounds` GEP
-  remain checked. The guaranteed first-element extent is enough for these
-  checks; it is not published as an allocation size. A chain that leaves this
-  extent and comes back is conservatively rejected.
+  remain checked. The guaranteed prefix through the selected element is used
+  for these checks; it is not published as an allocation size. A chain that
+  leaves this prefix and comes back is conservatively rejected. Extent/address
+  overflow is rejected before any pointed-to field is read.
 - Null bases, malformed layouts, unauthorized/widened fields, volatile/atomic
   loads and ambiguous eligible registrations remain rejected. An unbounded
   alias cannot rescue strict rejection of the same pointer base.
@@ -67,6 +86,8 @@ automatic lifetime tracking or runtime equality test.
 
 Legacy offset-only metadata can authorize an exact field start only when an
 aggregate-rooted GEP still describes the first element and its field width.
+The element-relative field offset may be used for a nonzero element only
+while that aggregate root still equals the registered pointer value.
 The shared field-size walker checks the innermost field, not a later pointer
 cast's apparent type. Malformed present layouts never fall back to offsets.
 Opaque byte chains with neither a layout nor recoverable aggregate type remain
@@ -75,8 +96,10 @@ fallback: a bare offset is not a width bound.
 
 ## Diagnostics and acceptance
 
-Verbose diagnostics report `lightweight-element-zero-witness` on a selected
-fallback. Rejection reasons include `witness-beyond-element-zero`,
+Verbose diagnostics report `lightweight-anchored-element-witness` on a selected
+fallback. Rejection reasons include `witness-before-pointer-base`,
+`nonzero-witness-unanchored-root`, `nonzero-witness-dynamic-element`,
+`witness-extent-overflow`,
 `legacy-witness-missing-type`, `invalid-gep-witness`,
 `layout-or-field-unauthorized`, `strict-pointer-alias` and
 `ambiguous-lightweight-registration`. Existing may-const and branch audits stay
@@ -88,6 +111,9 @@ Baseline/Instrumented/PGOUse, live stores, legacy typed offsets and negative
 authorization cases. A real native online-PGO test uses no allocation-size
 callback or bounds registration, reaches 64 T1 executions, publishes T2,
 deactivates, changes configuration and repeats.
+The nonzero-element extension repeats this online test at element 1 and adds
+cell 1/2/15, both byte orders, typed legacy/layout metadata, dynamic-cell,
+overflow, intermediate-escape, unrelated-root and strict-alias controls.
 
 Board acceptance still requires rebuilding the product runtime, running the
 same business workload with the established worker/owner initialization,
@@ -121,14 +147,21 @@ three pipeline tiers x two slot counts x two byte orders = 360 cases):
 | Case | Expected final marked load |
 | --- | --- |
 | cell0, unknown bounds, free_dim present | Removed, sink flag is constant 1 |
-| cell1, unknown bounds | Retained |
+| cell1, unknown bounds, native LE source root | Removed, sink flag is constant 0 |
+| cell1, unknown bounds, BE-on-LE pre-materialized root | Retained: specialization has erased the anchor |
 | cell1, explicit complete bounds | Removed, sink flag is constant 0 |
 | cell0, free_dim absent | Retained |
 | cell0, pointer registration absent | Retained |
 
 Both `%5` and `%10`, L2/L3 and Baseline/Instrumented/PGOUse configurations
-were checked. PR252 retains the load in all 72 unknown-bounds positive
-combinations; PR256 passes all 360 expected outcomes. The real slot argument
+were checked. The original element-zero version of PR256 retained the 72
+unknown-bounds cell1 combinations. The 36 native LE combinations are now
+positive, with distinct values checking that cell1 is not redirected to cell0.
+The 36 BE-on-LE model combinations remain negative: the fixture materializes
+the root before specialization, which then absorbs the constant cell offset.
+That is not the root materialization order of a native worker. Anchored
+nonzero-element IR is checked separately in both byte orders.
+The real slot argument
 and its dependent selected address remain live in every case. These tier
 configuration checks do not themselves run a live PGO profile; real online
 64-entry PGO and renewal validation is separate, as described above.

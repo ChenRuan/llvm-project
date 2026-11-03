@@ -1537,9 +1537,44 @@ static bool boundedPointerFieldAuthorized(const GlobalVariable &GV,
          Layout->authorizes(Relative % Layout->Stride, AccessSize);
 }
 
-// The deployment guarantees a live, compile-readable element zero and the
-// existing period/free-dim invariants. This is a minimum readable extent, NOT
-// a discovered allocation size, and is never registered or used by strict.
+// Retain a fixed outer-element selector, not just a nonzero result obtained
+// by setting an arbitrary dynamic outer index to its free-dim witness.
+static bool hasConstantWitnessElement(const AbsoluteGEPChain &Chain,
+                                      uintptr_t Base, uint64_t Stride,
+                                      uint64_t Element, const DataLayout &DL,
+                                      const AssumedArgMap &Assumed) {
+  APInt Current = Chain.RootAddress;
+  const AssumedArgMap NoAssumed;
+  for (auto It = Chain.LeafToRoot.rbegin(); It != Chain.LeafToRoot.rend();
+       ++It) {
+    const GEPOperator *GEP = *It;
+    const uint64_t Address = Current.getZExtValue();
+    auto Offset = computeAbsoluteGEPOffset(GEP, DL, Assumed, &Current);
+    if (!Offset)
+      return false;
+    if (Address >= Base && Address - Base < Stride) {
+      TypeSize SourceSize = DL.getTypeAllocSize(GEP->getSourceElementType());
+      if (!SourceSize.isScalable() && SourceSize.getFixedValue() == Stride)
+        if (auto *Index = dyn_cast<ConstantInt>(GEP->getOperand(1)))
+          if (!Index->isNegative() && Index->getValue().getActiveBits() <= 64 &&
+              Index->getZExtValue() == Element)
+            return true;
+      // A separate constant byte/field GEP can also select the outer element.
+      auto Fixed = computeAbsoluteGEPOffset(GEP, DL, NoAssumed, &Current);
+      if (Fixed) {
+        const uint64_t Next = (Current + *Fixed).getZExtValue();
+        if (Next >= Base && (Next - Base) / Stride == Element)
+          return true;
+      }
+    }
+    Current += *Offset;
+  }
+  return false;
+}
+
+// The deployment guarantees a live, compile-readable prefix through the
+// selected witness element and the existing period/free-dim invariants.
+// This trusted minimum extent is never registered or used by strict checking.
 static const char *checkLightweightPointerWitness(
     const GlobalVariable &GV, LoadInst *LI, uintptr_t Base, uintptr_t Target,
     uint64_t AccessSize, const MayConstOffsetMap &Fields, const DataLayout &DL,
@@ -1547,45 +1582,56 @@ static const char *checkLightweightPointerWitness(
   if (!Base)
     return "null-pointer-base";
   if (Target < Base)
-    return "witness-beyond-element-zero";
+    return "witness-before-pointer-base";
   const uint64_t Relative = Target - Base;
+  auto Chain = collectAbsoluteGEPChain(LI->getPointerOperand(), DL);
+  if (!Chain || Chain->LeafToRoot.empty())
+    return "invalid-gep-witness";
   bool Present = false;
   auto Layout = getPointerFieldLayout(GV, Present);
-  uint64_t Extent = 0;
+  uint64_t Stride = 0;
   if (Present) {
     if (!Layout)
       return "layout-or-field-unauthorized";
-    Extent = Layout->Stride;
-    uint64_t CheckedRelative = 0;
-    if (!absoluteRangeContains(Base, Extent, Target, AccessSize,
-                               CheckedRelative))
-      return "witness-beyond-element-zero";
-    // No modulo: a nonzero outer pointee element is not authorized.
-    if (!Layout->authorizes(Relative, AccessSize))
+    Stride = Layout->Stride;
+    if (!Layout->authorizes(Relative % Stride, AccessSize))
       return "layout-or-field-unauthorized";
   } else {
-    auto It = Fields.find(&GV);
-    if (It == Fields.end() || !llvm::is_contained(It->second, Relative))
-      return "layout-or-field-unauthorized";
     // Legacy offsets alone do not describe a field's width. Preserve typed
-    // first-element witnesses; opaque byte chains without layout stay live.
-    auto Chain = collectAbsoluteGEPChain(LI->getPointerOperand(), DL);
-    if (!Chain || Chain->LeafToRoot.empty() ||
-        Chain->RootAddress.getZExtValue() != Base)
+    // witnesses; opaque byte chains without layout stay live.
+    if (Chain->RootAddress.getZExtValue() != Base)
       return "legacy-witness-missing-type";
     Type *RootTy = Chain->LeafToRoot.back()->getSourceElementType();
     if (!RootTy->isAggregateType() || !RootTy->isSized())
       return "legacy-witness-missing-type";
     TypeSize RootSize = DL.getTypeAllocSize(RootTy);
-    auto FieldSize = ejitMayConstFieldSizeInType(RootTy, Relative, DL);
-    if (RootSize.isScalable() || !FieldSize || AccessSize > *FieldSize)
+    if (RootSize.isScalable() || !RootSize.getFixedValue())
       return "layout-or-field-unauthorized";
-    Extent = RootSize.getFixedValue();
-    uint64_t CheckedRelative = 0;
-    if (!absoluteRangeContains(Base, Extent, Target, AccessSize,
-                               CheckedRelative))
-      return "witness-beyond-element-zero";
+    Stride = RootSize.getFixedValue();
+    const uint64_t FieldOffset = Relative % Stride;
+    auto It = Fields.find(&GV);
+    auto FieldSize = ejitMayConstFieldSizeInType(RootTy, FieldOffset, DL);
+    if (It == Fields.end() || !llvm::is_contained(It->second, FieldOffset) ||
+        !FieldSize || AccessSize > *FieldSize)
+      return "layout-or-field-unauthorized";
   }
+  // Modulo checks field identity, not allocation identity. A later element
+  // must still be reached from a root in this registration's first element;
+  // otherwise every earlier unrelated allocation could appear eligible.
+  const uintptr_t Root = Chain->RootAddress.getZExtValue();
+  if (Relative >= Stride && (Root < Base || Root - Base >= Stride))
+    return "nonzero-witness-unanchored-root";
+  if (Relative >= Stride &&
+      !hasConstantWitnessElement(*Chain, Base, Stride, Relative / Stride, DL,
+                                 Assumed))
+    return "nonzero-witness-dynamic-element";
+  const uint64_t ElementOffset = Relative - Relative % Stride;
+  if (ElementOffset > std::numeric_limits<uint64_t>::max() - Stride)
+    return "witness-extent-overflow";
+  const uint64_t Extent = ElementOffset + Stride;
+  uint64_t CheckedRelative = 0;
+  if (!absoluteRangeContains(Base, Extent, Target, AccessSize, CheckedRelative))
+    return "witness-extent-overflow";
   if (!absoluteGEPChainFitsObject(LI->getPointerOperand(), DL, Assumed, Base,
                                   Extent))
     return "invalid-gep-witness";
@@ -1597,7 +1643,7 @@ static const char *checkLightweightPointerWitness(
 /// non-pointer registered object, accept only a unique, bounded and authorized
 /// field whose complete root-to-leaf GEP witness is valid. Pointer-form objects
 /// with explicit allocation bounds and compiler field ranges use the same
-/// witness checks. Unbounded pointers additionally accept element-zero free-dim
+/// witness checks. Unbounded pointers additionally accept anchored free-dim
 /// witnesses under the deployment's readable-pointee and lifecycle contract.
 /// Allocator-discovered bounds add strict folds only after legacy matching.
 static Constant *tryReplacePeriodAbsoluteAddress(
@@ -1753,7 +1799,7 @@ static Constant *tryReplacePeriodAbsoluteAddress(
       }
     if (LightweightBases.size() == 1) {
       EJIT_DIAG_VERBOSE("period absolute load folded fn=%s "
-                        "reason=lightweight-element-zero-witness",
+                        "reason=lightweight-anchored-element-witness",
                         F.getName().str().c_str());
       return createConstantFromMemory(reinterpret_cast<const uint8_t *>(Target),
                                       LI->getType(), DL);
@@ -2030,8 +2076,10 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   // 1. Use cached module-level metadata maps (built once per module by
   //    initFromModule(), reused across all function runs).
 
-  // 2. Scan all loads and collect replacements.
+  // 2. Give legacy and strict paths their existing first attempt.
   struct Replacement { LoadInst *LI; Constant *ConstVal; };
+  SmallVector<Replacement, 8> Roots;
+  SmallVector<LoadInst *, 16> PendingFields;
   SmallVector<Replacement, 16> replacements;
 #ifdef EJIT_DIAG_ENABLE
   size_t totalLoads = 0, mayConstLoads = 0;
@@ -2053,13 +2101,9 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       ++totalLoads;
 #endif
 
-      // A pointer-form period global is itself the root needed to reach nested
-      // may_const fields. It has no may_const marker of its own, but replacing
-      // it here exposes a concrete address to IPSCCP and later StructFieldPass
-      // rounds, including when the field access lives in a non-inlined helper.
       if (Constant *C = tryReplacePeriodPointerBase(
               LI, gvPeriodMap_, registry_, DL)) {
-        replacements.push_back({LI, C});
+        Roots.push_back({LI, C});
         continue;
       }
 
@@ -2109,15 +2153,33 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       if (C)
         replacements.push_back({LI, C});
-#ifdef EJIT_DIAG_ENABLE
       else
-        logReplaceFailure(LI, gvPeriodMap_, registry_, DL, freeDimArgs_);
-#endif
+        PendingFields.push_back(LI);
     }
   }
 
-  // 3. Apply replacements.
-  bool changed = false;
+  // 3. Retry unresolved fields after materializing roots, before InstCombine
+  // can absorb a nonzero cell offset and lose the registration anchor. Do not
+  // preempt legacy constant-index matches or change any live slot address.
+  for (auto &R : Roots)
+    R.LI->replaceAllUsesWith(R.ConstVal);
+  for (LoadInst *LI : PendingFields) {
+    Constant *C = Roots.empty() ? nullptr
+                                : tryReplacePeriodAbsoluteAddress(
+                                      LI, F, gvPeriodMap_, mayConstFieldMap_,
+                                      registry_, DL, freeDimArgs_);
+    if (C)
+      replacements.push_back({LI, C});
+#ifdef EJIT_DIAG_ENABLE
+    else
+      logReplaceFailure(LI, gvPeriodMap_, registry_, DL, freeDimArgs_);
+#endif
+  }
+  for (auto &R : Roots)
+    R.LI->eraseFromParent();
+
+  // 4. Apply field replacements.
+  bool changed = !Roots.empty();
   for (auto &R : replacements) {
     R.LI->replaceAllUsesWith(R.ConstVal);
     R.LI->eraseFromParent();
@@ -2131,16 +2193,17 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   // callees with no may_const activity stay silent, eliminating the bulk of
   // the struct-field log volume while preserving locatability for the
   // functions that matter. Raise the log level to VERBOSE to see this detail.
-  if (isEjitEntry || mayConstLoads > 0 || !replacements.empty()) {
+  if (isEjitEntry || mayConstLoads > 0 || changed) {
     EJIT_DIAG_VERBOSE("struct-field run func=%s entry=%d replaced=%zu",
                       F.getName().str().c_str(), isEjitEntry ? 1 : 0,
-                      replacements.size());
+                      Roots.size() + replacements.size());
     EJIT_DIAG_VERBOSE("  loads total=%zu may_const=%zu replaced=%zu",
-                      totalLoads, mayConstLoads, replacements.size());
+                      totalLoads, mayConstLoads,
+                      Roots.size() + replacements.size());
   }
 #endif
   LLVM_DEBUG(if (changed) dbgs() << "ejit-struct-field: replaced "
-                                 << replacements.size() << " load(s) in "
-                                 << F.getName() << "\n");
+                                 << Roots.size() + replacements.size()
+                                 << " load(s) in " << F.getName() << "\n");
   return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
