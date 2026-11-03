@@ -171,6 +171,107 @@ static void useLiveSlotStores(Module &M, const PointerFixture &Fixture) {
 }
 } // namespace
 
+TEST(EJitPointerPeriod, NestedGlobalAbsoluteSlotRequiresCompleteFieldMetadata) {
+  enum Case {
+    Complete,
+    NoFields,
+    NoFreeDim,
+    Neighbor,
+    Wide,
+    Volatile,
+    Atomic,
+    Unregistered
+  };
+  for (bool BE : {false, true})
+    for (auto Level :
+         {ejit::OptimizationLevel::L2, ejit::OptimizationLevel::L3})
+      for (auto Tier : {CompileTier::Baseline, CompileTier::Instrumented,
+                        CompileTier::PGOUse})
+        for (unsigned Mode = Complete; Mode <= Unregistered; ++Mode) {
+          SCOPED_TRACE(BE);
+          SCOPED_TRACE(static_cast<unsigned>(Level));
+          SCOPED_TRACE(static_cast<unsigned>(Tier));
+          SCOPED_TRACE(Mode);
+          std::vector<uint8_t> Data(1280, 0);
+          for (unsigned S = 0; S != 5; ++S)
+            Data[640 + S * 128 + 31] = 1;
+          std::ostringstream IR;
+          IR << "target datalayout = \"" << (BE ? 'E' : 'e')
+             << "-p:64:64-i64:64\"\n"
+                "%Slot = type { [31 x i8], i8, [96 x i8] }\n"
+                "%Cell = type { [5 x %Slot] }\n"
+                "@cfg = external global [2 x %Cell], !ejit.metadata !0\n"
+                "@gate = external global i8\n"
+                "declare void @observe(i16, i16)\n"
+                "define void @probe(i8 %cell, i8 %other, i16 %frame, "
+                "i16 %slot, i32 %mode, ptr %ctx) !ejit.metadata !3 {\n"
+                "entry:\n"
+                "  %g = load i8, ptr @gate\n"
+                "  %cond = icmp ugt i8 %g, 1\n"
+                "  %phase = urem i16 %slot, 5\n"
+                "  %index = zext nneg i16 %phase to i64\n"
+                "  br i1 %cond, label %read, label %exit\n"
+                "read:\n"
+                "  %offset = shl nuw nsw i64 %index, 7\n"
+                "  %field = getelementptr i8, ptr inttoptr (i64 "
+             << reinterpret_cast<uintptr_t>(Data.data() + 640 +
+                                            (Mode == Neighbor ? 32 : 31))
+             << " to ptr), i64 %offset\n"
+                "  %v = load "
+             << (Mode == Atomic     ? "atomic "
+                 : Mode == Volatile ? "volatile "
+                                    : "")
+             << (Mode == Wide ? "i16" : "i8") << ", ptr %field"
+             << (Mode == Atomic ? " monotonic" : "")
+             << ", align 1, !ejit.may_const !7\n";
+          if (Mode != Wide)
+            IR << "  %extended = zext i8 %v to i16\n";
+          IR << "  call void @observe(i16 "
+             << (Mode == Wide ? "%v" : "%extended")
+             << ", i16 %slot)\n  br label %exit\nexit:\n  ret void\n}\n"
+                "!0 = !{!1";
+          if (Mode != NoFields)
+            IR << ", !10, !11, !12, !13, !14";
+          IR << "}\n!1 = !{!\"ejit_period_arr\", !\"cell\", i32 2}\n"
+                "!3 = !{!4, !5";
+          if (Mode != NoFreeDim)
+            IR << ", !6";
+          IR << "}\n!4 = !{!\"ejit_entry\"}\n"
+                "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+                "!6 = !{!\"ejit_free_dim\", !\"\", i32 3}\n!7 = !{}\n";
+          for (unsigned S = 0; S != 5; ++S)
+            IR << '!' << 10 + S << " = !{!\"ejit_may_const_field\", i32 "
+               << 31 + S * 128 << "}\n";
+          LLVMContext Ctx;
+          SMDiagnostic Err;
+          auto M = parseAssemblyString(IR.str(), Err, Ctx);
+          ASSERT_NE(M, nullptr) << Err.getMessage().str();
+          ASSERT_FALSE(verifyModule(*M, &errs()));
+          PeriodArrayRegistry Registry;
+          if (Mode != Unregistered)
+            Registry.registerArray("cell", "cfg", Data.data(), 2);
+          optimize(*M, Registry, Tier, Level);
+          EXPECT_EQ(markedLoads(*M), Mode == Complete ? 0U : 1U);
+          unsigned Calls = 0;
+          for (Instruction &I : instructions(M->getFunction("probe")))
+            if (auto *Call = dyn_cast<CallInst>(&I))
+              if (Call->getCalledFunction() &&
+                  Call->getCalledFunction()->getName() == "observe") {
+                ++Calls;
+                EXPECT_EQ(Call->getArgOperand(1),
+                          M->getFunction("probe")->getArg(3));
+                auto *Value = dyn_cast<ConstantInt>(Call->getArgOperand(0));
+                if (Mode == Complete) {
+                  ASSERT_NE(Value, nullptr);
+                  EXPECT_EQ(Value->getZExtValue(), 1U);
+                } else {
+                  EXPECT_EQ(Value, nullptr);
+                }
+              }
+          EXPECT_EQ(Calls, 1U);
+        }
+}
+
 TEST(EJitPointerPeriod, PreservesBoundPointerContextAfterLoopUnrolling) {
   for (bool BigEndian : {false, true})
     for (unsigned Mode : {0U, 1U, 2U})
