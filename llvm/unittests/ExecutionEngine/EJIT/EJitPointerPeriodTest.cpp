@@ -16,10 +16,12 @@
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+#include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/ValueSymbolTable.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/SourceMgr.h"
@@ -148,7 +150,8 @@ static void optimize(Module &M, PeriodArrayRegistry &Registry,
   EXPECT_FALSE(verifyModule(M, &errs()));
 }
 
-static void useLiveSlotStores(Module &M, const PointerFixture &Fixture) {
+static void useLiveSlotStores(Module &M, const PointerFixture &Fixture,
+                              unsigned Element = 1) {
   Function *F = M.getFunction("probe");
   // Marked fields are immutable while active; exercise writes through the
   // real slot using a separate, unmarked byte in each element.
@@ -164,12 +167,307 @@ static void useLiveSlotStores(Module &M, const PointerFixture &Fixture) {
   Value *Slot = B.CreateZExt(
       B.CreateURem(F->getArg(1), B.getInt16(Fixture.Slots)), B.getInt64Ty());
   Value *Offset = B.CreateAdd(B.CreateMul(Slot, B.getInt64(4)),
-                              B.getInt64(Fixture.Stride + 8));
+                              B.getInt64(Element * Fixture.Stride + 8));
   Value *Live = B.CreateGEP(B.getInt8Ty(), Base, Offset);
   Value *Count = B.CreateLoad(B.getInt8Ty(), Live);
   B.CreateStore(B.CreateAdd(Count, B.getInt8(1)), Live);
 }
+
+// Keep the existing strict fixture on element 1. The lightweight contract
+// covers only element 0 of the pointer's pointee type.
+static void selectElementZero(Module &M, PointerFixture &Fixture,
+                              bool LegacyOffsets = false) {
+  for (unsigned I = 0; I < Fixture.Slots; ++I)
+    Fixture.Data[8 + I * 4 + 1] = 1;
+  for (Instruction &I : instructions(M.getFunction("probe")))
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
+      if (GEP->getName() == "selected")
+        GEP->setOperand(1,
+                        ConstantInt::get(Type::getInt64Ty(M.getContext()), 0));
+  if (LegacyOffsets) {
+    auto &Ctx = M.getContext();
+    GlobalVariable *GV = M.getGlobalVariable("cfg");
+    SmallVector<Metadata *, 8> Tags;
+    for (const MDOperand &Op : GV->getMetadata("ejit.metadata")->operands())
+      Tags.push_back(Op.get());
+    SmallVector<Metadata *, 16> Fields{
+        MDString::get(Ctx, "ejit_may_const_field")};
+    for (unsigned I = 0; I < Fixture.Slots; ++I)
+      Fields.push_back(ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt32Ty(Ctx), 8 + I * 4 + 1)));
+    Tags.push_back(MDNode::get(Ctx, Fields));
+    GV->setMetadata("ejit.metadata", MDNode::get(Ctx, Tags));
+  }
+}
 } // namespace
+
+TEST(EJitPointerPeriod, LightweightElementZeroAcrossTiersLevelsAndByteOrders) {
+  for (unsigned Slots : {5U, 10U})
+    for (bool BigEndian : {false, true})
+      for (auto Tier : {CompileTier::Baseline, CompileTier::Instrumented,
+                        CompileTier::PGOUse})
+        for (auto Level :
+             {ejit::OptimizationLevel::L2, ejit::OptimizationLevel::L3}) {
+          SCOPED_TRACE(Slots);
+          SCOPED_TRACE(BigEndian);
+          SCOPED_TRACE(static_cast<unsigned>(Tier));
+          SCOPED_TRACE(static_cast<unsigned>(Level));
+          PointerFixture Fixture(Slots);
+          LLVMContext Ctx;
+          auto M = Fixture.module(Ctx, BigEndian, true, true, true, BigEndian);
+          ASSERT_NE(M, nullptr);
+          selectElementZero(*M, Fixture);
+          PeriodArrayRegistry Registry;
+          Fixture.registerRoot(Registry);
+          optimize(*M, Registry, Tier, Level);
+          EXPECT_EQ(markedLoads(*M), 0U);
+          EXPECT_FALSE(M->getFunction("probe")->getArg(1)->use_empty());
+          bool DynamicStore = false;
+          for (Instruction &I : instructions(M->getFunction("probe")))
+            if (auto *Store = dyn_cast<StoreInst>(&I))
+              DynamicStore |= !isa<Constant>(Store->getPointerOperand());
+          EXPECT_TRUE(DynamicStore);
+        }
+}
+
+TEST(EJitPointerPeriod, LightweightUnknownLookupAndLegacyTypedFields) {
+  for (bool Layout : {false, true})
+    for (bool Lifecycle : {false, true}) {
+      SCOPED_TRACE(Layout);
+      SCOPED_TRACE(Lifecycle);
+      PointerFixture Fixture(5);
+      AllocationRecord Record{Fixture.Pointer, 0};
+      LLVMContext Ctx;
+      auto M = Fixture.module(Ctx, true, true, Layout, Lifecycle);
+      ASSERT_NE(M, nullptr);
+      selectElementZero(*M, Fixture, !Layout);
+      PeriodArrayRegistry Registry;
+      Fixture.registerRoot(Registry);
+      Registry.setAllocationSizeLookup({lookupAllocationSize, &Record});
+      optimize(*M, Registry);
+      EXPECT_EQ(markedLoads(*M), 0U);
+      EXPECT_GT(Record.Queries, 0U);
+    }
+}
+
+TEST(EJitPointerPeriod, LightweightRejectsUnsafeOrUnauthorizedWitnesses) {
+  for (unsigned Case = 0; Case != 10; ++Case) {
+    SCOPED_TRACE(Case);
+    PointerFixture Fixture(5);
+    LLVMContext Ctx;
+    auto M = Fixture.module(Ctx, true, Case != 0, Case != 1, true, false,
+                            Case == 2 ? 0 : 1,
+                            Case == 3 ? "sub nuw i16 %slot, 1" : "");
+    ASSERT_NE(M, nullptr);
+    if (Case != 4)
+      selectElementZero(*M, Fixture);
+    if (Case == 5 || Case == 6 || Case == 7) {
+      for (Instruction &I :
+           make_early_inc_range(instructions(M->getFunction("probe"))))
+        if (auto *Load = dyn_cast<LoadInst>(&I))
+          if (Load->hasMetadata("ejit.may_const")) {
+            if (Case == 5)
+              Load->setVolatile(true);
+            else if (Case == 6)
+              Load->setAtomic(AtomicOrdering::Acquire);
+            else {
+              IRBuilder<> B(Load);
+              auto *Wide = B.CreateAlignedLoad(
+                  B.getInt16Ty(), Load->getPointerOperand(), Align(1));
+              Wide->setMetadata("ejit.may_const",
+                                Load->getMetadata("ejit.may_const"));
+              Load->replaceAllUsesWith(B.CreateTrunc(Wide, B.getInt8Ty()));
+              Load->eraseFromParent();
+            }
+          }
+    }
+    if (Case == 8) {
+      auto *GV = M->getGlobalVariable("cfg");
+      auto *MD = GV->getMetadata("ejit.metadata");
+      // A malformed present layout must not fall back to legacy offsets.
+      selectElementZero(*M, Fixture, true);
+      auto *Layout = cast<MDNode>(MD->getOperand(1));
+      Layout->replaceOperandWith(1, ConstantAsMetadata::get(ConstantInt::get(
+                                        Type::getInt64Ty(Ctx), 0)));
+    }
+    PeriodArrayRegistry Registry;
+    if (Case != 9)
+      Fixture.registerRoot(Registry);
+    optimize(*M, Registry);
+    EXPECT_EQ(markedLoads(*M), 1U);
+  }
+}
+
+TEST(EJitPointerPeriod, LightweightNeverRescuesStrictRejections) {
+  for (bool Explicit : {false, true})
+    for (unsigned Case = 0; Case != 4; ++Case) {
+      SCOPED_TRACE(Explicit);
+      SCOPED_TRACE(Case);
+      PointerFixture Fixture(5);
+      AllocationRecord Record{Fixture.Pointer,
+                              Case == 0 ? 8 : Fixture.Data.size()};
+      if (Case == 1)
+        --Record.Size;
+      LLVMContext Ctx;
+      auto M = Fixture.module(Ctx, true, true, true, Case != 2, false,
+                              Case == 3 ? 0 : 1);
+      ASSERT_NE(M, nullptr);
+      selectElementZero(*M, Fixture);
+      PeriodArrayRegistry Registry;
+      Fixture.registerRoot(Registry);
+      if (Explicit)
+        ASSERT_TRUE(Registry.registerPointerPeriodBounds("cfg", Fixture.Pointer,
+                                                         Record.Size));
+      else
+        Registry.setAllocationSizeLookup({lookupAllocationSize, &Record});
+      optimize(*M, Registry);
+      EXPECT_EQ(markedLoads(*M), 1U);
+    }
+}
+
+TEST(EJitPointerPeriod,
+     LightweightRejectsAmbiguousAliasesAndStrictAliasRescue) {
+  for (bool StrictAlias : {false, true}) {
+    SCOPED_TRACE(StrictAlias);
+    PointerFixture Fixture(5);
+    LLVMContext Ctx;
+    auto M = Fixture.module(Ctx, true);
+    ASSERT_NE(M, nullptr);
+    selectElementZero(*M, Fixture);
+    auto *Alias =
+        new GlobalVariable(*M, PointerType::getUnqual(Ctx), false,
+                           GlobalValue::ExternalLinkage, nullptr, "alias");
+    Alias->setMetadata(
+        "ejit.metadata",
+        M->getGlobalVariable("cfg")->getMetadata("ejit.metadata"));
+    PeriodArrayRegistry Registry;
+    Fixture.registerRoot(Registry);
+    Registry.registerArray("cell", "alias", &Fixture.Pointer, 0);
+    if (StrictAlias)
+      ASSERT_TRUE(
+          Registry.registerPointerPeriodBounds("alias", Fixture.Pointer, 8));
+    optimize(*M, Registry);
+    EXPECT_EQ(markedLoads(*M), 1U);
+  }
+}
+
+TEST(EJitPointerPeriod, LightweightFoldsFlattenedModuloStride128) {
+  for (bool BigEndian : {false, true})
+    for (unsigned Slots : {5U, 10U})
+      for (bool NonzeroElement : {false, true}) {
+        SCOPED_TRACE(BigEndian);
+        SCOPED_TRACE(Slots);
+        SCOPED_TRACE(NonzeroElement);
+        std::vector<uint8_t> Data(Slots * 128);
+        for (unsigned I = 0; I < Slots; ++I)
+          Data[I * 128 + 31] = 7;
+        void *Pointer = Data.data();
+        std::ostringstream IR;
+        IR << "target datalayout = \"" << (BigEndian ? 'E' : 'e')
+           << "-p:64:64-i64:64\"\n"
+              "@cfg = external global ptr, !ejit.metadata !0\n"
+              "define i8 @probe(i8 %cell, i16 %slot) !ejit.metadata !3 {\n"
+              "  %phase = urem i16 %slot, "
+           << Slots
+           << "\n  %idx = zext nneg i16 %phase to i64\n"
+              "  %bytes = shl nuw nsw i64 %idx, 7\n"
+              "  %p = getelementptr inbounds nuw i8, ptr inttoptr (i64 "
+           << reinterpret_cast<uintptr_t>(Data.data()) + 31 +
+                  (NonzeroElement ? 128 : 0)
+           << " to ptr), i64 %bytes\n"
+              "  %v = load i8, ptr %p, !ejit.may_const !7\n"
+              "  ret i8 %v\n}\n"
+              "!0 = !{!1, !8}\n"
+              "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 0}\n"
+              "!3 = !{!4, !5, !6}\n"
+              "!4 = !{!\"ejit_entry\"}\n"
+              "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+              "!6 = !{!\"ejit_free_dim\", !\"\", i32 1}\n"
+              "!7 = !{}\n"
+              "!8 = !{!\"ejit_pointer_layout\", i64 128, !9}\n"
+              "!9 = !{i64 31, i64 1}\n";
+        LLVMContext Ctx;
+        SMDiagnostic Err;
+        auto M = parseAssemblyString(IR.str(), Err, Ctx);
+        ASSERT_NE(M, nullptr) << Err.getMessage().str();
+        PeriodArrayRegistry Registry;
+        Registry.registerArray("cell", "cfg", &Pointer, 0);
+        optimize(*M, Registry);
+        EXPECT_EQ(markedLoads(*M), NonzeroElement ? 1U : 0U);
+        if (!NonzeroElement) {
+          auto *Ret =
+              cast<ReturnInst>(M->getFunction("probe")->back().getTerminator());
+          auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
+          ASSERT_NE(Value, nullptr);
+          EXPECT_EQ(Value->getZExtValue(), 7U);
+        }
+      }
+}
+
+TEST(EJitPointerPeriod, LightweightChecksIntermediateInboundsBeforeReading) {
+  for (bool Escapes : {false, true}) {
+    SCOPED_TRACE(Escapes);
+    PointerFixture Fixture(5);
+    LLVMContext Ctx;
+    auto M = Fixture.module(Ctx, true);
+    ASSERT_NE(M, nullptr);
+    selectElementZero(*M, Fixture);
+    auto *Selected = cast<GetElementPtrInst>(
+        M->getFunction("probe")->getValueSymbolTable()->lookup("selected"));
+    IRBuilder<> B(Selected);
+    Value *Index = Selected->getOperand(3);
+    // The last numerical address is base+9 in both cases. In the rejected
+    // witness, an intermediate inbounds GEP nevertheless goes before base.
+    Value *Step = Escapes ? B.CreateSub(Index, B.getInt64(1)) : Index;
+    Value *First =
+        B.CreateInBoundsGEP(B.getInt8Ty(), Selected->getPointerOperand(), Step);
+    Value *Last =
+        B.CreateInBoundsGEP(B.getInt8Ty(), First, B.getInt64(Escapes ? 10 : 9));
+    Selected->replaceAllUsesWith(Last);
+    Selected->eraseFromParent();
+    PeriodArrayRegistry Registry;
+    Fixture.registerRoot(Registry);
+    EJitStructFieldPass Pass(Registry);
+    Pass.initFromModule(*M);
+    FunctionAnalysisManager AM;
+    Pass.run(*M->getFunction("probe"), AM);
+    EXPECT_FALSE(verifyModule(*M, &errs()));
+    EXPECT_EQ(markedLoads(*M), Escapes ? 1U : 0U);
+  }
+}
+
+TEST(EJitPointerPeriod, LightweightLegacyOffsetsStillRequireTypedAccessWidth) {
+  for (unsigned Case = 0; Case != 3; ++Case) {
+    SCOPED_TRACE(Case);
+    PointerFixture Fixture(5);
+    LLVMContext Ctx;
+    auto M = Fixture.module(Ctx, true, true, false);
+    ASSERT_NE(M, nullptr);
+    selectElementZero(*M, Fixture, true);
+    if (Case)
+      for (Instruction &I :
+           make_early_inc_range(instructions(M->getFunction("probe"))))
+        if (auto *Load = dyn_cast<LoadInst>(&I))
+          if (Load->hasMetadata("ejit.may_const")) {
+            IRBuilder<> B(Load);
+            Value *Address = Load->getPointerOperand();
+            if (Case == 2)
+              Address = B.CreateGEP(B.getInt16Ty(), Address, B.getInt64(0));
+            auto *Wide = B.CreateAlignedLoad(B.getInt16Ty(), Address, Align(1));
+            Wide->setMetadata("ejit.may_const",
+                              Load->getMetadata("ejit.may_const"));
+            Load->replaceAllUsesWith(B.CreateTrunc(Wide, B.getInt8Ty()));
+            Load->eraseFromParent();
+          }
+    PeriodArrayRegistry Registry;
+    Fixture.registerRoot(Registry);
+    EJitStructFieldPass Pass(Registry);
+    Pass.initFromModule(*M);
+    FunctionAnalysisManager AM;
+    Pass.run(*M->getFunction("probe"), AM);
+    EXPECT_EQ(markedLoads(*M), Case ? 1U : 0U);
+  }
+}
 
 TEST(EJitPointerPeriod, PreservesBoundPointerContextAfterLoopUnrolling) {
   for (bool BigEndian : {false, true})
@@ -1026,7 +1324,7 @@ TEST(EJitPointerPeriod,
   }
 }
 
-TEST(EJitPointerPeriod, OnlinePgoRecompilesAfterLifecycleUpdate) {
+static void runOnlinePgoLifecycle(bool Lightweight) {
 #ifndef EJIT_SRE_SHARED_TASKPOOL
   GTEST_SKIP() << "requires the shared taskpool runtime";
 #else
@@ -1035,10 +1333,13 @@ TEST(EJitPointerPeriod, OnlinePgoRecompilesAfterLifecycleUpdate) {
   PointerFixture Fixture(10);
   AllocationRecord Record{Fixture.Pointer, Fixture.Data.size()};
   LLVMContext Ctx;
-  auto M =
-      Fixture.module(Ctx, true, false, true, true, false, 1, "add i16 0, 3");
+  auto M = Fixture.module(Ctx, !Lightweight, Lightweight, true, true, false, 1,
+                          Lightweight ? "" : "add i16 0, 3");
   ASSERT_NE(M, nullptr);
-  useLiveSlotStores(*M, Fixture);
+  const unsigned Element = Lightweight ? 0 : 1;
+  if (Lightweight)
+    selectElementZero(*M, Fixture);
+  useLiveSlotStores(*M, Fixture, Element);
   auto JTMB = orc::JITTargetMachineBuilder::detectHost();
   ASSERT_TRUE(static_cast<bool>(JTMB));
   auto Layout = JTMB->getDefaultDataLayoutForTarget();
@@ -1070,8 +1371,9 @@ TEST(EJitPointerPeriod, OnlinePgoRecompilesAfterLifecycleUpdate) {
                         reinterpret_cast<const uint8_t *>(Bitcode.data()),
                         Bitcode.size());
   Store.registerPeriodArray("cell", "cfg", &Fixture.Pointer, 0);
-  ASSERT_EQ(ejit_set_allocation_size_lookup(lookupAllocationSize, &Record),
-            EJIT_OK);
+  if (!Lightweight)
+    ASSERT_EQ(ejit_set_allocation_size_lookup(lookupAllocationSize, &Record),
+              EJIT_OK);
   ASSERT_EQ(ejit_init_pgo(nullptr), EJIT_OK);
   const ejit_dim_pair_t Dim{CellDim, 1};
   using Probe = uint8_t (*)(uint8_t, uint16_t);
@@ -1082,7 +1384,7 @@ TEST(EJitPointerPeriod, OnlinePgoRecompilesAfterLifecycleUpdate) {
     // No invocation or compiler request is outstanding at the update point.
     // The previous round reached T2, and every read token was released.
     for (unsigned I = 0; I < Fixture.Slots; ++I)
-      Fixture.Data[Fixture.Stride + 8 + I * 4 + 1] = Value;
+      Fixture.Data[Element * Fixture.Stride + 8 + I * 4 + 1] = Value;
     ASSERT_EQ(ejit_activate("cell", 1), EJIT_OK);
     void *Tier1 = nullptr, *Tier2 = nullptr;
     unsigned Tier1Executions = 0;
@@ -1121,10 +1423,18 @@ TEST(EJitPointerPeriod, OnlinePgoRecompilesAfterLifecycleUpdate) {
     EXPECT_EQ(Disabled, nullptr);
   }
   for (unsigned I = 0; I < Fixture.Slots; ++I) {
-    EXPECT_EQ(Fixture.Data[Fixture.Stride + 8 + I * 4],
+    EXPECT_EQ(Fixture.Data[Element * Fixture.Stride + 8 + I * 4],
               SlotNo / Fixture.Slots + (I < SlotNo % Fixture.Slots));
-    EXPECT_EQ(Fixture.Data[Fixture.Stride + 8 + I * 4 + 1], 2U);
-    EXPECT_EQ(Fixture.Data[8 + I * 4], 0U);
+    EXPECT_EQ(Fixture.Data[Element * Fixture.Stride + 8 + I * 4 + 1], 2U);
+    EXPECT_EQ(Fixture.Data[(1 - Element) * Fixture.Stride + 8 + I * 4], 0U);
   }
 #endif
+}
+
+TEST(EJitPointerPeriod, OnlinePgoRecompilesAfterLifecycleUpdate) {
+  runOnlinePgoLifecycle(false);
+}
+
+TEST(EJitPointerPeriod, LightweightOnlinePgoRecompilesWithoutBoundsOrLookup) {
+  runOnlinePgoLifecycle(true);
 }

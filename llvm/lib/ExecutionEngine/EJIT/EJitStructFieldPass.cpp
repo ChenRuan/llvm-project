@@ -1466,54 +1466,130 @@ static bool absoluteFieldAuthorized(
          ejitAccessFitsMayConstField(GV, FieldOffset, AccessSize, DL);
 }
 
-/// Authorize a complete access within one compiler-described pointee element.
-/// Field ranges include nested arrays; the allocation may hold several
-/// pointee elements.
-static bool boundedPointerFieldAuthorized(const GlobalVariable &GV,
-                                          uint64_t AllocationSize,
-                                          uint64_t Relative,
-                                          uint64_t AccessSize) {
+struct PointerFieldLayout {
+  uint64_t Stride;
+  SmallVector<std::pair<uint64_t, uint64_t>, 8> Fields;
+
+  bool authorizes(uint64_t Offset, uint64_t AccessSize) const {
+    for (const auto &[Begin, Size] : Fields)
+      if (Offset >= Begin && Offset - Begin <= Size &&
+          AccessSize <= Size - (Offset - Begin))
+        return true;
+    return false;
+  }
+};
+
+// Distinguish absent legacy metadata from malformed present metadata: a bad
+// layout must not be rescued by the older offset-only representation.
+static std::optional<PointerFieldLayout>
+getPointerFieldLayout(const GlobalVariable &GV, bool &Present) {
+  Present = false;
   MDNode *MD = GV.getMetadata(MD_EJIT_METADATA);
   if (!MD)
-    return false;
+    return std::nullopt;
   const MDNode *Layout = nullptr;
   for (const MDOperand &Op : MD->operands()) {
     auto *Node = dyn_cast<MDNode>(Op.get());
-    if (!Node || Node->getNumOperands() < 2)
+    if (!Node || !Node->getNumOperands())
       continue;
     auto *Tag = dyn_cast<MDString>(Node->getOperand(0));
     if (Tag && Tag->getString() == "ejit_pointer_layout") {
+      Present = true;
       if (Layout)
-        return false;
+        return std::nullopt;
       Layout = Node;
     }
   }
-  if (!Layout)
-    return false;
+  if (!Layout || Layout->getNumOperands() < 2)
+    return std::nullopt;
   auto *StrideMD = mdconst::dyn_extract<ConstantInt>(Layout->getOperand(1));
   if (!StrideMD || StrideMD->getBitWidth() > 64)
-    return false;
+    return std::nullopt;
   uint64_t Stride = StrideMD->getZExtValue();
-  if (!Stride || AllocationSize % Stride)
-    return false;
-  uint64_t Offset = Relative % Stride;
-  bool Authorized = false;
+  if (!Stride)
+    return std::nullopt;
+  PointerFieldLayout Result{Stride, {}};
   for (unsigned I = 2; I < Layout->getNumOperands(); ++I) {
     auto *Field = dyn_cast<MDNode>(Layout->getOperand(I));
     if (!Field || Field->getNumOperands() != 2)
-      return false;
+      return std::nullopt;
     auto *BeginMD = mdconst::dyn_extract<ConstantInt>(Field->getOperand(0));
     auto *SizeMD = mdconst::dyn_extract<ConstantInt>(Field->getOperand(1));
     if (!BeginMD || !SizeMD || BeginMD->getBitWidth() > 64 ||
         SizeMD->getBitWidth() > 64)
-      return false;
+      return std::nullopt;
     uint64_t Begin = BeginMD->getZExtValue(), Size = SizeMD->getZExtValue();
     if (!Size || Begin > Stride || Size > Stride - Begin)
-      return false;
-    Authorized |= Offset >= Begin && Offset - Begin <= Size &&
-                  AccessSize <= Size - (Offset - Begin);
+      return std::nullopt;
+    Result.Fields.emplace_back(Begin, Size);
   }
-  return Authorized;
+  return Result;
+}
+
+/// Authorize a complete access within one compiler-described pointee element.
+static bool boundedPointerFieldAuthorized(const GlobalVariable &GV,
+                                          uint64_t AllocationSize,
+                                          uint64_t Relative,
+                                          uint64_t AccessSize) {
+  bool Present = false;
+  auto Layout = getPointerFieldLayout(GV, Present);
+  return Layout && AllocationSize % Layout->Stride == 0 &&
+         Layout->authorizes(Relative % Layout->Stride, AccessSize);
+}
+
+// The deployment guarantees a live, compile-readable element zero and the
+// existing period/free-dim invariants. This is a minimum readable extent, NOT
+// a discovered allocation size, and is never registered or used by strict.
+static const char *checkLightweightPointerWitness(
+    const GlobalVariable &GV, LoadInst *LI, uintptr_t Base, uintptr_t Target,
+    uint64_t AccessSize, const MayConstOffsetMap &Fields, const DataLayout &DL,
+    const AssumedArgMap &Assumed) {
+  if (!Base)
+    return "null-pointer-base";
+  if (Target < Base)
+    return "witness-beyond-element-zero";
+  const uint64_t Relative = Target - Base;
+  bool Present = false;
+  auto Layout = getPointerFieldLayout(GV, Present);
+  uint64_t Extent = 0;
+  if (Present) {
+    if (!Layout)
+      return "layout-or-field-unauthorized";
+    Extent = Layout->Stride;
+    uint64_t CheckedRelative = 0;
+    if (!absoluteRangeContains(Base, Extent, Target, AccessSize,
+                               CheckedRelative))
+      return "witness-beyond-element-zero";
+    // No modulo: a nonzero outer pointee element is not authorized.
+    if (!Layout->authorizes(Relative, AccessSize))
+      return "layout-or-field-unauthorized";
+  } else {
+    auto It = Fields.find(&GV);
+    if (It == Fields.end() || !llvm::is_contained(It->second, Relative))
+      return "layout-or-field-unauthorized";
+    // Legacy offsets alone do not describe a field's width. Preserve typed
+    // first-element witnesses; opaque byte chains without layout stay live.
+    auto Chain = collectAbsoluteGEPChain(LI->getPointerOperand(), DL);
+    if (!Chain || Chain->LeafToRoot.empty() ||
+        Chain->RootAddress.getZExtValue() != Base)
+      return "legacy-witness-missing-type";
+    Type *RootTy = Chain->LeafToRoot.back()->getSourceElementType();
+    if (!RootTy->isAggregateType() || !RootTy->isSized())
+      return "legacy-witness-missing-type";
+    TypeSize RootSize = DL.getTypeAllocSize(RootTy);
+    auto FieldSize = ejitMayConstFieldSizeInType(RootTy, Relative, DL);
+    if (RootSize.isScalable() || !FieldSize || AccessSize > *FieldSize)
+      return "layout-or-field-unauthorized";
+    Extent = RootSize.getFixedValue();
+    uint64_t CheckedRelative = 0;
+    if (!absoluteRangeContains(Base, Extent, Target, AccessSize,
+                               CheckedRelative))
+      return "witness-beyond-element-zero";
+  }
+  if (!absoluteGEPChainFitsObject(LI->getPointerOperand(), DL, Assumed, Base,
+                                  Extent))
+    return "invalid-gep-witness";
+  return nullptr;
 }
 
 /// Resolve a may_const load after IPSCCP/InstCombine has propagated a period
@@ -1521,7 +1597,8 @@ static bool boundedPointerFieldAuthorized(const GlobalVariable &GV,
 /// non-pointer registered object, accept only a unique, bounded and authorized
 /// field whose complete root-to-leaf GEP witness is valid. Pointer-form objects
 /// with explicit allocation bounds and compiler field ranges use the same
-/// witness checks. Unbounded pointers retain the legacy constant-index path.
+/// witness checks. Unbounded pointers additionally accept element-zero free-dim
+/// witnesses under the deployment's readable-pointee and lifecycle contract.
 /// Allocator-discovered bounds add strict folds only after legacy matching.
 static Constant *tryReplacePeriodAbsoluteAddress(
     LoadInst *LI, const Function &F, const GVPeriodMap &gvMap,
@@ -1546,14 +1623,16 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   // match that exists without an allocation lookup.
   unsigned DiscoveredMatches = 0;
   const uint8_t *DiscoveredCandidate = nullptr;
+  SmallVector<uintptr_t, 4> LightweightBases;
+  SmallVector<uintptr_t, 4> StrictBases;
   for (const auto &[GV, Info] : gvMap) {
     if (GV->getValueType()->isPointerTy()) {
       // Preserve the pre-existing constant-address path for pointer-valued
       // periods. It deliberately does not require the helper itself to carry
       // the consuming entry's lifecycle metadata: the pointer materialization
       // and the old absolute-address fold are also used through non-inlined
-      // helpers. Only supplied bounds below allow a free-dim witness; the
-      // legacy registration does not describe the pointee's extent.
+      // helpers. The lightweight witness path shares that lifecycle contract;
+      // it does not invent a new entry metadata requirement for such helpers.
       if (DL.getPointerSize(0) != sizeof(void *))
         continue;
       void *PointerSlot = resolveBase(GV, Info, reg);
@@ -1583,9 +1662,22 @@ static Constant *tryReplacePeriodAbsoluteAddress(
       // element-relative offset matcher missed. It grants no new lifecycle,
       // field-width or witness permissions: every strict check still applies.
       auto Bounds = reg.resolvePointerPeriodBounds(Name, Pointee);
+      if (Explicit || Bounds) {
+        StrictBases.push_back(PointeeBase);
+        if (Bounds)
+          StrictBases.push_back(reinterpret_cast<uintptr_t>(Bounds->base));
+      }
       uint64_t Relative = 0;
       const char *Rejection = nullptr;
-      if (!Bounds)
+      if (!Bounds && !Explicit && UsedAssumption) {
+        Rejection = checkLightweightPointerWitness(*GV, LI, PointeeBase, Target,
+                                                   AccessSize, mayConstFieldMap,
+                                                   DL, Assumed);
+        if (!Rejection) {
+          LightweightBases.push_back(PointeeBase);
+          continue;
+        }
+      } else if (!Bounds)
         Rejection = "unknown-bounds";
       else if (Pointee != Bounds->base)
         Rejection = "stale-pointer-base";
@@ -1649,6 +1741,27 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   // overlap remains ambiguous.
   if (!Matches && DiscoveredMatches == 1)
     return createConstantFromMemory(DiscoveredCandidate, LI->getType(), DL);
+  // Existing strict/legacy winners keep their precedence. A second global
+  // name must not rescue strict rejection of the same pointer allocation.
+  if (!Matches && !DiscoveredMatches && !LightweightBases.empty()) {
+    for (uintptr_t Base : LightweightBases)
+      if (llvm::is_contained(StrictBases, Base)) {
+        EJIT_DIAG_VERBOSE("period absolute load rejected fn=%s "
+                          "reason=strict-pointer-alias",
+                          F.getName().str().c_str());
+        return nullptr;
+      }
+    if (LightweightBases.size() == 1) {
+      EJIT_DIAG_VERBOSE("period absolute load folded fn=%s "
+                        "reason=lightweight-element-zero-witness",
+                        F.getName().str().c_str());
+      return createConstantFromMemory(reinterpret_cast<const uint8_t *>(Target),
+                                      LI->getType(), DL);
+    }
+    EJIT_DIAG_VERBOSE("period absolute load rejected fn=%s "
+                      "reason=ambiguous-lightweight-registration matches=%zu",
+                      F.getName().str().c_str(), LightweightBases.size());
+  }
   if (Matches > 1 || (!Matches && DiscoveredMatches > 1))
     EJIT_DIAG_VERBOSE("period absolute load rejected fn=%s "
                       "reason=ambiguous-registration matches=%u discovered=%u",
