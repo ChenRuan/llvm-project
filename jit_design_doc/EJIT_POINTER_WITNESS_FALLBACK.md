@@ -96,3 +96,49 @@ a synchronized configuration update. Host tests and BE object compilation are
 not multicore SRE/SDK acceptance. Enabling previously dormant annotations can
 expose incorrect business promises; additional folds must be audited rather
 than assuming that only previously reported sites will change.
+
+## C-source reproduction
+
+`ejit_test/ejit_pointer_witness_source_repro.c` is compiler-only input, not an
+SRE shell test. It deliberately declares, rather than supplies, the external
+storage and sink. It has no `main` or board initialization entry. The three
+entries cover direct access, taking `&g_1[cell].g_2[slot % N]` then reading,
+and taking the same address through an always-inline reader. Each sink also
+receives the real selected address, so removing the load must not redirect
+the pointer to slot zero. Slot stride is 128 bytes and the marked byte is at
+offset 31, matching the reported modulo/shift addressing shape.
+
+The C-source validation feeds the actual frontend embedded bitcode to the
+original PR252 field pass and the PR256 field pass with identical remaining
+pipeline components. It does not replace function bodies or synthesize field
+metadata. Set up two readable Cell objects; flags in cell0 are all one and
+flags in cell1 all zero. Register only the normal `g_1` period pointer slot,
+without pointer bounds or an allocation lookup for the positive case.
+
+Acceptance matrix (three entries x five cases x two optimization levels x
+three pipeline tiers x two slot counts x two byte orders = 360 cases):
+
+| Case | Expected final marked load |
+| --- | --- |
+| cell0, unknown bounds, free_dim present | Removed, sink flag is constant 1 |
+| cell1, unknown bounds | Retained |
+| cell1, explicit complete bounds | Removed, sink flag is constant 0 |
+| cell0, free_dim absent | Retained |
+| cell0, pointer registration absent | Retained |
+
+Both `%5` and `%10`, L2/L3 and Baseline/Instrumented/PGOUse configurations
+were checked. PR252 retains the load in all 72 unknown-bounds positive
+combinations; PR256 passes all 360 expected outcomes. The real slot argument
+and its dependent selected address remain live in every case. These tier
+configuration checks do not themselves run a live PGO profile; real online
+64-entry PGO and renewal validation is separate, as described above.
+
+The LE matrix uses the frontend pointer load unchanged. BE checks run on an
+LE host only after explicit root-pointer materialization; the frontend GEP,
+load and metadata remain intact. This is not a BE runtime or board execution.
+
+In the positive final IR, the flag load disappears and the call becomes
+`repro_sink(1, slot, selected)`. The `urem`/GEP may remain because `selected`
+must still identify the real slot. A surviving `urem` alone is not evidence
+that may_const folding failed. Product sites still require their real
+metadata and rejection reason to establish the same diagnosis.
