@@ -21,6 +21,28 @@ the runtime; business bitcode with PR249 pointer-layout metadata can be reused.
 Missing frontend field metadata is a separate problem, not repaired by this
 runtime fallback.
 
+### Local slot variables (PR247 integration)
+
+PR256 now also includes PR247's local-variable value boundaries. When slot is
+loaded inside the entry instead of passed as a free-dim parameter, use:
+
+```c
+const uint16_t slot ejit_free_dim = input->slot;
+uint8_t flag = g_1[cell].slots[slot % 5].flag;
+```
+
+The initialized integer local must remain read-only and not address-taken,
+inside an `ejit_entry` with a managed dimension. The usual field invariance,
+registered-root and lifecycle contracts still apply. This does not make every
+memory-loaded index constant or authorize an unmarked sibling use of
+`input->slot`. Real initializer evaluation, payload accesses and stores remain
+dynamic; only eligible marked loads consume the temporary zero witness.
+
+For this syntax, rebuild **both Clang and runtime from the integrated PR256**
+and regenerate business embedded bitcode. Updating the runtime alone cannot
+add a missing local marker to old bitcode. No additional flag, SDK callback,
+initializer or public ABI is needed. See `EJIT_LOCAL_FREE_DIM.md` for limits.
+
 ## Deployment contract
 
 The application explicitly guarantees all of the following, including for
@@ -128,8 +150,9 @@ than assuming that only previously reported sites will change.
 For the dedicated **core6 -> core16 -> core6** board test, use
 [`EJIT_POINTER_WITNESS_BOARD.md`](EJIT_POINTER_WITNESS_BOARD.md) and its single
 C `ejit_test/ejit_pointer_witness_sre_test.c`. It exercises unknown bounds at
-cell1, six marked fields, full-width i64, `%5/%10`, offsets and strides,
+cell1, seven marked fields, full-width i64, `%5/%10`, offsets and strides,
 normal 64-entry online PGO, live slot reads/writes and two generations. It
+includes `load(input+20) -> local free_dim -> %5 -> *184 -> +14`. It
 does not install the exact allocation-size callback used by the older
 pointer-period board demo. Default board waits are unlimited.
 

@@ -25,6 +25,8 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Transforms/IPO/Inliner.h"
+#include "llvm/Transforms/EmbeddedJIT/EJitFreeDim.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Transforms/IPO/SCCP.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Instrumentation/InstrProfiling.h"
@@ -143,6 +145,16 @@ void EJitOptimizer::clearAnalyses() {
 }
 
 void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
+  // All tier exits, including temporary PGO Gen and audit-only Baseline, must
+  // return executable IR with real runtime inputs and no private marker.
+  auto LowerFreeDims = make_scope_exit([&] {
+    if (lowerEJitLocalFreeDims(M))
+      EJIT_DIAG_VERBOSE("local-free-dim remaining boundaries lowered to real inputs");
+    // ORC destroys the module/context after materialization. MemorySSA and
+    // other cached analysis results must die while their IR is still alive,
+    // including unmarked modules and rejected-boundary fallback paths.
+    clearAnalyses();
+  });
   EJIT_DIAG_VERBOSE("pipeline begin func=%s key=0x%016lx opt=%d dims=%zu "
                     "tier=%d module=%s",
                     ctx.fnName.c_str(), ctx.cacheKey,
@@ -919,7 +931,10 @@ void EJitOptimizer::runStructFieldPass(Module &M,
       }
     }
   }
-  EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName);
+  SmallVector<EJitLocalWitnessPeriod, 4> LocalPeriods;
+  for (const auto &Dim : ctx.dimensions)
+    LocalPeriods.push_back({Dim.periodName, Dim.cellIdx});
+  EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName, LocalPeriods);
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration()) {

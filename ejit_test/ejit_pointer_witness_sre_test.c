@@ -1,5 +1,5 @@
 //===-- ejit_pointer_witness_sre_test.c - PR256 worker6 / owner16 demo ----===//
-// Matching EJIT Clang with PR249 pointer layouts + PR252/PR256 runtime.
+// Matching PR256 Clang/runtime, including PR247 local free-dim support.
 // Fresh image: core6 test_ejit_period; core16 test_ejit_period;
 // core6 test_ejit_pointer_witness_print. Shell arguments are ignored.
 // Normal online PGO, audit, diagnostics and runtime stats must be enabled.
@@ -35,7 +35,7 @@ extern uint8_t g_ucLocalCoreID;
 #define PR256_WAIT_ROUNDS 0u
 #endif
 #define PW_SHARED __attribute__((section(".mc_shared"), aligned(64)))
-#define PW_CASES 4u
+#define PW_CASES 5u
 #define PW_PHASES (2u * PW_CASES)
 
 struct WitnessNestedSlot {
@@ -77,6 +77,23 @@ struct WitnessFlatCell {
 struct WitnessLargeCell {
   struct WitnessLargeSlot slot[5];
 };
+struct WitnessLocalSlot {
+  uint32_t payload, visits;
+  uint8_t pad8[6];
+  ejit_may_const uint8_t field14;
+  uint8_t pad15[169];
+};
+struct WitnessLocalCell {
+  struct WitnessLocalSlot slot[5];
+};
+struct WitnessInput {
+  uint8_t pad[20];
+  uint16_t slot;
+};
+_Static_assert(sizeof(struct WitnessLocalSlot) == 184 &&
+                   offsetof(struct WitnessLocalSlot, field14) == 14 &&
+                   offsetof(struct WitnessInput, slot) == 20,
+               "Local slot witness must use load +20, stride184, field14");
 _Static_assert(sizeof(struct WitnessNestedSlot) == 352 &&
                    offsetof(struct WitnessNestedSlot, field9) == 9 &&
                    offsetof(struct WitnessNestedSlot, field344) == 344 &&
@@ -92,6 +109,7 @@ PW_SHARED struct WitnessNestedCell g_pr256_nested_cells[2];
 PW_SHARED struct WitnessWideCell g_pr256_wide_cells[2];
 PW_SHARED struct WitnessFlatCell g_pr256_flat_cells[2];
 PW_SHARED struct WitnessLargeCell g_pr256_large_cells[2];
+PW_SHARED struct WitnessLocalCell g_pr256_local_cells[2];
 PW_SHARED ejit_period_arr(cell)
 struct WitnessNestedCell *g_pr256_nested = g_pr256_nested_cells;
 PW_SHARED ejit_period_arr(cell)
@@ -100,6 +118,8 @@ PW_SHARED ejit_period_arr(cell)
 struct WitnessFlatCell *g_pr256_flat = g_pr256_flat_cells;
 PW_SHARED ejit_period_arr(cell)
 struct WitnessLargeCell *g_pr256_large = g_pr256_large_cells;
+PW_SHARED ejit_period_arr(cell)
+struct WitnessLocalCell *g_pr256_local = g_pr256_local_cells;
 
 ejit_entry uint64_t pr256_witness_nested(ejit_period_arr_ind(cell) uint8_t cell,
                                          ejit_free_dim uint16_t slot) {
@@ -134,14 +154,28 @@ ejit_entry uint64_t pr256_witness_mul1240(ejit_period_arr_ind(cell)
   return p->field9 * 100u + p->payload;
 }
 
+ejit_entry uint64_t pr256_witness_local184(ejit_period_arr_ind(cell)
+                                               uint8_t cell,
+                                           const struct WitnessInput *input) {
+  const uint16_t slot ejit_free_dim = input->slot;
+  struct WitnessLocalCell *cellp = &g_pr256_local[cell];
+  uint16_t offset = (uint16_t)((slot % 5u) * 184u);
+  struct WitnessLocalSlot *p =
+      (struct WitnessLocalSlot *)((unsigned char *)cellp + offset);
+  ++p->visits;
+  return p->field14 * 100u + p->payload;
+}
+
 typedef uint64_t (*pw_entry_t)(uint8_t, uint16_t);
+typedef uint64_t (*pw_local_entry_t)(uint8_t, const struct WitnessInput *);
 // Volatile indirection preserves actual generated wrapper calls at AOT O2.
-static pw_entry_t volatile pw_wrappers[PW_CASES] = {
+static pw_entry_t volatile pw_wrappers[4] = {
     pr256_witness_nested, pr256_witness_wide, pr256_witness_flat128,
     pr256_witness_mul1240};
+static pw_local_entry_t volatile pw_local_wrapper = pr256_witness_local184;
 static const char *const pw_names[PW_CASES] = {
     "pr256_witness_nested", "pr256_witness_wide", "pr256_witness_flat128",
-    "pr256_witness_mul1240"};
+    "pr256_witness_mul1240", "pr256_witness_local184"};
 static uint32_t pw_indices[PW_CASES], pw_cell_dim;
 static uint32_t pw_expected_visits[PW_CASES][10];
 enum { PW_RESET, PW_STARTING, PW_READY, PW_RUNNING, PW_DONE, PW_FAILED };
@@ -199,8 +233,10 @@ static uint32_t *pw_visits(unsigned which, unsigned cell, unsigned slot) {
     return &g_pr256_wide_cells[cell].slot[slot].visits;
   case 2:
     return &g_pr256_flat_cells[cell].slot[slot].visits;
-  default:
+  case 3:
     return &g_pr256_large_cells[cell].slot[slot].visits;
+  default:
+    return &g_pr256_local_cells[cell].slot[slot].visits;
   }
 }
 static uint32_t *pw_payload(unsigned which, unsigned cell, unsigned slot) {
@@ -211,8 +247,10 @@ static uint32_t *pw_payload(unsigned which, unsigned cell, unsigned slot) {
     return &g_pr256_wide_cells[cell].slot[slot].payload;
   case 2:
     return &g_pr256_flat_cells[cell].slot[slot].payload;
-  default:
+  case 3:
     return &g_pr256_large_cells[cell].slot[slot].payload;
+  default:
+    return &g_pr256_local_cells[cell].slot[slot].payload;
   }
 }
 static uint64_t pw_bits(unsigned mode) {
@@ -253,8 +291,15 @@ static int pw_call(unsigned which, unsigned slot, unsigned mode, unsigned extra,
     if (rc != EJIT_OK || !fn)
       return pw_fail("lookup failed");
   }
-  uint64_t actual = wrapper ? pw_wrappers[which](1u, (uint16_t)slot)
-                            : ((pw_entry_t)fn)(1u, (uint16_t)slot);
+  uint64_t actual;
+  if (which == 4u) {
+    const struct WitnessInput input = {{0}, (uint16_t)slot};
+    actual = wrapper ? pw_local_wrapper(1u, &input)
+                     : ((pw_local_entry_t)fn)(1u, &input);
+  } else {
+    actual = wrapper ? pw_wrappers[which](1u, (uint16_t)slot)
+                     : ((pw_entry_t)fn)(1u, (uint16_t)slot);
+  }
   if (!wrapper)
     ejit_taskpool_release_read(bucket);
   uint64_t expected = pw_expected(which, slot, mode, extra);
@@ -335,6 +380,7 @@ static void pw_set_data(unsigned mode) {
         g_pr256_flat_cells[cell].slot[slot].field9 = value;
         g_pr256_flat_cells[cell].slot[slot].field31 = value + 2u;
         g_pr256_large_cells[cell].slot[slot].field9 = value;
+        g_pr256_local_cells[cell].slot[slot].field14 = value;
       }
     }
     for (unsigned which = 0; which < PW_CASES; ++which)
@@ -482,8 +528,8 @@ int test_ejit_pointer_witness_print(uint8_t a, uint8_t b, uint8_t c,
     return -1;
   }
   SRE_printf("[PTR256] RUNTIME_CHECKS_PASS; FINAL_ACCEPTANCE_PENDING: "
-             "pgo=1, eight real 64-entry audits, four published T2 modules "
-             "entry_count=64; six marked fields folded, LIVE payload/visits. "
+             "pgo=1, ten real 64-entry audits, five published T2 modules "
+             "entry_count=64; seven marked fields folded, LIVE payload/visits. "
              "OWNER_DONE alone is not acceptance. Reset to rerun.\n");
   return 0;
 }
