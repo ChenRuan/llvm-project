@@ -19,6 +19,7 @@ add_llvm_unittest(EJITTests
   EJitPointerPeriodTest.cpp
   EJitFieldOffsetTest.cpp
   EJitLocalFreeDimTest.cpp
+  EJitPhiWitnessTest.cpp
   EJitLinkOptimizationPluginTest.cpp
   EJitPgoTest.cpp
   EJitVpMergeTest.cpp

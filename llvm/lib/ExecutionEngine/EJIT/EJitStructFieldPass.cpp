@@ -243,6 +243,13 @@ evalWithAssumed(const Value *V, const EJitFreeDimAssumptions &Assumed,
   if (isEJitLocalFreeDim(V) && Assumed.values.contains(V))
     return APInt(V->getType()->getIntegerBitWidth(), 0);
 
+  if (const auto *PN = dyn_cast<PHINode>(V)) {
+    auto It = Assumed.phiInputs.find(PN);
+    if (It == Assumed.phiInputs.end())
+      return std::nullopt;
+    return evalWithAssumed(It->second, Assumed, Depth + 1);
+  }
+
   if (const auto *Arg = dyn_cast<Argument>(V)) {
     auto It = Assumed.values.find(Arg);
     if (It == Assumed.values.end())
@@ -458,7 +465,7 @@ computeGEPOffset(const GEPOperator *GEP, const DataLayout &DL,
       IdxList.push_back(*I);
       continue;
     }
-    if (Assumed.values.empty())
+    if (Assumed.values.empty() && Assumed.phiInputs.empty())
       return std::nullopt;
     auto Folded = evalWithAssumed(*I, Assumed, 0);
     if (!Folded)
@@ -1215,7 +1222,7 @@ static std::optional<APInt> computeAbsoluteGEPOffset(
       Indices.push_back(CI->getValue());
       continue;
     }
-    if (Assumed.values.empty())
+    if (Assumed.values.empty() && Assumed.phiInputs.empty())
       return std::nullopt;
     auto Folded = evalWithAssumed(*I, Assumed, 0);
     if (!Folded || Folded->getBitWidth() > 64)
@@ -1620,7 +1627,8 @@ static bool hasConstantWitnessElement(const AbsoluteGEPChain &Chain,
                                       uint64_t Element, const DataLayout &DL,
                                       const EJitFreeDimAssumptions &Assumed) {
   APInt Current = Chain.RootAddress;
-  const EJitFreeDimAssumptions NoAssumed;
+  EJitFreeDimAssumptions NoAssumed;
+  NoAssumed.phiInputs = Assumed.phiInputs;
   for (auto It = Chain.LeafToRoot.rbegin(); It != Chain.LeafToRoot.rend();
        ++It) {
     const GEPOperator *GEP = *It;
@@ -1631,8 +1639,8 @@ static bool hasConstantWitnessElement(const AbsoluteGEPChain &Chain,
     if (Address >= Base && Address - Base < Stride) {
       TypeSize SourceSize = DL.getTypeAllocSize(GEP->getSourceElementType());
       if (!SourceSize.isScalable() && SourceSize.getFixedValue() == Stride)
-        if (auto *Index = dyn_cast<ConstantInt>(GEP->getOperand(1)))
-          if (!Index->isNegative() && Index->getValue().getActiveBits() <= 64 &&
+        if (auto Index = evalWithAssumed(GEP->getOperand(1), NoAssumed, 0))
+          if (!Index->isNegative() && Index->getActiveBits() <= 64 &&
               Index->getZExtValue() == Element)
             return true;
       // A separate constant byte/field GEP can also select the outer element.
@@ -1738,7 +1746,8 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   if (!TargetValue)
     return nullptr;
   const uintptr_t Target = static_cast<uintptr_t>(TargetValue->getZExtValue());
-  if (usesLocalFreeDim(LI->getPointerOperand(), Assumed) &&
+  if ((usesLocalFreeDim(LI->getPointerOperand(), Assumed) ||
+       !Assumed.phiInputs.empty()) &&
       (Target % LI->getAlign().value() ||
        Target % DL.getABITypeAlign(LI->getType()).value()))
     return nullptr;
@@ -2192,6 +2201,102 @@ tryReplaceIndirect(LoadInst *LI, const Value *PtrOp,
 }
 
 //===----------------------------------------------------------------------===//
+// Bounded PHI witness comparison
+//===----------------------------------------------------------------------===//
+
+static constexpr unsigned kMaxPhiWitnesses = 16;
+static constexpr unsigned kMaxPhiWitnessNodes = 64;
+
+static bool collectPhiWitnesses(
+    const Value *V, SmallPtrSetImpl<const Value *> &Active,
+    SmallPtrSetImpl<const Value *> &Visited,
+    SmallVectorImpl<const PHINode *> &Phis, unsigned &Witnesses,
+    unsigned Depth = 0) {
+  if (Depth > kMaxAssumedEvalDepth)
+    return false;
+  // A local free-dim call is a value boundary. In particular, do not inspect
+  // its initializer and accidentally authorize an unmarked sibling input.
+  if (isa<Constant, Argument, LoadInst, CallBase>(V))
+    return true;
+  if (Visited.contains(V))
+    return true;
+  if (Visited.size() + Active.size() >= kMaxPhiWitnessNodes ||
+      !Active.insert(V).second)
+    return false;
+  const auto *I = dyn_cast<Instruction>(V);
+  if (!I)
+    return false;
+  if (const auto *PN = dyn_cast<PHINode>(I)) {
+    unsigned Count = PN->getNumIncomingValues();
+    if (!PN->getType()->isIntegerTy() || !Count ||
+        Count > kMaxPhiWitnesses / Witnesses)
+      return false;
+    Witnesses *= Count;
+    Phis.push_back(PN);
+  }
+  for (const Use &Op : I->operands())
+    if (!collectPhiWitnesses(Op.get(), Active, Visited, Phis, Witnesses,
+                             Depth + 1))
+      return false;
+  Active.erase(V);
+  Visited.insert(V);
+  return true;
+}
+
+static Constant *tryReplacePhiWitness(
+    LoadInst *LI, const GVPeriodMap &Globals, const MayConstOffsetMap &Fields,
+    PeriodArrayRegistry &Registry, const DataLayout &DL,
+    const EJitFreeDimAssumptions &Assumed,
+    const StringMap<uint8_t> *LocalPeriods) {
+  if (!LI->isSimple() || !LI->getType()->isIntegerTy() ||
+      LI->getType()->getIntegerBitWidth() > 64)
+    return nullptr;
+  SmallPtrSet<const Value *, 16> Active, Visited;
+  SmallVector<const PHINode *, 4> Phis;
+  unsigned Witnesses = 1;
+  if (!collectPhiWitnesses(LI->getPointerOperand(), Active, Visited, Phis,
+                           Witnesses) || Phis.empty())
+    return nullptr;
+
+  const GlobalVariable *GV = findRootGV(LI->getPointerOperand());
+  auto Global = Globals.find(GV);
+  std::optional<uint8_t> Cell;
+  if (GV && Global != Globals.end() && LocalPeriods) {
+    auto P = LocalPeriods->find(Global->second.periodName);
+    if (P != LocalPeriods->end())
+      Cell = P->second;
+  }
+  EJitFreeDimAssumptions Selected = Assumed;
+  Constant *Common = nullptr;
+  // Enumerate a bounded superset of feasible edges. This may reject an
+  // infeasible combination, but never infer equality from only one path.
+  for (unsigned N = 0; N < Witnesses; ++N) {
+    unsigned Choice = N;
+    for (const PHINode *PN : Phis) {
+      unsigned Count = PN->getNumIncomingValues();
+      Selected.phiInputs[PN] = PN->getIncomingValue(Choice % Count);
+      Choice /= Count;
+    }
+    Constant *C = tryReplacePeriodAbsoluteAddress(
+        LI, *LI->getFunction(), Globals, Fields, Registry, DL, Selected);
+    if (!C && GV && Global != Globals.end())
+      C = tryReplaceLocalWitnessGEP(LI, LI->getPointerOperand(), GV,
+                                    Global->second, Fields, Registry, DL,
+                                    Selected, Cell);
+    if (!C || (Common && Common != C)) {
+      EJIT_DIAG_DEBUG("phi-witness missed fn=%s reason=%s",
+                      LI->getFunction()->getName().str().c_str(),
+                      C ? "different-incoming-values" : "unresolved-incoming");
+      return nullptr;
+    }
+    Common = C;
+  }
+  EJIT_DIAG_DEBUG("phi-witness folded fn=%s witnesses=%u",
+                  LI->getFunction()->getName().str().c_str(), Witnesses);
+  return Common;
+}
+
+//===----------------------------------------------------------------------===//
 // Public interface
 //===----------------------------------------------------------------------===//
 
@@ -2366,6 +2471,11 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
                                 : tryReplacePeriodAbsoluteAddress(
                                       LI, F, gvPeriodMap_, mayConstFieldMap_,
                                       registry_, DL, freeDimAssumptions_);
+    if (!C)
+      C = tryReplacePhiWitness(
+          LI, gvPeriodMap_, mayConstFieldMap_, registry_, DL,
+          freeDimAssumptions_,
+          F.getName() == boundRootFunction_ ? &localWitnessPeriods_ : nullptr);
     if (C)
       replacements.push_back({LI, C});
 #ifdef EJIT_DIAG_ENABLE

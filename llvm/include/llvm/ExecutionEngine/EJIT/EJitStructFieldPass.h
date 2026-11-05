@@ -26,6 +26,7 @@
 #endif
 
 namespace llvm {
+class PHINode;
 namespace ejit {
 
 struct GVPeriodInfo {
@@ -47,6 +48,9 @@ using AssumedArgMap = DenseMap<const Value *, uint64_t>;
 
 struct EJitFreeDimAssumptions {
   AssumedArgMap values;
+  // Per-candidate PHI edges, not new free-dim permissions. Populated only by
+  // the bounded all-incoming-values comparison; live SSA is never rewritten.
+  DenseMap<const PHINode *, const Value *> phiInputs;
   // Set only while collecting validated local marker calls. The pass never
   // creates markers, so marker-free modules need no dependency graph walks.
   bool hasLocalMarkers = false;
