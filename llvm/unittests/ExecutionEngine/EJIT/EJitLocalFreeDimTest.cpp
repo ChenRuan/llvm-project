@@ -25,6 +25,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "gtest/gtest.h"
 #include <chrono>
@@ -129,6 +130,157 @@ std::string serialize(Module &M) {
   return Bitcode;
 }
 } // namespace
+
+TEST(EJitLocalFreeDim, HoistedPointerFieldRetainsMayConstContract) {
+  for (bool Local : {false, true})
+    for (bool Mixed : {false, true})
+      for (auto Level :
+           {ejit::OptimizationLevel::L2, ejit::OptimizationLevel::L3})
+        for (auto Tier : {CompileTier::Baseline, CompileTier::Instrumented,
+                          CompileTier::PGOUse}) {
+          SCOPED_TRACE(::testing::Message()
+                       << "local=" << Local << " mixed=" << Mixed
+                       << "level=" << int(Level) << " tier=" << int(Tier));
+          LLVMContext C;
+          std::string IR = R"(
+            target datalayout = "e-p:64:64-i64:64-n8:16:32:64-S128"
+            %Algo = type { i64, [56 x i8] }
+            @branch_table = external global ptr, !ejit.metadata !0
+            declare i16 @__ejit_local_free_dim_v1_i16(i16) #0
+            declare void @before_a()
+            declare void @before_b()
+            declare void @sink_a(i64, i16, ptr)
+            declare void @sink_b(i64, i16, ptr)
+            declare void @sink_c(i64, i16, ptr)
+            define void @branch_work(i8 %trp, ptr %ctx, ptr %flags) !ejit.metadata !4 {
+            entry:
+              %slotp = getelementptr i8, ptr %ctx, i64 20
+              %raw = load i16, ptr %slotp, align 2
+          )";
+          if (Local)
+            IR += "%slot = call i16 @__ejit_local_free_dim_v1_i16(i16 %raw)\n";
+          else
+            IR += "%slot = add i16 %raw, 0\n";
+          IR += R"(
+              %flagp = getelementptr i8, ptr %flags, i64 8
+              %flag = load i8, ptr %flagp
+              %cond = icmp ne i8 %flag, 0
+              br i1 %cond, label %b, label %a
+            b:
+              call void @before_b()
+              %bp = load ptr, ptr @branch_table
+              %br = urem i16 %slot, 5
+              %bi = zext i16 %br to i64
+              %be = getelementptr %Algo, ptr %bp, i64 %bi
+              %bv = load i64, ptr %be, align 64, !ejit.may_const !7
+              call void @sink_b(i64 %bv, i16 %slot, ptr %be)
+              ret void
+            a:
+              call void @before_a()
+              %otherp = getelementptr i8, ptr %ctx, i64 22
+              %other = load i8, ptr %otherp
+              %choice = icmp ne i8 %other, 0
+              br i1 %choice, label %a1, label %a2
+            a1:
+              %ap = load ptr, ptr @branch_table
+              %ar = urem i16 %slot, 5
+              %ai = zext i16 %ar to i64
+              %ae = getelementptr %Algo, ptr %ap, i64 %ai
+              %av = load i64, ptr %ae, align 64, !ejit.may_const !7
+              call void @sink_a(i64 %av, i16 %slot, ptr %ae)
+              ret void
+            a2:
+              %cp = load ptr, ptr @branch_table
+              %cr = urem i16 %slot, 5
+              %ci = zext i16 %cr to i64
+              %ce = getelementptr %Algo, ptr %cp, i64 %ci
+              %cv = load i64, ptr %ce, align 64
+          )";
+          if (!Mixed)
+            IR += ", !ejit.may_const !7\n";
+          IR += R"(
+              call void @sink_c(i64 %cv, i16 %slot, ptr %ce)
+              ret void
+            }
+            attributes #0 = { nounwind willreturn memory(none) nocallback nosync "ejit.local_free_dim"="v1" }
+            !0 = !{!1, !2, !8}
+            !1 = !{!"ejit_period_arr", !"trp", i32 0}
+            !2 = !{!"ejit_may_const_field", i64 0}
+            !4 = !{!5, !6}
+            !5 = !{!"ejit_entry"}
+            !6 = !{!"ejit_period_arr_ind", !"trp", i32 0}
+            !7 = !{}
+            !8 = !{!"ejit_pointer_layout", i64 64, !9}
+            !9 = !{i64 0, i64 8}
+          )";
+          SMDiagnostic Error;
+          auto M = parseAssemblyString(IR, Error, C);
+          ASSERT_NE(M, nullptr) << Error.getMessage().str();
+          ASSERT_FALSE(verifyModule(*M, &errs()));
+          {
+            PassBuilder PB;
+            LoopAnalysisManager LAM;
+            FunctionAnalysisManager FAM;
+            CGSCCAnalysisManager CGAM;
+            ModuleAnalysisManager MAM;
+            PB.registerModuleAnalyses(MAM);
+            PB.registerCGSCCAnalyses(CGAM);
+            PB.registerFunctionAnalyses(FAM);
+            PB.registerLoopAnalyses(LAM);
+            PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+            FunctionPassManager FPM;
+            FPM.addPass(
+                SimplifyCFGPass(SimplifyCFGOptions().hoistCommonInsts(true)));
+            FPM.run(*M->getFunction("branch_work"), FAM);
+          }
+          auto *F = M->getFunction("branch_work");
+          unsigned Loads = 0, Marked = 0;
+          for (Instruction &I : instructions(F))
+            if (auto *L = dyn_cast<LoadInst>(&I))
+              if (L->getType()->isIntegerTy(64)) {
+                ++Loads;
+                Marked += L->hasMetadata("ejit.may_const");
+              }
+          ASSERT_EQ(Loads, 2U);
+          EXPECT_EQ(Marked, Mixed ? 1U : 2U);
+          alignas(64) uint64_t Data[40] = {};
+          for (unsigned I = 0; I < 5; ++I)
+            Data[I * 8] = 8;
+          void *Root = Data;
+          PeriodArrayRegistry Registry;
+          Registry.registerArray("trp", "branch_table", &Root, 0);
+          SpecializationContext Context;
+          Context.fnName = "branch_work";
+          Context.dimensions.push_back({"trp", 0});
+          Context.optLevel = Level;
+          Context.tier = Tier;
+          EJitOptimizer Optimizer(Registry);
+          Optimizer.runPipeline(*M, Context);
+          expectNoMarkers(*M);
+          Loads = 0;
+          unsigned ConstantSinks = 0, LiveInputLoads = 0;
+          for (Instruction &I : instructions(F)) {
+            if (auto *L = dyn_cast<LoadInst>(&I)) {
+              Loads += L->getType()->isIntegerTy(64);
+              LiveInputLoads += L->getType()->isIntegerTy(16);
+            }
+            if (auto *Call = dyn_cast<CallBase>(&I))
+              if (auto *Callee = Call->getCalledFunction())
+                if (Callee->getName().starts_with("sink_")) {
+                  if (auto *Value =
+                          dyn_cast<ConstantInt>(Call->getArgOperand(0))) {
+                    EXPECT_EQ(Value->getZExtValue(), 8U);
+                    ++ConstantSinks;
+                  }
+                  EXPECT_FALSE(isa<Constant>(Call->getArgOperand(1)));
+                  EXPECT_FALSE(isa<Constant>(Call->getArgOperand(2)));
+                }
+          }
+          EXPECT_EQ(Loads, Local ? unsigned(Mixed) : 2U);
+          EXPECT_EQ(ConstantSinks, Local ? (Mixed ? 1U : 3U) : 0U);
+          EXPECT_EQ(LiveInputLoads, 1U);
+        }
+}
 
 TEST(EJitLocalFreeDim, UnknownBoundsPointerFromLoadedSlotPreservesSibling) {
   for (bool BigEndian : {false, true})
