@@ -2104,9 +2104,77 @@ tryReplaceDirectGEP(LoadInst *LI, const Value *PtrOp, const GVPeriodMap &gvMap,
   return createConstantFromMemory(fieldAddr, LI->getType(), DL);
 }
 
-/// Pattern 3: load via an indirect pointer — first load a pointer from a GV,
-/// then GEP into the pointed-to data.
-/// e.g. %ptr = load ptr, ptr @g_pCfg  → GEP %S, ptr %ptr, i32 0, i32 0
+/// Upper bound on the GEPs and pointer loads resolveIndirectAddress walks
+/// through for one access.
+static constexpr unsigned kMaxIndirectWalkDepth = 16;
+
+struct IndirectAddress {
+  const uint8_t *addr;
+  unsigned reads; // pointer loads followed to reach addr
+};
+
+/// Resolve the runtime address \p Ptr denotes by walking from the access back
+/// to a period GlobalVariable, then reading every pointer on the way down.
+///
+/// The first pointer read out of the period global needs no marker: for a
+/// pointer-form period that slot is the period object itself. Every read past
+/// it must be a may_const load, since only a may_const pointer is promised not
+/// to change within the period. A null pointer ends the walk.
+static std::optional<IndirectAddress>
+resolveIndirectAddress(const Value *Ptr, const GVPeriodMap &gvMap,
+                       PeriodArrayRegistry &reg, const DataLayout &DL,
+                       unsigned Depth = 0) {
+  if (Depth >= kMaxIndirectWalkDepth)
+    return std::nullopt;
+  Ptr = Ptr->stripPointerCasts();
+
+  if (auto *GV = dyn_cast<GlobalVariable>(Ptr)) {
+    auto It = gvMap.find(GV);
+    // Pointer materialization exposes the strict absolute-address path on
+    // the next pass. Do not bypass its bounds/field checks here.
+    if (It == gvMap.end() || reg.getPointerPeriodBounds(GV->getName().str()))
+      return std::nullopt;
+    void *Base = resolveBase(GV, It->second, reg);
+    if (!Base)
+      return std::nullopt;
+    return IndirectAddress{static_cast<const uint8_t *>(Base), 0};
+  }
+
+  if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
+    auto Base = resolveIndirectAddress(GEP->getPointerOperand(), gvMap, reg,
+                                       DL, Depth + 1);
+    if (!Base)
+      return std::nullopt;
+    // See tryReplaceIndirect for why no free-dim assumption is used.
+    auto Off = computeGEPOffset(GEP, DL, EJitFreeDimAssumptions());
+    if (!Off)
+      return std::nullopt;
+    Base->addr += *Off;
+    return Base;
+  }
+
+  auto *Load = dyn_cast<LoadInst>(Ptr);
+  if (!Load || Load->isVolatile() || Load->isAtomic() ||
+      DL.getPointerSize(Load->getType()->getPointerAddressSpace()) !=
+          sizeof(void *))
+    return std::nullopt;
+  auto Slot = resolveIndirectAddress(Load->getPointerOperand(), gvMap, reg, DL,
+                                     Depth + 1);
+  if (!Slot || (Slot->reads && !Load->hasMetadata(MD_EJIT_MAY_CONST)))
+    return std::nullopt;
+  void *Pointee = nullptr;
+  std::memcpy(&Pointee, Slot->addr, sizeof(Pointee));
+  if (!Pointee)
+    return std::nullopt;
+  return IndirectAddress{static_cast<const uint8_t *>(Pointee),
+                         Slot->reads + 1};
+}
+
+/// Pattern 3: load through one or more pointers — a pointer read from a GV,
+/// optionally followed by may_const pointer fields, then a GEP into the
+/// pointed-to data.
+/// e.g. %p = load ptr, ptr @g_pCfg → %q = load ptr, (GEP %p), !ejit.may_const
+///      → load (GEP %q), !ejit.may_const
 static Constant *
 tryReplaceIndirect(LoadInst *LI, const Value *PtrOp,
                    const GVPeriodMap &gvMap, PeriodArrayRegistry &reg,
@@ -2117,76 +2185,10 @@ tryReplaceIndirect(LoadInst *LI, const Value *PtrOp,
   // tryReplaceDirectGEP bounds one. Declining the assumption is the
   // conservative half of that trade: a constant index still resolves exactly
   // as before, and no address the program may never form is dereferenced.
-  const EJitFreeDimAssumptions Assumed;
-  // Walk the GEP chain from the load's pointer operand to find
-  // the base LoadInst that reads the pointer value from a GV.
-  const Value *V = PtrOp;
-  SmallVector<const GEPOperator *, 4> FieldGEPs;
-  while (V) {
-    V = V->stripPointerCasts();
-    if (auto *GEP = dyn_cast<GEPOperator>(V)) {
-      FieldGEPs.push_back(GEP);
-      V = GEP->getPointerOperand();
-      continue;
-    }
-    break;
-  }
-
-  auto *BaseLoad = dyn_cast<LoadInst>(V);
-  if (!BaseLoad)
+  auto Field = resolveIndirectAddress(PtrOp, gvMap, reg, DL);
+  if (!Field || !Field->reads)
     return nullptr;
-
-  // Resolve the pointer-valued GV that BaseLoad reads from.
-  const Value *LoadPtr = BaseLoad->getPointerOperand()->stripPointerCasts();
-  const GlobalVariable *PtrGV = nullptr;
-  uint64_t ptrArrayByteOff = 0;
-
-  if (auto *DirectGV = dyn_cast<GlobalVariable>(LoadPtr)) {
-    PtrGV = DirectGV;
-  } else if (auto *PtrGEP = dyn_cast<GEPOperator>(LoadPtr)) {
-    PtrGV = dyn_cast<GlobalVariable>(
-        PtrGEP->getPointerOperand()->stripPointerCasts());
-    if (PtrGV) {
-      auto off = computeGEPOffset(PtrGEP, DL, Assumed);
-      if (!off)
-        return nullptr;
-      ptrArrayByteOff = *off;
-    }
-  }
-  if (!PtrGV)
-    return nullptr;
-
-  // Pointer materialization exposes the strict absolute-address path on the
-  // next pass. Do not bypass its bounds/field checks in this legacy fallback.
-  if (reg.getPointerPeriodBounds(PtrGV->getName().str()))
-    return nullptr;
-
-  auto it = gvMap.find(PtrGV);
-  if (it == gvMap.end())
-    return nullptr;
-
-  void *gvBase = resolveBase(PtrGV, it->second, reg);
-  if (!gvBase)
-    return nullptr;
-
-  // Read the stored pointer: *(void**)(gvBase + ptrArrayByteOff)
-  uintptr_t ptrSlot = reinterpret_cast<uintptr_t>(gvBase) + ptrArrayByteOff;
-  void *dataBase = nullptr;
-  std::memcpy(&dataBase, reinterpret_cast<void *>(ptrSlot), sizeof(void *));
-  if (!dataBase)
-    return nullptr;
-
-  // Compute field offset from the GEPs past the pointer dereference.
-  uint64_t fieldOff = 0;
-  for (auto It = FieldGEPs.rbegin(); It != FieldGEPs.rend(); ++It) {
-    auto off = computeGEPOffset(*It, DL, Assumed);
-    if (!off)
-      return nullptr;
-    fieldOff += *off;
-  }
-
-  auto *fieldAddr = static_cast<const uint8_t *>(dataBase) + fieldOff;
-  return createConstantFromMemory(fieldAddr, LI->getType(), DL);
+  return createConstantFromMemory(Field->addr, LI->getType(), DL);
 }
 
 //===----------------------------------------------------------------------===//
@@ -2342,7 +2344,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
                                     ? &localWitnessPeriods_
                                     : nullptr);
 
-      // Pattern 3: indirect pointer access (pointer-type period variable).
+      // Pattern 3: indirect pointer access (pointer-type period variable,
+      // then any number of may_const pointer fields).
       if (!C)
         C = tryReplaceIndirect(LI, PtrOp, gvPeriodMap_, registry_, DL);
 
