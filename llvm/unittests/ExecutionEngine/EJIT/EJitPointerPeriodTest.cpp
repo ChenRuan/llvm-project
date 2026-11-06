@@ -300,6 +300,188 @@ TEST(EJitPointerPeriod, LightweightNonzeroElementsAcrossTiersAndByteOrders) {
             }
 }
 
+// Rewrite the fixture's selected GEP so the free-dim witness is fused into
+// the outer element index: element = Element + (slot % Slots). This is the
+// shape `p[period_const * N + free % N]` takes after integer promotion, and
+// the fused byte form a flattened pool of stride-sized records produces.
+static void fuseWitnessElementIndex(Module &M, const PointerFixture &Fixture,
+                                    unsigned Element, bool ByteForm) {
+  Function *F = M.getFunction("probe");
+  auto *Selected =
+      cast<GetElementPtrInst>(F->getValueSymbolTable()->lookup("selected"));
+  auto *Phase = cast<Instruction>(F->getValueSymbolTable()->lookup("phase"));
+  IRBuilder<NoFolder> B(Selected);
+  Value *Witness = B.CreateZExt(Phase, B.getInt64Ty());
+  if (!ByteForm) {
+    // Typed element step, in the shape integer promotion produces: the add
+    // happens in a narrower width and is extended to the index width.
+    Value *Narrow = B.CreateAdd(B.CreateZExt(Phase, B.getInt32Ty()),
+                                B.getInt32(Element));
+    Selected->setOperand(1, B.CreateSExt(Narrow, B.getInt64Ty()));
+    Selected->setOperand(3, B.getInt64(0));
+    return;
+  }
+  Value *WitnessBytes = B.CreateMul(Witness, B.getInt64(Fixture.Stride));
+  Value *Offset =
+      B.CreateAdd(B.getInt64(Element * Fixture.Stride + 9), WitnessBytes);
+  auto *Bytes = cast<GetElementPtrInst>(B.CreateGEP(B.getInt8Ty(),
+                                                    Selected->getPointerOperand(),
+                                                    Offset, "fused"));
+  Selected->replaceAllUsesWith(Bytes);
+  Selected->eraseFromParent();
+}
+
+TEST(EJitPointerPeriod, LightweightFusedConstantPlusWitnessElements) {
+  for (unsigned Element : {0U, 1U, 2U, 15U})
+    for (unsigned Slots : {5U, 10U})
+      for (bool BigEndian : {false, true})
+        for (bool ByteForm : {false, true}) {
+          SCOPED_TRACE(Element);
+          SCOPED_TRACE(Slots);
+          SCOPED_TRACE(BigEndian);
+          SCOPED_TRACE(ByteForm);
+          PointerFixture Fixture(Slots);
+          Fixture.Data.resize((Element + 1) * Fixture.Stride);
+          Fixture.Pointer = Fixture.Data.data();
+          LLVMContext Ctx;
+          auto M = Fixture.module(Ctx, BigEndian, true, true, true, BigEndian);
+          ASSERT_NE(M, nullptr);
+          fuseWitnessElementIndex(*M, Fixture, Element, ByteForm);
+          for (unsigned I = 0; I < Slots; ++I)
+            Fixture.Data[Element * Fixture.Stride + 8 + I * 4 + 1] = 7;
+          useLiveSlotStores(*M, Fixture, Element);
+          PeriodArrayRegistry Registry;
+          Fixture.registerRoot(Registry);
+          optimize(*M, Registry);
+          EXPECT_EQ(markedLoads(*M), 0U);
+          EXPECT_FALSE(M->getFunction("probe")->getArg(1)->use_empty());
+          for (Instruction &I : instructions(M->getFunction("probe")))
+            if (auto *Ret = dyn_cast<ReturnInst>(&I)) {
+              auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
+              ASSERT_NE(Value, nullptr);
+              EXPECT_EQ(Value->getZExtValue(), 7U);
+            }
+          bool DynamicStore = false;
+          for (Instruction &I : instructions(M->getFunction("probe")))
+            if (auto *Store = dyn_cast<StoreInst>(&I))
+              DynamicStore |= !isa<Constant>(Store->getPointerOperand());
+          EXPECT_TRUE(DynamicStore);
+        }
+}
+
+TEST(EJitPointerPeriod, LightweightFusedWitnessAcrossTiersAndLevels) {
+  for (auto Tier : {CompileTier::Baseline, CompileTier::Instrumented,
+                    CompileTier::PGOUse})
+    for (auto Level :
+         {ejit::OptimizationLevel::L2, ejit::OptimizationLevel::L3})
+      for (bool BigEndian : {false, true}) {
+        SCOPED_TRACE(static_cast<unsigned>(Tier));
+        SCOPED_TRACE(static_cast<unsigned>(Level));
+        SCOPED_TRACE(BigEndian);
+        PointerFixture Fixture(5);
+        Fixture.Data.resize(3 * Fixture.Stride);
+        Fixture.Pointer = Fixture.Data.data();
+        LLVMContext Ctx;
+        auto M = Fixture.module(Ctx, BigEndian, true, true, true, BigEndian);
+        ASSERT_NE(M, nullptr);
+        fuseWitnessElementIndex(*M, Fixture, 2, false);
+        for (unsigned I = 0; I < Fixture.Slots; ++I)
+          Fixture.Data[2 * Fixture.Stride + 8 + I * 4 + 1] = 7;
+        useLiveSlotStores(*M, Fixture, 2);
+        PeriodArrayRegistry Registry;
+        Fixture.registerRoot(Registry);
+        optimize(*M, Registry, Tier, Level);
+        EXPECT_EQ(markedLoads(*M), 0U);
+        for (Instruction &I : instructions(M->getFunction("probe")))
+          if (auto *Ret = dyn_cast<ReturnInst>(&I)) {
+            auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
+            ASSERT_NE(Value, nullptr);
+            EXPECT_EQ(Value->getZExtValue(), 7U);
+          }
+      }
+}
+
+TEST(EJitPointerPeriod, LightweightRejectsUnsafeFusedWitnesses) {
+  for (unsigned Case = 0; Case != 6; ++Case) {
+    SCOPED_TRACE(Case);
+    PointerFixture Fixture(5);
+    LLVMContext Ctx;
+    auto M = Fixture.module(Ctx, true);
+    ASSERT_NE(M, nullptr);
+    auto *F = M->getFunction("probe");
+    auto *Selected =
+        cast<GetElementPtrInst>(F->getValueSymbolTable()->lookup("selected"));
+    auto *Phase = cast<Instruction>(F->getValueSymbolTable()->lookup("phase"));
+    IRBuilder<NoFolder> B(Selected);
+    if (Case == 3) {
+      // The fused shape folds; an unmarked sibling at the same address must
+      // survive on the real slot value.
+      Selected->setOperand(1,
+                           B.CreateAdd(B.CreateZExt(Phase, B.getInt64Ty()),
+                                       B.getInt64(1)));
+      Selected->setOperand(3, B.getInt64(0));
+      LoadInst *Marked = nullptr;
+      for (Instruction &I : instructions(F))
+        if (auto *Load = dyn_cast<LoadInst>(&I))
+          if (Load->hasMetadata("ejit.may_const"))
+            Marked = Load;
+      ASSERT_NE(Marked, nullptr);
+      IRBuilder<> SB(Marked);
+      (void)SB.CreateLoad(B.getInt8Ty(), Selected);
+    } else if (Case == 0) {
+      // A witness leaf that evaluates nonzero (xor(slot,1)) selects the
+      // element by assumption alone.
+      Selected->setOperand(1, B.CreateZExt(B.CreateXor(F->getArg(1),
+                                                       B.getInt16(1)),
+                                           B.getInt64Ty()));
+    } else if (Case == 1) {
+      // An outer index that is dynamic but not a free dim (the period
+      // argument before substitution) proves nothing.
+      Selected->setOperand(
+          1, B.CreateZExt(F->getArg(0), B.getInt64Ty()));
+    } else if (Case == 2) {
+      // The witness subtracted rather than added stays dynamic.
+      Selected->setOperand(1, B.CreateZExt(B.CreateSub(F->getArg(1),
+                                                       B.getInt16(1)),
+                                           B.getInt64Ty()));
+    } else if (Case == 4) {
+      // A constant part whose index*stride product overflows: the fixture
+      // GEP is `inbounds nuw`, so the flagged multiply rejects the target
+      // computation before any extent check runs.
+      Selected->setOperand(
+          1, B.CreateAdd(B.CreateZExt(Phase, B.getInt64Ty()),
+                         B.getInt64(uint64_t(1) << 61)));
+    } else {
+      // A select whose witness value is nonzero selects by assumption alone.
+      Selected->setOperand(
+          1, B.CreateSelect(B.CreateICmpEQ(F->getArg(1), B.getInt16(0)),
+                            B.getInt64(2), B.getInt64(0)));
+    }
+    PeriodArrayRegistry Registry;
+    Fixture.registerRoot(Registry);
+    EJitStructFieldPass Pass(Registry);
+    Pass.initFromModule(*M);
+    FunctionAnalysisManager AM;
+    Pass.run(*F, AM);
+    EXPECT_FALSE(verifyModule(*M, &errs()));
+    EXPECT_EQ(markedLoads(*M), Case == 3 ? 0U : 1U);
+    if (Case == 3) {
+      bool SiblingLoad = false;
+      for (Instruction &I : instructions(F))
+        if (auto *Load = dyn_cast<LoadInst>(&I))
+          if (!Load->hasMetadata("ejit.may_const"))
+            SiblingLoad |= !isa<Constant>(Load->getPointerOperand());
+      EXPECT_TRUE(SiblingLoad);
+      for (Instruction &I : instructions(F))
+        if (auto *Ret = dyn_cast<ReturnInst>(&I)) {
+          auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
+          ASSERT_NE(Value, nullptr);
+          EXPECT_EQ(Value->getZExtValue(), 1U);
+        }
+    }
+  }
+}
+
 TEST(EJitPointerPeriod, LightweightRejectsUnsafeOrUnauthorizedWitnesses) {
   for (unsigned Case = 0; Case != 10; ++Case) {
     SCOPED_TRACE(Case);
@@ -389,7 +571,9 @@ TEST(EJitPointerPeriod, LightweightNonzeroChecksSelectorsAndPrefix) {
       Selected->setOperand(
           0, ConstantExpr::getIntToPtr(B.getInt64(Base), B.getPtrTy()));
     } else if (Case < 5) {
-      // Neither slot+1 nor a wrapped slot-1 proves a fixed outer cell.
+      // slot+1 decomposes into a true constant (1) plus a zero witness, so
+      // the fused-index family accepts it (see the witness-fallback spec);
+      // a wrapped slot-1 still proves nothing.
       Value *Outer = Case == 3 ? B.CreateAdd(F->getArg(1), B.getInt16(1))
                                : B.CreateSub(F->getArg(1), B.getInt16(1));
       Selected->setOperand(1, B.CreateZExt(Outer, B.getInt64Ty()));
@@ -411,7 +595,14 @@ TEST(EJitPointerPeriod, LightweightNonzeroChecksSelectorsAndPrefix) {
     FunctionAnalysisManager AM;
     Pass.run(*F, AM);
     EXPECT_FALSE(verifyModule(*M, &errs()));
-    EXPECT_EQ(markedLoads(*M), Case == 5 ? 0U : 1U);
+    EXPECT_EQ(markedLoads(*M), (Case == 3 || Case == 5) ? 0U : 1U);
+    if (Case == 3 || Case == 5)
+      for (Instruction &I : instructions(F))
+        if (auto *Ret = dyn_cast<ReturnInst>(&I)) {
+          auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
+          ASSERT_NE(Value, nullptr);
+          EXPECT_EQ(Value->getZExtValue(), 1U);
+        }
   }
 }
 
@@ -663,7 +854,11 @@ TEST(EJitPointerPeriod, PreservesBoundPointerContextAfterLoopUnrolling) {
           if (WithSnapshot)
             Context.boundPointers.push_back({Data, sizeof(Data), 2, 1});
           Context.tier = Mode ? CompileTier::PGOUse : CompileTier::Baseline;
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+          // The audit-only field exists only in audit builds; without the
+          // define this iteration degenerates to the plain PGOUse case.
           Context.profileAuditOnly = Mode == 2;
+#endif
           Context.optLevel = Level;
           PeriodArrayRegistry Registry;
           EJitOptimizer Optimizer(Registry);

@@ -1613,6 +1613,88 @@ static bool boundedPointerFieldAuthorized(const GlobalVariable &GV,
          Layout->authorizes(Relative % Layout->Stride, AccessSize);
 }
 
+// Decompose a fused index add(true-constant, free-dim-witness) into the part
+// that is provable without witness assumptions. Additive chains recurse and
+// accumulate, and integer promotions (zext/sext/trunc) are looked through;
+// every other node must either fold under empty assumptions (a true
+// constant) or fold to exactly zero under the witness assumptions (a
+// free-dim term contributing nothing to the selected element). An unknown
+// dynamic value, or a witness that evaluates nonzero (xor(slot,1)), fails the
+// decomposition, so the element stays treated as dynamically selected. Both
+// directions go through evalWithAssumed, so the poison discipline for
+// nuw/nsw/nneg/samesign/trunc flags and the depth cap are inherited rather
+// than restated here.
+static std::optional<APInt>
+constantPartWithoutAssumptions(const Value *V,
+                               const EJitFreeDimAssumptions &Assumed,
+                               unsigned Depth = 0) {
+  if (Depth > kMaxAssumedEvalDepth || !V->getType()->isIntegerTy())
+    return std::nullopt;
+
+  const auto *BO = dyn_cast<BinaryOperator>(V);
+  if (BO && BO->getOpcode() == Instruction::Add) {
+    auto L = constantPartWithoutAssumptions(BO->getOperand(0), Assumed,
+                                            Depth + 1);
+    if (!L)
+      return std::nullopt;
+    auto R = constantPartWithoutAssumptions(BO->getOperand(1), Assumed,
+                                            Depth + 1);
+    if (!R)
+      return std::nullopt;
+    bool OvU = false, OvS = false;
+    APInt Res = L->uadd_ov(*R, OvU);
+    (void)L->sadd_ov(*R, OvS);
+    if ((BO->hasNoUnsignedWrap() && OvU) || (BO->hasNoSignedWrap() && OvS))
+      return std::nullopt;
+    return Res;
+  }
+
+  // An extension or truncation of a fused index decomposes through the cast:
+  // the constant part extends (or truncates), and a zero witness stays zero.
+  // Integer promotion wraps the source-level add in exactly this shape.
+  // Cast poison flags constrain the full value, which at the witness equals
+  // the constant part, so evalWithAssumed's checks apply to it directly.
+  if (const auto *Cast = dyn_cast<CastInst>(V)) {
+    const unsigned Opcode = Cast->getOpcode();
+    if (Opcode == Instruction::ZExt || Opcode == Instruction::SExt ||
+        Opcode == Instruction::Trunc) {
+      auto Inner = constantPartWithoutAssumptions(Cast->getOperand(0), Assumed,
+                                                  Depth + 1);
+      if (!Inner)
+        return std::nullopt;
+      const unsigned Width = V->getType()->getIntegerBitWidth();
+      if (Opcode == Instruction::ZExt) {
+        if (const auto *PNI = dyn_cast<PossiblyNonNegInst>(Cast))
+          if (PNI->hasNonNeg() && Inner->isNegative())
+            return std::nullopt;
+        return Inner->zext(Width);
+      }
+      if (Opcode == Instruction::SExt)
+        return Inner->sext(Width);
+      APInt Narrow = Inner->trunc(Width);
+      const auto *TI = cast<TruncInst>(Cast);
+      if (TI->hasNoUnsignedWrap() &&
+          Narrow.zext(Inner->getBitWidth()) != *Inner)
+        return std::nullopt;
+      if (TI->hasNoSignedWrap() &&
+          Narrow.sext(Inner->getBitWidth()) != *Inner)
+        return std::nullopt;
+      return Narrow;
+    }
+  }
+
+  // A true constant proves itself without any witness assumption.
+  if (auto Fixed = evalWithAssumed(V, EJitFreeDimAssumptions(), Depth))
+    return Fixed;
+
+  // Anything else must be a free-dim term whose witness contributes exactly
+  // zero; a nonzero witness would select an element by assumption alone.
+  auto Witness = evalWithAssumed(V, Assumed, Depth);
+  if (Witness && Witness->isZero())
+    return APInt(V->getType()->getIntegerBitWidth(), 0);
+  return std::nullopt;
+}
+
 // Retain a fixed outer-element selector, not just a nonzero result obtained
 // by setting an arbitrary dynamic outer index to its free-dim witness.
 static bool hasConstantWitnessElement(const AbsoluteGEPChain &Chain,
@@ -1642,6 +1724,34 @@ static bool hasConstantWitnessElement(const AbsoluteGEPChain &Chain,
         if (Next >= Base && (Next - Base) / Stride == Element)
           return true;
       }
+      // A fused single index add(true-constant, witness) selects the outer
+      // element with the same guarantee as the separate constant step above:
+      // the constant part proves the element without the witness, and every
+      // other term contributes exactly the zero witness. After period
+      // substitution this shape is indistinguishable from a source-level
+      // slot+K, so the accepted family and its costs are declared in the
+      // witness-fallback spec rather than narrowed here.
+      if (auto Const =
+              constantPartWithoutAssumptions(GEP->getOperand(1), Assumed))
+        if (!Const->isNegative() && Const->getActiveBits() <= 64)
+          if (!SourceSize.isScalable()) {
+            const uint64_t Scale = SourceSize.getFixedValue();
+            if (Scale == Stride) {
+              // Typed element step: the index is already in element units.
+              if (Const->getZExtValue() == Element)
+                return true;
+            } else if (GEP->getNumOperands() == 2 && Const->getZExtValue() &&
+                       Scale <= std::numeric_limits<uint64_t>::max() /
+                                    Const->getZExtValue()) {
+              // Single-index byte step: mirror the constant-step condition.
+              const uint64_t Next = (Current + APInt(Current.getBitWidth(),
+                                                     Const->getZExtValue() *
+                                                         Scale))
+                                        .getZExtValue();
+              if (Next >= Base && (Next - Base) / Stride == Element)
+                return true;
+            }
+          }
     }
     Current += *Offset;
   }

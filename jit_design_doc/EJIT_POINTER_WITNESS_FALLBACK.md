@@ -86,10 +86,17 @@ automatic lifetime tracking or runtime equality test.
   element is not enough to identify which unknown-sized registration owns it;
   it remains unsupported. In particular, normalizing arbitrary unrelated
   addresses by the stride must not create eligible matches.
-- The nonzero outer element must also be selected by a retained constant
-  typed index or a separate constant address step. A dynamic outer index
-  such as `slot+1` or wrapped `slot-1` is not granted a larger readable extent
-  merely because its zero-valued witness evaluates to a positive number.
+- The nonzero outer element must be selected by a retained constant typed
+  index, a separate constant address step, or a fused outer index
+  `add(true-constant, witness)`: the constant part must be provable without
+  witness assumptions, and every other term of the index must fold to exactly
+  the zero witness. Integer promotions (`zext`/`sext`/`trunc`) around the
+  fused add are looked through with the same poison checks. After period
+  substitution a fused `k * N + free % N` index is indistinguishable from a
+  source-level `slot+K`, so this family is accepted as a whole; the declared
+  costs below follow from that. A wrapped `slot-1` and a witness leaf that
+  evaluates nonzero (for example `xor(slot,1)`) are still not granted a
+  larger readable extent.
 - After trying existing legacy/strict paths, the pass materializes registered
   roots and retries unresolved field loads in the same round. This preserves
   the anchor before InstCombine folds the nonzero cell offset into the root.
@@ -105,6 +112,22 @@ automatic lifetime tracking or runtime equality test.
   alias cannot rescue strict rejection of the same pointer base.
 - Pure constant `p[k]` accesses gain no new permission. Existing legacy folds
   and PR252's bounded/discovered folds keep their existing behavior.
+
+Accepting the fused-index family revises PR254 v2's "element zero only,
+`free+K` refused" stance under the same deployment contract as the typed
+nonzero extension: the constant part selects the element exactly as a
+literal `p[k]` would, the readable-prefix promise covers the selected
+witness element, and value correctness across free dimensions remains the
+application's `free_dim + may_const` invariance promise — the fused
+acceptance adds no value-level trust. The cost is coverage, not safety:
+annotations that previously never folded because of the refusal now
+activate, so an incorrectly promised `slot+K` site freezes a wrong value
+instead of staying live, and board acceptance must diff audit counts (the
+expected delta equals the known fused sites — including raw `free*N + K`
+shapes, not just `k*N + free%N`; anything beyond that needs site-by-site
+investigation). A successful fold still reports
+`lightweight-anchored-element-witness`; a declined fused index still
+reports `nonzero-witness-dynamic-element`.
 
 Legacy offset-only metadata can authorize an exact field start only when an
 aggregate-rooted GEP still describes the first element and its field width.
@@ -136,6 +159,11 @@ deactivates, changes configuration and repeats.
 The nonzero-element extension repeats this online test at element 1 and adds
 cell 1/2/15, both byte orders, typed legacy/layout metadata, dynamic-cell,
 overflow, intermediate-escape, unrelated-root and strict-alias controls.
+The fused-index extension covers elements 0/1/2/15 with N=5/10 in typed and
+single-index byte form across byte orders and tiers, rejects `xor(slot,1)`,
+`slot-1`, unmapped dynamic outer arguments and extent overflow, keeps an
+unmarked sibling load live, and flips the former `slot+1` refusal into an
+accepted case with a per-element value check.
 
 Board acceptance still requires rebuilding the product runtime, running the
 same business workload with the established worker/owner initialization,
