@@ -76,8 +76,9 @@ static bool mayConstSitesCorrespond(const EJitMayConstLoadSite &L,
 }
 #endif
 
-EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
-    : registry_(reg) {
+EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM,
+                             bool verifySubstitution)
+    : registry_(reg), verifySubstitution_(verifySubstitution) {
   // Use the real llvm::PassBuilder to register the FULL analysis set. The O2
   // function-simplification pipeline (GVN, CorrelatedValuePropagation, etc.)
   // needs analyses the minimal EJitPassBuilder does not register (~13 vs ~40).
@@ -184,6 +185,12 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   lastMayConstLoadSites_.clear();
+#endif
+
+#ifdef EJIT_VERIFY_SUBSTITUTION
+  if (verifySubstitution_)
+    EJIT_DIAG("verify mode: checking may_const values instead of freezing "
+              "them; diagnostic image, not a performance measurement");
 #endif
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
@@ -934,7 +941,8 @@ void EJitOptimizer::runStructFieldPass(Module &M,
   SmallVector<EJitLocalWitnessPeriod, 4> LocalPeriods;
   for (const auto &Dim : ctx.dimensions)
     LocalPeriods.push_back({Dim.periodName, Dim.cellIdx});
-  EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName, LocalPeriods);
+  EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName,
+                                  LocalPeriods, verifySubstitution_);
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration()) {
