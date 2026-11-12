@@ -102,6 +102,33 @@ typedef enum {
   EJIT_STATUS_ICACHE_HIT_SENTINEL = 0xFE,
 } ejit_status_t;
 
+/// Register the allocation behind a pointer-valued period global before
+/// ejit_init. \p varName is the global's symbol name, \p base is the pointer's
+/// value (not its address), and \p size is the allocation size in bytes. The
+/// allocation must stay mapped until ejit_shutdown; bounds do not follow the
+/// pointer to a different allocation. Repeating identical bounds succeeds;
+/// invalid, conflicting, or post-init calls return EJIT_ERR_INVALID_PARAM.
+ejit_status_t ejit_register_pointer_period_bounds(const char *varName,
+                                                  const void *base,
+                                                  uint64_t size);
+
+/// Return the size in bytes of the allocation starting exactly at \p base, or
+/// zero if unknown. Reported allocations must stay mapped until ejit_shutdown.
+/// Called from the compiler worker, so it must be thread-safe, and it must not
+/// call back into EJIT.
+typedef uint64_t (*ejit_allocation_size_lookup_t)(const void *base,
+                                               void *context);
+
+/// Install an allocator size lookup before ejit_init, on every image including
+/// the compiler worker. Compilation queries it for pointer-valued period
+/// globals so free_dim loads through them can fold without per-global bounds.
+/// Explicit bounds take precedence, and folds made without a lookup are
+/// unchanged. Compiled code is not invalidated when allocations change.
+/// Repeating an identical install succeeds; null, conflicting, or post-init
+/// installs return EJIT_ERR_INVALID_PARAM. Install again after ejit_shutdown.
+ejit_status_t ejit_set_allocation_size_lookup(ejit_allocation_size_lookup_t lookup,
+                                             void *context);
+
 typedef enum {
   EJIT_COMPILE_SYNC = 0,
   EJIT_COMPILE_ASYNC = 1,
@@ -166,6 +193,70 @@ typedef struct {
   char message[256];
   char funcName[128];
 } ejit_error_t;
+
+/// Substitution-verifier counters (ejit_init_verify). `sites` counts emitted
+/// instrumented sites since the last reset; `checks` and `mismatches` count
+/// executions since that reset. A non-zero `mismatches` proves frozen/live
+/// disagreement, but does not by itself classify the cause as an invalid
+/// annotation.
+typedef struct {
+  uint64_t sites;      ///< emitted sites since reset
+  uint64_t checks;     ///< executed checks since reset
+  uint64_t mismatches; ///< frozen/live disagreements since reset
+} ejit_verify_stats_t;
+
+/// Longest site name kept per record, including the terminator. Must match
+/// llvm::ejit::kVerifySiteNameMax.
+#define EJIT_VERIFY_SITE_NAME_MAX 64
+
+/// One instrumented may_const access. `site` is a bounded display name of the
+/// form "<func>:<global>+<byteOffset>". Record identity is kept separately by
+/// the runtime, so callers must not use a truncated display prefix as a key.
+/// The totals say something diverged; this says which field did — and without
+/// EJIT_DIAG_ENABLE it is the only form that says so.
+typedef struct {
+  char site[EJIT_VERIFY_SITE_NAME_MAX];
+  uint64_t checks;      ///< executions of this site
+  uint64_t mismatches;  ///< executions where memory != the frozen value
+  uint64_t lastFrozen;  ///< frozen value at the most recent mismatch
+  uint64_t lastActual;  ///< memory value at the most recent mismatch
+} ejit_verify_site_t;
+
+/// The verifier entry points below are DEFINED only under EJIT_VERIFY_SUBSTITUTION;
+/// linking them otherwise is an undefined reference. They are declared
+/// unconditionally because a caller cannot see the runtime's build flags —
+/// test for the symbol at build time (ejit_test/build.sh reads CMakeCache)
+/// rather than calling one to find out.
+
+/// Initialize with the may_const substitution verifier enabled: keep the marked
+/// loads and check them against what would have been frozen, instead of
+/// freezing them (EJitVerify.h). Additive entry point for the same reason as
+/// ejit_init_pgo — `ejit_config_t` keeps its original layout, so an old
+/// caller's struct is never over-read. Eligible marked loads survive for
+/// checking; other optimizations still run. Plain ejit_init() never verifies.
+ejit_status_t ejit_init_verify(const ejit_config_t *config);
+
+/// Same diagnostic with normal online PGO (T1 sampling and T2 publication).
+/// Choose this instead of calling ejit_init_pgo followed by ejit_init_verify.
+/// Both participating SRE cores must use the same initializer on a fresh image.
+ejit_status_t ejit_init_verify_pgo(const ejit_config_t *config);
+
+/// Always 1 where defined at all.
+int ejit_verify_available(void);
+
+void ejit_verify_get_stats(ejit_verify_stats_t *out);
+
+/// Copy up to \p max per-site records into \p out, returning the number
+/// written (ordered by first execution). Sites past the runtime's fixed table
+/// capacity are counted in the totals but have no record.
+size_t ejit_verify_get_sites(ejit_verify_site_t *out, size_t max);
+
+void ejit_verify_reset_stats(void);
+
+/// Shell-friendly summary and retained site records, at INFO log level.
+/// Zero executed checks explicitly means no verification coverage, not PASS.
+/// Does not reset counters or change the active runtime.
+void ejit_verify_dump(void);
 
 // Initialization
 ejit_status_t ejit_init(const ejit_config_t *config);

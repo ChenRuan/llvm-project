@@ -206,6 +206,8 @@ ALL_TESTS=(
   ejit_fixed_dim_test
   ejit_perf_bench
   ejit_ptr_period_test
+  ejit_pointer_period_bounds_test
+  ejit_pointer_period_lookup_test
   ejit_trace_test
   ejit_volatile_test
   ejit_l0_dispatch_test
@@ -221,6 +223,15 @@ if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] && \
   ALL_TESTS+=(ejit_switch_case_test ejit_switch_case_pgo_test)
   echo "Switch-case:    EJIT_SWITCH_CASE=ON (ejit_switch_case_test," \
        "ejit_switch_case_pgo_test enabled)"
+fi
+
+# Substitution-verifier test: the ejit_verify_* entry points exist only in a
+# runtime built with EJIT_VERIFY_SUBSTITUTION, so building it against a normal
+# runtime is an undefined-reference link failure, not a skip.
+if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] && \
+   grep -q "^EJIT_VERIFY_SUBSTITUTION:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
+  ALL_TESTS+=(ejit_verify_subst_test)
+  echo "Verifier:       EJIT_VERIFY_SUBSTITUTION=ON (ejit_verify_subst_test enabled)"
 fi
 
 # Per-test compile flags (e.g. for disabling global constructors)
