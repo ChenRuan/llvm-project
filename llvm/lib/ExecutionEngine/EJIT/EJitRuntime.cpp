@@ -363,6 +363,8 @@ static_assert(std::is_standard_layout<ejit_config_t>::value,
 // ejit_init_verify. \p forcePgo forces the online-PGO auto-trigger on and
 // \p forceVerify the substitution verifier, both regardless of the
 // (unversioned) config.
+static bool gFinalVersionMergeEnabled = false;
+
 static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo,
                                   bool forceVerify = false) {
   if (gEJIT) {
@@ -380,6 +382,7 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo,
 
   Config cfg;
   parseConfig(config, cfg);
+  cfg.enableFinalVersionMerge = gFinalVersionMergeEnabled;
 #if defined(EJIT_SRE_SHARED_TASKPOOL) &&                                  \
     defined(EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE)
   // Fixed-worker deployments may skip EJIT constructors on producer cores.
@@ -429,6 +432,14 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo,
 }
 
 extern "C" {
+
+ejit_status_t ejit_set_final_version_merge(int enabled) {
+  if (gEJIT)
+    return gFinalVersionMergeEnabled == (enabled != 0) ? EJIT_OK
+                                                      : EJIT_ERR_INVALID_PARAM;
+  gFinalVersionMergeEnabled = enabled != 0;
+  return EJIT_OK;
+}
 
 ejit_status_t ejit_init(const ejit_config_t *config) {
   return ejitInitImpl(config, /*forcePgo=*/false);
