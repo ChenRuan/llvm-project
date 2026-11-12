@@ -25,6 +25,7 @@ add_llvm_unittest(EJITTests
   EJitVpScalarSpecTest.cpp
   EJitVpPipelineTest.cpp
   EJitSwitchCaseTest.cpp
+  EJitVersionMergeTest.cpp
 
   PARTIAL_SOURCES_INTENDED
   )
