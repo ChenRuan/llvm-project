@@ -1383,9 +1383,12 @@ Vyukov MPSC，单消费者=唯一 owner worker（§1.3 SC 前提不变）：
 
 ### 11.9 构建开关（最小集合）
 
+迁移注意：分配器模块 ID 现固定为 0，共享池拆分页表固定跟踪 16 个不同的 2MiB 池。若仍通过编译器 `-D` 设置 `EJIT_SRE_CODE_POOL_MID` 或 `EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS`，原默认值可兼容，其他值会报编译错误。遇到此错误须先确认固定值适用于产品，再移除旧参数并重编所有参与镜像；不要混用不同布局的镜像。
+
 | CMake / build.sh | 含义 | 默认 |
 |------|------|------|
 | `EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE` / `--sre-taskpool-worker-stack-size=` | worker 栈字节数（**单一事实源**；`EJitSreTask_sre.cpp` 直接消费） | 1048576 |
+| `EJIT_SRE_TASK_PRIORITY` | 传给 `SRE_TaskCreate` 的 worker 优先级；十进制 0–65535，须符合平台调度器限制 | 20 |
 | `EJIT_SRE_SHARED_CODE_POINTERS` / `--sre-shared-code-pointers` | 允许非 owner 核读共享 cache fnPtr（需平台同 VA + cache coherent；错误开启可致非法执行） | OFF |
 | `EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS` | 每桶固定缓存槽数 | 16 |
 | `EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE` / `--sre-shared-worker-core=<n>` | 固定 worker 核：仅指定核可赢 owner 竞选并运行唯一 worker，非指定核有界等待后 attach（空 = 开放 CAS 竞选；指定核必须在 bring-up 以 Async 激活 EJit） | 空（生产 preset `ejit-minimal-aarch64_be` 固定为核 6） |

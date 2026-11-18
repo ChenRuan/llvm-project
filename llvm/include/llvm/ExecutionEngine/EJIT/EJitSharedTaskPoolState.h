@@ -66,13 +66,6 @@
 #ifndef EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS
 #define EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS 16u
 #endif
-// Number of distinct 2MiB code pools whose per-core 4K split state is tracked
-// in the shared blob. Open-addressed by pool base, so this is a hard capacity:
-// once full, a peer hitting an untracked pool cleanly falls back rather than
-// risking an unbounded table or a duplicate split entry.
-#ifndef EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS
-#define EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS 16u
-#endif
 #ifndef EJIT_SRE_SHARED_DUMP_NAME_BYTES
 #define EJIT_SRE_SHARED_DUMP_NAME_BYTES 128u
 #endif
@@ -103,7 +96,16 @@ constexpr uint32_t kEJitSharedCacheBuckets = EJIT_SRE_TASKPOOL_BUCKETS;
 constexpr uint32_t kEJitNoBucket = 0xFFFFFFFFu;
 constexpr uint32_t kEJitSharedCacheSlots = EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS;
 constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
-constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
+// Number of distinct 2MiB code pools whose per-core 4K split state is tracked
+// in the shared blob. Open-addressed by pool base, so this is a hard capacity:
+// once full, a peer hitting an untracked pool cleanly falls back rather than
+// risking an unbounded table or a duplicate split entry.
+constexpr uint32_t kEJitSharedPoolSlots = 16u;
+#ifdef EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS
+static_assert(EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS == kEJitSharedPoolSlots,
+              "EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS is retired; remove the "
+              "override and rebuild all images with the same shared layout");
+#endif
 constexpr uint32_t kEJitSharedMaxConcurrentProfiles = 16u;
 static_assert(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES >= 1u &&
                   EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES <=

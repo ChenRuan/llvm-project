@@ -35,17 +35,15 @@
 #define EJIT_SRE_CODE_POOL_PTNO 8
 #endif
 
-// Memory module id passed to SRE_MemDbgAlloc. Not architecturally significant
-// for the pool; overridable if a deployment needs a specific id.
-#ifndef EJIT_SRE_CODE_POOL_MID
-#define EJIT_SRE_CODE_POOL_MID 0
-#endif
-
 namespace {
 constexpr unsigned long long kSrePoolSize = EJIT_SRE_CODE_POOL_SIZE;
 constexpr unsigned char kSrePtNo =
     static_cast<unsigned char>(EJIT_SRE_CODE_POOL_PTNO);
-constexpr unsigned kSreMid = static_cast<unsigned>(EJIT_SRE_CODE_POOL_MID);
+constexpr unsigned kSreMid = 0;
+#ifdef EJIT_SRE_CODE_POOL_MID
+static_assert(EJIT_SRE_CODE_POOL_MID == kSreMid,
+              "EJIT_SRE_CODE_POOL_MID is retired; only module ID 0 is supported");
+#endif
 constexpr size_t k2MiB = static_cast<size_t>(2) * 1024 * 1024;
 constexpr size_t k4KiB = static_cast<size_t>(4) * 1024;
 } // namespace
