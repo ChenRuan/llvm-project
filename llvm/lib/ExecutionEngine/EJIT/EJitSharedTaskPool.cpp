@@ -1464,29 +1464,6 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
       } else {
         sampleIndex = Slot.hitCount.fetchAdd(1) + 1;
       }
-      uint32_t admissionSlot = kEJitSharedMaxConcurrentProfiles;
-      if (slotTier == kEJitTierInstrumented && threshold) {
-        const uint32_t encoded = Slot.funcIndex + 1;
-        for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
-          if (state_->pgoActiveFunctions[i].loadAcquire() == encoded) {
-            admissionSlot = i;
-            break;
-          }
-        }
-      }
-      if (admissionSlot != kEJitSharedMaxConcurrentProfiles) {
-        uint32_t quarter = static_cast<uint32_t>(
-            std::min<uint64_t>(4, (sampleIndex * 4) / threshold));
-        uint32_t oldQuarter =
-            state_->pgoProgressQuarters[admissionSlot].loadRelaxed();
-        while (quarter > oldQuarter &&
-               !state_->pgoProgressQuarters[admissionSlot].compareExchange(
-                   oldQuarter, quarter)) {
-        }
-        if (quarter > oldQuarter)
-          EJIT_DIAG("PGO profile progress func=%u: %llu/%u", Slot.funcIndex,
-                    static_cast<unsigned long long>(sampleIndex), threshold);
-      }
       // >= (not ==): if the enqueue fails (queue full / already pending),
       // the next hit can still arm — a transient failure is not fatal (§7).
       if (threshold && sampleIndex >= threshold) {
@@ -1649,7 +1626,6 @@ bool EJitSharedTaskPool::admitPgoFunction(uint32_t funcIndex,
     return false;
   }
 
-  state_->pgoProgressQuarters[freeSlot].storeRelaxed(0);
   state_->pgoActiveFunctions[freeSlot].storeRelease(encoded);
   state_->pgoActiveFunctionCount.storeRelease(activeCount + 1);
   state_->pgoAdmissionLock.storeRelease(0);
@@ -1676,7 +1652,6 @@ void EJitSharedTaskPool::finishPgoFunction(uint32_t funcIndex, bool completed,
     state_->pgoAdmissionLock.storeRelease(0);
     return;
   }
-  state_->pgoProgressQuarters[slot].storeRelaxed(0);
   state_->pgoActiveFunctions[slot].storeRelease(0);
   uint32_t activeCount = state_->pgoActiveFunctionCount.loadRelaxed();
   state_->pgoActiveFunctionCount.storeRelease(activeCount - 1);
@@ -2650,7 +2625,7 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   st->pgoActiveFunctionCount.storeRelaxed(0);
   for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
     st->pgoActiveFunctions[i].storeRelaxed(0);
-    st->pgoProgressQuarters[i].storeRelaxed(0);
+    st->reservedPgoProgress[i].storeRelaxed(0);
   }
   st->pgoCompletedFunctions.storeRelaxed(0);
   st->pgoDeferredMisses.storeRelaxed(0);
@@ -3441,28 +3416,31 @@ void EJitSharedTaskPool::compilePendingBatchRequests() {
         return decodeReqTier(A.req.funcIndex) < decodeReqTier(B.req.funcIndex);
       });
 
-  [[maybe_unused]] size_t Dim0Groups = 0;
-  bool HavePrevious = false;
-  bool PreviousHasDim0 = false;
-  EJitDimPair Previous{};
-  for (const PendingBatchCompile &P : pendingBatchCompiles_) {
-    const bool HasDim0 = P.req.numDims != 0;
-    const bool Same =
-        HavePrevious && HasDim0 == PreviousHasDim0 &&
-        (!HasDim0 || (Previous.dimType == P.req.dims[0].dimType &&
-                      Previous.instanceId == P.req.dims[0].instanceId));
-    if (!Same) {
-      ++Dim0Groups;
-      Previous = HasDim0 ? P.req.dims[0] : EJitDimPair{};
-    }
-    HavePrevious = true;
-    PreviousHasDim0 = HasDim0;
-  }
-
   std::vector<PendingBatchCompile> Batch;
   Batch.swap(pendingBatchCompiles_);
-  EJIT_DIAG_DEBUG("shared worker batch layout: requests=%zu dim0Groups=%zu",
-                  Batch.size(), Dim0Groups);
+#ifdef EJIT_DIAG_ENABLE
+  if (gEJitDiagLevel >= EJIT_LOG_LVL_DEBUG) {
+    size_t Dim0Groups = 0;
+    bool HavePrevious = false;
+    bool PreviousHasDim0 = false;
+    EJitDimPair Previous{};
+    for (const PendingBatchCompile &P : Batch) {
+      const bool HasDim0 = P.req.numDims != 0;
+      const bool Same =
+          HavePrevious && HasDim0 == PreviousHasDim0 &&
+          (!HasDim0 || (Previous.dimType == P.req.dims[0].dimType &&
+                        Previous.instanceId == P.req.dims[0].instanceId));
+      if (!Same) {
+        ++Dim0Groups;
+        Previous = HasDim0 ? P.req.dims[0] : EJitDimPair{};
+      }
+      HavePrevious = true;
+      PreviousHasDim0 = HasDim0;
+    }
+    EJIT_DIAG_DEBUG("shared worker batch layout: requests=%zu dim0Groups=%zu",
+                    Batch.size(), Dim0Groups);
+  }
+#endif
   for (const PendingBatchCompile &P : Batch) {
     runCompile(P.req, P.hasSharedMarker);
     // Sorted batch compilation happens inside one publish worker step. Yield
@@ -4070,11 +4048,7 @@ void EJitSharedTaskPool::getDiagnostics(EJitSharedDiagnostics &out) const {
   out.registrationFingerprint = state_->registrationFingerprint.loadAcquire();
   out.queueDepth =
       state_->enqueuePos.loadRelaxed() - state_->dequeuePos.loadRelaxed();
-  uint32_t pending = 0;
-  for (uint32_t i = 0; i < kEJitSharedMaxFuncIndex; ++i)
-    if (state_->inFlight[i].loadRelaxed() != 0)
-      ++pending;
-  out.pendingCount = pending;
+  out.pendingCount = pendingCount();
   uint32_t ready = 0;
   for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
     for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s)

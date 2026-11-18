@@ -29,6 +29,10 @@ add_llvm_unittest(EJITTests
   PARTIAL_SOURCES_INTENDED
   )
 
+if(EJIT_DUMP_SUPPORT)
+  target_compile_definitions(EJITTests PRIVATE EJIT_DUMP_SUPPORT)
+endif()
+
 # The value-profile test sources are #ifdef EJIT_SRE_PGO_VALUE_PROFILE-gated,
 # matching the LLVMEJIT build; without these definitions they compile to empty
 # translation units.

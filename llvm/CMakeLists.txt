@@ -614,6 +614,8 @@ if(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
   add_definitions(-DEJIT_TRIM_LLVM_BACKEND)
 endif()
 
+option(EJIT_DUMP_SUPPORT "Capture JIT IR and available assembly for diagnostic dumps" ON)
+
 # Re-enable textual assembly (.s) emission for the JIT IR/ASM diagnostic dump
 # (ejit_dump_func / ejit_print_dumped) even in an EJIT_TRIM_LLVM_BACKEND build.
 # The trim normally #ifdef's out the AssemblyFile codegen path

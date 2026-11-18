@@ -5663,7 +5663,7 @@ TEST_F(SharedTaskPoolTest, SharedPgoProfilesFunctionsSequentially) {
     if (hit.hasReadToken)
       pool.releaseRead(hit.bucketIndex);
   }
-  EXPECT_EQ(state_->pgoProgressQuarters[0].loadAcquire(), 4u);
+  EXPECT_EQ(tier1->hitCount.loadAcquire(), 2u);
   EXPECT_EQ(pool.pendingCount(), 1u);
 
   // Tier-2 completion releases admission. The next called function can then
@@ -5892,10 +5892,13 @@ TEST_F(SharedTaskPoolTest,
   EXPECT_EQ(owner.pendingCount(), 2u);
   uint32_t profilesAtThreshold = 0;
   for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
-    if (state_->pgoActiveFunctions[i].loadAcquire() == 0)
+    const uint32_t encoded = state_->pgoActiveFunctions[i].loadAcquire();
+    if (!encoded)
       continue;
     ++profilesAtThreshold;
-    EXPECT_EQ(state_->pgoProgressQuarters[i].loadAcquire(), 4u);
+    const auto *slot = findReadySlot(encoded - 1);
+    ASSERT_NE(slot, nullptr);
+    EXPECT_EQ(slot->hitCount.loadAcquire(), 2u);
   }
   EXPECT_EQ(profilesAtThreshold, 2u);
   EJitCoreId::setCurrentForTest(kOwnerCore);

@@ -27,6 +27,7 @@
 #ifndef EJIT_SRE_DIAG
 #include <cstdio>
 #endif
+#include <algorithm>
 #include <cstddef>
 #include <type_traits>
 
@@ -1013,6 +1014,14 @@ void ejit_taskpool_print_stats() {
   ejitDumpIcacheSlots(gEJIT ? &gEJIT->moduleLoader() : nullptr);
 }
 
+#ifdef EJIT_DIAG_ENABLE
+// NO_RECLAIM dumps are best-effort. Never use unchecked shared data as
+// an array index, even when it can only affect diagnostic output.
+static uint32_t compiledDimCount(const EJitSharedCacheSlot &slot) {
+  return std::min<uint32_t>(slot.numDims, kEJitSharedMaxDims);
+}
+#endif
+
 void ejit_taskpool_print_compiled() {
 #ifndef EJIT_DIAG_ENABLE
   // Diagnostics compiled out: nothing can print, so do not walk the cache
@@ -1046,17 +1055,13 @@ void ejit_taskpool_print_compiled() {
   } count = {{0}, {0}, {0}, 0};
   EJitSharedTaskPool::ForEachCompiledStats st = sp->forEachCompiled(
       [](const EJitSharedCacheSlot &slot, void *cbCtx) {
-        // Valid numDims is 0..kEJitSharedMaxDims; clamp a corrupt slot's
-        // value so the tally cannot index past byDims.
-        uint32_t n = slot.numDims < kEJitSharedMaxDims ? slot.numDims
-                                                       : kEJitSharedMaxDims;
-        ++static_cast<CountCtx *>(cbCtx)->byDims[n];
+        ++static_cast<CountCtx *>(cbCtx)->byDims[compiledDimCount(slot)];
         uint8_t tier = slot.tier.loadRelaxed();
         if (tier <= kEJitTierPgoUse)
           ++static_cast<CountCtx *>(cbCtx)->byTier[tier];
         if (slot.poolKind <= static_cast<uint32_t>(EJitCodePoolKind::Far))
           ++static_cast<CountCtx *>(cbCtx)->byPool[slot.poolKind];
-        if (tier != kEJitTierInstrumented &&
+        if ((tier == kEJitTierBaseline || tier == kEJitTierPgoUse) &&
             slot.postPublishSeen.loadRelaxed() != 0)
           ++static_cast<CountCtx *>(cbCtx)->finalPostPublishSeen;
       },
@@ -1096,9 +1101,7 @@ void ejit_taskpool_print_compiled() {
   EJIT_DIAG_RAW("compiled final reuse: post_publish_seen=%u unseen=%u "
                 "(tier1_collecting_excluded=%u)",
                 count.finalPostPublishSeen,
-                FinalVersions >= count.finalPostPublishSeen
-                    ? FinalVersions - count.finalPostPublishSeen
-                    : 0,
+                FinalVersions - count.finalPostPublishSeen,
                 count.byTier[kEJitTierInstrumented]);
 #else
   constexpr bool ReuseTrackingEnabled = false;
@@ -1109,7 +1112,9 @@ void ejit_taskpool_print_compiled() {
   struct PrintCtx {
     EJitModuleLoader &loader;
     bool reuseTrackingEnabled;
-  } printCtx{loader, ReuseTrackingEnabled};
+    uint32_t threshold;
+  } printCtx{loader, ReuseTrackingEnabled,
+             sp->state()->tier2Threshold.loadAcquire()};
   EJitSharedTaskPool::ForEachCompiledStats st2 = sp->forEachCompiled(
       [](const EJitSharedCacheSlot &slot, void *cbCtx) {
         PrintCtx &ctx = *static_cast<PrintCtx *>(cbCtx);
@@ -1119,11 +1124,7 @@ void ejit_taskpool_print_compiled() {
         // Per the publish protocol: fnPtr is read with acquire only after
         // state==Ready was observed with acquire (forEachCompiled did).
         void *fn = reinterpret_cast<void *>(slot.fnPtr.loadAcquire());
-        // Only the numDims leading pairs are meaningful; clamp a corrupt
-        // slot's numDims to the ABI maximum so the builders cannot overflow.
-        const uint32_t n = slot.numDims < kEJitSharedMaxDims
-                               ? slot.numDims
-                               : kEJitSharedMaxDims;
+        const uint32_t n = compiledDimCount(slot);
         // dims=[d:i,...] for the n meaningful pairs, e.g. "1:5" / "1:5,2:7".
         // Sized for the uint32 worst case: kEJitSharedMaxDims x
         // ("4294967295:4294967295" = 21) + separators + NUL.
@@ -1151,6 +1152,11 @@ void ejit_taskpool_print_compiled() {
                 : slot.poolKind == static_cast<uint32_t>(EJitCodePoolKind::Far)
                       ? "far"
                       : "unknown";
+        char samples[sizeof(" samples=18446744073709551615/4294967295")] = {};
+        if (SlotTier == kEJitTierInstrumented && ctx.threshold)
+          snprintf(samples, sizeof(samples), " samples=%llu/%u",
+                   static_cast<unsigned long long>(slot.hitCount.loadRelaxed()),
+                   ctx.threshold);
         if (gEJitDiagLevel >= EJIT_LOG_LVL_VERBOSE) {
           // Same shape for the per-instance version snapshot (uint32 x
           // kEJitSharedMaxDims + separators + NUL).
@@ -1166,18 +1172,18 @@ void ejit_taskpool_print_compiled() {
           EJIT_DIAG_RAW("funcIdx=%u name=%s tier=%s numDims=%u dims=[%s] fn=%p "
                         "post_publish_seen=%s ver=[%s] size=%llu "
                         "pool=%s pool_id=%u "
-                        "gen=%u",
+                        "gen=%u%s",
                         slot.funcIndex,
                         name.empty() ? "<unknown>" : name.c_str(), Tier,
                         slot.numDims, dims, fn, PostPublishSeen, ver,
                         static_cast<unsigned long long>(slot.codeSize),
-                        PoolKind, slot.poolId, slot.generation);
+                        PoolKind, slot.poolId, slot.generation, samples);
         } else {
           EJIT_DIAG_RAW("funcIdx=%u name=%s tier=%s numDims=%u dims=[%s] fn=%p "
-                        "pool=%s post_publish_seen=%s",
+                        "pool=%s post_publish_seen=%s%s",
                         slot.funcIndex,
                         name.empty() ? "<unknown>" : name.c_str(), Tier,
-                        slot.numDims, dims, fn, PoolKind, PostPublishSeen);
+                        slot.numDims, dims, fn, PoolKind, PostPublishSeen, samples);
         }
         ejitDiagPrintThrottle();
       },
@@ -1192,28 +1198,36 @@ void ejit_taskpool_print_compiled() {
 }
 
 void ejit_dump_func(const char *name) {
+#ifdef EJIT_DUMP_SUPPORT
   // gDumpSharedState is bound once in ejit_init (and cleared in ejit_shutdown);
   // no per-call rebind needed here.
   std::string filter = (name && name[0]) ? std::string(name) : std::string();
   EJIT_DIAG("dump_func filter=%s", filter.empty() ? "(off)" : filter.c_str());
   setDumpFuncFilter(filter);
+#endif
 }
 
 void ejit_print_dumped(const char *name) {
+#ifdef EJIT_DUMP_SUPPORT
   // gDumpSharedState is bound once in ejit_init; no per-call rebind needed.
   EJIT_DIAG_RAW("print_dumped name=%s", (name && name[0]) ? name : "(all)");
   (void)printDumped(name);
+#endif
 }
 
 void ejit_print_dumped_module(const char *name) {
+#ifdef EJIT_DUMP_SUPPORT
   EJIT_DIAG_RAW("print_dumped_module name=%s",
                 (name && name[0]) ? name : "(all)");
   (void)printDumpedModule(name);
+#endif
 }
 
 void ejit_dump_all(bool enable) {
+#ifdef EJIT_DUMP_SUPPORT
   EJIT_DIAG("dump_all enable=%u", enable ? 1u : 0u);
   setDumpFuncFilter(enable ? std::string("*") : std::string());
+#endif
 }
 
 // Sentinel returned when no owner core is elected (e.g. not initialized or the

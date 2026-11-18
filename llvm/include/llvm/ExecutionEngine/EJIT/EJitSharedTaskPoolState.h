@@ -513,8 +513,8 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU32 pgoMaxActiveFunctions;
   EJitAtomicU32 pgoActiveFunctionCount;
   EJitAtomicU32 pgoActiveFunctions[kEJitSharedMaxConcurrentProfiles];
-  /// Last logged progress quarter for each admission slot: 0..4.
-  EJitAtomicU32 pgoProgressQuarters[kEJitSharedMaxConcurrentProfiles];
+  /// Reserved v18 storage. Progress is read from live T1 hit counts on demand.
+  EJitAtomicU32 reservedPgoProgress[kEJitSharedMaxConcurrentProfiles];
   EJitAtomicU64 pgoCompletedFunctions;
   EJitAtomicU64 pgoDeferredMisses;
   EJitAtomicU32 anyInstanceActivated; ///< 1 once any instance first

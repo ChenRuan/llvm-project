@@ -99,6 +99,7 @@ void initializeEJitTargets() {
 
 } // namespace
 
+#ifdef EJIT_DIAG_ENABLE
 static const GlobalVariable *rootGlobal(Value *V) {
   while (V) {
     V = V->stripPointerCasts();
@@ -133,6 +134,8 @@ static void collectReferencedExternalDecls(
     }
   }
 }
+
+#endif
 
 static void isolateSpecializationEntry(Module &M, StringRef EntryName) {
   for (Function &F : M.functions()) {
@@ -177,20 +180,22 @@ struct EJitOrcEngine::Impl {
   /// User-registered symbols (functions + globals) for bare-metal.
   /// Populated via ejit_register_symbol() / addUserSymbol().
   std::map<std::string, void *> userSymbols;
+  // Target-aware optimization needs this machine even when dumps are disabled.
+  std::unique_ptr<TargetMachine> optimizerTM;
+#ifdef EJIT_DUMP_SUPPORT
   /// If non-empty, dump JIT-optimized IR to this directory.
   std::string dumpJITDir;
-  /// Persistent optimizer — analysis managers are registered once and reused.
-  /// TargetMachine used for the name-filtered ASM diagnostic dump (created
-  /// once from the same JITTargetMachineBuilder the JIT compiles with, so the
-  /// emitted assembly matches the real JIT output). Null if creation failed.
-  std::unique_ptr<TargetMachine> dumpFunctionTM;
+#if !defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM)
   std::unique_ptr<TargetMachine> dumpModuleTM;
+#endif
+#endif
   std::unique_ptr<EJitOptimizer> optimizer;
 };
 
 namespace llvm {
 namespace ejit {
 
+#ifdef EJIT_DUMP_SUPPORT
 // Mutex type for the dump store. On SRE/freestanding std::mutex is
 // unavailable and BareMetalMutex is a no-op, so use a real CAS spinlock (built
 // on the __atomic wrappers in EJitAtomic.h). The dump store is per-core (each
@@ -529,6 +534,7 @@ bool detail::shouldCaptureDump(CompileTier tier, StringRef filter,
          (filter == "*" || filter == fnName);
 }
 
+#if !defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM)
 /// Clone a diagnostic codegen module with only the requested function body.
 /// Other function definitions become declarations, preserving the target
 /// function's calls while avoiding a second codegen of its whole closure.
@@ -555,6 +561,7 @@ static bool renderDumpAssembly(TargetMachine &TM, std::unique_ptr<Module> M,
   out.assign(AsmBuf.begin(), AsmBuf.end());
   return true;
 }
+#endif
 
 /// Print one stored entry: header (name, key hi/lo, IR/ASM sizes) followed by
 /// the IR and ASM bodies. SRE-safe: no Twine, no lambda, no temporary label.
@@ -667,6 +674,13 @@ bool printDumpedModule(const char *name) {
   return true;
 }
 
+#else
+void setDumpFuncFilter(const std::string &) {}
+void setDumpSharedState(EJitSharedTaskPoolState *) {}
+bool printDumped(const char *) { return false; }
+bool printDumpedModule(const char *) { return false; }
+#endif // EJIT_DUMP_SUPPORT
+
 } // namespace ejit
 } // namespace llvm
 
@@ -686,7 +700,9 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   auto engine = std::unique_ptr<EJitOrcEngine>(new EJitOrcEngine());
   engine->P->periodReg = &periodReg;
   engine->P->runtimeState = &runtimeState;
+#ifdef EJIT_DUMP_SUPPORT
   engine->P->dumpJITDir = config.dumpJITDir;
+#endif
 
   // Bare-metal / cross-compiled: use compile-time target triple.
   // Native host: auto-detect via detectHost().
@@ -718,17 +734,18 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // the per-global cost match AOT (ADRP+LDR), so specialization gains show.
   JTMBOrErr->setCodeModel(CodeModel::Small);
 
-  // Build a TargetMachine (same options the JIT compiles with) for the
-  // name-filtered ASM diagnostic dump. Failure is non-fatal — the dump is
-  // simply unavailable.
+  // Use the JIT target options for optimization and the optional function dump.
   if (auto TMOrErr = JTMBOrErr->createTargetMachine())
-    engine->P->dumpFunctionTM = std::move(*TMOrErr);
+    engine->P->optimizerTM = std::move(*TMOrErr);
   else
     consumeError(TMOrErr.takeError());
+#if defined(EJIT_DUMP_SUPPORT) && \
+    (!defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM))
   if (auto TMOrErr = JTMBOrErr->createTargetMachine())
     engine->P->dumpModuleTM = std::move(*TMOrErr);
   else
     consumeError(TMOrErr.takeError());
+#endif
 
   orc::LLJITBuilder Builder;
   Builder.setJITTargetMachineBuilder(*JTMBOrErr);
@@ -806,7 +823,7 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // Create persistent optimizer — analysis managers are registered once here
   // and reused across compilations (cleared between runs).
   engine->P->optimizer = std::make_unique<EJitOptimizer>(
-      periodReg, engine->P->dumpFunctionTM.get());
+      periodReg, engine->P->optimizerTM.get());
 
   // Register all known global variable addresses from the PeriodArrayRegistry
   // so that external global references in any loaded bitcode module resolve
@@ -848,6 +865,7 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
           // (each compilation uses a fresh Module with new IR unit pointers).
           engine->P->optimizer->clearAnalyses();
 
+#ifdef EJIT_DUMP_SUPPORT
           // Dump pre-optimization IR (before the JIT pipeline runs).
           if (!engine->P->dumpJITDir.empty()) {
             std::string prePath = engine->P->dumpJITDir + "/" + ctx->fnName +
@@ -858,9 +876,11 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
             if (!EC)
               M.print(preOS, nullptr);
           }
+#endif
 
           engine->P->optimizer->runPipeline(M, *ctx);
 
+#ifdef EJIT_DUMP_SUPPORT
           // Dump post-optimization IR.
           if (!engine->P->dumpJITDir.empty()) {
             std::string path = engine->P->dumpJITDir + "/" + ctx->fnName + "_" +
@@ -925,10 +945,10 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
           // path of the emit does not call errs(), so once the path is
           // compiled in it is SRE-safe.
 #if !defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM)
-              if (engine->P->dumpFunctionTM && engine->P->dumpModuleTM) {
+              if (engine->P->optimizerTM && engine->P->dumpModuleTM) {
                 EJIT_DIAG_DEBUG("dump asm begin fn=%s", ctx->fnName.c_str());
                 bool FunctionOK = renderDumpAssembly(
-                    *engine->P->dumpFunctionTM,
+                    *engine->P->optimizerTM,
                     cloneDumpFunctionModule(M, ctx->fnName), FunctionAsm);
                 bool ModuleOK = renderDumpAssembly(*engine->P->dumpModuleTM,
                                                    CloneModule(M), ModuleAsm);
@@ -951,6 +971,7 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
                           std::move(ModuleIR), std::move(ModuleAsm));
             }
           }
+#endif // EJIT_DUMP_SUPPORT
         });
         // PGO: claim transform-generated __profc_*/__profd_* (Instrumented).
         // Gen creates them inside runPipeline (after addIRModule), so the
@@ -1101,17 +1122,6 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
 
   // Resolve undefined function symbols from user-registered table.
   // Required for bare-metal where dynamic lookup (dlsym) is unavailable.
-  // Throttle diagnostics: tally unresolved externals and emit a single
-  // summary line per load (below) instead of one line per symbol; the
-  // individual names are listed at DEBUG for regression triage.
-  size_t unresolvedFuncs = 0;
-  size_t unresolvedGlobals = 0;
-  SmallVector<std::string, 16> unresolvedNames;
-  static constexpr size_t kMaxUnresolvedNames = 32;
-  SmallPtrSet<const Function *, 16> ReferencedExternalFuncs;
-  SmallPtrSet<const GlobalVariable *, 16> ReferencedExternalGlobals;
-  collectReferencedExternalDecls(**ModuleOrErr, ReferencedExternalFuncs,
-                                 ReferencedExternalGlobals);
   for (Function &F : (*ModuleOrErr)->functions()) {
     if (!F.isDeclaration() || F.getName().empty() ||
         isEJitLocalFreeDimFunction(F))
@@ -1120,14 +1130,8 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
     if (globalSymbols.count(P->J->mangleAndIntern(name)))
       continue;
     auto it = P->userSymbols.find(name);
-    if (it == P->userSymbols.end()) {
-      if (!F.isIntrinsic() && ReferencedExternalFuncs.contains(&F)) {
-        ++unresolvedFuncs;
-        if (unresolvedNames.size() < kMaxUnresolvedNames)
-          unresolvedNames.push_back("f:" + name);
-      }
+    if (it == P->userSymbols.end())
       continue;
-    }
     globalSymbols[P->J->mangleAndIntern(name)] = orc::ExecutorSymbolDef(
         orc::ExecutorAddr::fromPtr(it->second), JITSymbolFlags::Exported);
   }
@@ -1138,26 +1142,41 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
     if (globalSymbols.count(P->J->mangleAndIntern(name)))
       continue;
     auto it = P->userSymbols.find(name);
-    if (it == P->userSymbols.end()) {
-      if (ReferencedExternalGlobals.contains(&GV)) {
-        ++unresolvedGlobals;
-        if (unresolvedNames.size() < kMaxUnresolvedNames)
-          unresolvedNames.push_back("g:" + name);
-      }
+    if (it == P->userSymbols.end())
       continue;
-    }
     globalSymbols[P->J->mangleAndIntern(name)] = orc::ExecutorSymbolDef(
         orc::ExecutorAddr::fromPtr(it->second), JITSymbolFlags::Exported);
   }
-  if (unresolvedFuncs || unresolvedGlobals)
-    EJIT_DIAG("loadBitcode: %zu unresolved external(s) not registered "
-              "(%zu funcs, %zu globals)",
-              unresolvedFuncs + unresolvedGlobals, unresolvedFuncs,
-              unresolvedGlobals);
-  EJIT_DIAG_DEBUG("loadBitcode: %zu unresolved name(s) listed (of %zu total):",
-                  unresolvedNames.size(), unresolvedFuncs + unresolvedGlobals);
-  for (const std::string &n : unresolvedNames)
-    EJIT_DIAG_DEBUG("  %s", n.c_str());
+#ifdef EJIT_DIAG_ENABLE
+  if (gEJitDiagLevel >= EJIT_LOG_LVL_DEBUG) {
+    SmallPtrSet<const Function *, 16> Funcs;
+    SmallPtrSet<const GlobalVariable *, 16> Globals;
+    collectReferencedExternalDecls(**ModuleOrErr, Funcs, Globals);
+    SmallVector<std::string, 16> Names;
+    size_t NF = 0, NG = 0;
+    auto tally = [&](const GlobalValue &GV, StringRef Prefix, size_t &Count) {
+      if (globalSymbols.count(P->J->mangleAndIntern(GV.getName())))
+        return;
+      ++Count;
+      if (Names.size() < 32)
+        Names.push_back((Prefix + GV.getName()).str());
+    };
+    for (const Function &F : (*ModuleOrErr)->functions())
+      if (Funcs.contains(&F) && !F.getName().empty() &&
+          !isEJitLocalFreeDimFunction(F))
+        tally(F, "f:", NF);
+    for (const GlobalVariable &GV : (*ModuleOrErr)->globals())
+      if (Globals.contains(&GV))
+        tally(GV, "g:", NG);
+    if (NF || NG)
+      EJIT_DIAG("loadBitcode: %zu unresolved external(s) not registered "
+                "(%zu funcs, %zu globals)", NF + NG, NF, NG);
+    EJIT_DIAG_DEBUG("loadBitcode: %zu unresolved name(s) listed (of %zu total):",
+                    Names.size(), NF + NG);
+    for (const std::string &N : Names)
+      EJIT_DIAG_DEBUG("  %s", N.c_str());
+  }
+#endif
 
   // Provide codegen-synthesized runtime symbols (memset/memcpy/memmove/memcmp
   // and the stack-protector guard/fail) that the AOT symbol collector cannot

@@ -41,6 +41,7 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Testing/Support/SupportHelpers.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "gtest/gtest.h"
 #include <algorithm>
@@ -59,6 +60,7 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+#ifdef EJIT_DUMP_SUPPORT
 TEST(EJitDump, FunctionAndModuleViewsHaveDifferentScopes) {
   LLVMContext Ctx;
   Module M("dump_selective", Ctx);
@@ -86,8 +88,9 @@ TEST(EJitDump, FunctionAndModuleViewsHaveDifferentScopes) {
   EXPECT_NE(Output.find("define internal"), std::string::npos) << Output;
   EXPECT_NE(Output.find("@dump_helper("), std::string::npos) << Output;
 }
+#endif
 
-TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
+TEST(EJitDump, FilteredCaptureMatchesBuildConfiguration) {
   std::string Bitcode;
   {
     LLVMContext Ctx;
@@ -115,6 +118,14 @@ TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
 
   EJitRuntimeState State;
   Config Cfg;
+  unittest::TempDir Dir("ejit-dump", /*Unique=*/true);
+  ASSERT_FALSE(Dir.path().empty());
+  Cfg.dumpJITDir = Dir.path().str();
+#ifdef EJIT_DUMP_SUPPORT
+  constexpr bool ExpectDump = true;
+#else
+  constexpr bool ExpectDump = false;
+#endif
   // Direct engine creation owns target registration just like the shared
   // worker-owner path; callers and producer-only EJit instances do not.
   auto EngineOrErr = EJitOrcEngine::Create(Cfg, State.getRegistry(), State);
@@ -132,16 +143,20 @@ TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
     ASSERT_FALSE(errorToBool(Engine->loadBitcodeModule(Bitcode, Key, Name)));
     auto FnOrErr = Engine->lookup(Key, Name);
     ASSERT_TRUE(static_cast<bool>(FnOrErr));
+    std::string Stem = std::string(Name) + "_" + std::to_string(Key);
+    for (const char *Suffix : {"_pre.ll", "_opt.ll"})
+      EXPECT_EQ(ExpectDump, sys::fs::exists(Dir.path(Stem + Suffix)));
   }
   Engine->setActiveContext(nullptr);
   setDumpFuncFilter("");
 
   for (const char *Name : {"dump_a", "dump_b", "dump_c"}) {
-    EXPECT_TRUE(printDumped(Name)) << Name;
-    EXPECT_TRUE(printDumpedModule(Name)) << Name;
+    EXPECT_EQ(ExpectDump, printDumped(Name)) << Name;
+    EXPECT_EQ(ExpectDump, printDumpedModule(Name)) << Name;
   }
 }
 
+#ifdef EJIT_DUMP_SUPPORT
 TEST(EJitDump, SkipsTemporaryPgoTier1Capture) {
   EXPECT_FALSE(llvm::ejit::detail::shouldCaptureDump(
       CompileTier::Instrumented, "*", "dump_temporary_tier1"));
@@ -155,6 +170,7 @@ TEST(EJitDump, SkipsTemporaryPgoTier1Capture) {
   EXPECT_FALSE(llvm::ejit::detail::shouldCaptureDump(
       CompileTier::PGOUse, "other", "dump_temporary_tier1"));
 }
+#endif
 
 static int nestedEntryWrapper(int X) { return X + 100; }
 static int wrongNestedEntryWrapper(int X) { return X + 1000; }
@@ -250,14 +266,14 @@ struct EJitOptimizerTestAccess : EJitOptimizer {
   // Isolated pass tests without a specialization supply an empty context;
   // production callers must carry the actual entry and bound-pointer views.
   void runStructFieldPass(Module &M) {
-    EJitOptimizer::runStructFieldPass(M, SpecializationContext{});
+    EJitOptimizer::runStructFieldPass(M, SpecializationContext{}, {});
   }
   void runOptimizationPipeline(Module &M, OptimizationLevel Level,
                                CompileTier Tier) {
     SpecializationContext Context;
     Context.optLevel = Level;
     Context.tier = Tier;
-    EJitOptimizer::runOptimizationPipeline(M, Context, Tier);
+    EJitOptimizer::runOptimizationPipeline(M, Context, Tier, {});
   }
 };
 } // namespace ejit
@@ -2058,6 +2074,89 @@ TEST(EJitStructFieldPass, InstrumentsRuntimeMayConstHitsBeforeReplacement) {
 }
 #endif
 
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE) && \
+    GTEST_HAS_STREAM_REDIRECTION
+TEST(EJitOptimizer, AuditEndpointsAcrossTierExits) {
+  PeriodArrayRegistry Registry;
+  EJitOptimizer Opt(Registry);
+  SpecializationContext Spec;
+  Spec.fnName = "audit_entry";
+  std::vector<EJitMayConstLoadSite> Sampled;
+  for (unsigned Case = 0; Case != 5; ++Case) {
+    SCOPED_TRACE(Case);
+    LLVMContext Ctx;
+    SMDiagnostic Err;
+    auto M = parseAssemblyString(R"(
+      target triple = "aarch64-unknown-linux-gnu"
+      define i32 @audit_entry(ptr %p, ptr %q, ptr %r) !ejit.metadata !0 {
+        %dead = load i32, ptr %p, !ejit.may_const !2
+        %excluded = load volatile i32, ptr %r, !ejit.may_const !2
+        %live = load i32, ptr %q, !ejit.may_const !2
+        ret i32 %live
+      }
+      !0 = !{!1}
+      !1 = !{!"ejit_entry"}
+      !2 = !{}
+    )", Err, Ctx);
+    ASSERT_TRUE(M) << Err.getMessage().str();
+    Spec.tier = Case == 0 || Case == 4 ? CompileTier::Baseline
+                          : Case == 1 ? CompileTier::Instrumented
+                                      : CompileTier::PGOUse;
+    Spec.profileAuditOnly = Case == 2;
+    Spec.mayConstLoadSites = Sampled;
+    if (Case == 4) {
+      // Baseline with a supplied snapshot uses that inventory, even when the
+      // optimized module has more sites. Preserve the signed net difference.
+      Spec.mayConstLoadSites.resize(1);
+      auto &BB = M->getFunction("audit_entry")->getEntryBlock();
+      auto *Ret = cast<ReturnInst>(BB.getTerminator());
+      IRBuilder<> B(Ret);
+      Ret->setOperand(0, B.CreateAdd(&BB.front(), Ret->getReturnValue()));
+    }
+    const auto OldLevel = ejit_get_log_level();
+    ejit_set_log_level(EJIT_LOG_LVL_DEBUG);
+    testing::internal::CaptureStdout();
+    Opt.runPipeline(*M, Spec);
+    std::string Output = testing::internal::GetCapturedStdout();
+    ejit_set_log_level(OldLevel);
+    ASSERT_FALSE(verifyModule(*M, &errs()));
+    if (Case == 1) {
+      EXPECT_EQ(Output.find("mayconst-audit entry="), std::string::npos);
+      EXPECT_EQ(Output.find("mayconst-site entry="), std::string::npos);
+      EXPECT_NE(M->getGlobalVariable(EJitStructFieldPass::MayConstCounterName),
+                nullptr);
+      auto Sites = Opt.getLastMayConstLoadSites();
+      ASSERT_EQ(Sites.size(), 2u);
+      Sampled.assign(Sites.begin(), Sites.end());
+      EXPECT_EQ(Sampled[0].siteId, 1u);
+      EXPECT_EQ(Sampled[1].siteId, 2u);
+      Sampled[0].runtimeHits = 17;
+      Sampled[1].runtimeHits = 11;
+      continue;
+    }
+    EXPECT_TRUE(Opt.getLastMayConstLoadSites().empty());
+    EXPECT_NE(Output.find("versions=1 mayconst="), std::string::npos);
+    EXPECT_EQ(M->getGlobalVariable(EJitStructFieldPass::MayConstCounterName),
+              nullptr);
+    if (Case == 4) {
+      EXPECT_NE(Output.find("mayconst=1/na/2 removed=-1"), std::string::npos)
+          << Output;
+      continue;
+    }
+    if (Case != 0) {
+      EXPECT_NE(Output.find("offset=unknown hits=17"), std::string::npos);
+      EXPECT_NE(Output.find("offset=unknown hits=11"), std::string::npos);
+    }
+    EXPECT_NE(Output.find("mayconst=2/na/1 removed=1 direct=na pipeline=na"),
+              std::string::npos) << Output;
+    EXPECT_NE(Output.find(Case == 0
+                              ? "runtime_hits=0 hit_sites=0 removed_runtime_hits=0"
+                              : "runtime_hits=28 hit_sites=2 removed_runtime_hits=17"),
+              std::string::npos) << Output;
+  }
+}
+#endif
+
 TEST(EJitStructFieldPass, NoMayConstNoChange) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("test_nochange", Ctx);
@@ -2619,6 +2718,52 @@ TEST(EJitStructFieldPass, InconsistentHelperDimensionSourcesAreNotSpecialized) {
                           [](Instruction &I) { return isa<LoadInst>(I); }),
             1)
       << "all callsites must agree on the helper cell identity";
+}
+
+TEST(EJitOptimizer, ResolvesBoundPeriodAgainForEachModule) {
+  PeriodArrayRegistry Registry;
+  EJitOptimizer Opt(Registry);
+  SpecializationContext Spec;
+  Spec.fnName = "root";
+  Spec.dimensions = {{"cell", 2}, {"trp", 7}};
+  int32_t Object = 42;
+  Spec.boundPointers.push_back(
+      {reinterpret_cast<const uint8_t *>(&Object), sizeof(Object), 1});
+  for (StringRef Period : {"cell", "trp", "cell"}) {
+    LLVMContext Ctx;
+    SMDiagnostic Err;
+    // Identical symbols, argument index and context; only the module's
+    // contract changes. The call matches cell instance 2, never trp 7.
+    std::string IR = R"(
+      define i32 @root(i8 %d, ptr %p) !ejit.metadata !0 {
+        %r = call i32 @helper(i8 2, ptr %p)
+        ret i32 %r
+      }
+      define i32 @helper(i8 %d, ptr %p) noinline !ejit.metadata !0 {
+        %v = load i32, ptr %p, !ejit.may_const !5
+        ret i32 %v
+      }
+      !0 = !{!1, !2, !3}
+      !1 = !{!"ejit_entry"}
+      !2 = !{!"ejit_period_arr_ind", !")" + Period.str() + R"(", i32 0}
+      !3 = !{!"ejit_bound_ptr", !")" + Period.str() + R"(", i32 1, i64 4, !4}
+      !4 = !{i64 0, i64 4}
+      !5 = !{}
+    )";
+    auto M = parseAssemblyString(IR, Err, Ctx);
+    ASSERT_TRUE(M) << Err.getMessage().str();
+    Opt.runPipeline(*M, Spec);
+    Function *Helper = M->getFunction("helper");
+    ASSERT_NE(Helper, nullptr);
+    auto *Ret = cast<ReturnInst>(Helper->getEntryBlock().getTerminator());
+    if (Period == "cell") {
+      auto *C = dyn_cast<ConstantInt>(Ret->getReturnValue());
+      ASSERT_NE(C, nullptr);
+      EXPECT_EQ(C->getSExtValue(), Object);
+    } else {
+      EXPECT_TRUE(isa<LoadInst>(Ret->getReturnValue()));
+    }
+  }
 }
 
 TEST(EJitStructFieldPass, BoundPointerHelperSupportsMultipleCellVersions) {

@@ -322,6 +322,7 @@ void ejit_taskpool_print_stats();
 /// Print every published shared-cache version and its dimensions. Stats builds
 /// also report whether a later taskpool lookup reused each published version;
 /// wrapper inline-cache calls after that first reuse remain intentionally free.
+/// An instrumented entry also reports its current sample count and PGO quota.
 void ejit_taskpool_print_compiled();
 uint32_t ejit_taskpool_get_worker_core();
 
