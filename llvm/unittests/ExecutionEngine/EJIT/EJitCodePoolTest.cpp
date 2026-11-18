@@ -836,6 +836,37 @@ TEST(EJitCodePoolFixed, PermissionRangeCannotCrossPoolBoundary) {
   EXPECT_EQ(M.SealCalls, 0u);
 }
 
+TEST(EJitCodePool4K, RestoreAttemptsRemainingPagesAfterFailure) {
+  MockSre4K M;
+  auto O = fourKOpts();
+  O.needsEnableRw = true;
+  auto Mgr = makeManager4K(M, O);
+  auto *P = static_cast<char *>(cantFail(Mgr.allocateCode(3 * kFourKiB, 64)));
+  M.FailSealOnCall = 2;
+  Error Err = Mgr.restoreRxRange(P + 1, 2 * kFourKiB);
+  ASSERT_TRUE(static_cast<bool>(Err));
+  consumeError(std::move(Err));
+  EXPECT_EQ(M.SealCalls, 3u);
+  EXPECT_EQ(M.SealedPages, (std::vector<uintptr_t>{A(P), A(P) + 2 * kFourKiB}));
+}
+
+TEST(EJitCodePoolBatch, RejectsOverflowBeforeRecordingOrSealing) {
+  MockSre4K M;
+  auto O = fourKOpts();
+  O.batchedPageSeal = true;
+  auto Mgr = makeManager4K(M, O);
+  void *P = cantFail(Mgr.allocateCode(64, 16));
+  EJitWritableRange W{A(P), 1};
+  EXPECT_FALSE(Mgr.recordPendingRange(P, 64, &W, kEJitMaxWritableRanges + 1));
+  EXPECT_FALSE(Mgr.recordPendingRange(P, SIZE_MAX));
+  EXPECT_FALSE(Mgr.recordPendingRange(P, O.poolSize + 1));
+  EXPECT_EQ(Mgr.pendingRangeCount(), 0u);
+  cantFail(Mgr.flushPendingRanges());
+  EXPECT_EQ(M.SealCalls, 0u);
+  EJitCompiledCodeInfo Info{};
+  EXPECT_FALSE(Mgr.findRange(P, Info));
+}
+
 TEST(EJitCodePoolBatch, PacksRangesAndStartsFreshPageAfterFlush) {
   MockSre4K M;
   auto O = fourKOpts();

@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
+#include "EJitAutoRegister.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -55,17 +56,32 @@ EJitRegisterPeriodPass::run(Module &M, ModuleAnalysisManager &AM) {
     if (!MD)
       continue;
 
-    std::string varName = GV.getName().str();
-
-    if (hasMDStringEntry(MD, TAG_EJIT_PERIOD_ARR)) {
-      StringRef periodName = getMDStringValue(MD, TAG_EJIT_PERIOD_ARR);
-      uint32_t size = getMDIntValue(MD, TAG_EJIT_PERIOD_ARR);
-      PeriodArrays.push_back({&GV, periodName.str(), varName, size});
+    bool IsArray = false, IsStatic = false;
+    MDString *PeriodName = nullptr;
+    ConstantInt *Size = nullptr;
+    for (const MDOperand &Op : MD->operands()) {
+      auto *Sub = dyn_cast<MDNode>(Op.get());
+      if (!Sub || !Sub->getNumOperands())
+        continue;
+      auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+      if (!Tag)
+        continue;
+      IsStatic |= Tag->getString() == TAG_EJIT_PERIOD;
+      if (Tag->getString() != TAG_EJIT_PERIOD_ARR)
+        continue;
+      IsArray = true;
+      // As before, take the first well-typed value for each field independently.
+      if (!PeriodName && Sub->getNumOperands() >= 2)
+        PeriodName = dyn_cast<MDString>(Sub->getOperand(1));
+      if (!Size && Sub->getNumOperands() >= 3)
+        Size = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
     }
-
-    if (hasMDStringEntry(MD, TAG_EJIT_PERIOD)) {
-      StaticVars.push_back({&GV, varName});
-    }
+    if (IsArray)
+      PeriodArrays.push_back({&GV, PeriodName ? PeriodName->getString().str() : "",
+                              GV.getName().str(),
+                              Size ? static_cast<uint32_t>(Size->getZExtValue()) : 0});
+    if (IsStatic)
+      StaticVars.push_back({&GV, GV.getName().str()});
   }
 
   if (PeriodArrays.empty() && StaticVars.empty()) {
@@ -86,14 +102,7 @@ EJitRegisterPeriodPass::run(Module &M, ModuleAnalysisManager &AM) {
       FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, PtrTy}, false));
 
   // Find or create ejit_auto_register
-  Function *AutoReg = M.getFunction(FN_AUTO_REGISTER);
-  if (!AutoReg) {
-    auto *AutoRegTy = FunctionType::get(Type::getVoidTy(Ctx), false);
-    AutoReg = Function::Create(AutoRegTy, GlobalValue::InternalLinkage,
-                               FN_AUTO_REGISTER, &M);
-    BasicBlock::Create(Ctx, "entry", AutoReg);
-    ReturnInst::Create(Ctx, &AutoReg->getEntryBlock());
-  }
+  Function *AutoReg = getOrCreateAutoRegister(M).first;
 
   // Insert calls before return
   BasicBlock *EntryBB = &AutoReg->getEntryBlock();

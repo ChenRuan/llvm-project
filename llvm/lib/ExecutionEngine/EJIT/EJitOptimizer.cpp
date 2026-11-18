@@ -217,9 +217,6 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   lastMayConstLoadSites_.clear();
-#endif
-
-#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   std::vector<EJitMayConstLoadSite> AuditInputSites;
   uint64_t AuditSampledEntries = 0;
   if (ctx.tier == CompileTier::Instrumented ||

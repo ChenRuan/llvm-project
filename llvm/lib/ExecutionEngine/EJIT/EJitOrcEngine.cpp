@@ -1,6 +1,7 @@
 //===-- EJitOrcEngine.cpp - OrcJIT Engine Wrapper -------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
+#include "EJitCodePoolCounters.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Config/Targets.h"
@@ -734,17 +735,19 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // the per-global cost match AOT (ADRP+LDR), so specialization gains show.
   JTMBOrErr->setCodeModel(CodeModel::Small);
 
-  // Use the JIT target options for optimization and the optional function dump.
-  if (auto TMOrErr = JTMBOrErr->createTargetMachine())
-    engine->P->optimizerTM = std::move(*TMOrErr);
-  else
-    consumeError(TMOrErr.takeError());
+  auto createTM = [&]() -> std::unique_ptr<TargetMachine> {
+    auto TM = JTMBOrErr->createTargetMachine();
+    if (TM)
+      return std::move(*TM);
+    consumeError(TM.takeError());
+    return nullptr;
+  };
+  engine->P->optimizerTM = createTM();
 #if defined(EJIT_DUMP_SUPPORT) && \
     (!defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM))
-  if (auto TMOrErr = JTMBOrErr->createTargetMachine())
-    engine->P->dumpModuleTM = std::move(*TMOrErr);
-  else
-    consumeError(TMOrErr.takeError());
+  // AArch64 caches subtargets and resets per-function FP options on the TM.
+  // Module emission must not change that state on the function-dump machine.
+  engine->P->dumpModuleTM = createTM();
 #endif
 
   orc::LLJITBuilder Builder;
@@ -860,10 +863,6 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
           const SpecializationContext *ctx = engine->P->activeCtx;
           if (!ctx)
             return;
-
-          // Clear stale analysis results from previous compilations
-          // (each compilation uses a fresh Module with new IR unit pointers).
-          engine->P->optimizer->clearAnalyses();
 
 #ifdef EJIT_DUMP_SUPPORT
           // Dump pre-optimization IR (before the JIT pipeline runs).
@@ -1281,18 +1280,9 @@ EJitTieredCodePoolStats EJitOrcEngine::getTieredCodePoolStats() const {
     Out.near = P->nearCodePool->getStats();
   if (P->farCodePool)
     Out.far = P->farCodePool->getStats();
-#define EJIT_SUM_STAT(Field) Out.total.Field = Out.near.Field + Out.far.Field
-  EJIT_SUM_STAT(poolCount);
-  EJIT_SUM_STAT(sealedCount);
-  EJIT_SUM_STAT(activeCount);
-  EJIT_SUM_STAT(usedBytes);
-  EJIT_SUM_STAT(reservedBytes);
-  EJIT_SUM_STAT(wastedBytes);
-  EJIT_SUM_STAT(sealInvocations);
-  EJIT_SUM_STAT(splitInvocations);
-  EJIT_SUM_STAT(rwEnableInvocations);
-  EJIT_SUM_STAT(finalizedRangeCount);
-#undef EJIT_SUM_STAT
+  sumPoolCounters(Out.total, Out.near, Out.far);
+  Out.total.rwEnableInvocations =
+      Out.near.rwEnableInvocations + Out.far.rwEnableInvocations;
   return Out;
 }
 

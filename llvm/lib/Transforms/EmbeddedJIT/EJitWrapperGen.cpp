@@ -32,6 +32,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
+#include "EJitAutoRegister.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <limits>
 #include <map>
@@ -129,49 +130,36 @@ struct BoundPtrInfo {
   uint64_t PointeeSize;
 };
 
-static SmallVector<BoundPtrInfo, 8> getBoundPtrInfos(const Function &F) {
-  SmallVector<BoundPtrInfo, 8> Result;
-  MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
-  if (!MD)
-    return Result;
-  for (const MDOperand &Op : MD->operands()) {
-    auto *Sub = dyn_cast<MDNode>(Op.get());
-    if (!Sub || Sub->getNumOperands() < 4)
-      continue;
-    auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-    auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
-    auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
-    auto *Size = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(3));
-    if (Tag && Tag->getString() == TAG_EJIT_BOUND_PTR && PN && Idx && Size)
-      Result.push_back(BoundPtrInfo{PN->getString().str(),
-                                    static_cast<unsigned>(Idx->getZExtValue()),
-                                    Size->getZExtValue()});
-  }
-  return Result;
-}
+struct EntryInfo {
+  Function *F;
+  SmallVector<PeriodArrIndInfo, 4> PeriodInds;
+  SmallVector<BoundPtrInfo, 8> BoundPtrs;
+};
 
-static SmallVector<PeriodArrIndInfo, 4> getPeriodArrIndInfo(const Function &F) {
-  SmallVector<PeriodArrIndInfo, 4> Result;
-  MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
-  if (!MD)
-    return Result;
-
-  for (const MDOperand &Op : MD->operands()) {
+static EntryInfo parseEntryInfo(Function &F, const MDNode &MD) {
+  EntryInfo Info{&F, {}, {}};
+  for (const MDOperand &Op : MD.operands()) {
     auto *Sub = dyn_cast<MDNode>(Op.get());
     if (!Sub || Sub->getNumOperands() < 3)
       continue;
-    if (auto *Tag = dyn_cast<MDString>(Sub->getOperand(0))) {
-      if (Tag->getString() == TAG_EJIT_PERIOD_ARR_IND) {
-        auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
-        auto *IdxC = dyn_cast<ConstantAsMetadata>(Sub->getOperand(2));
-        if (PN && IdxC)
-          if (auto *CI = dyn_cast<ConstantInt>(IdxC->getValue()))
-            Result.push_back({PN->getString().str(),
-                              static_cast<unsigned>(CI->getZExtValue()), 0});
-      }
-    }
+    auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+    if (!Tag || (Tag->getString() != TAG_EJIT_PERIOD_ARR_IND &&
+                 Tag->getString() != TAG_EJIT_BOUND_PTR))
+      continue;
+    auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
+    auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+    if (!PN || !Idx)
+      continue;
+    if (Tag->getString() == TAG_EJIT_PERIOD_ARR_IND)
+      Info.PeriodInds.push_back({PN->getString().str(),
+                                 static_cast<unsigned>(Idx->getZExtValue()), 0});
+    else if (Sub->getNumOperands() >= 4)
+      if (auto *Size = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(3)))
+        Info.BoundPtrs.push_back({PN->getString().str(),
+                                  static_cast<unsigned>(Idx->getZExtValue()),
+                                  Size->getZExtValue()});
   }
-  return Result;
+  return Info;
 }
 
 // Per-lifecycle i32 global holding the dimType slot. Internal linkage so the
@@ -209,16 +197,7 @@ emitLifecycleRegistration(Module &M,
       FN_REGISTER_LIFECYCLE,
       FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, PtrTy}, false));
 
-  Function *AutoReg = M.getFunction(FN_AUTO_REGISTER);
-  bool CreatedAutoReg = false;
-  if (!AutoReg) {
-    auto *AutoRegTy = FunctionType::get(Type::getVoidTy(Ctx), false);
-    AutoReg = Function::Create(AutoRegTy, GlobalValue::InternalLinkage,
-                               FN_AUTO_REGISTER, &M);
-    BasicBlock::Create(Ctx, "entry", AutoReg);
-    ReturnInst::Create(Ctx, &AutoReg->getEntryBlock());
-    CreatedAutoReg = true;
-  }
+  auto [AutoReg, CreatedAutoReg] = getOrCreateAutoRegister(M);
   Instruction *Ret = AutoReg->getEntryBlock().getTerminator();
   FunctionCallee FnRegLc = M.getFunction(FN_REGISTER_LIFECYCLE);
   for (auto &KV : LCs) {
@@ -372,16 +351,7 @@ emitFuncIndexRegistration(Module &M,
       FN_REGISTER_FUNCINDEX,
       FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, PtrTy}, false));
 
-  Function *AutoReg = M.getFunction(FN_AUTO_REGISTER);
-  bool CreatedAutoReg = false;
-  if (!AutoReg) {
-    auto *AutoRegTy = FunctionType::get(Type::getVoidTy(Ctx), false);
-    AutoReg = Function::Create(AutoRegTy, GlobalValue::InternalLinkage,
-                               FN_AUTO_REGISTER, &M);
-    BasicBlock::Create(Ctx, "entry", AutoReg);
-    ReturnInst::Create(Ctx, &AutoReg->getEntryBlock());
-    CreatedAutoReg = true;
-  }
+  auto [AutoReg, CreatedAutoReg] = getOrCreateAutoRegister(M);
   Instruction *Ret = AutoReg->getEntryBlock().getTerminator();
   FunctionCallee FnReg = M.getFunction(FN_REGISTER_FUNCINDEX);
   for (auto &KV : Fns) {
@@ -470,16 +440,7 @@ emitIcacheSlotRegistration(Module &M,
     return (Elem && !Elem->isNullValue()) ? Elem : nullptr;
   };
 
-  Function *AutoReg = M.getFunction(FN_AUTO_REGISTER);
-  bool CreatedAutoReg = false;
-  if (!AutoReg) {
-    auto *AutoRegTy = FunctionType::get(Type::getVoidTy(Ctx), false);
-    AutoReg = Function::Create(AutoRegTy, GlobalValue::InternalLinkage,
-                               FN_AUTO_REGISTER, &M);
-    BasicBlock::Create(Ctx, "entry", AutoReg);
-    ReturnInst::Create(Ctx, &AutoReg->getEntryBlock());
-    CreatedAutoReg = true;
-  }
+  auto [AutoReg, CreatedAutoReg] = getOrCreateAutoRegister(M);
   Instruction *Ret = AutoReg->getEntryBlock().getTerminator();
   FunctionCallee FnReg = M.getFunction(FN_REGISTER_ICACHE_SLOT);
   for (auto &KV : Fns) {
@@ -540,12 +501,12 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   LLVMContext &Ctx = M.getContext();
   auto *PtrTy = PointerType::getUnqual(Ctx);
 
-  SmallVector<Function *, 4> EntryFuncs;
+  SmallVector<EntryInfo, 4> EntryFuncs;
   for (Function &F : M.functions()) {
     MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
     if (hasMDStringEntry(MD, TAG_EJIT_ENTRY) && !F.isDeclaration() &&
         !F.isVarArg())
-      EntryFuncs.push_back(&F);
+      EntryFuncs.push_back(parseEntryInfo(F, *MD));
   }
 
   if (EntryFuncs.empty()) {
@@ -563,8 +524,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   M.getOrInsertFunction(
       FN_TASKPOOL_COMPILE_OR_GET,
       FunctionType::get(I32Ty, {I32Ty, PtrTy, I32Ty, PtrTy, PtrTy}, false));
-  bool HasBoundPtr = llvm::any_of(EntryFuncs, [](const Function *F) {
-    return !getBoundPtrInfos(*F).empty();
+  bool HasBoundPtr = llvm::any_of(EntryFuncs, [](const EntryInfo &E) {
+    return !E.BoundPtrs.empty();
   });
   if (HasBoundPtr)
     M.getOrInsertFunction(FN_TASKPOOL_COMPILE_OR_GET_BOUND,
@@ -612,7 +573,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   // — and re-emitting the module-level lifecycle registration would duplicate
   // it.
   if (llvm::all_of(EntryFuncs,
-                   [&](Function *F) { return isAlreadyWrapped(*F); }))
+                   [&](const EntryInfo &E) { return isAlreadyWrapped(*E.F); }))
     return PreservedAnalyses::all();
 
   // Cross-module-stable dimType: gather the distinct lifecycle (period) names
@@ -624,8 +585,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   // different lifecycles never collide (EJitLifecycleRegistry.h). funcIndex is
   // assigned the same way by the process-global EJitFuncRegistry (below).
   std::map<std::string, GlobalVariable *> DimTypeGlobals;
-  for (Function *F : EntryFuncs)
-    for (auto &PI : getPeriodArrIndInfo(*F))
+  for (const EntryInfo &E : EntryFuncs)
+    for (const auto &PI : E.PeriodInds)
       if (!PI.PeriodName.empty())
         DimTypeGlobals.emplace(PI.PeriodName, nullptr);
   if (DimTypeGlobals.size() > kEJitMaxDimTypes) {
@@ -647,9 +608,9 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   // exhausted). The loader keys its table by the SAME registry index, so no two
   // functions can alias one slot (EJitFuncRegistry.h).
   std::map<std::string, GlobalVariable *> FuncIndexGlobals;
-  for (Function *F : EntryFuncs)
-    FuncIndexGlobals.emplace(F->getName().str(),
-                             getOrCreateFuncIndexGlobal(M, F->getName()));
+  for (const EntryInfo &E : EntryFuncs)
+    FuncIndexGlobals.emplace(E.F->getName().str(),
+                             getOrCreateFuncIndexGlobal(M, E.F->getName()));
   emitFuncIndexRegistration(M, FuncIndexGlobals);
 
   // Per-function inline-cache slot globals (@__ejit_icache_fn_<name>), created
@@ -660,8 +621,9 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   // slot at its initial miss value; it may still serve the generic lookup.
   std::map<std::string, IcacheSlotInfo> IcacheFnGlobals;
   if (EJitInlineCache) {
-    for (Function *F : EntryFuncs) {
-      unsigned NumDims = getPeriodArrIndInfo(*F).size();
+    for (const EntryInfo &E : EntryFuncs) {
+      Function *F = E.F;
+      unsigned NumDims = E.PeriodInds.size();
       // Skip functions exceeding the cache dimensionality cap from the icache
       // map. They are still wrapped (taskpool path) but without an icache
       // probe; the per-function DimCount > EJIT_ICACHE_MAX_DIMS check below
@@ -684,7 +646,10 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   LLVM_DEBUG(dbgs() << "ejit-wrapper-gen: " << EntryFuncs.size()
                     << " entry function(s)\n");
   bool Changed = false;
-  for (Function *F : EntryFuncs) {
+  for (const EntryInfo &E : EntryFuncs) {
+    Function *F = E.F;
+    const auto &PeriodInds = E.PeriodInds;
+    const auto &BoundPtrs = E.BoundPtrs;
     LLVM_DEBUG(dbgs() << "ejit-wrapper-gen: wrapping " << F->getName() << "\n");
     // Idempotency guard: skip functions already wrapped by an earlier pass run.
     // PASS3 may be invoked multiple times via EJitAotModulePass (e.g. O1+O2
@@ -704,8 +669,6 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     if (!F->hasFnAttribute(Attribute::AlwaysInline))
       F->addFnAttr(Attribute::NoInline);
 
-    auto PeriodInds = getPeriodArrIndInfo(*F);
-    SmallVector<BoundPtrInfo, 8> BoundPtrs = getBoundPtrInfos(*F);
     unsigned DimCount = PeriodInds.size();
 
     if (BoundPtrs.size() > MAX_BOUND_PTR_PARAMS) {

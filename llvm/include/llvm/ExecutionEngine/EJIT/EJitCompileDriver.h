@@ -98,6 +98,11 @@ public:
   void registerSymbol(const std::string &name, void *addr);
 
 private:
+  /// A dequeued request has already passed the shared-record boundary.
+  void *compileNowValidated(const EJitCompileRequest &req);
+  static bool taskpoolCompileThunk(void *ctx, const EJitCompileRequest &req,
+                                   void **outFn);
+
   const Config &config_;
   EJitRuntimeState &runtimeState_;
   EJitModuleLoader &loader_;

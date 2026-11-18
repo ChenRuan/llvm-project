@@ -1,6 +1,7 @@
 //===-- EJit.cpp - EmbeddedJIT Main C++ API -------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
+#include "EJitCodePoolCounters.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h" // SECT_EJIT_* section names
@@ -329,11 +330,8 @@ EJit::EJit(const Config &config) : config_(config) {
 }
 
 EJit::~EJit() {
-  // Destroy in reverse order (compile driver holds references to other
-  // components)
+  // Stop and join the worker before tearing down anything it borrows.
   compileDriver_.reset();
-  moduleLoader_.reset();
-  runtimeState_.reset();
 }
 
 void EJit::recordInitError(int code, const std::string &message,
@@ -372,8 +370,7 @@ bool EJit::activate(const std::string &periodName, uint32_t cellIdx) {
     // period instance. setEnabled(true) flips 0->1 + bumps version on first
     // activate; it is a no-op while already active, until a deactivate flips
     // the bit back.
-    if (EJitSharedTaskPool *sp = sharedTaskPool())
-      sp->setInstanceEnabled(dt, cellIdx, /*enabled=*/true);
+    sharedTaskPool()->setInstanceEnabled(dt, cellIdx, /*enabled=*/true);
     return true;
   }
   if (!runtimeState_->getRegistry().getArrays(periodName)) {
@@ -396,8 +393,7 @@ bool EJit::deactivate(const std::string &periodName, uint32_t cellIdx) {
     // shared compileOrGet / runCompile / cacheLookup. invalidateByPeriod below
     // still drains the per-instance LRU; the shared POD cache is invalidated by
     // version alone.
-    if (EJitSharedTaskPool *sp = sharedTaskPool())
-      sp->setInstanceEnabled(dt, cellIdx, /*enabled=*/false);
+    sharedTaskPool()->setInstanceEnabled(dt, cellIdx, /*enabled=*/false);
     return true;
   }
   if (!runtimeState_->getRegistry().getArrays(periodName)) {
@@ -414,8 +410,7 @@ bool EJit::activateAll(const std::string &periodName) {
   if (dt != kEJitInvalidDimType) {
     // One batched call: the per-instance entry point drains the whole cell
     // table each time, so looping it here cost MAX_INSTANCES full drains.
-    if (EJitSharedTaskPool *sp = sharedTaskPool())
-      sp->setAllInstancesEnabled(dt, /*enabled=*/true);
+    sharedTaskPool()->setAllInstancesEnabled(dt, /*enabled=*/true);
     return true;
   }
   if (!runtimeState_->getRegistry().getArrays(periodName)) {
@@ -429,8 +424,7 @@ bool EJit::activateAll(const std::string &periodName) {
 bool EJit::deactivateAll(const std::string &periodName) {
   uint32_t dt = EJitLifecycleRegistry::instance().lookup(periodName);
   if (dt != kEJitInvalidDimType) {
-    if (EJitSharedTaskPool *sp = sharedTaskPool())
-      sp->setAllInstancesEnabled(dt, /*enabled=*/false);
+    sharedTaskPool()->setAllInstancesEnabled(dt, /*enabled=*/false);
     return true;
   }
   if (!runtimeState_->getRegistry().getArrays(periodName)) {
@@ -452,10 +446,8 @@ bool EJit::isActive(const std::string &periodName, uint32_t cellIdx) const {
   // producer sees and the worker gates on. A non-lifecycle period name (a
   // plain period array without a dimType) still consults the private state.
   uint32_t dt = EJitLifecycleRegistry::instance().lookup(periodName);
-  if (dt != kEJitInvalidDimType) {
-    if (const EJitSharedTaskPool *sp = sharedTaskPool())
-      return sp->isInstanceActive(dt, cellIdx);
-  }
+  if (dt != kEJitInvalidDimType)
+    return sharedTaskPool()->isInstanceActive(dt, cellIdx);
   // Cell-index range already validated above; the private state still takes a
   // uint8_t (its tables are sized kEJitMaxInstances, keyed by the validated
   // index), so the narrowing here is provably safe.
@@ -479,8 +471,7 @@ void EJit::invalidateAllByPeriod(const std::string &periodName) {
 }
 
 void EJit::registerSymbol(const std::string &name, void *addr) {
-  if (compileDriver_)
-    compileDriver_->registerSymbol(name, addr);
+  compileDriver_->registerSymbol(name, addr);
 }
 
 bool EJit::registerBitcode(const std::string &funcName, const uint8_t *data,
@@ -488,10 +479,6 @@ bool EJit::registerBitcode(const std::string &funcName, const uint8_t *data,
   // Post-init runtime registration. The bool propagates to the caller (the C
   // ABI records a failure into the registration-error sink); construction-time
   // registration validates separately in the constructor (recordInitError).
-  if (!moduleLoader_) {
-    EJIT_DIAG("registerBitcode reject func=%s: no module loader", funcName.c_str());
-    return false;
-  }
   // Frozen after init: the worker reads the loader/registries lock-free, so no
   // runtime registration is allowed (nothing is mutated on rejection).
   if (registrationFrozen()) {
@@ -505,11 +492,6 @@ bool EJit::registerBitcode(const std::string &funcName, const uint8_t *data,
 bool EJit::registerPeriodArray(const std::string &periodName,
                                const std::string &varName, void *baseAddr,
                                uint64_t arraySize) {
-  if (!runtimeState_) {
-    EJIT_DIAG("registerPeriodArray reject period=%s: no runtime state",
-              periodName.c_str());
-    return false;
-  }
   if (registrationFrozen()) {
     EJIT_DIAG("registerPeriodArray reject period=%s: registration frozen",
               periodName.c_str());
@@ -521,11 +503,6 @@ bool EJit::registerPeriodArray(const std::string &periodName,
 }
 
 bool EJit::registerStaticVar(const std::string &varName, void *varAddr) {
-  if (!runtimeState_) {
-    EJIT_DIAG("registerStaticVar reject var=%s: no runtime state",
-              varName.c_str());
-    return false;
-  }
   if (registrationFrozen()) {
     EJIT_DIAG("registerStaticVar reject var=%s: registration frozen",
               varName.c_str());
@@ -544,10 +521,10 @@ OptimizationLevel EJit::getOptimizationLevel() const {
 }
 
 EJitSharedTaskPool *EJit::sharedTaskPool() {
-  return compileDriver_ ? compileDriver_->sharedTaskPool() : nullptr;
+  return compileDriver_->sharedTaskPool();
 }
 const EJitSharedTaskPool *EJit::sharedTaskPool() const {
-  return compileDriver_ ? compileDriver_->sharedTaskPool() : nullptr;
+  return compileDriver_->sharedTaskPool();
 }
 
 void EJit::printRegistry() const {
@@ -671,34 +648,6 @@ bool EJit::getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const {
   if (!out)
     return false;
 #ifdef EJIT_SRE_CODE_POOL
-  auto CopyShared = [](ejit_code_pool_stats_t &Dst,
-                       const EJitCodePoolStatsOut::Detail &Src) {
-    Dst.poolCount = Src.poolCount;
-    Dst.sealedCount = Src.sealedCount;
-    Dst.activeCount = Src.activeCount;
-    Dst.usedBytes = Src.usedBytes;
-    Dst.reservedBytes = Src.reservedBytes;
-    Dst.wastedBytes = Src.wastedBytes;
-    Dst.sealInvocations = Src.sealInvocations;
-    Dst.splitInvocations = Src.splitInvocations;
-    Dst.finalizedRangeCount = Src.finalizedRangeCount;
-  };
-#endif
-#ifdef EJIT_SRE_CODE_POOL
-  auto CopyManager = [](ejit_code_pool_stats_t &Dst,
-                        const EJitCodePoolManager::Stats &Src) {
-    Dst.poolCount = Src.poolCount;
-    Dst.sealedCount = Src.sealedCount;
-    Dst.activeCount = Src.activeCount;
-    Dst.usedBytes = Src.usedBytes;
-    Dst.reservedBytes = Src.reservedBytes;
-    Dst.wastedBytes = Src.wastedBytes;
-    Dst.sealInvocations = Src.sealInvocations;
-    Dst.splitInvocations = Src.splitInvocations;
-    Dst.finalizedRangeCount = Src.finalizedRangeCount;
-  };
-#endif
-#ifdef EJIT_SRE_CODE_POOL
   // Shared build: read the owner-published mirror so every core (owner and
   // non-owner) sees the SAME code-pool stats. The real pools are owner-private,
   // so a non-owner's per-core manager is empty (pools=0) — the mirror is the
@@ -706,33 +655,21 @@ bool EJit::getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const {
   if (const EJitSharedTaskPool *sp = sharedTaskPool()) {
     EJitCodePoolStatsOut s{};
     if (sp->readCodePoolStats(&s)) {
-      EJitCodePoolStatsOut::Detail Total;
-      Total.poolCount = s.poolCount;
-      Total.sealedCount = s.sealedCount;
-      Total.activeCount = s.activeCount;
-      Total.usedBytes = s.usedBytes;
-      Total.reservedBytes = s.reservedBytes;
-      Total.wastedBytes = s.wastedBytes;
-      Total.sealInvocations = s.sealInvocations;
-      Total.splitInvocations = s.splitInvocations;
-      Total.finalizedRangeCount = s.finalizedRangeCount;
-      CopyShared(out->total, Total);
-      CopyShared(out->near, s.near);
-      CopyShared(out->far, s.far);
+      copyPoolCounters(out->total, s);
+      copyPoolCounters(out->near, s.near);
+      copyPoolCounters(out->far, s.far);
       return true;
     }
   }
-#endif
-#ifdef EJIT_SRE_CODE_POOL
   if (!compileDriver_)
     return false;
   EJitOrcEngine *engine = compileDriver_->getJitEngine();
   if (!engine)
     return false;
   EJitTieredCodePoolStats s = engine->getTieredCodePoolStats();
-  CopyManager(out->total, s.total);
-  CopyManager(out->near, s.near);
-  CopyManager(out->far, s.far);
+  copyPoolCounters(out->total, s.total);
+  copyPoolCounters(out->near, s.near);
+  copyPoolCounters(out->far, s.far);
   return true;
 #else
   return false;
@@ -774,16 +711,9 @@ void EJit::printCodePoolStats() const {
 }
 
 bool EJit::printMayConstRanking() {
-  if (!compileDriver_) {
-    EJIT_DIAG_RAW("mayconst-ranking: no compile driver");
-    return false;
-  }
   if (EJitOrcEngine *Engine = compileDriver_->getJitEngine())
     return Engine->printMayConstRanking();
-  if (EJitSharedTaskPool *Pool = compileDriver_->sharedTaskPool())
-    return Pool->requestMayConstRanking();
-  EJIT_DIAG_RAW("mayconst-ranking: no local or shared compiler");
-  return false;
+  return sharedTaskPool()->requestMayConstRanking();
 }
 
 void EJit::printActive() const {

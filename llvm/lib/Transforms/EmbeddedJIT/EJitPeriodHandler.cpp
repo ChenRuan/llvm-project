@@ -39,11 +39,8 @@ struct LifecycleInfo {
 };
 
 static SmallVector<LifecycleInfo, 4>
-collectLifecycleInfo(Function &F) {
+collectLifecycleInfo(MDNode *MD) {
   SmallVector<LifecycleInfo, 4> Result;
-  MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
-  if (!MD)
-    return Result;
 
   // Collect period names from ejit_period_lc entries
   for (const MDOperand &Op : MD->operands()) {
@@ -86,11 +83,11 @@ collectLifecycleInfo(Function &F) {
 PreservedAnalyses
 EJitPeriodHandlerPass::run(Module &M, ModuleAnalysisManager &AM) {
   bool Changed = false;
-  SmallVector<Function *, 4> LcFuncs;
+  SmallVector<std::pair<Function *, MDNode *>, 4> LcFuncs;
   for (Function &F : M.functions()) {
     MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
     if (hasMDStringEntry(MD, TAG_EJIT_PERIOD_LC) && !F.isDeclaration())
-      LcFuncs.push_back(&F);
+      LcFuncs.emplace_back(&F, MD);
   }
 
   if (LcFuncs.empty()) {
@@ -113,8 +110,8 @@ EJitPeriodHandlerPass::run(Module &M, ModuleAnalysisManager &AM) {
   M.getOrInsertFunction(FN_ACTIVATE,
       FunctionType::get(VoidTy, {PtrTy, I32Ty}, false));
 
-  for (Function *F : LcFuncs) {
-    auto LcInfos = collectLifecycleInfo(*F);
+  for (auto [F, MD] : LcFuncs) {
+    auto LcInfos = collectLifecycleInfo(MD);
     if (LcInfos.empty())
       continue;
 

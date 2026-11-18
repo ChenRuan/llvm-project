@@ -1,6 +1,7 @@
 //===-- EJitCompileDriver.cpp - Compilation Scheduler ---------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
+#include "EJitCodePoolCounters.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
@@ -37,18 +38,19 @@ static uint64_t auditClockNow() {
 using namespace llvm;
 using namespace llvm::ejit;
 
-namespace {
 /// Adapter so the taskpool can call back into the driver's cold compile path
 /// through a plain function pointer (never std::function). The produced JIT
 /// pointer still comes from the OrcJIT engine (SRE code pool when enabled).
-bool taskpoolCompileThunk(void *ctx, const EJitCompileRequest &req,
-                          void **outFn) {
+bool EJitCompileDriver::taskpoolCompileThunk(void *ctx,
+                                             const EJitCompileRequest &req,
+                                             void **outFn) {
   auto *drv = static_cast<EJitCompileDriver *>(ctx);
-  void *fn = drv->compileNow(req);
+  void *fn = drv->compileNowValidated(req);
   *outFn = fn;
   return fn != nullptr;
 }
 
+namespace {
 void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
                           bool published) {
   static_cast<EJitCompileDriver *>(ctx)->notifyTaskpoolPublished(req,
@@ -114,30 +116,9 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
   EJitOrcEngine *eng = drv->getJitEngine();
   if (eng && out) {
     EJitTieredCodePoolStats tiered = eng->getTieredCodePoolStats();
-    const EJitCodePoolManager::Stats &s = tiered.total;
-    out->poolCount = s.poolCount;
-    out->sealedCount = s.sealedCount;
-    out->activeCount = s.activeCount;
-    out->usedBytes = s.usedBytes;
-    out->reservedBytes = s.reservedBytes;
-    out->wastedBytes = s.wastedBytes;
-    out->sealInvocations = s.sealInvocations;
-    out->splitInvocations = s.splitInvocations;
-    out->finalizedRangeCount = s.finalizedRangeCount;
-    auto CopyDetail = [](EJitCodePoolStatsOut::Detail &Dst,
-                         const EJitCodePoolManager::Stats &Src) {
-      Dst.poolCount = Src.poolCount;
-      Dst.sealedCount = Src.sealedCount;
-      Dst.activeCount = Src.activeCount;
-      Dst.usedBytes = Src.usedBytes;
-      Dst.reservedBytes = Src.reservedBytes;
-      Dst.wastedBytes = Src.wastedBytes;
-      Dst.sealInvocations = Src.sealInvocations;
-      Dst.splitInvocations = Src.splitInvocations;
-      Dst.finalizedRangeCount = Src.finalizedRangeCount;
-    };
-    CopyDetail(out->near, tiered.near);
-    CopyDetail(out->far, tiered.far);
+    copyPoolCounters(*out, tiered.total);
+    copyPoolCounters(out->near, tiered.near);
+    copyPoolCounters(out->far, tiered.far);
     return true;
   }
   return false;
@@ -459,12 +440,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   for (unsigned i = 0; i < dimCount; ++i)
     ctx.dimensions.push_back({periodNames[i], dims[i]});
   if (request && request->boundCount) {
-    if (!validateBoundPtrDescriptors(request->boundPointers,
-                                     request->boundCount)) {
-      EJIT_DIAG("compile FAIL key=0x%016lx func=%s: invalid bound pointer list",
-                cacheKey, funcName.c_str());
-      return nullptr;
-    }
     for (uint32_t I = 0; I < request->boundCount; ++I) {
       const EJitBoundPtrDescriptor &B = request->boundPointers[I];
       // Keep this lookup as an explicit loop. libc++ may lower generic
@@ -553,18 +528,8 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
             (void)aggregateValueSamples(samples, vpFuncs, vpIt->second.targets,
                                         valueSites, scalarSites);
             const size_t totalScalar = scalarSites.size();
-            size_t dropped = 0;
-            for (PgoScalarSite &s : scalarSites) {
-              if (s.topCount < EJIT_SRE_VP_MIN_SAMPLES ||
-                  s.topCount * 100 < s.total * EJIT_SRE_VP_MIN_CONF_PERCENT)
-                dropped++;
-            }
-            // Apply the dominance thresholds: below them a site stays on the
-            // generic fallback path.
-            llvm::erase_if(scalarSites, [](const PgoScalarSite &s) {
-              return s.topCount < EJIT_SRE_VP_MIN_SAMPLES ||
-                     s.topCount * 100 < s.total * EJIT_SRE_VP_MIN_CONF_PERCENT;
-            });
+            llvm::erase_if(scalarSites, belowScalarThreshold);
+            const size_t dropped = totalScalar - scalarSites.size();
             ctx.scalarValueSites.assign(scalarSites.begin(), scalarSites.end());
             ctx.profileData = synthesizeProfileBuffer(refs, valueSites);
             // Consume: forget this function's collected values so a later
@@ -754,6 +719,12 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
 }
 
 void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
+  if (!EJitSharedTaskPool::validCompileRequest(req))
+    return nullptr;
+  return compileNowValidated(req);
+}
+
+void *EJitCompileDriver::compileNowValidated(const EJitCompileRequest &req) {
   // PGO tier rides in req.funcIndex's top 2 bits (EJitTaskPoolTypes.h). Strip it to
   // recover the real funcIndex - the loader lookup and cacheKey must NOT carry
   // tier (Tier-1 and Tier-2 of the same (funcIndex, dims) share one cacheKey,
@@ -763,34 +734,14 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
 
   EJIT_DIAG("compileNow begin func=%u dims=%u tier=%u", funcIdx, req.numDims,
             tier);
-  if (req.numDims > 4) {
-    EJIT_DIAG("compileNow reject func=%u: numDims=%u > 4", funcIdx,
-              req.numDims);
-    return nullptr;
-  }
-
-  // Validate the request: instanceIds must be encodable in the legacy 8-bit
-  // cacheKey slots, and no two dims may share a dimType (a duplicated lifecycle
-  // dimension).
-  uint32_t seenDimTypes[4] = {};
-  uint32_t seenCount = 0;
-
+  // Duplicate lifecycle dimensions cannot be packed into the cache key.
   for (uint32_t i = 0; i < req.numDims; ++i) {
-    if (req.dims[i].instanceId > 255u) {
-      EJIT_DIAG("compileNow reject func=%u: instanceId=%u > 255 (dim[%u])",
-                funcIdx, req.dims[i].instanceId, i);
-      return nullptr;
-    }
-
-    for (uint32_t j = 0; j < seenCount; ++j)
-      if (seenDimTypes[j] == req.dims[i].dimType) {
+    for (uint32_t j = 0; j < i; ++j)
+      if (req.dims[j].dimType == req.dims[i].dimType) {
         EJIT_DIAG("compileNow reject func=%u: duplicate dimType=%u (dim[%u])",
                   funcIdx, req.dims[i].dimType, i);
         return nullptr;
       }
-
-    assert(seenCount < 4 && "seenDimTypes overflow: numDims guard broken");
-    seenDimTypes[seenCount++] = req.dims[i].dimType;
   }
 
   // meta.dimTypes[i] is the explicit dimType slot the loader read back BY NAME

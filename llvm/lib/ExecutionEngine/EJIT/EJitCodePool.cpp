@@ -7,6 +7,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitCodePool.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/Sequence.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/Support/MathExtras.h"
 #include <algorithm>
@@ -28,6 +30,21 @@ inline uintptr_t alignUpAddr(uintptr_t V, size_t A) {
 }
 
 inline uintptr_t addr(const void *P) { return reinterpret_cast<uintptr_t>(P); }
+
+struct SealPages {
+  uintptr_t Begin, End;
+  size_t Page;
+
+  SealPages(uintptr_t Start, size_t Size, size_t Page)
+      : Begin(alignDownAddr(Start, Page)), End(alignUpAddr(Start + Size, Page)),
+        Page(Page) {}
+
+  auto addresses() const {
+    const uintptr_t Count = End > Begin ? (End - Begin) / Page : 0;
+    return map_range(seq(Count),
+                     [this](uintptr_t I) { return Begin + I * Page; });
+  }
+};
 
 bool rangeFitsPool(const CodePool &P, const void *Start, size_t Size) {
   uintptr_t A = addr(Start);
@@ -246,13 +263,11 @@ Error EJitCodePoolManager::sealCodeRange(const void *Start, size_t Size) {
 
   // Seal every 4KiB page the written code overlaps: page-align the start down
   // and the end up, then enable_ex(1, pageVA) per page.
-  size_t Page = Opts_.sealPageSize;
-  uintptr_t PageStart = alignDownAddr(addr(Start), Page);
-  uintptr_t PageEnd = alignUp(addr(Start) + Size, Page);
+  SealPages Pages(addr(Start), Size, Opts_.sealPageSize);
   EJIT_DIAG("sealCodeRange: start=%p size=%zu pageStart=0x%llx pageEnd=0x%llx",
-            Start, Size, static_cast<unsigned long long>(PageStart),
-            static_cast<unsigned long long>(PageEnd));
-  for (uintptr_t VA = PageStart; VA < PageEnd; VA += Page) {
+            Start, Size, static_cast<unsigned long long>(Pages.Begin),
+            static_cast<unsigned long long>(Pages.End));
+  for (uintptr_t VA : Pages.addresses()) {
     unsigned Rc = Seal_ ? Seal_(reinterpret_cast<void *>(VA)) : 1;
     if (Rc != 0) {
       EJIT_DIAG("sealCodeRange FAIL: enable_ex page=0x%llx rc=%u",
@@ -297,14 +312,12 @@ Error EJitCodePoolManager::enableRwRange(const void *Start, size_t Size) {
         inconvertibleErrorCode());
   }
   // Make every 4KiB page the slab overlaps writable, mirroring sealCodeRange.
-  size_t Page = Opts_.sealPageSize;
-  uintptr_t PageStart = alignDownAddr(addr(Start), Page);
-  uintptr_t PageEnd = alignUp(addr(Start) + Size, Page);
+  SealPages Pages(addr(Start), Size, Opts_.sealPageSize);
   EJIT_DIAG_DEBUG(
       "enableRwRange: start=%p size=%zu pageStart=0x%llx pageEnd=0x%llx", Start,
-      Size, static_cast<unsigned long long>(PageStart),
-      static_cast<unsigned long long>(PageEnd));
-  for (uintptr_t VA = PageStart; VA < PageEnd; VA += Page) {
+      Size, static_cast<unsigned long long>(Pages.Begin),
+      static_cast<unsigned long long>(Pages.End));
+  for (uintptr_t VA : Pages.addresses()) {
     unsigned Rc = EnableRw_ ? EnableRw_(reinterpret_cast<void *>(VA)) : 1;
     if (Rc != 0) {
       EJIT_DIAG("enableRwRange FAIL: enable_rw page=0x%llx rc=%u",
@@ -318,7 +331,8 @@ Error EJitCodePoolManager::enableRwRange(const void *Start, size_t Size) {
           "EJitCodePool: enable_rw failed (rc=" + Twine(Rc) + ") for page " +
               Twine(VA),
           inconvertibleErrorCode());
-      for (uintptr_t RollVA = PageStart; RollVA < VA; RollVA += Page) {
+      SealPages Changed(Pages.Begin, VA - Pages.Begin, Pages.Page);
+      for (uintptr_t RollVA : Changed.addresses()) {
         unsigned SealRc = Seal_ ? Seal_(reinterpret_cast<void *>(RollVA)) : 1;
         if (SealRc == 0) {
           ++SealInvocations_;
@@ -366,11 +380,9 @@ Error EJitCodePoolManager::restoreRxRange(const void *Start, size_t Size) {
         inconvertibleErrorCode());
   }
 
-  size_t Page = Opts_.sealPageSize;
-  uintptr_t PageStart = alignDownAddr(addr(Start), Page);
-  uintptr_t PageEnd = alignUpAddr(addr(Start) + Size, Page);
+  SealPages Pages(addr(Start), Size, Opts_.sealPageSize);
   Error Err = Error::success();
-  for (uintptr_t VA = PageStart; VA < PageEnd; VA += Page) {
+  for (uintptr_t VA : Pages.addresses()) {
     unsigned Rc = Seal_ ? Seal_(reinterpret_cast<void *>(VA)) : 1;
     if (Rc == 0) {
       ++SealInvocations_;
@@ -390,37 +402,8 @@ Error EJitCodePoolManager::restoreRxRange(const void *Start, size_t Size) {
 bool EJitCodePoolManager::recordPendingRange(const void *Base, size_t Size,
                                              const EJitWritableRange *Writables,
                                              uint32_t WritableCount) {
-  if (!Opts_.batchedPageSeal || !Base || Size == 0)
-    return true;
-  if (WritableCount > kEJitMaxWritableRanges ||
-      (WritableCount != 0 && !Writables))
-    return false;
-#ifndef EJIT_FREESTANDING
-  std::lock_guard<std::mutex> Lock(Mutex_);
-#endif
-  const uintptr_t Start = addr(Base);
-  if (Start + Size < Start)
-    return false;
-  CodePool *Owner = findPoolLocked(Base);
-  if (!Owner || !rangeFitsPool(*Owner, Base, Size))
-    return false;
-  for (uint32_t I = 0; I < WritableCount; ++I) {
-    const uintptr_t WStart = Writables[I].addr;
-    const uint64_t WSize = Writables[I].size;
-    if (WSize == 0 || WStart + static_cast<uintptr_t>(WSize) < WStart ||
-        !rangeFitsPool(*Owner, reinterpret_cast<const void *>(WStart),
-                       static_cast<size_t>(WSize)))
-      return false;
-  }
-  for (const FinalizedRange &R : PendingRanges_)
-    if (R.start == Start && R.size == Size)
-      return true;
-  FinalizedRange Rec{Start, static_cast<uint64_t>(Size)};
-  Rec.writableCount = WritableCount;
-  for (uint32_t I = 0; I < WritableCount; ++I)
-    Rec.writables[I] = Writables[I];
-  PendingRanges_.push_back(Rec);
-  return true;
+  return !Opts_.batchedPageSeal ||
+         recordRange(RecordKind::Pending, Base, Size, Writables, WritableCount);
 }
 
 void EJitCodePoolManager::notePendingAllocation() {
@@ -463,9 +446,8 @@ Error EJitCodePoolManager::flushPendingRanges() {
           "EJitCodePool: pending range is outside its code pool",
           inconvertibleErrorCode());
     Bytes += static_cast<size_t>(R.size);
-    uintptr_t Begin = alignDownAddr(R.start, Opts_.sealPageSize);
-    uintptr_t End = alignUpAddr(R.start + R.size, Opts_.sealPageSize);
-    for (uintptr_t VA = Begin; VA < End; VA += Opts_.sealPageSize)
+    SealPages Covered(R.start, R.size, Opts_.sealPageSize);
+    for (uintptr_t VA : Covered.addresses())
       Pages.push_back(VA);
   }
   std::sort(Pages.begin(), Pages.end());
@@ -520,8 +502,19 @@ bool EJitCodePoolManager::contains(const void *Ptr) const {
 bool EJitCodePoolManager::recordFinalizedRange(
     const void *Base, size_t Size, const EJitWritableRange *Writables,
     uint32_t WritableCount) {
+  return recordRange(RecordKind::Finalized, Base, Size, Writables,
+                     WritableCount);
+}
+
+bool EJitCodePoolManager::recordRange(RecordKind Kind, const void *Base,
+                                      size_t Size,
+                                      const EJitWritableRange *Writables,
+                                      uint32_t WritableCount) {
+  const bool Pending = Kind == RecordKind::Pending;
   if (!Base || Size == 0) {
-    EJIT_DIAG_DEBUG("recordFinalizedRange skip: base=%p size=%zu", Base, Size);
+    if (!Pending)
+      EJIT_DIAG_DEBUG("recordFinalizedRange skip: base=%p size=%zu", Base,
+                      Size);
     return true; // benign no-op (no executable extent to record).
   }
   // Over-bound writable set: REJECT (do not record). Truncating to zero would
@@ -529,20 +522,25 @@ bool EJitCodePoolManager::recordFinalizedRange(
   // writes, so a peer would under-prepare and fault. Rejecting makes findRange
   // fail -> the owner never publishes a callable pointer for it.
   if (WritableCount > kEJitMaxWritableRanges) {
-    EJIT_DIAG("recordFinalizedRange REJECT: base=%p writableCount=%u > max=%u",
-              Base, WritableCount, kEJitMaxWritableRanges);
+    if (!Pending)
+      EJIT_DIAG(
+          "recordFinalizedRange REJECT: base=%p writableCount=%u > max=%u",
+          Base, WritableCount, kEJitMaxWritableRanges);
     return false;
   }
   // A non-zero count with no array is malformed: reject rather than silently
   // record zero writable ranges.
   if (WritableCount > 0 && !Writables) {
-    EJIT_DIAG("recordFinalizedRange REJECT: base=%p writableCount=%u but null "
-              "Writables",
-              Base, WritableCount);
+    if (!Pending)
+      EJIT_DIAG(
+          "recordFinalizedRange REJECT: base=%p writableCount=%u but null "
+          "Writables",
+          Base, WritableCount);
     return false;
   }
-  EJIT_DIAG_DEBUG("recordFinalizedRange: base=%p size=%zu writable=%u", Base,
-                  Size, WritableCount);
+  if (!Pending)
+    EJIT_DIAG_DEBUG("recordFinalizedRange: base=%p size=%zu writable=%u", Base,
+                    Size, WritableCount);
 #ifndef EJIT_FREESTANDING
   std::lock_guard<std::mutex> Lock(Mutex_);
 #endif
@@ -550,8 +548,9 @@ bool EJitCodePoolManager::recordFinalizedRange(
   // Overflow guard: a range whose end wraps is malformed; reject it (findRange
   // would otherwise admit any pointer).
   if (Start + Size < Start) {
-    EJIT_DIAG("recordFinalizedRange REJECT: wraparound start=0x%llx size=%zu",
-              static_cast<unsigned long long>(Start), Size);
+    if (!Pending)
+      EJIT_DIAG("recordFinalizedRange REJECT: wraparound start=0x%llx size=%zu",
+                static_cast<unsigned long long>(Start), Size);
     return false;
   }
   // The executable extent must belong to a known pool; every writable range
@@ -560,20 +559,25 @@ bool EJitCodePoolManager::recordFinalizedRange(
   // a malformed set can never be published as a callable, under-prepared range.
   CodePool *Owner = findPoolLocked(Base);
   if (!Owner) {
-    EJIT_DIAG("recordFinalizedRange REJECT: base=%p not owned by any pool",
-              Base);
+    if (!Pending)
+      EJIT_DIAG("recordFinalizedRange REJECT: base=%p not owned by any pool",
+                Base);
     return false;
   }
+  // Pending records will drive permission changes across the full extent.
+  if (Pending && !rangeFitsPool(*Owner, Base, Size))
+    return false;
   for (uint32_t I = 0; I < WritableCount; ++I) {
     uintptr_t WStart = Writables[I].addr;
     uint64_t WSize = Writables[I].size;
     if (WSize == 0 || WStart + static_cast<uintptr_t>(WSize) < WStart ||
         !rangeFitsPool(*Owner, reinterpret_cast<const void *>(WStart),
                        static_cast<size_t>(WSize))) {
-      EJIT_DIAG("recordFinalizedRange REJECT: base=%p writable[%u] "
-                "addr=0x%llx size=%llu invalid or out of pool",
-                Base, I, static_cast<unsigned long long>(WStart),
-                static_cast<unsigned long long>(WSize));
+      if (!Pending)
+        EJIT_DIAG("recordFinalizedRange REJECT: base=%p writable[%u] "
+                  "addr=0x%llx size=%llu invalid or out of pool",
+                  Base, I, static_cast<unsigned long long>(WStart),
+                  static_cast<unsigned long long>(WSize));
       return false;
     }
   }
@@ -584,21 +588,24 @@ bool EJitCodePoolManager::recordFinalizedRange(
   // can see here; a *partial* overlap would imply address reuse and is treated
   // as a distinct range (findRange resolves it deterministically: first match
   // in append order wins).
-  for (const FinalizedRange &R : FinalizedRanges_)
+  auto &Ranges = Pending ? PendingRanges_ : FinalizedRanges_;
+  for (const FinalizedRange &R : Ranges)
     if (R.start == Start && R.size == static_cast<uint64_t>(Size)) {
-      EJIT_DIAG_DEBUG(
-          "recordFinalizedRange dup: base=%p size=%zu (already recorded)", Base,
-          Size);
+      if (!Pending)
+        EJIT_DIAG_DEBUG(
+            "recordFinalizedRange dup: base=%p size=%zu (already recorded)",
+            Base, Size);
       return true;
     }
   FinalizedRange Rec{Start, static_cast<uint64_t>(Size)};
   Rec.writableCount = WritableCount;
   for (uint32_t I = 0; I < WritableCount; ++I)
     Rec.writables[I] = Writables[I];
-  FinalizedRanges_.push_back(Rec);
-  EJIT_DIAG_DEBUG(
-      "recordFinalizedRange OK: base=%p size=%zu writable=%u total=%zu", Base,
-      Size, Rec.writableCount, FinalizedRanges_.size());
+  Ranges.push_back(Rec);
+  if (!Pending)
+    EJIT_DIAG_DEBUG(
+        "recordFinalizedRange OK: base=%p size=%zu writable=%u total=%zu", Base,
+        Size, Rec.writableCount, Ranges.size());
   return true;
 }
 

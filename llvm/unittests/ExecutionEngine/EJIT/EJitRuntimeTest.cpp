@@ -90,6 +90,16 @@ TEST(EJitDump, FunctionAndModuleViewsHaveDifferentScopes) {
 }
 #endif
 
+TEST(EJitOrcEngine, DefaultConstructedEngineHasNoOptimizerResults) {
+  EJitOrcEngine Engine;
+  EXPECT_TRUE(Engine.getLastCounterNames().empty());
+  EXPECT_TRUE(Engine.getLastVpFunctions().empty());
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  EXPECT_TRUE(Engine.getLastMayConstLoadSites().empty());
+#endif
+  EXPECT_FALSE(Engine.printMayConstRanking());
+}
+
 TEST(EJitDump, FilteredCaptureMatchesBuildConfiguration) {
   std::string Bitcode;
   {
@@ -139,6 +149,9 @@ TEST(EJitDump, FilteredCaptureMatchesBuildConfiguration) {
     SpecializationContext Ctx;
     Ctx.fnName = Name;
     Ctx.cacheKey = Key;
+    // Exercise capture after an actual final-tier materialization as well.
+    if (StringRef(Name) == "dump_c")
+      Ctx.tier = CompileTier::PGOUse;
     Engine->setActiveContext(&Ctx);
     ASSERT_FALSE(errorToBool(Engine->loadBitcodeModule(Bitcode, Key, Name)));
     auto FnOrErr = Engine->lookup(Key, Name);
@@ -857,6 +870,10 @@ extern int ejit_taskpool_compile_or_get_bound(uint32_t,
                                               const ejit_dim_pair_test_t *,
                                               uint32_t, const void *, uint32_t,
                                               uint32_t, void **, uint32_t *);
+extern int ejit_taskpool_compile_or_get_bound_v(
+    uint32_t, const ejit_dim_pair_test_t *, uint32_t,
+    const llvm::ejit::EJitBoundPtrDescriptor *, uint32_t, void **, uint32_t *);
+extern void ejit_taskpool_release_read(uint32_t);
 extern void ejit_set_log_level(int level);
 extern int ejit_get_log_level(void);
 extern void ejit_print_registry(void);
@@ -1043,6 +1060,55 @@ TEST(EJitCApiTaskpool, SingleBoundRejectsEmptyObject) {
             -1);
   EXPECT_EQ(Fn, nullptr);
   EXPECT_EQ(Bucket, 0u);
+  ejit_shutdown();
+}
+
+TEST(EJitCApiTaskpool, OptionalOutputsAndValidationPrecedence) {
+  resetTaskpoolRegState();
+  auto resolve = ejit_taskpool_compile_or_get_bound_v;
+  void *fn = reinterpret_cast<void *>(1);
+  uint32_t bucket = 19;
+  EXPECT_EQ(resolve(0, nullptr, 1, nullptr, 1, &fn, nullptr), -2);
+  EXPECT_EQ(fn, nullptr);
+  EXPECT_EQ(resolve(0, nullptr, 1, nullptr, 1, nullptr, &bucket), -2);
+  EXPECT_EQ(bucket, 0u);
+  ejit_taskpool_release_read(0);
+
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
+  ejit_dim_pair_test_t dim{0, 0};
+  EXPECT_EQ(resolve(0, &dim, UINT32_MAX, nullptr, 0, nullptr, nullptr), -1);
+  EXPECT_EQ(resolve(0, nullptr, 1, nullptr, 0, nullptr, nullptr), -1);
+  EXPECT_EQ(resolve(0, nullptr, 0, nullptr, UINT32_MAX, nullptr, nullptr), -1);
+  llvm::ejit::EJitBoundPtrDescriptor b{nullptr, 4, 0};
+  EXPECT_EQ(resolve(0, nullptr, 0, &b, 1, nullptr, nullptr), -1);
+  dim.instanceId = UINT32_MAX;
+  EXPECT_EQ(resolve(0, &dim, 1, nullptr, 0, nullptr, nullptr), -1);
+  dim = {UINT32_MAX, 0};
+  EXPECT_EQ(resolve(0, &dim, 1, nullptr, 0, nullptr, nullptr), -1);
+  // Zero counts skip both lists; the otherwise invalid entries are not read.
+  EXPECT_NE(resolve(0, &dim, 0, &b, 0, &fn, &bucket), -1);
+  if (fn)
+    ejit_taskpool_release_read(bucket);
+  ejit_shutdown();
+  ejit_taskpool_release_read(0);
+  ejit_taskpool_release_read(UINT32_MAX);
+}
+
+TEST(EJitCApiTaskpool, MissingRegistrationFixupsAreSkipped) {
+  resetTaskpoolRegState();
+  auto check = [] {
+    uint32_t slot = 37;
+    ejit_register_lifecycle(nullptr, &slot);
+    ejit_register_funcindex(nullptr, &slot);
+    EXPECT_EQ(slot, 37u);
+    ejit_register_lifecycle("skipped", nullptr);
+    ejit_register_funcindex("skipped", nullptr);
+    ejit_register_icache_slot("skipped", nullptr, 0, nullptr);
+    EXPECT_FALSE(llvm::ejit::EJitRegistrationStore::instance().hasError());
+  };
+  check();
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
+  check(); // Missing inputs do not become frozen-registration errors.
   ejit_shutdown();
 }
 

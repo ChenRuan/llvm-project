@@ -249,6 +249,12 @@ typedef struct {
   uint32_t argIndex;
 } ejit_bound_ptr_t;
 
+/// All three taskpool resolve calls accept omitted outputs (for example,
+/// status-only input validation). A caller that can hit in a reclaiming build
+/// must collect the bucket and release the read after using the function.
+/// In NO_RECLAIM a successful lookup needs no reader release; releasing the
+/// returned sentinel is harmless. Callers must not retain tokens across init
+/// generations.
 ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
                                            const ejit_dim_pair_t *dims,
                                            uint32_t numDims, void **outFn,

@@ -614,11 +614,23 @@ TEST_F(SharedTaskPoolTest, PeerRequestsMayConstRankingFromOwnerWorker) {
   EJitCoreId::setCurrentForTest(1);
   ASSERT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
 
-  EXPECT_TRUE(peer.requestMayConstRanking());
-  EXPECT_EQ(log.calls, 1u);
+  // Keep a request outstanding across every ranking ticket. An idle-only
+  // service policy would drain the queue (or starve under continuous load).
+  for (unsigned i = 0; i != 32; ++i) {
+    ASSERT_EQ(peer.compileOrGet(i, nullptr, 0, nullptr).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(peer.requestMayConstRanking());
+    EXPECT_EQ(state_->dequeuePos.loadAcquire(), i);
+    driveOwnerOnRequesterIdle(&drive, 1);
+  }
+  EXPECT_EQ(owner.workerConsumeLoops(), 64u);
+  EXPECT_EQ(owner.workerIdleYields(), 0u);
+  EXPECT_EQ(peer.workerIdleYields(), 32u);
+  EXPECT_EQ(state_->dequeuePos.loadAcquire(), 32u);
+  EXPECT_EQ(log.calls, 32u);
   EXPECT_EQ(log.callbackCore, 0u);
-  EXPECT_EQ(state_->mayConstRankingRequest.loadAcquire(), 1u);
-  EXPECT_EQ(state_->mayConstRankingComplete.loadAcquire(), 1u);
+  EXPECT_EQ(state_->mayConstRankingRequest.loadAcquire(), 32u);
+  EXPECT_EQ(state_->mayConstRankingComplete.loadAcquire(), 32u);
   EXPECT_EQ(state_->mayConstRankingResult.loadAcquire(), 1u);
 }
 
@@ -947,6 +959,51 @@ TEST_F(SharedTaskPoolTest, BoundPointerDescriptorsAreFixedAndValidated) {
   EXPECT_EQ(
       owner.compileOrGet(105, nullptr, 0, codeFor(105), &Invalid, 1).status,
       EJitCompileOrGetStatus::InvalidParam);
+}
+
+TEST_F(SharedTaskPoolTest, MalformedRequestNeverReachesCompiler) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  pool.setPgoEnabled(true, 2, /*maxConcurrentProfiles=*/1);
+  unsigned calls = 0;
+  pool.setCompiler(
+      [](void *ctx, const EJitCompileRequest &req, void **out) {
+        ++*static_cast<unsigned *>(ctx);
+        *out = codeFor(req.funcIndex);
+        return true;
+      },
+      &calls);
+
+  EJitDimPair dim{};
+  EXPECT_EQ(pool.tryCacheHit(1, &dim, UINT32_MAX).status,
+            EJitCompileOrGetStatus::InvalidParam);
+  EXPECT_EQ(pool.compileOrGet(1, nullptr, 1, nullptr).status,
+            EJitCompileOrGetStatus::InvalidParam);
+  for (unsigned i = 0; i < 4; ++i) {
+    ASSERT_EQ(pool.compileOrGet(i, nullptr, 0, nullptr).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    // No worker thread in this fixture. Corrupt the published record, not
+    // the producer's input, to exercise the independent dequeue boundary.
+    auto &req =
+        state_->ring[state_->dequeuePos.loadAcquire() % kEJitSharedQueueSlots]
+            .data;
+    if (i == 0)
+      req.numDims = UINT32_MAX;
+    else if (i == 1)
+      req.boundCount = UINT32_MAX;
+    else {
+      req.numDims = 1;
+      req.dims[0] = i == 2 ? EJitDimPair{kEJitSharedDimTypes, 0}
+                           : EJitDimPair{0, kEJitSharedInstances};
+    }
+    ASSERT_TRUE(pool.pollOne());
+    EXPECT_EQ(calls, 0u);
+    EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  }
+  ASSERT_EQ(pool.compileOrGet(4, nullptr, 0, nullptr).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+  EXPECT_EQ(calls, 1u);
 }
 
 TEST_F(SharedTaskPoolTest, PgoBoundPointerIsReadOnlyDuringCompile) {
@@ -1611,6 +1668,48 @@ TEST_F(SharedTaskPoolTest, DeactivateDuringCompileBlocksPublish) {
   EXPECT_EQ(d.compileFailed, 1u);
   EXPECT_EQ(observer.calls, 1u);
   EXPECT_FALSE(observer.lastPublished);
+}
+
+TEST_F(SharedTaskPoolTest, PeerReadsNearFarCountersAndLegacyTotals) {
+  EJitSharedTaskPool owner, peer;
+  bringUpOwner(owner);
+  owner.setCodePoolStatsProvider(
+      [](void *, EJitCodePoolStatsOut *s) {
+        s->near = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+        s->far = {10, 20, 30, 40, UINT64_C(1) << 33, 60, 70, 80, 90};
+        s->poolCount = 11;
+        s->sealedCount = 22;
+        s->activeCount = 33;
+        s->usedBytes = 44;
+        s->reservedBytes = (UINT64_C(1) << 33) + 5;
+        s->wastedBytes = 66;
+        s->sealInvocations = 77;
+        s->splitInvocations = 88;
+        s->finalizedRangeCount = 99;
+        return true;
+      }, nullptr);
+  peer.bind(state_.get());
+  EJitCodePoolStatsOut s{};
+  ASSERT_TRUE(peer.readCodePoolStats(&s));
+  EXPECT_EQ(s.reservedBytes, 0u);
+  publish(owner, 10);
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_TRUE(peer.readCodePoolStats(&s));
+  EXPECT_EQ(s.near.poolCount, 1u);
+  EXPECT_EQ(s.far.poolCount, 10u);
+  EXPECT_EQ(s.near.reservedBytes, 5u);
+  EXPECT_EQ(s.far.reservedBytes, UINT64_C(1) << 33);
+  EXPECT_EQ(s.poolCount, 11u);
+  EXPECT_EQ(s.sealedCount, 22u);
+  EXPECT_EQ(s.activeCount, 33u);
+  EXPECT_EQ(s.usedBytes, 44u);
+  EXPECT_EQ(s.reservedBytes, (UINT64_C(1) << 33) + 5);
+  EXPECT_EQ(s.wastedBytes, 66u);
+  EXPECT_EQ(s.sealInvocations, 77u);
+  EXPECT_EQ(s.splitInvocations, 88u);
+  EXPECT_EQ(s.finalizedRangeCount, 99u);
+  EXPECT_EQ(state_->codePoolStats.reservedBytes.loadRelaxed(), s.reservedBytes);
+  EXPECT_EQ(state_->codePoolStats.finalizedRangeCount.loadRelaxed(), 99u);
 }
 
 TEST_F(SharedTaskPoolTest, PublishCallbackRunsAfterCommit) {
@@ -3377,6 +3476,36 @@ TEST_F(SharedTaskPoolTest, TryCacheHitMissFallsThroughToCompileOrGet) {
   EXPECT_EQ(d.asyncEnqueues, 1u);
   EXPECT_EQ(d.queueDepth, 1u);
   EXPECT_EQ(d.pendingCount, 1u);
+}
+
+TEST_F(SharedTaskPoolTest, DispatchRechecksPublicationAfterFastMiss) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  const EJitDimPair d = dim(1, 4);
+  owner.setInstanceEnabled(1, 4, true);
+  ASSERT_FALSE(owner.tryCacheHit(5, &d, 1).fastPathTerminal);
+
+  // A competing producer wins while the first caller is entering dispatch.
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_EQ(owner.compileOrGet(5, &d, 1, nullptr).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EJitCoreId::setCurrentForTest(0);
+  EXPECT_EQ(owner.compileOrGet(5, &d, 1, nullptr).status,
+            EJitCompileOrGetStatus::AlreadyPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  // Invalid descriptors cannot bypass validation even on a now-ready hit.
+  EJitBoundPtrDescriptor invalid{};
+  EXPECT_EQ(owner.compileOrGet(5, &d, 1, nullptr, &invalid, 1).status,
+            EJitCompileOrGetStatus::InvalidParam);
+  auto hit = owner.compileOrGet(5, &d, 1, nullptr);
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  if (hit.hasReadToken)
+    owner.releaseRead(hit.bucketIndex);
+  owner.setInstanceEnabled(1, 4, false);
+  EXPECT_EQ(owner.compileOrGet(5, &d, 1, nullptr).status,
+            EJitCompileOrGetStatus::InstanceDisabled);
+  EXPECT_FALSE(owner.pollOne());
 }
 
 // 3/ A disabled instance returns InstanceDisabled on the fast path and NEVER

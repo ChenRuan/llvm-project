@@ -824,6 +824,8 @@ public:
   void ownerShutdown();
 
   //--- producer path ----------------------------------------------------------
+  static bool validCompileRequest(const EJitCompileRequest &req);
+
   /// Submit a request carrying borrowed raw bound-pointer descriptors. Only
   /// the fixed descriptors are copied into the queue; pointee bytes are read
   /// by the compile callback and are never owned by this pool.
@@ -1093,6 +1095,17 @@ public:
   uint64_t workerIdleYields() const { return workerIdleYields_.loadRelaxed(); }
 
 private:
+  // Only the C ABI dispatcher may bypass the public producer checks: it
+  // validates before even probing L0.
+  friend struct EJitRuntimeDispatch;
+  CompileOrGetResult tryCacheHitValidated(
+      uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+      const EJitBoundPtrDescriptor *boundPointers, uint32_t boundCount);
+  CompileOrGetResult
+  compileOrGetValidated(uint32_t funcIndex, const EJitDimPair *dims,
+                        uint32_t numDims, void *fallback,
+                        const EJitBoundPtrDescriptor *boundPointers,
+                        uint32_t boundCount);
   static void workerEntryThunk(void *ctx);
   /// Yield/delay the CPU (injected hook, or a reordering barrier). \p ticks=1
   /// is a single yield (idle/wait); \p ticks=MULT*DELAY_TICKS is the post-task
@@ -1144,50 +1157,22 @@ private:
                         const EJitDimPair *dims, uint32_t numDims);
   SharedLookup cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
                            uint32_t numDims);
+  SharedLookup cacheLookupDynamic(uint32_t funcIndex, const EJitDimPair *dims,
+                                  uint32_t numDims);
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
   /// Load-only seqlock cache lookup (no per-hit read-token RMW). Returned hits
   /// carry no read token (SharedLookup::noTokenHit). See the .cpp for the
   /// never-free safety precondition.
   SharedLookup cacheLookupSeq(uint32_t funcIndex, const EJitDimPair *dims,
                               uint32_t numDims);
-  /// Fixed-dimension load-only seqlock specializations (0-2 dims). Same
-  /// never-free seqlock discipline as cacheLookupSeq() but with the identity
-  /// hashing, slot identity comparison, and version comparison unrolled exactly
-  /// like cacheLookup0D/1D/2D — so a NO_RECLAIM fixed-dimension caller reaches
-  /// the shared slot resolution without the generic numDims loop, the
-  /// slotIdentityMatches() call, or variable-length dims[] handling. Behavior
-  /// is identical to cacheLookupSeq() with the matching numDims. 3D/4D keep
-  /// using the generic cacheLookupSeq() (rare on the hot path).
-  SharedLookup cacheLookupSeq0D(uint32_t funcIndex);
-  SharedLookup cacheLookupSeq1D(uint32_t funcIndex, uint32_t dim0,
-                                uint32_t inst0);
-  SharedLookup cacheLookupSeq2D(uint32_t funcIndex, uint32_t dim0,
-                                uint32_t inst0, uint32_t dim1, uint32_t inst1);
 #endif
-  /// Fixed-dimension specializations of cacheLookup() (0-4 dims). Identity
-  /// hashing, slot identity comparison, and version comparison are all unrolled
-  /// (no numDims loops, no dims[] indexing), so a cache hit reaches the shared
-  /// slot resolution with the least per-hit work. Behavior is identical to
-  /// cacheLookup() with the matching numDims. The cross-core fnPtr gate and the
-  /// cold non-owner preparation are shared via resolveMatchedSlot() /
-  /// peerPrepareSlot(), so these stay small on the hot path.
-  SharedLookup cacheLookup0D(uint32_t funcIndex);
-  SharedLookup cacheLookup1D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0);
-  SharedLookup cacheLookup2D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
-                             uint32_t dim1, uint32_t inst1);
-  SharedLookup cacheLookup3D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
-                             uint32_t dim1, uint32_t inst1, uint32_t dim2,
-                             uint32_t inst2);
-  SharedLookup cacheLookup4D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
-                             uint32_t dim1, uint32_t inst1, uint32_t dim2,
-                             uint32_t inst2, uint32_t dim3, uint32_t inst3);
   /// Resolve a cache slot whose identity + versions already matched, with the
   /// bucket read lock HELD on entry. Applies the cross-core fnPtr gate and
   /// returns the hit (with the read token held) for the owner core or a core
   /// that has already memoized execute permission; a core that may not read the
   /// pointer gets a clean readyButNotShareable fallback (lock released). The
   /// rare non-owner first-touch case is delegated to peerPrepareSlot(). Shared
-  /// by cacheLookup() and all fixed-dimension specializations.
+  /// by the token and seqlock scans.
   SharedLookup resolveMatchedSlot(EJitSharedCacheBucket &bucket,
                                   uint32_t bucketIndex, uint32_t slotIndex);
   /// Submit Tier-2 from an identity/version-validated slot while its bucket
@@ -1206,7 +1191,7 @@ private:
   /// slot, with the bucket read lock HELD on entry (this function releases it).
   /// Snapshots the slot, drops the lock for the per-core platform seal, then
   /// re-validates before handing back the prepared pointer. Kept out-of-line
-  /// (noinline) so it never bloats the hit path in cacheLookup()/cacheLookupNd.
+  /// (noinline) so it never bloats the hit path.
   SharedLookup peerPrepareSlot(EJitSharedCacheBucket &bucket,
                                uint32_t bucketIndex, uint32_t slotIndex);
   /// Convert a shared cache lookup outcome into a CompileOrGetResult with the

@@ -106,14 +106,7 @@ extern "C" int SRE_printf(const char *fmt, ...);
 #endif
 
 static void bindDumpSharedStateFromRuntime() {
-  if (!gEJIT) {
-    setDumpSharedState(nullptr);
-    return;
-  }
-  if (EJitSharedTaskPool *sp = gEJIT->sharedTaskPool())
-    setDumpSharedState(sp->state());
-  else
-    setDumpSharedState(nullptr);
+  setDumpSharedState(gEJIT->sharedTaskPool()->state());
 }
 
 static void parseConfig(const ejit_config_t *src, Config &dst) {
@@ -443,14 +436,9 @@ ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx) {
     EJIT_DIAG("activate(%s,%u) failed: not initialized", periodName, cellIdx);
     return EJIT_ERR_NOT_ACTIVE;
   }
-  // The AOT call site passes the instance index as an i32; reject anything the
-  // runtime tables cannot hold instead of silently activating the wrong
-  // instance (the pre-fix uint8_t signature truncated at the call boundary).
-  if (cellIdx >= kEJitMaxInstances) {
-    EJIT_DIAG("activate(%s,%u) failed: instance index >= kEJitMaxInstances=%u",
-              periodName, cellIdx, kEJitMaxInstances);
+  // The independent C++ entry checks cellIdx before narrowing it.
+  if (!periodName)
     return EJIT_ERR_INVALID_PARAM;
-  }
   EJIT_DIAG("activate(%s,%u)", periodName, cellIdx);
   // In a taskpool build this also syncs the SwitchController and returns false
   // for an unknown lifecycle (no state changed). In the legacy build it always
@@ -465,12 +453,8 @@ ejit_status_t ejit_deactivate(const char *periodName, uint32_t cellIdx) {
     EJIT_DIAG("deactivate(%s,%u) failed: not initialized", periodName, cellIdx);
     return EJIT_ERR_NOT_ACTIVE;
   }
-  if (cellIdx >= kEJitMaxInstances) {
-    EJIT_DIAG(
-        "deactivate(%s,%u) failed: instance index >= kEJitMaxInstances=%u",
-        periodName, cellIdx, kEJitMaxInstances);
+  if (!periodName)
     return EJIT_ERR_INVALID_PARAM;
-  }
   EJIT_DIAG("deactivate(%s,%u)", periodName, cellIdx);
   if (!gEJIT->deactivate(periodName, cellIdx))
     return EJIT_ERR_INVALID_PARAM; // unknown lifecycle: nothing changed.
@@ -484,7 +468,7 @@ ejit_status_t ejit_activate_all(const char *periodName) {
     EJIT_DIAG("activate_all(%s) failed: not initialized", periodName);
     return EJIT_ERR_NOT_ACTIVE;
   }
-  if (!gEJIT->activateAll(periodName))
+  if (!periodName || !gEJIT->activateAll(periodName))
     return EJIT_ERR_INVALID_PARAM;
   return EJIT_OK;
 }
@@ -495,7 +479,7 @@ ejit_status_t ejit_deactivate_all(const char *periodName) {
     EJIT_DIAG("deactivate_all(%s) failed: not initialized", periodName);
     return EJIT_ERR_NOT_ACTIVE;
   }
-  if (!gEJIT->deactivateAll(periodName))
+  if (!periodName || !gEJIT->deactivateAll(periodName))
     return EJIT_ERR_INVALID_PARAM;
   gEJIT->invalidateAllByPeriod(periodName);
   return EJIT_OK;
@@ -506,14 +490,8 @@ bool ejit_is_active(const char *periodName, uint32_t cellIdx) {
     EJIT_DIAG("is_active(%s,%u) failed: not initialized", periodName, cellIdx);
     return false;
   }
-  // Reject out-of-range indices instead of truncating at the ABI boundary and
-  // querying the wrong instance (pre-fix uint8_t signature).
-  if (cellIdx >= kEJitMaxInstances) {
-    EJIT_DIAG(
-        "is_active(%s,%u) rejected: instance index >= kEJitMaxInstances=%u",
-        periodName, cellIdx, kEJitMaxInstances);
+  if (!periodName)
     return false;
-  }
   return gEJIT->isActive(periodName, cellIdx);
 }
 
@@ -530,8 +508,7 @@ void ejit_clear_cache(void) {
   if (!gEJIT)
     return;
   gEJIT->clearCache();
-  if (auto *tp = gEJIT->sharedTaskPool())
-    tp->retireDispatchCache();
+  gEJIT->sharedTaskPool()->retireDispatchCache();
 }
 
 void ejit_invalidate(const char *periodName, uint32_t cellIdx) {
@@ -546,9 +523,10 @@ void ejit_invalidate(const char *periodName, uint32_t cellIdx) {
         periodName, cellIdx, kEJitMaxInstances);
     return;
   }
+  if (!periodName)
+    return;
   gEJIT->invalidateByPeriod(periodName, cellIdx);
-  if (auto *tp = gEJIT->sharedTaskPool())
-    tp->retireDispatchCache();
+  gEJIT->sharedTaskPool()->retireDispatchCache();
 }
 
 ejit_status_t ejit_get_stats(ejit_stats_t *stats) {
@@ -588,25 +566,11 @@ static ejit_status_t taskpoolStatus(EJitCompileOrGetStatus s) {
 }
 
 namespace {
-// The C ABI always dispatches through the shared scheduler.
-inline EJitSharedTaskPool *activeTaskPool() {
-  return gEJIT ? gEJIT->sharedTaskPool() : nullptr;
-}
-
-// Open a resolve window and return the token icacheFill needs to prove no drain
-// overlapped it. Runs at the taskpool entry point, BEFORE any bucket read
-// token. The token lives in the caller's LOCAL, so a higher-priority task
-// preempting this core mid-resolve cannot clobber it.
-inline uint64_t ejitIcacheBeginResolve() {
-  if (EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr)
-    return sp->icacheBeginResolve();
-  return 0;
-}
-
 // Fill the icache cell on a successful taskpool resolve (cache hit or fresh
 // compile), so a cold icache is filled on the first taskpool hit, not only on a
 // fresh compile. dims selects the [D]^numDims cell.
-inline void ejitIcacheFillOnSuccess(uint32_t funcIndex, void *fnPtr,
+inline void ejitIcacheFillOnSuccess(EJitSharedTaskPool &pool,
+                                    uint32_t funcIndex, void *fnPtr,
                                     const EJitDimPair *dims, uint32_t numDims,
                                     uint64_t token) {
   // Deliberately silent. A null fnPtr is the NORMAL outcome of a resolve while
@@ -625,26 +589,23 @@ inline void ejitIcacheFillOnSuccess(uint32_t funcIndex, void *fnPtr,
 #endif
     return;
   }
-  EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr;
-  if (!sp) {
-    // Unlike the above this is a real misconfiguration, but it would repeat on
-    // every call just the same, so report it once.
-#ifdef EJIT_DIAG_ENABLE
-    static bool NoPoolLogged = false;
-    if (!NoPoolLogged) {
-      NoPoolLogged = true;
-      EJIT_DIAG("icacheFillOnSuccess DECLINE func=%u: no shared pool "
-                "(gEJIT=%p) -- the inline cache cannot be filled at all",
-                funcIndex, (void *)gEJIT);
-    }
-#endif
-    return;
-  }
-  sp->icacheFill(funcIndex, fnPtr, dims, numDims, token);
+  pool.icacheFill(funcIndex, fnPtr, dims, numDims, token);
 }
 } // namespace
 
-static ejit_status_t taskpoolCompileOrGetImpl(
+} // extern "C"
+
+namespace llvm::ejit {
+struct EJitRuntimeDispatch {
+  static ejit_status_t resolve(uint32_t funcIndex, const ejit_dim_pair_t *dims,
+                               uint32_t numDims,
+                               const EJitBoundPtrDescriptor *bounds,
+                               uint32_t boundCount, void **outFn,
+                               uint32_t *outBucket);
+};
+} // namespace llvm::ejit
+
+ejit_status_t EJitRuntimeDispatch::resolve(
     uint32_t funcIndex, const ejit_dim_pair_t *dims, uint32_t numDims,
     const EJitBoundPtrDescriptor *boundPointers, uint32_t boundCount,
     void **outFn, uint32_t *outBucket) {
@@ -660,20 +621,14 @@ static ejit_status_t taskpoolCompileOrGetImpl(
   // the status code.
   if (!gEJIT)
     return EJIT_ERR_NOT_ACTIVE;
-  auto *tp = activeTaskPool();
-  if (!tp) {
-    EJIT_DIAG("taskpool_compile_or_get reject func=%u: no taskpool", funcIndex);
-    return EJIT_ERR_NOT_ACTIVE;
-  }
+  auto *tp = gEJIT->sharedTaskPool();
   if (!validateBoundPtrDescriptors(boundPointers, boundCount)) {
     EJIT_DIAG("taskpool_compile_or_get reject func=%u: invalid bound pointer "
               "list count=%u",
               funcIndex, boundCount);
     return EJIT_ERR_INVALID_PARAM;
   }
-  const uint64_t icTok = ejitIcacheBeginResolve();
-
-  if (numDims > 4) {
+  if (numDims > kEJitSharedMaxDims) {
     EJIT_DIAG("taskpool_compile_or_get reject func=%u: numDims=%u > 4",
               funcIndex, numDims);
     return EJIT_ERR_INVALID_PARAM;
@@ -709,6 +664,7 @@ static ejit_status_t taskpoolCompileOrGetImpl(
   // so a hit still hands back outBucket for ejit_taskpool_release_read and a
   // disabled instance never returns stale code. A true miss falls through to
   // compileOrGet unchanged (enqueue/dedup/compile).
+  const uint64_t icTok = tp->icacheBeginResolve();
   void *l0Fn = nullptr;
   // L0 remains valid for bound calls: it contains only the identity -> code
   // pointer mapping, while bound descriptors are needed only on a miss or a
@@ -721,42 +677,31 @@ static ejit_status_t taskpoolCompileOrGetImpl(
       *outBucket = kEJitNoBucket;
     return EJIT_OK;
   }
-  auto fast =
-      tp->tryCacheHit(funcIndex, dimsCast, numDims, boundPointers, boundCount);
-  if (fast.fastPathTerminal) {
-    if (outFn)
-      *outFn = fast.fnPtr;
-    if (outBucket)
-      *outBucket = fast.bucketIndex;
-    EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u fast status=%u fn=%p",
-                      funcIndex, static_cast<unsigned>(fast.status),
-                      fast.fnPtr);
-    ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dimsCast, numDims, icTok);
-    if (fast.fnPtr)
-      tp->l0Fill(funcIndex, fast.fnPtr, dimsCast, numDims);
-    return taskpoolStatus(fast.status);
-  }
-
-  auto r = tp->compileOrGet(funcIndex, dimsCast, numDims,
-                            /*fallback=*/nullptr, boundPointers, boundCount);
+  auto r = tp->tryCacheHitValidated(funcIndex, dimsCast, numDims, boundPointers,
+                                    boundCount);
+  if (!r.fastPathTerminal)
+    r = tp->compileOrGetValidated(funcIndex, dimsCast, numDims, nullptr,
+                                  boundPointers, boundCount);
   if (outFn)
     *outFn = r.fnPtr;
   if (outBucket)
     *outBucket = r.bucketIndex;
   EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u status=%u fn=%p",
                     funcIndex, static_cast<unsigned>(r.status), r.fnPtr);
-  ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dimsCast, numDims, icTok);
+  ejitIcacheFillOnSuccess(*tp, funcIndex, r.fnPtr, dimsCast, numDims, icTok);
   if (r.fnPtr)
     tp->l0Fill(funcIndex, r.fnPtr, dimsCast, numDims);
   return taskpoolStatus(r.status);
 }
 
+extern "C" {
+
 ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
                                            const ejit_dim_pair_t *dims,
                                            uint32_t numDims, void **outFn,
                                            uint32_t *outBucket) {
-  return taskpoolCompileOrGetImpl(funcIndex, dims, numDims, nullptr, 0, outFn,
-                                  outBucket);
+  return EJitRuntimeDispatch::resolve(funcIndex, dims, numDims, nullptr, 0,
+                                      outFn, outBucket);
 }
 
 ejit_status_t ejit_taskpool_compile_or_get_bound(
@@ -777,8 +722,8 @@ ejit_status_t ejit_taskpool_compile_or_get_bound(
     return EJIT_ERR_INVALID_PARAM;
   }
   EJitBoundPtrDescriptor Bound{rawPtr, rawSize, boundArgIndex};
-  return taskpoolCompileOrGetImpl(funcIndex, dims, numDims, &Bound, 1u, outFn,
-                                  outBucket);
+  return EJitRuntimeDispatch::resolve(funcIndex, dims, numDims, &Bound, 1u,
+                                      outFn, outBucket);
 }
 
 ejit_status_t ejit_taskpool_compile_or_get_bound_v(
@@ -796,7 +741,7 @@ ejit_status_t ejit_taskpool_compile_or_get_bound_v(
   static_assert(offsetof(ejit_bound_ptr_t, argIndex) ==
                     offsetof(EJitBoundPtrDescriptor, argIndex),
                 "C and C++ bound arg offsets must match");
-  return taskpoolCompileOrGetImpl(
+  return EJitRuntimeDispatch::resolve(
       funcIndex, dims, numDims,
       reinterpret_cast<const EJitBoundPtrDescriptor *>(bounds), boundCount,
       outFn, outBucket);
@@ -811,10 +756,6 @@ void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
     return;
   }
   EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
-  if (!sp) {
-    EJIT_DIAG("taskpool_set_instance_enabled reject: no shared taskpool");
-    return;
-  }
   sp->setInstanceEnabled(dimType, instanceId, enabled != 0);
 }
 
@@ -824,12 +765,7 @@ void ejit_taskpool_release_read(uint32_t bucketIndex) {
               bucketIndex);
     return;
   }
-  auto *tp = activeTaskPool();
-  if (!tp) {
-    EJIT_DIAG("taskpool_release_read bucket=%u reject: no taskpool",
-              bucketIndex);
-    return;
-  }
+  auto *tp = gEJIT->sharedTaskPool();
   tp->releaseRead(bucketIndex);
 }
 
@@ -839,11 +775,7 @@ unsigned ejit_taskpool_poll_one(void) {
     EJIT_DIAG("taskpool_poll_one reject: not initialized");
     return 0;
   }
-  auto *tp = activeTaskPool();
-  if (!tp) {
-    EJIT_DIAG("taskpool_poll_one reject: no taskpool");
-    return 0;
-  }
+  auto *tp = gEJIT->sharedTaskPool();
   return tp->pollOne() ? 1u : 0u;
 }
 
@@ -852,11 +784,7 @@ unsigned ejit_taskpool_poll_budget(unsigned maxItems) {
     EJIT_DIAG("taskpool_poll_budget max=%u reject: not initialized", maxItems);
     return 0;
   }
-  auto *tp = activeTaskPool();
-  if (!tp) {
-    EJIT_DIAG("taskpool_poll_budget max=%u reject: no taskpool", maxItems);
-    return 0;
-  }
+  auto *tp = gEJIT->sharedTaskPool();
   return tp->pollBudget(maxItems);
 }
 #endif
@@ -866,11 +794,7 @@ unsigned ejit_taskpool_pending_count(void) {
     EJIT_DIAG("taskpool_pending_count reject: not initialized");
     return 0;
   }
-  auto *tp = activeTaskPool();
-  if (!tp) {
-    EJIT_DIAG("taskpool_pending_count reject: no taskpool");
-    return 0;
-  }
+  auto *tp = gEJIT->sharedTaskPool();
   return tp->pendingCount();
 }
 
@@ -881,10 +805,6 @@ ejit_status_t ejit_publish_pending_code(void) {
     return EJIT_ERR_DISABLED;
   }
   EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
-  if (!sp) {
-    EJIT_DIAG("publish_pending_code failed: no shared taskpool");
-    return EJIT_ERR_DISABLED;
-  }
   if (!sp->requestCodeBatchFlushAndWait()) {
     EJIT_DIAG("publish_pending_code failed: worker flush/enable");
     return EJIT_ERR_COMPILE_FAILED;
@@ -907,10 +827,6 @@ ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out) {
     return EJIT_ERR_NOT_ACTIVE;
   }
   EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
-  if (!sp) {
-    EJIT_DIAG("taskpool_get_stats failed: no shared taskpool");
-    return EJIT_ERR_NOT_ACTIVE;
-  }
   EJitSharedDiagnostics d;
   sp->getDiagnostics(d);
   out->cacheHits = d.cacheHits;
@@ -1037,7 +953,7 @@ void ejit_taskpool_print_compiled() {
   if (gEJitDiagLevel < EJIT_LOG_LVL_INFO)
     return;
   EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
-  if (!sp || !sp->state()) {
+  if (!sp->state()) {
     EJIT_DIAG_RAW("print_compiled: no shared taskpool / state");
     return;
   }
@@ -1238,8 +1154,6 @@ uint32_t ejit_taskpool_get_worker_core() {
   if (!gEJIT)
     return kEJitInvalidOwnerCore;
   EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
-  if (!sp)
-    return kEJitInvalidOwnerCore;
   EJitSharedTaskPoolState *sp_state = sp->state();
   if (!sp_state)
     return kEJitInvalidOwnerCore;

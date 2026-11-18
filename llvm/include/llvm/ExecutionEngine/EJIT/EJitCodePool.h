@@ -285,6 +285,9 @@ private:
     uint32_t writableCount = 0;
     EJitWritableRange writables[kEJitMaxWritableRanges] = {};
   };
+  enum class RecordKind { Pending, Finalized };
+  bool recordRange(RecordKind Kind, const void *Base, size_t Size,
+                   const EJitWritableRange *Writables, uint32_t WritableCount);
   std::vector<FinalizedRange> FinalizedRanges_;
   std::vector<FinalizedRange> PendingRanges_;
   size_t PendingAllocations_ = 0;
