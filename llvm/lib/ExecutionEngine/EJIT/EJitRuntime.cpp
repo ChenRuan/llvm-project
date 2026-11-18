@@ -495,14 +495,6 @@ bool ejit_is_active(const char *periodName, uint32_t cellIdx) {
   return gEJIT->isActive(periodName, cellIdx);
 }
 
-void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn) {
-  if (out_pfn)
-    *out_pfn = nullptr;
-  EJIT_DIAG("compile_or_get(key=0x%016lx): retired, use taskpool API",
-            cacheKey);
-  return nullptr;
-}
-
 void ejit_clear_cache(void) {
   EJIT_DIAG("clear_cache");
   if (!gEJIT)
@@ -768,26 +760,6 @@ void ejit_taskpool_release_read(uint32_t bucketIndex) {
   auto *tp = gEJIT->sharedTaskPool();
   tp->releaseRead(bucketIndex);
 }
-
-#ifdef EJIT_SRE_TASKPOOL_TESTING
-unsigned ejit_taskpool_poll_one(void) {
-  if (!gEJIT) {
-    EJIT_DIAG("taskpool_poll_one reject: not initialized");
-    return 0;
-  }
-  auto *tp = gEJIT->sharedTaskPool();
-  return tp->pollOne() ? 1u : 0u;
-}
-
-unsigned ejit_taskpool_poll_budget(unsigned maxItems) {
-  if (!gEJIT) {
-    EJIT_DIAG("taskpool_poll_budget max=%u reject: not initialized", maxItems);
-    return 0;
-  }
-  auto *tp = gEJIT->sharedTaskPool();
-  return tp->pollBudget(maxItems);
-}
-#endif
 
 unsigned ejit_taskpool_pending_count(void) {
   if (!gEJIT) {
@@ -1136,13 +1108,6 @@ void ejit_print_dumped_module(const char *name) {
   EJIT_DIAG_RAW("print_dumped_module name=%s",
                 (name && name[0]) ? name : "(all)");
   (void)printDumpedModule(name);
-#endif
-}
-
-void ejit_dump_all(bool enable) {
-#ifdef EJIT_DUMP_SUPPORT
-  EJIT_DIAG("dump_all enable=%u", enable ? 1u : 0u);
-  setDumpFuncFilter(enable ? std::string("*") : std::string());
 #endif
 }
 

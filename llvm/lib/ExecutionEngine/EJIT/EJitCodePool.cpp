@@ -91,7 +91,6 @@ bool EJitCodePoolManager::poolHasRoomLocked(const CodePool &P, size_t Size,
 }
 
 Error EJitCodePoolManager::newActivePoolLocked() {
-  uint8_t *RawBytes = nullptr;
   uint8_t *Base = nullptr;
 
   if (Opts_.fixedSize > 0) {
@@ -117,8 +116,7 @@ Error EJitCodePoolManager::newActivePoolLocked() {
               " bytes; no fallback to dynamic allocation)",
           inconvertibleErrorCode());
     }
-    RawBytes = reinterpret_cast<uint8_t *>(Next);
-    Base = RawBytes; // already poolAlign-aligned by the carve
+    Base = reinterpret_cast<uint8_t *>(Next); // already aligned by the carve
     FixedUsed_ = (Next + Opts_.poolSize) - Opts_.fixedBase;
     EJIT_DIAG("newActivePool: fixed region base=%p size=%zu used=%zu/%zu",
               static_cast<void *>(Base), Opts_.poolSize, FixedUsed_,
@@ -136,7 +134,7 @@ Error EJitCodePoolManager::newActivePoolLocked() {
                                      inconvertibleErrorCode());
     }
     EJIT_DIAG("newActivePool: rawAlloc=%p size=%zu", Raw, RawSize);
-    RawBytes = static_cast<uint8_t *>(Raw);
+    auto *RawBytes = static_cast<uint8_t *>(Raw);
     Base =
         reinterpret_cast<uint8_t *>(alignUp(addr(RawBytes), Opts_.poolAlign));
     EJIT_DIAG("newActivePool: alignedBase=%p", static_cast<void *>(Base));
@@ -168,7 +166,6 @@ Error EJitCodePoolManager::newActivePoolLocked() {
   ++SplitInvocations_;
 
   auto P = std::make_unique<CodePool>();
-  P->raw = RawBytes;
   P->base = Base;
   P->size = Opts_.poolSize;
   P->used = 0;

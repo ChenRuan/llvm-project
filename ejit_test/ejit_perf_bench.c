@@ -175,7 +175,7 @@ int main(int argc, char **argv) {
 
   printf("\n--- AOT Fallback (不激活时间窗) ---\n");
 
-  // 不激活 → ejit_compile_or_get 发现 time window not active → fallback
+  // 未激活时 wrapper 继续走 AOT。
   uint64_t aot_sum = 0;
   double aot_time = 0;
   for (int w = 0; w < n_warmup; w++) {

@@ -280,8 +280,10 @@ struct BatchTimelineIdleCtx {
 };
 
 void mockBatchTimelineIdle(void *ctx, uint32_t ticks) {
+  if (ticks == 1u)
+    return;
   auto *T = static_cast<BatchTimelineIdleCtx *>(ctx);
-  if (ticks != 1u && T->batch->recordTimeline)
+  if (T->batch->recordTimeline)
     T->batch->timeline.push_back('D');
   // Stop the real worker loop after the post-publish throttle has run.
   if (!T->batch->timeline.empty() && T->batch->timeline.back() == 'D' &&
@@ -1415,21 +1417,35 @@ TEST_F(SharedTaskPoolTest, ExplicitPublishFourTier2CompilesRetainThrottle) {
   Batch.activeCompiles = 0;
   Batch.maxActiveCompiles = 0;
   Batch.recordTimeline = true;
-  BatchTimelineIdleCtx Idle{&Batch, state_.get()};
-  Owner.setWorkerIdleHook(&mockBatchTimelineIdle, &Idle);
+  Owner.setWorkerIdleHook(
+      [](void *Ctx, uint32_t Ticks) {
+        if (Ticks != 1u)
+          static_cast<BatchPublishCtx *>(Ctx)->timeline.push_back('D');
+      },
+      &Batch);
 
-  std::atomic<int> PublishResult{-1};
-  std::thread Caller([&] {
-    PublishResult.store(Owner.requestCodeBatchFlushAndWait() ? 1 : 0,
-                        std::memory_order_release);
-  });
-  while (state_->codeBatchRequestState.loadAcquire() !=
-         static_cast<uint32_t>(EJitCodeBatchRequestState::Requested))
-    std::this_thread::yield();
-  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
-  Caller.join();
-
-  EXPECT_EQ(PublishResult.load(std::memory_order_acquire), 1);
+  // Schedule the owner at the requester's first wait. Separate facades let
+  // requester waits and worker throttles use different hooks; neither needs
+  // to stop the pool or depend on host thread scheduling.
+  EJitSharedTaskPool Caller;
+  Caller.bind(state_.get());
+  EJitSharedTaskPool *NextWorker = &Owner;
+  Caller.setWorkerIdleHook(
+      [](void *Ctx, uint32_t Ticks) {
+        auto &Next = *static_cast<EJitSharedTaskPool **>(Ctx);
+        if (auto *Worker = std::exchange(Next, nullptr)) {
+          EXPECT_EQ(Ticks, 1u);
+          EXPECT_EQ(
+              Worker->state()->codeBatchRequestState.loadAcquire(),
+              static_cast<uint32_t>(EJitCodeBatchRequestState::Requested));
+          EXPECT_EQ(Worker->workerPollOnce(), EJitWorkerStep::Consumed);
+        }
+      },
+      &NextWorker);
+  EXPECT_TRUE(Caller.requestCodeBatchFlushAndWait());
+  EXPECT_EQ(NextWorker, nullptr);
+  EXPECT_EQ(state_->codeBatchRequestState.loadAcquire(),
+            static_cast<uint32_t>(EJitCodeBatchRequestState::Idle));
   EXPECT_EQ(Batch.timeline, "CDCDCDCDF");
   EXPECT_EQ(Batch.maxActiveCompiles, 1u);
   EXPECT_EQ(Batch.flushCalls, 1u);

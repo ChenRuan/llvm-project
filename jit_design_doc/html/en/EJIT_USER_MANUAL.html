@@ -552,7 +552,7 @@ build_release_x86/bin/clang -O2 -g \
       <tr><td><code>!ejit.metadata</code></td><td>Functions and globals carry <code>EJIT_ENTRY</code>, <code>EJIT_IN_PERIOD</code>, <code>EJIT_IN_PERIOD_ARRAY</code>, etc. metadata</td></tr>
       <tr><td><code>!ejit.may_const</code></td><td>Loads of annotated fields carry may_const metadata</td></tr>
       <tr><td><code>@__ejit_bitcode</code></td><td>The embedded bitcode is in a dedicated section</td></tr>
-      <tr><td><code>ejit_compile_or_get</code></td><td>The wrapper entry calls the runtime</td></tr>
+      <tr><td><code>ejit_taskpool_compile_or_get</code></td><td>The wrapper entry calls the runtime</td></tr>
       <tr><td><code>jit_dispatch</code> / <code>jit_fallback</code></td><td>A JIT dispatch path and an AOT fallback path exist</td></tr>
       <tr><td><code>ejit_deactivate</code> / <code>ejit_activate</code></td><td>Lifecycle-function entry/exit instrumentation</td></tr>
     </tbody>
@@ -625,7 +625,7 @@ cmake -S llvm --preset ejit-minimal-aarch64_be</code></pre>
     <li>Confirm you are using an EJIT-enabled Clang, not a system Clang.</li>
     <li>Confirm <code>ejit_init</code> ran before calling <code>EJIT_ENTRY</code>.</li>
     <li>Confirm the relevant time window has been <code>ejit_activate</code>-d.</li>
-    <li>Confirm the build output contains <code>@__ejit_bitcode</code> and <code>ejit_compile_or_get</code>.</li>
+    <li>Confirm the build output contains <code>@__ejit_bitcode</code> and <code>ejit_taskpool_compile_or_get</code>.</li>
     <li>On bare-metal, confirm the registry section was not garbage-collected by the linker.</li>
     <li>Check the API return status and INFO diagnostics.</li>
   </ol>

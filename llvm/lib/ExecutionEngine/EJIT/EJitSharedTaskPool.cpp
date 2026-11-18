@@ -567,8 +567,8 @@ uint32_t EJitSharedTaskPool::instanceVersion(uint32_t dimType,
 // The production hit path does NOT call icacheTry: the ejit_entry wrapper reads
 // the shared @__ejit_icache_fn_<name> table directly (GEP into the [D]^numDims
 // array by the ejit_dim arg values + one load + null check + indirect call, no
-// call, no per-call guards). icacheTry is retained for unit tests and
-// diagnostics. icacheFill writes the specialization pointer through the cell at
+// call, no per-call guards). icacheTry models that probe in unit tests.
+// icacheFill writes the specialization pointer through the cell at
 // [i0][i1]... (linearized from dims) on a successful resolve, and
 // icacheDrainAll zeroes every cell on a period toggle - so a cell holds the
 // specialization for its identity under the CURRENT period values, and stops
@@ -579,6 +579,7 @@ uint32_t EJitSharedTaskPool::instanceVersion(uint32_t dimType,
 // test builds; the wrapper's inline probe is only enabled under
 // EJIT_SRE_SHARED_CODE_POINTERS, where the gate is compile-time true).
 //===----------------------------------------------------------------------===//
+#ifdef EJIT_SRE_TASKPOOL_TESTING
 bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
                                    uint32_t numDims, void **outFn) {
   if (!outFn)
@@ -626,6 +627,7 @@ bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
   *outFn = reinterpret_cast<void *>(p);
   return true;
 }
+#endif
 
 //===----------------------------------------------------------------------===//
 // Per-core L0 dispatch cache
@@ -3543,12 +3545,14 @@ bool EJitSharedTaskPool::serviceMayConstRankingRequest() {
   return true;
 }
 
+#ifdef EJIT_SRE_TASKPOOL_TESTING
 unsigned EJitSharedTaskPool::pollBudget(unsigned maxItems) {
   unsigned n = 0;
   while (n < maxItems && pollOne())
     ++n;
   return n;
 }
+#endif
 
 EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
   if (!state_)

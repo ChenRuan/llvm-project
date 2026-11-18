@@ -119,8 +119,7 @@ ejit_status_t ejit_get_stats(ejit_stats_t *stats);</code></pre>
 
   <section>
     <h2>8. Internal wrapper API</h2>
-<pre><code class="language-c">void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn);</code></pre>
-    <div class="note">Ordinary users do not call this directly. The AOT wrapper precomputes <code>cacheKey = funcIdx(32b) | dim[3] | dim[2] | dim[1] | dim[0]</code> and calls it. When it returns NULL, the wrapper automatically falls back to the original function body.</div>
+    <p>On a miss, the wrapper uses the shared taskpool APIs in the next section. If no specialization is ready it executes the original AOT body. Application code need not dispatch manually.</p>
   </section>
 
   <section>

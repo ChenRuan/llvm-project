@@ -295,11 +295,6 @@ unsigned ejit_taskpool_pending_count(void);
 /// entries were backfilled by the owner worker.
 ejit_status_t ejit_publish_pending_code(void);
 
-#ifdef EJIT_SRE_TASKPOOL_TESTING
-unsigned ejit_taskpool_poll_one(void);
-unsigned ejit_taskpool_poll_budget(unsigned maxItems);
-#endif
-
 // SRE taskpool statistics. Separate from ejit_stats_t (which reports the legacy
 // LRU EJitCache); these counters describe the taskpool cache/dedup/queue
 // shared taskpool pipeline. Fixed layout
@@ -370,11 +365,6 @@ void ejit_print_dumped(const char *name);
 /// prints every module saved on the calling core. This is worker-local and
 /// does not perform cross-core lookup.
 void ejit_print_dumped_module(const char *name);
-
-/// Enable or disable capture of every JIT-compiled specialization. Equivalent
-/// to ejit_dump_func("*") when enabled. Captures are keyed by function name in
-/// the worker-local store and replaced when the same function is recompiled.
-void ejit_dump_all(bool enable);
 
 /// Runtime diagnostic log level. Mirrors the EJIT_DIAG* macro thresholds.
 ///   EJIT_LOG_OFF    — no diagnostic output

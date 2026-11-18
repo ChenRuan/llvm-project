@@ -120,8 +120,7 @@ ejit_status_t ejit_get_stats(ejit_stats_t *stats);</code></pre>
 
   <section>
     <h2>8. 内部 wrapper API</h2>
-<pre><code class="language-c">void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn);</code></pre>
-    <div class="note">普通用户不直接调用该接口。AOT wrapper 会预先计算 <code>cacheKey = funcIdx(32b) | dim[3] | dim[2] | dim[1] | dim[0]</code> 并调用它。返回 NULL 时 wrapper 自动 fallback 到原函数体。</div>
+    <p>wrapper 未命中时调用下一节的共享任务池接口。没有可执行的特化版本时继续执行 AOT 函数体；业务代码不需要手动派发。</p>
   </section>
 
   <section>

@@ -188,9 +188,6 @@ generateRegistryTablePeriod(
   // No sentinel entry: the runtime iterates the linker-provided
   // [__start_ejit_period, __stop_ejit_period) range over the dedicated
   // section, so each translation unit contributes only its own entries.
-  if (Entries.empty())
-    return;
-
   ArrayType *ArrayTy = ArrayType::get(EntryTy, Entries.size());
   Constant *ArrayInit = ConstantArray::get(ArrayTy, Entries);
 

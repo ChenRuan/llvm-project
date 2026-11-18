@@ -20,8 +20,8 @@
 //     core waits — bounded, yielding — for the designated core to initialize,
 //     then attaches.
 //   * the producer path compileOrGet() operating purely on shared state.
-//   * the consumer path pollOne()/pollBudget() (the worker, or a test, drives
-//     it) with the two version checkpoints and the commit-gated cache publish.
+//   * the consumer path pollOne(), with the two version checkpoints and the
+//     commit-gated cache publish.
 //   * read-only diagnostics.
 //
 //  The compile callback, the physical-code release callback, and the worker
@@ -518,7 +518,6 @@ public:
     mayConstRankingCtx_ = ctx;
   }
   void setReleaser(ReleaseCallback fn, void *ctx) {
-    const bool had = (releaseFn_ != nullptr);
     releaseFn_ = fn;
     releaseCtx_ = ctx;
     // v2 inline cache never reclaims (no HP-scan retire, ever). A wired
@@ -532,7 +531,6 @@ public:
     // would happily refill what this one just drained, and the probe consults
     // no gate at all. Track the transition as a count in the blob so the cache
     // re-arms only when the LAST releaser goes away.
-    (void)had;
     icacheReclamationSafe_ = (fn == nullptr);
     syncIcacheReleaserCount();
     if (fn) {
@@ -917,13 +915,14 @@ public:
   bool isInstanceActive(uint32_t dimType, uint32_t instanceId) const;
 
   //--- per-function inline cache (multi-version direct-indexed) --------------
+#ifdef EJIT_SRE_TASKPOOL_TESTING
   // NOTE: the production hit path does NOT use icacheTry. With -ejit-inline-cache
   // the ejit_entry wrapper reads its per-function @__ejit_icache_fn_<name> slot
   // directly - a GEP into the [D]^numDims array by the ejit_dim arg values, one
   // load + indirect call, NO ejit_icache_try call, NO
   // per-call guards; for NumDims <= 2 (no timing) the table is sentinel-formed,
   // so even the null-check is gone - a miss BLRs into MissFn itself. icacheTry
-  // is retained for unit tests / diagnostics: on a
+  // models the probe for unit tests: on a
   // hit it sets *outFn to the cached specialization for the given dims (call
   // with NO releaseRead) and returns true; on a miss returns false. It keeps
   // the reclamation-safety, pool-Ready, range, and cross-core code-sharing gates
@@ -932,6 +931,7 @@ public:
   // compile-time true).
   bool icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
                  uint32_t numDims, void **outFn);
+#endif
   // Fill the per-function icache cell at [i0][i1]... (linearized from \p dims,
   // row-major, dim0 = leftmost ejit_dim param - MUST match the AOT array order)
   // with a freshly resolved specialization (call on a taskpool cache hit or a
@@ -1045,7 +1045,9 @@ public:
 
   //--- consumer path (worker / test) -----------------------------------------
   bool pollOne();
+#ifdef EJIT_SRE_TASKPOOL_TESTING
   unsigned pollBudget(unsigned maxItems);
+#endif
 
   //--- diagnostics ------------------------------------------------------------
   void getDiagnostics(EJitSharedDiagnostics &out) const;

@@ -234,8 +234,6 @@ emitLifecycleRegistration(Module &M,
                   ConstantExpr::getBitCast(KV.second, PtrTy),
                   ConstantInt::get(I64Ty, 0)}));
   }
-  if (Entries.empty())
-    return;
   ArrayType *ArrayTy = ArrayType::get(EntryTy, Entries.size());
   auto *GV = new GlobalVariable(
       M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
@@ -386,8 +384,6 @@ emitFuncIndexRegistration(Module &M,
                   ConstantExpr::getBitCast(KV.second, PtrTy),
                   ConstantInt::get(I64Ty, 0)}));
   }
-  if (Entries.empty())
-    return;
   ArrayType *ArrayTy = ArrayType::get(EntryTy, Entries.size());
   auto *GV = new GlobalVariable(
       M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
@@ -483,8 +479,6 @@ emitIcacheSlotRegistration(Module &M,
                   ConstantExpr::getBitCast(KV.second.GV, PtrTy),
                   ConstantInt::get(I64Ty, KV.second.NumDims)}));
   }
-  if (Entries.empty())
-    return;
   ArrayType *ArrayTy = ArrayType::get(EntryTy, Entries.size());
   auto *GV = new GlobalVariable(
       M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
@@ -660,7 +654,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
     // Prevent the CGSCC inliner from inlining the wrapped function into
     // callers. Each call site would duplicate the JIT dispatch logic
-    // (cacheKey computation, ejit_compile_or_get call, indirect call) and
+    // (cache probe, taskpool lookup, indirect call) and
     // the inliner may produce inconsistent AOT fallback code depending on
     // call-site context. This is unconditional: the entry must stay
     // out-of-line for LTO correctness. Sema rejects always_inline on
@@ -697,8 +691,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     SmallVector<StringRef, 4> SeenNames;
     unsigned ArgCount = F->arg_size();
     for (unsigned I = 0; I < DimCount; ++I) {
-      auto GIt = DimTypeGlobals.find(PeriodInds[I].PeriodName);
-      if (PeriodInds[I].PeriodName.empty() || GIt == DimTypeGlobals.end()) {
+      if (PeriodInds[I].PeriodName.empty()) {
         F->getContext().emitError("ejit-wrapper-gen: invalid period name in "
                                   "ejit_period_arr_ind: " +
                                   PeriodInds[I].PeriodName);
@@ -953,13 +946,6 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
           BasicBlock::Create(Ctx, "miss_entry", MissFn, MissFallback);
       auto *MissCall = BasicBlock::Create(Ctx, "miss_call", MissFn);
       auto *MissDispatch = BasicBlock::Create(Ctx, "miss_dispatch", MissFn);
-      if (!MissFallback->getTerminator()) {
-        IRBuilder<> B(MissFallback);
-        if (F->getReturnType()->isVoidTy())
-          B.CreateRetVoid();
-        else
-          B.CreateRet(PoisonValue::get(F->getReturnType()));
-      }
       emitSlowPath(*MissFn, MissEntry, MissCall, MissDispatch, MissFallback);
 
       // Wrapper (F): frame-less probe + tail calls. Sentinel-form tables
@@ -1067,13 +1053,6 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       auto *JitFallback = BasicBlock::Create(Ctx, "jit_fallback", F);
       auto *JitDispatch = BasicBlock::Create(Ctx, "jit_dispatch", F);
       spliceOriginalBody(JitFallback);
-      if (!JitFallback->getTerminator()) {
-        IRBuilder<> B(JitFallback);
-        if (F->getReturnType()->isVoidTy())
-          B.CreateRetVoid();
-        else
-          B.CreateRet(PoisonValue::get(F->getReturnType()));
-      }
       emitSlowPath(*F, JitEntry, JitCall, JitDispatch, JitFallback);
     }
 

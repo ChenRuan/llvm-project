@@ -23,7 +23,7 @@
 <pre><code>1. 编译期是否识别属性？
    └─ 看 Clang Sema/CodeGen 是否有 EJIT 诊断或 metadata
 2. AOT pass 是否生效？
-   └─ 看 @__ejit_bitcode、ejit_compile_or_get、jit_dispatch/jit_fallback
+   └─ 看 @__ejit_bitcode、ejit_taskpool_compile_or_get、jit_dispatch/jit_fallback
 3. 运行时是否初始化和注册？
    └─ ejit_init 返回值、诊断日志、registry/static table
 4. 时间窗是否 active？
@@ -49,7 +49,7 @@
       <h3>检查 3：IR/二进制里是否有 wrapper 特征</h3>
       <table>
         <tr><th>关键词</th><th>含义</th></tr>
-        <tr><td><code>ejit_compile_or_get</code></td><td>wrapper 入口调用运行时</td></tr>
+        <tr><td><code>ejit_taskpool_compile_or_get</code></td><td>wrapper 入口调用运行时</td></tr>
         <tr><td><code>jit_dispatch</code></td><td>JIT 成功路径</td></tr>
         <tr><td><code>jit_fallback</code></td><td>AOT fallback 路径</td></tr>
         <tr><td><code>@__ejit_bitcode</code></td><td>嵌入 bitcode</td></tr>

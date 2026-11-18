@@ -194,7 +194,6 @@ ejit_init(&cfg);
 
 ```c
 void ejit_dump_func(const char *name);  // 按名开启捕获；name="*" 捕获全部；NULL/"" 关闭后续捕获
-void ejit_dump_all(bool enable);        // 等价于 ejit_dump_func("*")（enable=true 时）
 void ejit_print_dumped(const char *name);// 打印 entry 函数视图；NULL/"" 打印本核全部
 void ejit_print_dumped_module(const char *name); // 打印完整特化模块视图
 ```
@@ -213,7 +212,7 @@ ejit_dump_func("process_cell");   // 只捕获感兴趣函数的下一次特化
 ejit_print_dumped("process_cell"); // 回读 IR+ASM
 ejit_print_dumped_module("process_cell"); // 回读该 entry 的完整特化模块
 
-ejit_dump_all(true);              // 捕获所有特化
+ejit_dump_func("*");              // 捕获所有特化
 ```
 
 ---

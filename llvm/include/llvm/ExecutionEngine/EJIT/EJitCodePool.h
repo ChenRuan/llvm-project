@@ -50,10 +50,7 @@ namespace ejit {
 
 /// A single 2MiB-aligned JIT code pool.
 struct CodePool {
-  /// Raw pointer returned by the injected allocator (SRE_MemDbgAlloc on the
-  /// target). Retained for debugging and possible future reclamation.
-  uint8_t *raw = nullptr;
-  /// 2MiB-aligned usable base inside [raw, raw + rawSize).
+  /// 2MiB-aligned usable base of the fixed or dynamically allocated region.
   uint8_t *base = nullptr;
   /// Usable size of the pool (the configured pool size, default 2MiB).
   size_t size = 0;

@@ -22,7 +22,7 @@
 <pre><code>1. Were attributes recognized at compile time?
    └─ Check Clang Sema/CodeGen for EJIT diagnostics or metadata
 2. Did the AOT pass take effect?
-   └─ Look for @__ejit_bitcode, ejit_compile_or_get, jit_dispatch/jit_fallback
+   └─ Look for @__ejit_bitcode, ejit_taskpool_compile_or_get, jit_dispatch/jit_fallback
 3. Is the runtime initialized and registered?
    └─ ejit_init return value, diagnostics, registry/static table
 4. Is the time window active?
@@ -48,7 +48,7 @@
       <h3>Check 3: Are there wrapper signatures in the IR/binary</h3>
       <table>
         <tr><th>Keyword</th><th>Meaning</th></tr>
-        <tr><td><code>ejit_compile_or_get</code></td><td>The wrapper entry calls the runtime</td></tr>
+        <tr><td><code>ejit_taskpool_compile_or_get</code></td><td>The wrapper entry calls the runtime</td></tr>
         <tr><td><code>jit_dispatch</code></td><td>JIT success path</td></tr>
         <tr><td><code>jit_fallback</code></td><td>AOT fallback path</td></tr>
         <tr><td><code>@__ejit_bitcode</code></td><td>Embedded bitcode</td></tr>

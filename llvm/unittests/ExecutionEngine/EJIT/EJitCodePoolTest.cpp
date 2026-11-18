@@ -738,6 +738,7 @@ TEST(EJitCodePoolFixed, EnableRwRangeFlipsCoveredPages) {
   void *P = cantFail(Mgr.allocateCode(384, 64));
   cantFail(Mgr.enableRwRange(P, 384));
   EXPECT_EQ(M.RwEnableCalls, 2u);
+  EXPECT_EQ(Mgr.getStats().rwEnableInvocations, 2u);
   ASSERT_EQ(M.RwEnabledPages.size(), 2u);
   EXPECT_EQ(M.RwEnabledPages[0], A(P));
   EXPECT_EQ(M.RwEnabledPages[1], A(P) + kPage);
@@ -769,6 +770,7 @@ TEST(EJitCodePoolFixed, EnableRwRangeNoOpWhenNotNeeded) {
   void *P = cantFail(Mgr.allocateCode(128, 64));
   cantFail(Mgr.enableRwRange(P, 128));
   EXPECT_EQ(M.RwEnableCalls, 0u);
+  EXPECT_EQ(Mgr.getStats().rwEnableInvocations, 0u);
   EXPECT_TRUE(M.RwEnabledPages.empty());
 }
 
@@ -800,6 +802,7 @@ TEST(EJitCodePoolFixed, EnableRwRangeFailsOnRc) {
   Error E = Mgr.enableRwRange(P, 128);
   EXPECT_TRUE(bool(E)) << "enable_rw failure must propagate as an Error";
   consumeError(std::move(E));
+  EXPECT_EQ(Mgr.getStats().rwEnableInvocations, 0u);
 }
 
 // A range whose first byte is owned but whose end crosses the pool boundary

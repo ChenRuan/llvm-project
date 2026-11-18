@@ -549,7 +549,7 @@ build_release_x86/bin/clang -O2 -g \
       <tr><td><code>!ejit.metadata</code></td><td>函数和全局变量包含 <code>EJIT_ENTRY</code>、<code>EJIT_IN_PERIOD</code>、<code>EJIT_IN_PERIOD_ARRAY</code> 等 metadata</td></tr>
       <tr><td><code>!ejit.may_const</code></td><td>标注字段的 load 指令带 may_const metadata</td></tr>
       <tr><td><code>@__ejit_bitcode</code></td><td>嵌入 bitcode 位于专用 section</td></tr>
-      <tr><td><code>ejit_compile_or_get</code></td><td>wrapper 入口调用运行时</td></tr>
+      <tr><td><code>ejit_taskpool_compile_or_get</code></td><td>wrapper 入口调用运行时</td></tr>
       <tr><td><code>jit_dispatch</code> / <code>jit_fallback</code></td><td>存在 JIT 分发路径和 AOT fallback 路径</td></tr>
       <tr><td><code>ejit_deactivate</code> / <code>ejit_activate</code></td><td>生命周期函数入口/出口插桩</td></tr>
     </tbody>
@@ -622,7 +622,7 @@ cmake -S llvm --preset ejit-minimal-aarch64_be</code></pre>
     <li>确认使用的是带 EJIT 的 Clang，而不是系统 Clang。</li>
     <li>确认 <code>ejit_init</code> 已在调用 <code>EJIT_ENTRY</code> 前执行。</li>
     <li>确认相关时间窗已经 <code>ejit_activate</code>。</li>
-    <li>确认编译产物中存在 <code>@__ejit_bitcode</code> 和 <code>ejit_compile_or_get</code>。</li>
+    <li>确认编译产物中存在 <code>@__ejit_bitcode</code> 和 <code>ejit_taskpool_compile_or_get</code>。</li>
     <li>裸核场景确认 registry section 没被链接器垃圾回收。</li>
     <li>查看 API 返回值及 INFO 级诊断日志。</li>
   </ol>

@@ -363,7 +363,7 @@ def doit_gc_merge(args):
         "ejit_register_period_array", "ejit_register_static_var",
         "ejit_register_pointer_period_bounds",
         "ejit_set_allocation_size_lookup",
-        "ejit_clear_cache", "ejit_compile_or_get", "ejit_invalidate",
+        "ejit_clear_cache", "ejit_invalidate",
         # General diagnostics.
         "ejit_set_log_level", "ejit_get_log_level",
         "ejit_print_registry", "ejit_print_func_meta",
@@ -383,7 +383,7 @@ def doit_gc_merge(args):
         "ejit_publish_pending_code",
         "ejit_taskpool_get_stats", "ejit_taskpool_print_stats", "ejit_taskpool_get_worker_core",
         "ejit_taskpool_print_compiled", "ejit_dump_func", "ejit_print_dumped",
-        "ejit_print_dumped_module", "ejit_dump_all",
+        "ejit_print_dumped_module",
         "ejit_print_mayconst_ranking",
         # Inline-cache: ejit_register_icache_slot is called from
         # ejit_auto_register (AOT) when -ejit-inline-cache is on, not from the

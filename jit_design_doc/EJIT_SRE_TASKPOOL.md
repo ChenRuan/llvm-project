@@ -1073,18 +1073,7 @@ unsigned ejit_taskpool_pending_count(void);
 ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
 ```
 
-**测试专用接口** —— 仅在定义 `EJIT_SRE_TASKPOOL_TESTING` 宏时编译,**不进入生产 `libLLVMEJIT.a`**:
-
-```c
-#ifdef EJIT_SRE_TASKPOOL_TESTING
-// 直接驱动 queue 消费一次。host 测试中用于显式控制 pop 时序,
-// 替代真实的 EJitWorker 循环。**不应在内部 worker 已启动时调用**——
-// 测试代码自己负责保证生命周期不重叠(测试模式要么用真实 worker,要么用
-// 这两个函数,二选一,详见 §9.2 的两类测试模式划分)。
-unsigned ejit_taskpool_poll_one(void);
-unsigned ejit_taskpool_poll_budget(unsigned maxItems);
-#endif
-```
+需要控制出队时序的 C++ 测试可直接驱动自己持有的共享池；不要同时启动后台 worker。业务 C 接口不提供手动出队入口。
 
 **角色总结**：
 
@@ -1100,9 +1089,8 @@ ejit_taskpool_compile_or_get(       内部 EJitSreTask 创建的 task 中循环:
            release_read(bucket)
   → miss → 入队 → 返回 fallback
 
-释放:                                测试构建额外提供:
-ejit_taskpool_release_read(...)        ejit_taskpool_poll_one      [TESTING-ONLY]
-                                       ejit_taskpool_poll_budget   [TESTING-ONLY]
+释放:
+ejit_taskpool_release_read(...)
 ```
 
 **统计结构体**：

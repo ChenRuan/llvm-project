@@ -240,8 +240,6 @@ collectInitializerClosureRefs(Constant *C, SmallPtrSetImpl<Constant *> &Visited,
                                   Globals);
     return;
   }
-  if (isa<GlobalValue>(C))
-    return;
   for (Value *Op : C->operands())
     if (auto *OpC = dyn_cast<Constant>(Op))
       collectInitializerClosureRefs(OpC, Visited, Functions, Globals);
@@ -456,8 +454,6 @@ static void preOptimizeBitcode(Module &) {}
 /// never serialize. Writes both .ll (readable: grep "define @Fn" vs
 /// "declare @Fn") and .bc.
 static void dumpExtractedBitcode(const Module &M, StringRef Dir) {
-  if (Dir.empty())
-    return;
   if (std::error_code EC = sys::fs::create_directories(Dir))
     return;
   std::string Stem;
@@ -675,8 +671,6 @@ runSpecializationDiagnostic(Module &Extracted,
     for (auto &KV : Info) {
       const Function *F = KV.first;
       for (const Function *Callee : KV.second.Callees) {
-        if (!Info.count(Callee))
-          continue;
         if (ClosureMC[Callee] && !ClosureMC[F]) {
           ClosureMC[F] = true;
           Changed = true;
@@ -695,8 +689,6 @@ runSpecializationDiagnostic(Module &Extracted,
       continue;
     auto MCIt = ClosureMC.find(EF);
     auto RefIt = ClosureRefs.find(EF);
-    if (MCIt == ClosureMC.end() || RefIt == ClosureRefs.end())
-      continue;
 
     // #1: no ejit_may_const read in the specialization closure.
     if (EJitWarnNoSpecialization && !MCIt->second)
@@ -734,8 +726,6 @@ runSpecializationDiagnostic(Module &Extracted,
         if (!Seen.insert(F).second)
           continue;
         auto It = Info.find(F);
-        if (It == Info.end())
-          continue;
         K += It->second.MayConstCount;
         J += It->second.MayConstInLoopCount;
         for (const Function *Callee : It->second.Callees)
@@ -1143,9 +1133,6 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
   // No sentinel entry: the runtime iterates the linker-provided
   // [__start_ejit_bitcode, __stop_ejit_bitcode) range over the dedicated
   // section, so each translation unit contributes only its own entries.
-  if (Entries.empty())
-    return;
-
   ArrayType *ArrayTy = ArrayType::get(EntryTy, Entries.size());
   Constant *ArrayInit = ConstantArray::get(ArrayTy, Entries);
 
@@ -1180,8 +1167,6 @@ EJitRegisterBitcodePass::run(Module &M, ModuleAnalysisManager &) {
   computeTransitiveClosure(EntryFuncs, ClosureFuncs, ClosureGlobals);
   LLVM_DEBUG(dbgs() << "ejit-register-bitcode: closure " << ClosureFuncs.size()
                     << " funcs, " << ClosureGlobals.size() << " globals\n");
-  if (ClosureFuncs.empty())
-    return PreservedAnalyses::all();
 
   // Helpers to externalize: non-entry closure functions whose bodies cost
   // more than the AOT registration record that replaces them. Computed on
