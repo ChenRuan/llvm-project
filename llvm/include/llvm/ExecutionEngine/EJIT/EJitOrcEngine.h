@@ -184,7 +184,6 @@ public:
   /// wasted bytes, enable_ex invocations) for diagnostics and tests. Returns a
   /// zeroed snapshot if no pool is active. Available only with
   /// EJIT_SRE_CODE_POOL.
-  EJitCodePoolManager::Stats getCodePoolStats() const;
 
   /// Snapshot aggregate and placement-specific statistics. Tier-1 uses the
   /// far dynamic pool; final Baseline/Tier-2 code uses the near fixed pool.

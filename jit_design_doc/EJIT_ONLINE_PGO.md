@@ -1,5 +1,8 @@
 # EmbeddedJIT 在线 PGO 设计方案
 
+> spec5 实现说明：下文有关自定义 `EJitPassBuilder` 的描述是历史设计。当前
+> `EJitOptimizer` 通过 LLVM 的 `PassBuilder` 注册分析，在线 PGO 也走这条路径。
+
 **版本**: 0.14
 **日期**: 2026-07-11
 **关联文档**: SPEC4.md, PLAN4.md, PASS6_EJitStructFieldPass.md, PASS7_EJitRuntime_OrcJITLink.md, EJIT_SRE_TASKPOOL.md, EJIT_SRE_CODE_POOL.md, EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL_STUBS.md, [EJIT_VALUE_PROFILE.md](EJIT_VALUE_PROFILE.md)

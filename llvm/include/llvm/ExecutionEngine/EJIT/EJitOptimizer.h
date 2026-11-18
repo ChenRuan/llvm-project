@@ -22,7 +22,6 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
-#include "llvm/ExecutionEngine/EJIT/EJitPassBuilder.h"
 #include "llvm/IR/Module.h"
 
 namespace llvm {

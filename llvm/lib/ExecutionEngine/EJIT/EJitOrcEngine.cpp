@@ -1299,10 +1299,6 @@ void EJitOrcEngine::addUserSymbol(const std::string &name, void *addr) {
 }
 
 #ifdef EJIT_SRE_CODE_POOL
-EJitCodePoolManager::Stats EJitOrcEngine::getCodePoolStats() const {
-  return getTieredCodePoolStats().total;
-}
-
 EJitTieredCodePoolStats EJitOrcEngine::getTieredCodePoolStats() const {
   EJitTieredCodePoolStats Out;
   if (P->nearCodePool)

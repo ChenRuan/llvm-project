@@ -99,7 +99,6 @@ endforeach()
 set(EJIT_SOURCES
   EJit.cpp
   EJitRuntime.cpp
-  EJitRegistryTable.c
   EJitOrcEngine.cpp
   EJitLinkDiagPlugin.cpp
   EJitLinkOptimizationPlugin.cpp
@@ -110,7 +109,6 @@ set(EJIT_SOURCES
   EJitRegistrationStore.cpp
   EJitStructFieldPass.cpp
   EJitOptimizer.cpp
-  EJitPassBuilder.cpp
   EJitProfileMerge.cpp
   EJitCodePool.cpp
   EJitCodePoolMemoryManager.cpp
@@ -160,12 +158,6 @@ endif()
 
 if(EJIT_SRE_PGO_BRANCH_AUDIT)
   list(APPEND EJIT_SOURCES EJitBranchProfile.cpp)
-endif()
-
-# Async/sync compiler — excluded in freestanding mode (single-threaded, no std::thread)
-if(NOT EJIT_FREESTANDING)
-  list(APPEND EJIT_SOURCES
-  )
 endif()
 
 add_llvm_component_library(LLVMEJIT

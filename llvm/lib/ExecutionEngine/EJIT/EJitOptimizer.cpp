@@ -78,9 +78,9 @@ static bool mayConstSitesCorrespond(const EJitMayConstLoadSite &L,
 
 EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
     : registry_(reg) {
-  // Use the real llvm::PassBuilder to register the FULL analysis set. The O2
-  // function-simplification pipeline (GVN, CorrelatedValuePropagation, etc.)
-  // needs analyses the minimal EJitPassBuilder does not register (~13 vs ~40).
+  // The function-simplification pipeline queries more than the analyses
+  // referenced directly by EJIT. Register the full LLVM analysis set and
+  // wire its proxies before constructing the per-tier pass managers.
   PassBuilder PB(TM);
   PB.registerFunctionAnalyses(FAM_);
   PB.registerLoopAnalyses(LAM_);
