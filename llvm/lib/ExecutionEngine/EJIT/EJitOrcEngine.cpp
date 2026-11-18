@@ -1232,31 +1232,6 @@ Expected<void *> EJitOrcEngine::lookup(uint64_t cacheKey,
   }
   void *Ptr = reinterpret_cast<void *>(addr->getValue());
 
-#ifdef EJIT_SRE_CODE_POOL
-  // Legacy whole-pool seal: flip the 2MiB pool that contains the resolved
-  // function to RX before it is handed back. This is the only point a JIT pool
-  // transitions RW->RX in whole-pool mode. Idempotent: a pool already sealed
-  // (e.g. on allocation rollover) is not re-flipped, so repeated lookups of the
-  // same function do not re-invoke enable_ex. Only pool-backed code is sealed;
-  // an address resolved outside the pools (e.g. a process/absolute symbol) is
-  // left untouched. If sealing fails we must not return a callable pointer.
-  //
-  // In 4K page-seal mode the seal already happened per-page at finalize (in the
-  // code-pool memory manager), so nothing is done here.
-  EJitCodePoolManager *OwningPool = nullptr;
-  if (P->nearCodePool && P->nearCodePool->contains(Ptr))
-    OwningPool = P->nearCodePool.get();
-  else if (P->farCodePool && P->farCodePool->contains(Ptr))
-    OwningPool = P->farCodePool.get();
-  if (OwningPool && !OwningPool->usesPageSeal()) {
-    if (auto Err = OwningPool->sealPoolContaining(Ptr)) {
-      EJIT_DIAG("lookup FAIL key=0x%016lx ptr=%p: seal pool error", cacheKey,
-                Ptr);
-      return std::move(Err);
-    }
-  }
-#endif
-
   EJIT_DIAG_VERBOSE("lookup OK key=0x%016lx name=%s ptr=%p", cacheKey,
                     name.c_str(), Ptr);
   return Ptr;

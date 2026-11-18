@@ -696,24 +696,9 @@ if(EJIT_SRE_CODE_POOL)
                  "(size=${EJIT_SRE_CODE_POOL_SIZE}, ptNo=${EJIT_SRE_CODE_POOL_PTNO})")
 endif()
 
-# 4K-granular execute-permission sealing for the code pool. The target's large
-# page is still 2MiB (pools stay 2MiB-aligned), but the platform exposes
-# split_2m_to_4k() to break a 2MiB window into 4K mappings and enable_ex() then
-# flips execute permission per 4KiB page. With this ON the pool seals only the
-# 4K pages a finalized function actually covers (instead of a whole 2MiB pool),
-# which is much more memory efficient. Single boolean — no extra numeric knobs;
-# the 2MiB / 4KiB values are baked-in platform constants. Effective only when
-# EJIT_SRE_CODE_POOL is ON; default ON because the code pool targets the SRE
-# platform whose execute-permission interface is now 4K-granular.
-#
-# The -DEJIT_CODE_POOL_4K_SEAL definition is applied narrowly to the LLVMEJIT
-# target (its only user is the SRE adapter EJitSrePlatform.cpp), in
-# llvm/lib/ExecutionEngine/EJIT/CMakeLists.txt, rather than globally — so
-# toggling it does not recompile the whole tree.
-option(EJIT_CODE_POOL_4K_SEAL
-  "Seal JIT code execute permission per 4KiB page (split_2m_to_4k + enable_ex) instead of per 2MiB pool" ON)
-if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
-  message(STATUS "EmbeddedJIT: SRE code pool uses 4K-granular page sealing")
+# A pool is split into 4KiB mappings before any code is written.
+if(EJIT_SRE_CODE_POOL AND DEFINED EJIT_CODE_POOL_4K_SEAL AND NOT EJIT_CODE_POOL_4K_SEAL)
+  message(FATAL_ERROR "Whole-pool sealing has been retired; remove EJIT_CODE_POOL_4K_SEAL=OFF")
 endif()
 
 # Experimental near-code-pool packing. Ordinary EJIT code and online-PGO Tier-2
@@ -725,9 +710,9 @@ endif()
 option(EJIT_CODE_POOL_BATCHED_PUBLISH
   "Pack pure JIT code at 16-byte alignment for explicit RX batch publication" OFF)
 if(EJIT_CODE_POOL_BATCHED_PUBLISH)
-  if(NOT EJIT_SRE_CODE_POOL OR NOT EJIT_CODE_POOL_4K_SEAL)
+  if(NOT EJIT_SRE_CODE_POOL)
     message(FATAL_ERROR
-      "EJIT_CODE_POOL_BATCHED_PUBLISH requires EJIT_SRE_CODE_POOL=ON and EJIT_CODE_POOL_4K_SEAL=ON")
+      "EJIT_CODE_POOL_BATCHED_PUBLISH requires EJIT_SRE_CODE_POOL=ON")
   endif()
   message(STATUS
     "EmbeddedJIT: 16-byte compact code + manual batched publish enabled")

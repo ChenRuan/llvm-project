@@ -223,14 +223,6 @@ if(EJIT_SRE_PGO_BRANCH_AUDIT)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_SRE_PGO_BRANCH_AUDIT)
 endif()
 
-# 4K-granular code-pool sealing. The only user of this macro is the SRE adapter
-# (EJitSrePlatform.cpp), so scope it to LLVMEJIT instead of a global
-# add_definitions — toggling it then does not recompile the whole LLVM tree.
-# Effective only when the SRE code pool itself is enabled.
-if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
-  target_compile_definitions(LLVMEJIT PRIVATE EJIT_CODE_POOL_4K_SEAL)
-endif()
-
 if(EJIT_CODE_POOL_BATCHED_PUBLISH)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_CODE_POOL_BATCHED_PUBLISH)
 endif()
@@ -238,8 +230,7 @@ endif()
 # Pin the JIT code pool to a fixed linker-script region [__ejit_code_start,
 # __ejit_code_end) in the RX code segment (enable_rw write / enable_ex seal)
 # instead of dynamic SRE_MemDbgAlloc. The only user of this macro is the SRE
-# adapter (EJitSrePlatform.cpp), so scope it to LLVMEJIT like
-# EJIT_CODE_POOL_4K_SEAL above. Effective only when the SRE code pool is on.
+# adapter, so scope it to LLVMEJIT.
 if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_FIXED_CODE_POOL)
 endif()
@@ -258,7 +249,7 @@ endif()
 # designated core (empty = open CAS election, the default). The consumers are
 # EJitSharedTaskPool.cpp (the election gate) and EJit.cpp (the init-failure
 # message), both inside LLVMEJIT, so scope the definition to this target like
-# EJIT_CODE_POOL_4K_SEAL above - toggling it does not recompile the tree.
+# other target-local options above.
 # Non-empty test, not truthiness: "0" is a valid core id (CMake if() treats
 # the string "0" as FALSE - see the trap note in llvm/CMakeLists.txt).
 if(EJIT_SRE_SHARED_TASKPOOL AND
@@ -271,7 +262,7 @@ endif()
 # only meaningful with the shared taskpool). The consumers are
 # EJitSharedTaskPool.cpp (the peer pointer gate) and EJitCompileDriver.cpp
 # (the resolve path), both inside LLVMEJIT, so scope it to this target like
-# EJIT_CODE_POOL_4K_SEAL above - never a global add_definitions: the
+# other target-local options above - never a global add_definitions: the
 # EJITSharedTaskPoolTests target compiles EJitSharedTaskPool.cpp directly and
 # deliberately tests the code-sharing-OFF peer rejection, so a leaked
 # -DEJIT_SRE_SHARED_CODE_POINTERS makes the gate always-true and fails 5

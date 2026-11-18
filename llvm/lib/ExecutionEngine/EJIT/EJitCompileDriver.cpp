@@ -62,16 +62,6 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
 }
 
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-[[maybe_unused]] bool sharedPrepareCodeThunk(void * /*ctx*/,
-                                             const void *fnPtr) {
-#ifdef EJIT_SRE_CODE_POOL
-  return prepareSreCodeForCurrentCore(fnPtr);
-#else
-  (void)fnPtr;
-  return false;
-#endif
-}
-
 // Owner-private: resolve a freshly compiled pointer to its real, finalized
 // executable range + owning pool (from the code-pool allocation metadata) so it
 // can be published into the shared cache slot for cross-core 4K sealing.
@@ -293,7 +283,7 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
 #endif
 #ifdef EJIT_SRE_SHARED_CODE_POINTERS
   sharedPool_.setCodeSharingEnabled(true);
-#ifdef EJIT_CODE_POOL_4K_SEAL
+#ifdef EJIT_SRE_CODE_POOL
   // 4K page seal: a non-owner core splits its 2MiB pool once and then seals
   // exactly the 4KiB pages the code covers, in its own translation context.
   sharedPool_.setSealMode(true);
@@ -303,9 +293,8 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   // counters), make those data pages writable per-core before execution.
   sharedPool_.setEnableRwPageCallback(&sharedEnableRwPageThunk, this);
 #else
-  // Legacy whole-2MiB-pool seal: align fnPtr to its pool base and enable_ex.
-  sharedPool_.setSealMode(false);
-  sharedPool_.setPrepareCodeCallback(&sharedPrepareCodeThunk, this);
+  // No SRE permission backend: never hand an unprepared pointer to a peer.
+  sharedPool_.setCodeSharingEnabled(false);
 #endif
 #else
   sharedPool_.setCodeSharingEnabled(false);
