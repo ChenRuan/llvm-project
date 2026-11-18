@@ -78,11 +78,8 @@ void update_cell_cfg(EJIT_DIM(cell) uint8_t cellIdx,
     <h2>4. Initialize EJIT and activate the time window</h2>
 <pre><code class="language-c">int main(void) {
     ejit_config_t cfg = {0};
-    cfg.compileMode = EJIT_COMPILE_SYNC;
+    cfg.compileMode = EJIT_COMPILE_ASYNC;
     cfg.optLevel = EJIT_OPT_L2;
-    cfg.maxCodeMemory = 2 * 1024 * 1024;
-    cfg.maxCacheEntries = 4096;
-    cfg.enableLogger = true;
 
     if (ejit_init(&amp;cfg) != EJIT_OK)
         return 1;

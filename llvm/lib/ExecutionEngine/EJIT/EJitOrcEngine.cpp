@@ -45,9 +45,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #endif
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
-#endif
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -235,9 +233,7 @@ static std::string &dumpFuncFilter() {
   return Filter;
 }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 EJitSharedTaskPoolState *gDumpSharedState = nullptr;
-#endif
 
 void setDumpFuncFilter(const std::string &name) {
   std::string &Filter = dumpFuncFilter();
@@ -247,7 +243,6 @@ void setDumpFuncFilter(const std::string &name) {
     EJIT_DIAG_DEBUG("set_dump_filter value=%s &filter=%p",
                     Filter.empty() ? "(off)" : Filter.c_str(), (void *)&Filter);
   }
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (gDumpSharedState) {
     EJitSharedDumpState &D = gDumpSharedState->dump;
     uint32_t expected = 0;
@@ -276,10 +271,8 @@ void setDumpFuncFilter(const std::string &name) {
     EJIT_DIAG_DEBUG("set_dump_filter shared enabled=%u len=%u &shared=%p",
                     len ? 1u : 0u, len, (void *)gDumpSharedState);
   }
-#endif
 }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 void setDumpSharedState(EJitSharedTaskPoolState *state) {
   gDumpSharedState = state;
   EJIT_DIAG_DEBUG("set_dump_shared_state state=%p", (void *)state);
@@ -320,15 +313,10 @@ static bool getSharedDumpFilter(std::string &out) {
   sharedDumpUnlock(D);
   return enabled;
 }
-#else
-void setDumpSharedState(EJitSharedTaskPoolState * /*state*/) {}
-#endif
 
 static bool getActiveDumpFilter(std::string &out) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (getSharedDumpFilter(out))
     return true;
-#endif
   std::lock_guard<DumpMutexType> lock(dumpMutex());
   std::string &Filter = dumpFuncFilter();
   if (Filter.empty())
@@ -397,7 +385,6 @@ static void dumpLinesSafe(const char *label, const std::string &s) {
   dumpBytesSafe(label, s.data(), s.size());
 }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 static uint32_t copyDumpBytes(char *dst, uint32_t cap, const char *src,
                               size_t size, bool &truncated) {
   if (cap == 0)
@@ -489,7 +476,6 @@ static bool printSharedDumpHint(const char *name) {
                   stored, workerCore, stored, irSize, asmSize, keyHi, keyLo);
   return true;
 }
-#endif
 
 /// Called from the IR transform layer when the filter matches: save the
 /// post-optimization IR and emitted ASM for later selective printing.
@@ -509,12 +495,10 @@ static void captureDump(const std::string &fnName, uint64_t cacheKey,
       DumpEntry{cacheKey, tier, std::move(FunctionIR), std::move(FunctionASM),
                 std::move(ModuleIR), std::move(ModuleASM)};
   EJIT_DIAG_DEBUG("capture store_size after=%u", (unsigned)Store.size());
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   // Publish only small metadata. Full text remains in the worker-local map.
   const DumpEntry &E = Store[fnName];
   captureSharedDumpMetadata(fnName, cacheKey, E.FunctionIR.size(),
                             E.FunctionASM.size());
-#endif
 }
 
 /// Render only the requested entry definition. A specialization module may
@@ -645,12 +629,10 @@ bool printDumped(const char *name) {
       return true;
     }
   }
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   // A non-worker core cannot read the worker-private payload. Shared state
   // carries only enough metadata to direct the caller to the owning core.
   if (printSharedDumpHint(name))
     return true;
-#endif
   if (hasName)
     EJIT_DIAG_DEBUG("print_dumped miss name=%s store_size=%u", name,
                     (unsigned)Store.size());

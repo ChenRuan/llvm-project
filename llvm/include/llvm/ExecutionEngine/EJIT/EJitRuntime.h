@@ -116,8 +116,9 @@ ejit_status_t ejit_set_allocation_size_lookup(ejit_allocation_size_lookup_t look
                                              void *context);
 
 typedef enum {
-  EJIT_COMPILE_SYNC = 0,
+  // Value 0 was the retired Sync mode. Select a mode explicitly.
   EJIT_COMPILE_ASYNC = 1,
+  EJIT_COMPILE_OFF = 2,
 } ejit_compile_mode_t;
 
 typedef enum {
@@ -126,14 +127,11 @@ typedef enum {
   EJIT_OPT_L3 = 3,
 } ejit_opt_level_t;
 
+/// Unversioned config ABI. Rebuild firmware and all callers with this header;
+/// objects using the previous, larger config layout are not compatible.
 typedef struct {
   ejit_compile_mode_t compileMode;
   ejit_opt_level_t optLevel;
-  size_t maxCodeMemory;
-  size_t maxDataMemory;
-  size_t maxCacheEntries;
-  size_t maxCacheSize;
-  bool enableLogger;
   /// If true, force the static registry table path (skip constructors).
   bool forceStaticRegistry;
   /// If non-NULL, dump JIT-optimized LLVM IR (.ll) to this directory.
@@ -174,18 +172,10 @@ typedef struct ejit_code_pool_stats_v2_t {
   ejit_code_pool_stats_t far;
 } ejit_code_pool_stats_v2_t;
 
-typedef struct {
-  int code;
-  char message[256];
-  char funcName[128];
-} ejit_error_t;
-
 // Initialization
 ejit_status_t ejit_init(const ejit_config_t *config);
 /// Initialize with online PGO enabled (Tier-1 instrumentation + lazy Tier-2
-/// PGOUse recompile). Additive, ABI-compatible entry point: `ejit_config_t`
-/// keeps its original layout (no versioned tail field), so an old caller's
-/// struct is never over-read. Behaves exactly like ejit_init(config) but forces
+/// PGOUse recompile). Uses the same config layout as ejit_init(config) but forces
 /// the runtime's online-PGO auto-trigger on. Requires the runtime to be linked
 /// with LLVMProfileData + LLVMInstrumentation (a build without PGO support
 /// treats this as ejit_init). PGO is off for plain ejit_init().
@@ -242,9 +232,7 @@ ejit_status_t ejit_deactivate_all(const char *periodName);
 // and silently querying instance 0.
 bool ejit_is_active(const char *periodName, uint32_t cellIdx);
 
-// Compilation
-// ejit_taskpool_compile_or_get is the single compilation entry point for both
-// Sync and Async modes (runtime-configurable via ejit_set_compile_mode).
+// Compile misses run on the worker. Off is selected only at initialization.
 
 typedef struct {
   uint32_t dimType;
@@ -308,7 +296,7 @@ unsigned ejit_taskpool_poll_budget(unsigned maxItems);
 
 // SRE taskpool statistics. Separate from ejit_stats_t (which reports the legacy
 // LRU EJitCache); these counters describe the taskpool cache/dedup/queue
-// pipeline used when EJIT_SRE_TASKPOOL is built. Fixed layout
+// shared taskpool pipeline. Fixed layout
 // (uint64_t/uint32_t only) for stable ABI across the aarch64_be target.
 typedef struct {
   uint64_t cacheHits;      ///< Calls served from the taskpool cache.
@@ -457,7 +445,8 @@ void ejit_print_active(void);
 /// exact source it was compiled from.
 void ejit_print_version(void);
 
-// Cache
+// Retire dispatch shortcuts. These calls do not start a new period version;
+// change specialized configuration between deactivate and activate.
 void ejit_clear_cache(void);
 // uint32_t for the same reason as ejit_activate above: an out-of-range index
 // is rejected (no-op) instead of being truncated at the ABI boundary and
@@ -466,11 +455,6 @@ void ejit_invalidate(const char *periodName, uint32_t cellIdx);
 
 // Statistics
 ejit_status_t ejit_get_stats(ejit_stats_t *stats);
-const ejit_error_t *ejit_get_last_error(void);
-
-// Configuration
-void ejit_set_compile_mode(ejit_compile_mode_t mode);
-ejit_compile_mode_t ejit_get_compile_mode(void);
 
 #ifdef __cplusplus
 }

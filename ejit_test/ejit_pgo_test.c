@@ -43,9 +43,7 @@ int main(int argc, char **argv) {
   ejit_default_config(&cfg);
   printf("PGO enabled, mode=%d\n", (int)cfg.compileMode);
 
-  // Online PGO is opted in through the dedicated, ABI-stable ejit_init_pgo()
-  // entry point (ejit_config_t keeps its original layout — no enablePgo tail
-  // field). Plain ejit_init() would run with PGO off.
+  // PGO is selected by the entry point, not by a config field.
   int rc = (int)ejit_init_pgo(&cfg);
   if (rc != EJIT_OK) {
     printf("FAIL: ejit_init_pgo=%d\n", rc);

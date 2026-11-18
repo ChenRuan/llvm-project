@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-//  Platform seam for the cross-core SHARED taskpool (EJIT_SRE_SHARED_TASKPOOL).
+//  Platform seam for the cross-core shared taskpool.
 //
 //  Two host-overridable / platform-injected primitives live here so the rest of
 //  the shared taskpool never names a platform symbol directly:

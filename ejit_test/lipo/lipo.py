@@ -364,9 +364,7 @@ def doit_gc_merge(args):
         "ejit_register_pointer_period_bounds",
         "ejit_set_allocation_size_lookup",
         "ejit_clear_cache", "ejit_compile_or_get", "ejit_invalidate",
-        "ejit_set_compile_mode", "ejit_get_compile_mode", "ejit_get_last_error",
-        # General diagnostics (always available — defined outside the
-        # EJIT_SRE_TASKPOOL ifdef in EJitRuntime.cpp).
+        # General diagnostics.
         "ejit_set_log_level", "ejit_get_log_level",
         "ejit_print_registry", "ejit_print_func_meta",
         "ejit_get_code_pool_stats", "ejit_get_code_pool_stats_v2",

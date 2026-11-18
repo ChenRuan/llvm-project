@@ -186,7 +186,6 @@ void          ejit_print_code_pool_stats(void);
 ejit_config_t cfg = {};
 cfg.compileMode  = EJIT_COMPILE_ASYNC;
 cfg.optLevel     = EJIT_OPT_L2;
-cfg.enableLogger = true;
 cfg.dumpJITDir   = "/tmp/ejit_ir";   // 非空即开启
 ejit_init(&cfg);
 ```
@@ -266,40 +265,7 @@ ejit_print_version();                 // 可在 init 前后任意时刻调用
 
 ## 6. 错误报告
 
-```c
-typedef struct {
-  int  code;
-  char message[256];
-  char funcName[128];
-} ejit_error_t;
-
-const ejit_error_t *ejit_get_last_error(void);
-```
-
-返回最近一次错误的指针（code / message / funcName），底层为预分配环形缓冲（最多 32 条），无动态分配。
-
-| 字段 | 含义 |
-|------|------|
-| `code` | 对应附录中的 `ejit_status_t` 错误码。 |
-| `message` | 最近一次被记录错误的简短原因，不保证包含底层编译器的完整诊断。 |
-| `funcName` | 与错误关联的函数或注册项名称；错误不属于特定函数时可能为空。 |
-
-返回指针由 EJIT 内部环形缓冲持有，后续错误记录可能覆盖其内容；需要长期保留时应由调用方立即复制这三个字段。
-
-配套配置项 `enableLogger`（`ejit_config_t` 的 `bool` 字段）控制错误环形缓冲是否启用；它与 §1 的运行时日志等级是两套独立机制。注意该 C 结构体字段**无默认值**：零初始化的 `ejit_config_t` 会得到 `enableLogger = false`，需显式置 `true` 才会记录错误。freestanding 构建会强制关闭该错误记录器：
-
-```c
-ejit_config_t cfg = {};
-cfg.enableLogger = true;   // 必须显式设置；零初始化结构体为 false
-ejit_init(&cfg);
-```
-
-```c
-if (ejit_taskpool_compile_or_get(...) != EJIT_OK) {
-  const ejit_error_t *e = ejit_get_last_error();
-  if (e) printf("EJIT error %d: %s (%s)\n", e->code, e->message, e->funcName);
-}
-```
+检查返回的 `ejit_status_t`。初始化前暂存的注册错误由 `ejit_init` 或 `ejit_init_pgo` 返回，不依赖日志是否开启。启用 `EJIT_DIAG_ENABLE` 时，INFO 级日志会给出注册及编译失败的原因；编译失败时 wrapper 仍回退到 AOT。
 
 ---
 
@@ -410,7 +376,7 @@ clang -fembed-bitcode ... -mllvm -ejit-dump-bitcode-dir=/tmp/ejit_bc process.c
 
 ### 10.3 该编译的没编译 / 编译失败
 
-1. `ejit_get_last_error()` 读失败原因（code / message / funcName）。
+1. 检查 API 的返回值，并从 INFO 日志中查找注册或编译失败的具体原因。
 2. `EJIT_LOG_VERBOSE` 看逐次 `compile_or_get` 与 taskpool 请求。
 3. `ejit_taskpool_get_stats()` 看 `compileFailed` / `publishFailed` / `queueFull` / `queueApproxSize`，判断是失败、被拒还是拥塞。
 4. `ejit_taskpool_print_compiled()` 看实际编译了哪些特化。

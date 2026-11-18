@@ -40,14 +40,13 @@
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h" // EJitWritableRange bound
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
-#include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h" // EJitCompileRequest, EJitDimPair
+#include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h" // EJitCompileRequest, EJitDimPair
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
 //===----------------------------------------------------------------------===//
-// Compile-time capacities (overridable by the build via -D). Defaults mirror
-// the non-shared taskpool so the two stay aligned.
+// Compile-time capacities (overridable by the build via -D).
 //===----------------------------------------------------------------------===//
 #ifndef EJIT_SRE_TASKPOOL_BUCKETS
 #define EJIT_SRE_TASKPOOL_BUCKETS 32u
@@ -251,8 +250,7 @@ struct EJitSharedCacheSlot {
 
 //===----------------------------------------------------------------------===//
 // EJitSharedCacheBucket: a fixed array of slots guarded by an embedded
-// two-word reader/writer lock (same protocol as EJitRwLock, but inline in the
-// shared blob). Buckets are cache-line aligned so a writer to one bucket never
+// two-word reader/writer lock in the shared blob. Buckets are cache-line aligned so a writer to one bucket never
 // false-shares with readers of another.
 //===----------------------------------------------------------------------===//
 struct alignas(kEJitSharedCacheLine) EJitSharedCacheBucket {

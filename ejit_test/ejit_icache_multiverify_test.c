@@ -181,7 +181,6 @@ int test_ejit_icache_multiverify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
 
   ejit_config_t cfg = {.compileMode = EJIT_COMPILE_ASYNC,
                        .optLevel = EJIT_OPT_L2,
-                       .enableLogger = false,
                        .forceStaticRegistry = true};
   ejit_status_t rc = ejit_init(&cfg);
   uint32_t worker = ejit_taskpool_get_worker_core();

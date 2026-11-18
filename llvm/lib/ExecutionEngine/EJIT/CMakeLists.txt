@@ -99,6 +99,7 @@ endforeach()
 set(EJIT_SOURCES
   EJit.cpp
   EJitRuntime.cpp
+  EJitDiag.cpp
   EJitOrcEngine.cpp
   EJitLinkDiagPlugin.cpp
   EJitLinkOptimizationPlugin.cpp
@@ -115,32 +116,12 @@ set(EJIT_SOURCES
   EJitSrePlatform.cpp
 )
 
-# EJitLogger has its own #ifndef EJIT_FREESTANDING no-op stubs, so always include it.
-list(APPEND EJIT_SOURCES
-  EJitLogger.cpp
-)
-
-# SRE taskpool compile scheduler — always compiled (PASS3 unconditionally
-# generates ejit_taskpool_compile_or_get calls). It uses no C++ threading
-# facilities, so it is compatible with EJIT_FREESTANDING.
-list(APPEND EJIT_SOURCES
-  EJitTaskPool.cpp
-  EJitSreQueue.cpp
-  EJitWorker.cpp
-)
+# PASS3 always emits the shared taskpool C ABI.
+list(APPEND EJIT_SOURCES EJitSharedTaskPool.cpp EJitSharedPlatform.cpp)
 if(EJIT_FREESTANDING)
   list(APPEND EJIT_SOURCES EJitSreTask_sre.cpp)
 else()
   list(APPEND EJIT_SOURCES EJitSreTask_host.cpp)
-endif()
-# Cross-core shared taskpool (single shared worker owner) — optional.
-# POD shared state + injectable core-id seam; no C++ threading facilities, so
-# it is compatible with EJIT_FREESTANDING.
-if(EJIT_SRE_SHARED_TASKPOOL)
-  list(APPEND EJIT_SOURCES
-    EJitSharedTaskPool.cpp
-    EJitSharedPlatform.cpp
-  )
 endif()
 
 # Online-PGO value profiling (default OFF): per-core collector + the runtime
@@ -238,12 +219,10 @@ endif()
 # EJIT_ICACHE_DIM_SIZE: per-dim bound D of the multi-version inline cache.
 # Used by icacheFill/icacheTry linearization in EJitSharedTaskPool. Must match
 # the AOT -mllvm -print-ejit-icache-dim-size value (both from the top-level CMake
-# var). Scoped to LLVMEJIT (the icache runtime lives here); gated on the shared
-# taskpool, which is the only build the icache is compiled under.
-if(EJIT_SRE_SHARED_TASKPOOL)
-  target_compile_definitions(LLVMEJIT PRIVATE EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE})
-  target_compile_definitions(LLVMEJIT PRIVATE EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS})
-endif()
+# var). Scoped to LLVMEJIT, where the runtime icache lives.
+target_compile_definitions(LLVMEJIT PRIVATE
+  EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}
+  EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS})
 
 # Fixed worker core: close the shared taskpool's owner election to the
 # designated core (empty = open CAS election, the default). The consumers are
@@ -252,8 +231,7 @@ endif()
 # other target-local options above.
 # Non-empty test, not truthiness: "0" is a valid core id (CMake if() treats
 # the string "0" as FALSE - see the trap note in llvm/CMakeLists.txt).
-if(EJIT_SRE_SHARED_TASKPOOL AND
-   NOT (EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE STREQUAL ""))
+if(NOT (EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE STREQUAL ""))
   target_compile_definitions(LLVMEJIT PRIVATE
     EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE})
 endif()
@@ -268,7 +246,7 @@ endif()
 # -DEJIT_SRE_SHARED_CODE_POINTERS makes the gate always-true and fails 5
 # tests. EJITTier1WritableIntegrationTests / EJITSharedCacheQueryBench define
 # it themselves when they want the sharing path.
-if(EJIT_SRE_SHARED_TASKPOOL AND EJIT_SRE_SHARED_CODE_POINTERS)
+if(EJIT_SRE_SHARED_CODE_POINTERS)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_SRE_SHARED_CODE_POINTERS)
 endif()
 

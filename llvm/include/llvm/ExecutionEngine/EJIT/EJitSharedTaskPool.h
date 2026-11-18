@@ -37,7 +37,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
-#include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h" // EJitCompileMode, status enum
+#include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -715,9 +715,7 @@ public:
   /// I/D-cache coherent for cross-core execution (spec §11 fnPtr
   /// prerequisites).
   void setCodeSharingEnabled(bool enabled) { codeSharingEnabled_ = enabled; }
-  /// Owner-only PRE-INIT configuration: the mode the owner publishes into the
-  /// shared state during init(). After the blob is Ready this only stages the
-  /// desired mode; use setSharedMode() to change the live cross-core mode.
+  /// The owner publishes this initial mode when creating the shared state.
   void setMode(EJitCompileMode mode) { configuredMode_ = mode; }
 
   /// PGO (§6): enable the online-PGO Tier-2 auto-trigger on the shared
@@ -774,45 +772,6 @@ public:
   /// stay on AOT until the current Tier-2 finishes.
   bool admitPgoFunction(uint32_t funcIndex, bool &newlyAdmitted);
 
-  //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
-  /// Publish the compile/taskpool mode as cross-core shared runtime state.
-  /// Compile mode is a shared control flag (engine/worker ownership stays
-  /// owner-private): once the blob is Ready any core may flip it and every
-  /// core's compileOrGet() observes it through an acquire load of state_->mode.
-  /// A mode flip is a pure control flag — it never touches the queue, dedup,
-  /// cache, owner election, or the single worker.
-  ///   * If the blob is Ready, write state_->mode with RELEASE semantics so the
-  ///     new mode is visible to every core (including peers/other cores), not
-  ///     only to the owner object.
-  ///   * If the blob is not yet initialized, only stage configuredMode_ so the
-  ///     owner publishes the desired mode during init().
-  void setSharedMode(EJitCompileMode mode) {
-    configuredMode_ = mode;
-    if (state_ && state_->initState.loadAcquire() ==
-                      static_cast<uint32_t>(EJitSharedInitState::Ready))
-      state_->mode.storeRelease(static_cast<uint32_t>(mode));
-  }
-  /// Publish \p mode only if the blob is still Ready at generation \p gen --
-  /// the one asyncServiceAvailable() validated. An ownerShutdown that lands in
-  /// between bumps the generation, so the stale mode is never committed and the
-  /// caller learns the switch did not take. Returns false without writing then.
-  bool publishSharedMode(EJitCompileMode mode, uint32_t gen) {
-    if (!state_)
-      return false;
-    if (state_->initState.loadAcquire() !=
-            static_cast<uint32_t>(EJitSharedInitState::Ready) ||
-        state_->generation.loadAcquire() != gen)
-      return false;
-    configuredMode_ = mode;
-    state_->mode.storeRelease(static_cast<uint32_t>(mode));
-    // Re-check: if the owner went Stopping between the gate and the store, the
-    // write is stale. Producers gate on Ready before enqueuing so nothing can
-    // act on it, but report the failure rather than claim the switch took.
-    return state_->initState.loadAcquire() ==
-               static_cast<uint32_t>(EJitSharedInitState::Ready) &&
-           state_->generation.loadAcquire() == gen;
-  }
-
   /// The current cross-core compile mode: the shared state's mode (acquire
   /// load) once the blob is Ready, otherwise the staged configuredMode_.
   EJitCompileMode getSharedMode() const {
@@ -832,14 +791,12 @@ public:
   /// Can an async request submitted from THIS core actually be compiled? True
   /// when the blob is Ready, an owner is elected, and that owner's single
   /// worker started. Says nothing about a LOCAL engine: peers have none by
-  /// design and the owner compiles for every core (see EJit::setCompileMode).
+  /// design and the owner compiles for every core.
   ///
   /// The fields are re-read after the check and the whole thing is rejected if
   /// the generation or state moved, so the answer describes ONE generation
-  /// rather than a mix of before- and after-shutdown reads. \p outGeneration
-  /// receives that generation; pass it to publishSharedMode() so the mode can
-  /// only commit against the same one.
-  bool asyncServiceAvailable(uint32_t *outGeneration = nullptr) const {
+  /// rather than a mix of before- and after-shutdown reads.
+  bool asyncServiceAvailable() const {
     if (!state_)
       return false;
     const uint32_t gen = state_->generation.loadAcquire();
@@ -859,8 +816,6 @@ public:
             static_cast<uint32_t>(EJitSharedInitState::Ready) ||
         state_->generation.loadAcquire() != gen)
       return false;
-    if (outGeneration)
-      *outGeneration = gen;
     return true;
   }
 

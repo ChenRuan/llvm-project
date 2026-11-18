@@ -67,7 +67,6 @@
 |---|---|
 | ~~`EJitAsyncCompiler.cpp/.h`~~ | （已移除，由 taskpool worker 取代） |
 | `EJitSyncCompiler.cpp/.h` | 只被 Async 调用，一并排除 |
-| `EJitLogger.cpp` | no-op 桩 |
 | ~~`EJitCache.cpp`~~ | （已移除，LRU 缓存由 taskpool 缓存取代） |
 | `EJitRegistrationStore.cpp` | std::mutex → BareMetalMutex |
 | `EJitRuntimeState.cpp` | std::mutex → BareMetalMutex |

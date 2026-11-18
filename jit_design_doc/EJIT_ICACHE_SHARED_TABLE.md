@@ -193,7 +193,7 @@ probe requires, so the gate was closed in every build the cache was allowed in.
 **P2 — placement must match the deployment.** `EJIT_ICACHE_SECTION` must name an
 inter-core shared section. This is a link-time contract with no runtime check: the
 symbol resolves to the same address either way, so the mistake is undetectable
-from code. CMake warns when `EJIT_SRE_SHARED_TASKPOOL + EJIT_FREESTANDING` is
+from code. CMake warns when `EJIT_FREESTANDING` is
 configured with an empty section. See §8.
 
 **P3 — `ejit_dim` values stay in `[0, D)`.** The accepted ranges never agreed: the

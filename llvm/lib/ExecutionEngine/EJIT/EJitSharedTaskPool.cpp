@@ -9,10 +9,7 @@
 //  Implements owner election and the producer/consumer paths over the POD
 //  EJitSharedTaskPoolState. Uses ONLY EJitAtomic (acquire/release) — no
 //  std::thread / std::mutex / std::condition_variable, no STL containers in the
-//  shared data path. The switch/dedup/queue/commit-gate logic mirrors the
-//  single-instance EJitTaskPool, re-expressed against shared POD storage; the
-//  result cache is a fixed-capacity POD table (no std::unordered_map can live
-//  in shared memory).
+//  shared data path. The result cache is a fixed-capacity POD table.
 //
 //===----------------------------------------------------------------------===//
 
@@ -99,8 +96,7 @@ constexpr uint32_t kEJitFixedWorkerCore = kEJitInvalidCoreId;
 #endif
 
 //===----------------------------------------------------------------------===//
-// Inline per-bucket reader/writer lock over the two POD words (same protocol as
-// EJitRwLock §3.2, but operating on shared-blob fields directly).
+// Reader/writer locking directly on the shared bucket fields.
 //
 // EJIT_SRE_TASKPOOL_NO_RECLAIM changes the READER discipline to a load-only
 // seqlock (no per-hit RMW on the shared readers line). This is memory-safe ONLY
@@ -746,10 +742,8 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   // per-core .bss table used to give structurally.
   //
   // Gating every shape on icacheCrossCoreExecutable() instead disables the
-  // cache in every build it is allowed in: EJitCompileDriver sets fourKSeal_
-  // under EJIT_CODE_POOL_4K_SEAL and wires prepareCodeFn_ otherwise, both
-  // inside EJIT_SRE_SHARED_CODE_POINTERS, which the AOT probe requires. Both
-  // branches close it, so no cell would ever be filled on any real target.
+  // cache in the SRE configuration: every peer has its own page mappings
+  // to prepare. An ordinary hosted pool may not require that step.
   //
   // What such a gate would protect against is two cores sharing a dim identity,
   // where the second loads a pointer only the first has sealed. For a
@@ -3308,110 +3302,6 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
       static_cast<uint32_t>(EJitCompileMode::Off)) {
     EJIT_DIAG_VERBOSE("shared taskpool fallback func=%u: mode off", funcIndex);
     R.status = EJitCompileOrGetStatus::OffMode;
-    return R;
-  }
-  // Sync mode: compile inline on the calling thread (no queue, no worker). Only
-  // the owner core has the compile callback; non-owner cores fall back cleanly.
-  if (state_->mode.loadAcquire() ==
-      static_cast<uint32_t>(EJitCompileMode::Sync)) {
-    if (!isOwner_ || !compileFn_) {
-      EJIT_DIAG_VERBOSE(
-          "shared taskpool sync fallback func=%u: not owner (owner=%u fn=%p)",
-          funcIndex, static_cast<unsigned>(isOwner_),
-          reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(compileFn_)));
-      R.status = EJitCompileOrGetStatus::OffMode;
-      return R;
-    }
-    // Build request with current instance versions, then compile inline.
-    EJitCompileRequest ReqLocal{};
-    ReqLocal.funcIndex = funcIndex;
-    ReqLocal.numDims = numDims;
-    for (uint32_t i = 0; i < numDims; ++i) {
-      ReqLocal.dims[i] = dims[i];
-      ReqLocal.versions[i] =
-          instanceVersion(dims[i].dimType, dims[i].instanceId);
-    }
-    ReqLocal.boundCount = boundCount;
-    for (uint32_t i = 0; i < boundCount; ++i)
-      ReqLocal.boundPointers[i] = boundPointers[i];
-    if (!versionsCurrent(ReqLocal)) {
-      EJIT_DIAG(
-          "shared taskpool sync bound request drop func=%u: version changed",
-          funcIndex);
-      R.status = EJitCompileOrGetStatus::CompileFailed;
-      return R;
-    }
-    void *fn = nullptr;
-    bool ok = compileFn_(compileCtx_, ReqLocal, &fn);
-    if (!ok || !fn) {
-      EJIT_STAT_INC(state_->counters.compileFailed);
-      EJIT_DIAG("shared taskpool sync compile failed func=%u ok=%u", funcIndex,
-                static_cast<unsigned>(ok));
-      R.status = EJitCompileOrGetStatus::CompileFailed;
-      return R;
-    }
-    // Sync callers need a callable result immediately. A batched allocator may
-    // have linked this address while leaving its page RW/NX, so force the
-    // current batch executable instead of publishing an unsafe pointer.
-    if (codeReadyFn_ && !codeReadyFn_(codeBatchCtx_, fn) &&
-        (!codeBatchFlushFn_ || !codeBatchFlushFn_(codeBatchCtx_) ||
-         !codeReadyFn_(codeBatchCtx_, fn))) {
-      if (releaseFn_)
-        releaseFn_(releaseCtx_, fn);
-      EJIT_STAT_INC(state_->counters.compileFailed);
-      EJIT_DIAG("shared taskpool sync compile failed func=%u: batch enable",
-                funcIndex);
-      R.status = EJitCompileOrGetStatus::CompileFailed;
-      return R;
-    }
-    if (!versionsCurrent(ReqLocal)) {
-      if (releaseFn_)
-        releaseFn_(releaseCtx_, fn);
-      EJIT_STAT_INC(state_->counters.compileFailed);
-      EJIT_DIAG("shared taskpool sync compile drop func=%u: version changed",
-                funcIndex);
-      R.status = EJitCompileOrGetStatus::CompileFailed;
-      return R;
-    }
-    EJitCompiledCodeInfo info;
-    if (codeRangeFn_)
-      codeRangeFn_(codeRangeCtx_, fn, &info);
-    EJitPublishStatus PS =
-        cachePublish(ReqLocal, fn, info.codeSize ? &info : nullptr);
-    if (PS == EJitPublishStatus::Published) {
-      EJIT_STAT_INC(state_->counters.asyncCompiles);
-      publishCodePoolStats();
-#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-      SharedLookup Hit2 = cacheLookupSeq(funcIndex, dims, numDims);
-      if ((Hit2.hasReadToken || Hit2.noTokenHit) && Hit2.fnPtr) {
-        R.status = EJitCompileOrGetStatus::CacheHit;
-        R.fnPtr = Hit2.fnPtr;
-        R.bucketIndex = Hit2.bucketIndex; // sentinel -> releaseRead no-op
-        R.hasReadToken = Hit2.hasReadToken;
-        EJIT_DIAG_VERBOSE("shared taskpool sync compiled func=%u fn=%p",
-                          funcIndex, Hit2.fnPtr);
-        return R;
-      }
-#else
-      SharedLookup Hit2 = cacheLookup(funcIndex, dims, numDims);
-      if (Hit2.hasReadToken && Hit2.fnPtr) {
-        R.status = EJitCompileOrGetStatus::CacheHit;
-        R.fnPtr = Hit2.fnPtr;
-        R.bucketIndex = Hit2.bucketIndex;
-        R.hasReadToken = true;
-        EJIT_DIAG_VERBOSE("shared taskpool sync compiled func=%u fn=%p",
-                          funcIndex, Hit2.fnPtr);
-        return R;
-      }
-#endif
-    } else {
-      if (releaseFn_)
-        releaseFn_(releaseCtx_, fn);
-    }
-    EJIT_STAT_INC(state_->counters.compileFailed);
-    EJIT_DIAG("shared taskpool sync compile failed func=%u publish=%u",
-              funcIndex, static_cast<unsigned>(PS));
-    R.status = EJitCompileOrGetStatus::CompileFailed;
     return R;
   }
   // Dedup + enqueue (§5.2 step 3) — Async path. Claim the per-function

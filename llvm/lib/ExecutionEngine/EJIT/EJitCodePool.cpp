@@ -123,33 +123,32 @@ Error EJitCodePoolManager::newActivePoolLocked() {
     Base =
         reinterpret_cast<uint8_t *>(alignUp(addr(RawBytes), Opts_.poolAlign));
     EJIT_DIAG("newActivePool: alignedBase=%p", static_cast<void *>(Base));
-      // The 2MiB-aligned usable window must stay inside the raw allocation.
-      if (addr(Base) + Opts_.poolSize > addr(RawBytes) + RawSize) {
-        EJIT_DIAG(
-            "newActivePool FAIL: aligned window base=%p +%zu > raw %p +%zu",
-            static_cast<void *>(Base), Opts_.poolSize,
-            static_cast<void *>(RawBytes), RawSize);
-        return make_error<StringError>(
-            "EJitCodePool: aligned pool window exceeds raw allocation",
-            inconvertibleErrorCode());
-      }
-  }
-
-    // Split the 2MiB-aligned region into 4K mappings before any enable_ex. One
-    // split per pool; per-page enable_ex happens later at seal time. Applies in
-    // both modes (fixed region is RW until sealed too).
-    unsigned Rc = Split_ ? Split_(Base, Opts_.poolSize) : 1;
-    if (Rc != 0) {
-      EJIT_DIAG("newActivePool FAIL: split_2m_to_4k base=%p size=%zu rc=%u",
-                static_cast<void *>(Base), Opts_.poolSize, Rc);
+    // The 2MiB-aligned usable window must stay inside the raw allocation.
+    if (addr(Base) + Opts_.poolSize > addr(RawBytes) + RawSize) {
+      EJIT_DIAG("newActivePool FAIL: aligned window base=%p +%zu > raw %p +%zu",
+                static_cast<void *>(Base), Opts_.poolSize,
+                static_cast<void *>(RawBytes), RawSize);
       return make_error<StringError>(
-          "EJitCodePool: split_2m_to_4k failed (rc=" + Twine(Rc) +
-              ") for pool base " + Twine(addr(Base)),
+          "EJitCodePool: aligned pool window exceeds raw allocation",
           inconvertibleErrorCode());
     }
-    EJIT_DIAG("newActivePool: split ok base=%p size=%zu",
-              static_cast<void *>(Base), Opts_.poolSize);
-    ++SplitInvocations_;
+  }
+
+  // Split the 2MiB-aligned region into 4K mappings before any enable_ex. One
+  // split per pool; per-page enable_ex happens later at seal time. Applies in
+  // both modes (fixed region is RW until sealed too).
+  unsigned Rc = Split_ ? Split_(Base, Opts_.poolSize) : 1;
+  if (Rc != 0) {
+    EJIT_DIAG("newActivePool FAIL: split_2m_to_4k base=%p size=%zu rc=%u",
+              static_cast<void *>(Base), Opts_.poolSize, Rc);
+    return make_error<StringError>(
+        "EJitCodePool: split_2m_to_4k failed (rc=" + Twine(Rc) +
+            ") for pool base " + Twine(addr(Base)),
+        inconvertibleErrorCode());
+  }
+  EJIT_DIAG("newActivePool: split ok base=%p size=%zu",
+            static_cast<void *>(Base), Opts_.poolSize);
+  ++SplitInvocations_;
 
   auto P = std::make_unique<CodePool>();
   P->raw = RawBytes;
@@ -194,22 +193,22 @@ Expected<void *> EJitCodePoolManager::allocateCode(size_t Size, size_t Align) {
   std::lock_guard<std::mutex> Lock(Mutex_);
 #endif
 
-    // 4K seal mode: never whole-seal a pool on rollover. Individual pages are
-    // sealed at finalize; when the active pool runs out of room we simply move
-    // to a fresh pool (the old pool's already-sealed pages stay RX, any unused
-    // tail is just abandoned RW memory).
-    if (!Active_ || !poolHasRoomLocked(*Active_, Size, EffAlign)) {
-      if (auto Err = newActivePoolLocked())
-        return std::move(Err);
-    }
-    size_t Off = alignUp(Active_->used, EffAlign);
-    uint8_t *Ptr = Active_->base + Off;
-    Active_->used = Opts_.batchedPageSeal
-                        ? Off + Size
-                        : alignUp(Off + Size, Opts_.sealPageSize);
-    EJIT_DIAG_DEBUG("allocateCode res4k: ptr=%p size=%zu",
-                    static_cast<void *>(Ptr), Size);
-    return static_cast<void *>(Ptr);
+  // 4K seal mode: never whole-seal a pool on rollover. Individual pages are
+  // sealed at finalize; when the active pool runs out of room we simply move
+  // to a fresh pool (the old pool's already-sealed pages stay RX, any unused
+  // tail is just abandoned RW memory).
+  if (!Active_ || !poolHasRoomLocked(*Active_, Size, EffAlign)) {
+    if (auto Err = newActivePoolLocked())
+      return std::move(Err);
+  }
+  size_t Off = alignUp(Active_->used, EffAlign);
+  uint8_t *Ptr = Active_->base + Off;
+  Active_->used = Opts_.batchedPageSeal
+                      ? Off + Size
+                      : alignUp(Off + Size, Opts_.sealPageSize);
+  EJIT_DIAG_DEBUG("allocateCode res4k: ptr=%p size=%zu",
+                  static_cast<void *>(Ptr), Size);
+  return static_cast<void *>(Ptr);
 }
 
 CodePool *EJitCodePoolManager::findPoolLocked(const void *Ptr) {

@@ -71,7 +71,6 @@ function inlining and cloning.
 
 ```sh
 ./build.sh release aarch64_be \
-  --sre-taskpool --sre-shared-taskpool \
   --sre-taskpool-no-reclaim --sre-shared-code-pointers \
   --sre-pgo-branch-audit \
   --sre-pgo-max-concurrent-profiles=4 --stats

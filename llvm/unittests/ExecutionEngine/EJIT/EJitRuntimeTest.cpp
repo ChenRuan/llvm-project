@@ -16,20 +16,14 @@
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
-#include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
-#endif
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
-#ifdef EJIT_SRE_TASKPOOL
-#include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
-#endif
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
@@ -268,13 +262,6 @@ struct EJitOptimizerTestAccess : EJitOptimizer {
 };
 } // namespace ejit
 } // namespace llvm
-
-// ejit_status_t values mirrored locally. EJitError::code is a plain int that
-// stores ejit_status_t codes (see EJitRuntime.h). The C header is not included
-// here because it conflicts with the local extern "C" test declarations further
-// down (which intentionally use a private signature for the C API).
-static constexpr int kEjitStatusOk = 0;             // EJIT_OK
-static constexpr int kEjitStatusCompileFailed = -3; // EJIT_ERR_COMPILE_FAILED
 
 //===----------------------------------------------------------------------===//
 // EJitRegistrationStore tests (T3-08)
@@ -720,71 +707,11 @@ TEST(EJitRuntimeState, ThreadSafety) {
 #endif // EJIT_FREESTANDING
 
 //===----------------------------------------------------------------------===//
-// EJitLogger tests (T3-12)
-//===----------------------------------------------------------------------===//
-
-#ifndef EJIT_FREESTANDING
-TEST(EJitLogger, LogAndGetLastError) {
-  EJitLogger logger;
-  logger.log(kEjitStatusCompileFailed, "test error", "myfunc", "mykey");
-
-  const EJitError *err = logger.getLastError();
-  ASSERT_NE(err, nullptr);
-  EXPECT_EQ(err->code, kEjitStatusCompileFailed);
-  EXPECT_EQ(err->message, "test error");
-  EXPECT_EQ(err->funcName, "myfunc");
-  EXPECT_EQ(err->cacheKey, "mykey");
-}
-
-TEST(EJitLogger, GetLastErrorEmpty) {
-  EJitLogger logger;
-  EXPECT_EQ(logger.getLastError(), nullptr);
-}
-
-TEST(EJitLogger, RingBufferWrap) {
-  EJitLogger logger;
-
-  // Write more than kMaxErrors entries
-  for (size_t i = 0; i < EJitLogger::kMaxErrors + 10; ++i) {
-    logger.log(kEjitStatusOk, "msg" + std::to_string(i));
-  }
-
-  const EJitError *last = logger.getLastError();
-  ASSERT_NE(last, nullptr);
-  EXPECT_EQ(last->message, "msg" + std::to_string(EJitLogger::kMaxErrors + 9));
-}
-
-TEST(EJitLogger, GetErrors) {
-  EJitLogger logger;
-
-  for (size_t i = 0; i < 5; ++i)
-    logger.log(kEjitStatusOk, "msg" + std::to_string(i));
-
-  auto errors = logger.getErrors(3);
-  EXPECT_EQ(errors.size(), 3u);
-  EXPECT_EQ(errors[0].message, "msg0");
-  EXPECT_EQ(errors[1].message, "msg1");
-  EXPECT_EQ(errors[2].message, "msg2");
-}
-
-TEST(EJitLogger, Clear) {
-  EJitLogger logger;
-  logger.log(kEjitStatusOk, "test");
-  logger.clear();
-  EXPECT_EQ(logger.getLastError(), nullptr);
-}
-
-#endif // EJIT_FREESTANDING
-
-//===----------------------------------------------------------------------===//
 // EJit end-to-end construction test (T3-20)
 //===----------------------------------------------------------------------===//
 
 TEST(EJit, ConstructionAndBasicOps) {
   Config config;
-  config.compileMode = CompileMode::Sync;
-  config.maxCacheEntries = 64;
-  config.maxCacheSize = 1024 * 1024;
 
   // Register the period array BEFORE construction (staged) so this works in
   // both builds — a taskpool build freezes registration after construction.
@@ -835,24 +762,6 @@ TEST(EJit, CacheOperations) {
   ejit.invalidateByPeriod("test", 0);
 }
 
-TEST(EJit, CompileMode) {
-  // Default is Async (background worker handles compilation).
-  EJit ejit(Config{});
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Async);
-  ASSERT_NE(ejit.taskPool(), nullptr);
-
-  // Switch to sync: compile inline on calling thread.
-  EXPECT_TRUE(ejit.setCompileMode(CompileMode::Sync));
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Sync);
-
-  // Switch to off: no JIT, always AOT fallback.
-  EXPECT_TRUE(ejit.setCompileMode(CompileMode::Off));
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Off);
-
-  // Back to async.
-  EXPECT_TRUE(ejit.setCompileMode(CompileMode::Async));
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Async);
-}
 
 TEST(EJit, OptimizationLevel) {
   EJit ejit(Config{});
@@ -862,15 +771,17 @@ TEST(EJit, OptimizationLevel) {
   EXPECT_EQ(ejit.getOptimizationLevel(), llvm::ejit::OptimizationLevel::L3);
 }
 
-#ifdef EJIT_SRE_TASKPOOL
 TEST(EJitTaskpoolInit, OffModeSucceedsWithoutWorker) {
   Config config;
   config.compileMode = CompileMode::Off;
   EJit ejit(config);
   EXPECT_FALSE(ejit.initFailed());
   EXPECT_EQ(ejit.getCompileMode(), CompileMode::Off);
-  ASSERT_NE(ejit.taskPool(), nullptr);
-  EXPECT_FALSE(ejit.taskPool()->isWorkerRunning());
+  ASSERT_NE(ejit.sharedTaskPool(), nullptr);
+  EXPECT_EQ(ejit.sharedTaskPool()->state(), nullptr);
+  EXPECT_FALSE(ejit.sharedTaskPool()->asyncServiceAvailable());
+  EXPECT_EQ(ejit.sharedTaskPool()->compileOrGet(1, nullptr, 0, nullptr).status,
+            EJitCompileOrGetStatus::OffMode);
 }
 
 TEST(EJitTaskpoolInit, DefaultAsyncInitSucceeds) {
@@ -878,7 +789,7 @@ TEST(EJitTaskpoolInit, DefaultAsyncInitSucceeds) {
   // ORC engine is always created; async init succeeds.
   EXPECT_FALSE(ejit.initFailed());
   EXPECT_EQ(ejit.getCompileMode(), CompileMode::Async);
-  ASSERT_NE(ejit.taskPool(), nullptr);
+  ASSERT_NE(ejit.sharedTaskPool()->state(), nullptr);
 }
 
 // Finding (二): a constructed taskpool EJit freezes registration once its
@@ -898,7 +809,6 @@ TEST(EJit, TaskpoolRegistrationFrozenAfterConstruction) {
   // Nothing was registered: the registry is unchanged.
   EXPECT_EQ(ejit.getRegistry().getArrays("frozen_period"), nullptr);
 }
-#endif // EJIT_SRE_TASKPOOL
 
 //===----------------------------------------------------------------------===//
 // C API tests with runtime-dynamic cellIdx (T3-21)
@@ -946,19 +856,11 @@ extern void ejit_print_active(void);
 extern void ejit_print_version(void);
 }
 
-// The "runtime-dynamic cellIdx" C-API tests below exercise the LEGACY model:
-// dynamic period-array registration AFTER ejit_init, then period-name activate.
-// In a taskpool build that model is intentionally replaced — registration is
-// frozen after init and activate is keyed on registered lifecycles — so these
-// tests run only in the non-taskpool build. Taskpool-mode equivalents (freeze,
-// lifecycle activate, array sync) live in the EJitCApiTaskpool section.
-#ifndef EJIT_SRE_TASKPOOL
-
 TEST(EJitCApi, ActivateWithDynamicCellIdx) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   // Per-array activation model: register an array for the period first.
   int arr[256];
   ejit_register_period_array("dynamic", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   uint8_t idx = 42;
   EXPECT_EQ(ejit_activate("dynamic", idx), EJIT_OK_C);
   EXPECT_TRUE(ejit_is_active("dynamic", idx));
@@ -968,9 +870,9 @@ TEST(EJitCApi, ActivateWithDynamicCellIdx) {
 }
 
 TEST(EJitCApi, LoopWithDynamicCellIdx) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int arr[256];
   ejit_register_period_array("loop", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   for (uint8_t i = 0; i < 10; i++)
     EXPECT_EQ(ejit_activate("loop", i), EJIT_OK_C);
   for (uint8_t i = 0; i < 10; i++)
@@ -987,9 +889,9 @@ static uint8_t computeCellIdx(int x, int y) {
 }
 
 TEST(EJitCApi, ActivateWithComputedCellIdx) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int arr[256];
   ejit_register_period_array("compute", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   uint8_t idx = computeCellIdx(100, 55);
   EXPECT_EQ(idx, 155);
   EXPECT_EQ(ejit_activate("compute", idx), EJIT_OK_C);
@@ -1003,9 +905,9 @@ TEST(EJitCApi, ActivateWithComputedCellIdx) {
 }
 
 TEST(EJitCApi, DynamicCellIdxBoundaries) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int arr[256];
   ejit_register_period_array("bound", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   EXPECT_EQ(ejit_activate("bound", (uint8_t)0), EJIT_OK_C);
   EXPECT_TRUE(ejit_is_active("bound", (uint8_t)0));
   EXPECT_EQ(ejit_activate("bound", (uint8_t)255), EJIT_OK_C);
@@ -1028,10 +930,10 @@ TEST(EJitCApi, DynamicCellIdxBoundaries) {
 }
 
 TEST(EJitCApi, MultiPeriodDynamicIndices) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int cellArr[256], trpArr[256];
   ejit_register_period_array("cell", "cellArr", cellArr, 256);
   ejit_register_period_array("trp", "trpArr", trpArr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   uint8_t indices[] = {3, 7, 15, 31, 63};
   for (size_t i = 0; i < sizeof(indices) / sizeof(indices[0]); i++) {
     EXPECT_EQ(ejit_activate("cell", indices[i]), EJIT_OK_C);
@@ -1051,9 +953,9 @@ TEST(EJitCApi, MultiPeriodDynamicIndices) {
 }
 
 TEST(EJitCApi, InvalidateWithDynamicCellIdx) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int arr[256];
   ejit_register_period_array("inv", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   for (uint8_t i = 0; i < 5; i++)
     ejit_activate("inv", i);
   for (uint8_t i = 0; i < 5; i++)
@@ -1066,9 +968,9 @@ TEST(EJitCApi, InvalidateWithDynamicCellIdx) {
 }
 
 TEST(EJitCApi, ActivationCycleWithRuntimeIndex) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int arr[256];
   ejit_register_period_array("cycle", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   uint8_t workload[] = {10, 20, 30, 40, 50};
   for (size_t cycle = 0; cycle < 3; cycle++) {
     for (size_t i = 0; i < sizeof(workload) / sizeof(workload[0]); i++)
@@ -1083,9 +985,7 @@ TEST(EJitCApi, ActivationCycleWithRuntimeIndex) {
   ejit_shutdown();
 }
 
-#endif // !EJIT_SRE_TASKPOOL
 
-#ifdef EJIT_SRE_TASKPOOL
 //===----------------------------------------------------------------------===//
 // Taskpool-mode C-API: registration freeze (finding 二) + name/array control
 // plane synced to the SwitchController (findings 一/五).
@@ -1179,7 +1079,6 @@ TEST(EJitCApiTaskpool, PreInitLifecycleActivateAndArraySync) {
   ejit_shutdown();
 }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 // The C ABI's ejit_register_icache_slot gained a 4th argument: the sentinel
 // MissFn the branchless wrapper's cell table is DEFINED pre-filled with. The
 // registration must carry it into the slot registry, so a drain triggered
@@ -1248,7 +1147,6 @@ TEST(EJitCApiTaskpool, IcacheSlotRegistrationCarriesTheSentinel) {
   EXPECT_EQ(guardedCells[3], 0u)
       << "a guarded (null-missFn) slot must keep the historical 0";
 }
-#endif // EJIT_SRE_SHARED_TASKPOOL
 
 // Finding (一): name-level activate/deactivate through the PUBLIC EJit API
 // syncs the time-window state AND the taskpool SwitchController; the version
@@ -1263,45 +1161,31 @@ TEST(EJitTaskpoolArray, NameLevelSyncsSwitchController) {
   ejit_register_period_array("cell", "cellArr", cellArr, 16); // staged
   EJit ejit(Config{});
   ASSERT_FALSE(ejit.initFailed());
-  EJitTaskPool *tp = ejit.taskPool();
-  ASSERT_NE(tp, nullptr);
   uint32_t dt = EJitLifecycleRegistry::instance().lookup("cell");
   ASSERT_NE(dt, kEJitInvalidDimType);
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  // Shared build: deactivate/activate writes the shared pool's switch
-  // controller, which is separate from the per-instance EJitTaskPool switch.
-  // Check enabled state via the shared pool (instanceVersion is private).
-  // initSharedStorage defaults all instances to disabled — enable explicitly.
+  // The shared state starts inactive. Activate explicitly for this test.
   EJitSharedTaskPool *sp = ejit.sharedTaskPool();
   ASSERT_NE(sp, nullptr);
   EXPECT_TRUE(sp->setInstanceEnabled(dt, 5, true));
   auto instanceEnabled = [&]() { return sp->isInstanceActive(dt, 5); };
-#else
-  EJitSwitchController &sw = tp->switchController();
-  auto instanceEnabled = [&]() { return sw.isInstanceEnabled(dt, 5); };
-  auto instanceVer = [&]() { return sw.getInstanceVersion(dt, 5); };
+  auto instanceVer = [&]() { return sp->state()->version[dt][5].loadAcquire(); };
   uint32_t v0 = instanceVer();
-#endif
 
   EXPECT_TRUE(instanceEnabled()); // defaults enabled
   // deactivate.
   EXPECT_TRUE(ejit.deactivate("cell", 5));
   EXPECT_FALSE(ejit.isActive("cell", 5));
   EXPECT_FALSE(instanceEnabled());
-#ifndef EJIT_SRE_SHARED_TASKPOOL
   EXPECT_EQ(instanceVer(), v0 + 1);
-#endif
   // activate.
   EXPECT_TRUE(ejit.activate("cell", 5));
   EXPECT_TRUE(ejit.isActive("cell", 5));
   EXPECT_TRUE(instanceEnabled());
-#ifndef EJIT_SRE_SHARED_TASKPOOL
   EXPECT_EQ(instanceVer(), v0 + 2);
   // Redundant activate: no flip.
   EXPECT_TRUE(ejit.activate("cell", 5));
   EXPECT_EQ(instanceVer(), v0 + 2);
-#endif
   resetTaskpoolRegState();
 }
 
@@ -1316,16 +1200,16 @@ TEST(EJitTaskpoolArray, UnknownPeriodCleanReject) {
   ejit_register_period_array("cell", "cellArr", cellArr, 16);
   EJit ejit(Config{});
   ASSERT_FALSE(ejit.initFailed());
-  EJitTaskPool *tp = ejit.taskPool();
-  ASSERT_NE(tp, nullptr);
+  auto *sp = ejit.sharedTaskPool();
+  ASSERT_NE(sp, nullptr);
   uint32_t dt = EJitLifecycleRegistry::instance().lookup("cell");
-  EJitSwitchController &sw = tp->switchController();
-
-  uint32_t v0 = sw.getInstanceVersion(dt, 2);
+  ASSERT_NE(dt, kEJitInvalidDimType);
+  ASSERT_TRUE(ejit.activate("cell", 2));
+  uint32_t v0 = sp->state()->version[dt][2].loadAcquire();
   EXPECT_FALSE(ejit.activate("wrong", 2));   // unknown lifecycle -> reject
   EXPECT_FALSE(ejit.deactivate("wrong", 2));
-  EXPECT_TRUE(sw.isInstanceEnabled(dt, 2));
-  EXPECT_EQ(sw.getInstanceVersion(dt, 2), v0);
+  EXPECT_TRUE(sp->isInstanceActive(dt, 2));
+  EXPECT_EQ(sp->state()->version[dt][2].loadAcquire(), v0);
   EXPECT_FALSE(ejit.isActive("wrong", 2));
   resetTaskpoolRegState();
 }
@@ -1354,8 +1238,8 @@ TEST(EJitTaskpoolInit, InitFailureSetsFailedAndStopsWorker) {
   const uint8_t bc[] = {1, 2, 3};
   EXPECT_FALSE(ejit.registerBitcode("x", bc, sizeof(bc)));
   // The worker was never started on a failed init.
-  if (EJitTaskPool *tp = ejit.taskPool())
-    EXPECT_FALSE(tp->isWorkerRunning());
+  ASSERT_NE(ejit.sharedTaskPool(), nullptr);
+  EXPECT_FALSE(ejit.sharedTaskPool()->asyncServiceAvailable());
   resetTaskpoolRegState();
 }
 
@@ -1376,7 +1260,6 @@ TEST(EJitCApiTaskpool, InitFailsAndDestroysOnRegistrationError) {
   ejit_shutdown();                              // safe no-op
   resetTaskpoolRegState();
 }
-#endif // EJIT_SRE_TASKPOOL
 
 //===----------------------------------------------------------------------===//
 // PeriodArrayRegistry::getArrayByBaseAddr tests
