@@ -4215,6 +4215,21 @@ TEST_F(SharedTaskPoolTest, DISABLED_HotHitContendedBench) {
 // is exactly what makes "core A's drain clears core B's cell" testable in a
 // single-process simulation.
 //===----------------------------------------------------------------------===//
+#ifndef EJIT_SRE_SHARED_CODE_POINTERS
+TEST_F(SharedTaskPoolTest, PrivateCodeNeverPopulatesDirectWrapperSlots) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const EJitDimPair dims[] = {dim(0, 1)};
+  uintptr_t slots[EJIT_ICACHE_DIM_SIZE] = {};
+  uintptr_t scalar = reinterpret_cast<uintptr_t>(codeFor(10));
+  registerSlot(3, slots, 1);
+  registerSlot(4, &scalar, 0, codeFor(10));
+  pool.icacheFill(3, codeFor(3), dims, 1, pool.icacheBeginResolve());
+  pool.icacheFill(4, codeFor(4), nullptr, 0, pool.icacheBeginResolve());
+  EXPECT_EQ(slots[1], 0u);
+  EXPECT_EQ(scalar, reinterpret_cast<uintptr_t>(codeFor(10)));
+}
+#else
 TEST_F(SharedTaskPoolTest, InlineCacheFillAndServe) {
   EJitSharedTaskPool pool;
   bringUpOwner(pool); // core 0 owner, Ready, code sharing off (owner-only).
@@ -4479,6 +4494,8 @@ TEST_F(SharedTaskPoolTest, InlineCacheDrainsOnOwnerShutdown) {
   EXPECT_EQ(slot, 0u);
 }
 
+#endif // EJIT_SRE_SHARED_CODE_POINTERS
+
 // numDims sizes the [D]^numDims array the drain walks, so an over-cap value
 // would make the drain write far past the end of the wrapper's global. Reject
 // the registration instead: the cell stays null and the taskpool serves every
@@ -4505,6 +4522,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheRegistrationRejectsAnOverCapShape) {
   EXPECT_EQ(ejitIcacheRegisterSlot(3, &cells[0], 1), EJitIcacheRegResult::Ok);
 }
 
+#ifdef EJIT_SRE_SHARED_CODE_POINTERS
 // Cross-core executability gate. A shared cell publishes the pointer to every
 // core the instant it is written, so it may only be filled where a resolved
 // fnPtr is callable on every core with no per-core work. Wiring per-core
@@ -5009,7 +5027,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheMultiVersion) {
 //===----------------------------------------------------------------------===//
 // Sentinel-form slots: the branchless wrapper.
 //
-// For NumDims <= 2 (no -ejit-wrapper-timing) the AOT DEFINES the cell table
+// For NumDims <= 2 the AOT pass defines the cell table
 // pre-filled with &MissFn and the wrapper is load + musttail BLR with no null
 // guard, so a cell holding 0 is a crash, not a miss. The runtime's side of
 // that contract: whatever path empties a cell writes the slot's registered
@@ -5220,6 +5238,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheClearAllDropsTheSentinelRegistration) {
   ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
   EXPECT_EQ(slot, 0u) << "clearAll must drop the missFn, not leak it";
 }
+#endif // EJIT_SRE_SHARED_CODE_POINTERS
 
 //===----------------------------------------------------------------------===//
 // Per-core L0 dispatch cache
@@ -5534,6 +5553,7 @@ TEST_F(SharedTaskPoolTest, SharedPgoDisablesL0Fill) {
   EXPECT_FALSE(pool.l0Try(5, nullptr, 0, &out));
 }
 
+#ifdef EJIT_SRE_SHARED_CODE_POINTERS
 TEST_F(SharedTaskPoolTest, SharedPgoInlineCacheWaitsForTier2) {
   ejitIcacheClearAll();
   EJitSharedTaskPool pool;
@@ -5609,6 +5629,7 @@ TEST_F(SharedTaskPoolTest, SharedPgoInlineCacheRequiresExactTier2Identity) {
     pool.releaseRead(tier2.bucketIndex);
   ejitIcacheClearAll();
 }
+#endif // EJIT_SRE_SHARED_CODE_POINTERS
 
 // Shared equivalent of EJitTaskPoolTest::PgoHitThresholdArmsTier2Recompile.
 // Set PGO threshold=3, publish Tier-1, hit it twice (below threshold), then

@@ -906,14 +906,8 @@ public:
   tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
               const EJitBoundPtrDescriptor *boundPointers = nullptr,
               uint32_t boundCount = 0);
-  /// Fixed-dimension fast cache-hit entries (0-4 dims). Same terminal
-  /// semantics as tryCacheHit() but the instance-enabled check is unrolled and
-  /// the dim identity is built directly on the stack (no numDims loop / no
-  /// variable-length array handling), so the C ABI fixed-dimension entries
-  /// (ejit_taskpool_compile_or_get_Nd) reach the cache lookup with the least
-  /// overhead. The cache lookup itself is still the shared generic
-  /// cacheLookup(). 4 is the maximum dimension count (numDims > 4 is rejected
-  /// by the C ABI); higher-dimension callers keep using tryCacheHit().
+  /// Internal fixed-arity queries. Their terminal results and token ownership
+  /// match tryCacheHit() for the same identity.
   CompileOrGetResult tryCacheHit0D(uint32_t funcIndex);
   CompileOrGetResult tryCacheHit1D(uint32_t funcIndex, uint32_t dim0,
                                    uint32_t inst0);

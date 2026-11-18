@@ -24,6 +24,20 @@
 #ifndef EJIT_FREESTANDING
 #include <chrono>
 #endif
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+#ifdef EJIT_FREESTANDING
+extern "C" uint64_t SRE_CycleCountGet64(void);
+#endif
+static uint64_t auditClockNow() {
+#ifdef EJIT_FREESTANDING
+  return SRE_CycleCountGet64();
+#else
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+#endif
+}
+#endif
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -559,7 +573,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       auto mayConstIt = tier1MayConst_.find(cacheKey);
       if (mayConstIt != tier1MayConst_.end()) {
         ctx.mayConstLoadSites = mayConstIt->second.sites;
-        const uint64_t SampleEnd = ejit_taskpool_trace_now();
+        const uint64_t SampleEnd = auditClockNow();
         if (mayConstIt->second.sampleStart != 0)
           ctx.mayConstSampleCycles =
               SampleEnd - mayConstIt->second.sampleStart;
@@ -911,7 +925,7 @@ void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
     if (published && hasPendingTier1MayConstKey_) {
       auto It = tier1MayConst_.find(pendingTier1MayConstKey_);
       if (It != tier1MayConst_.end())
-        It->second.sampleStart = ejit_taskpool_trace_now();
+        It->second.sampleStart = auditClockNow();
     }
     pendingTier1MayConstKey_ = 0;
     hasPendingTier1MayConstKey_ = false;

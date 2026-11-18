@@ -258,31 +258,9 @@ ejit_print_version();                 // 可在 init 前后任意时刻调用
 
 ---
 
-## 5. Wrapper 计时
+## 5. Wrapper 开销
 
-在 AOT 生成的 `ejit_entry` wrapper 中插入计时探针，测量 taskpool 查找、间接 JIT 调用、读令牌释放各段耗时，定位 wrapper 开销。运行库自动按固定间隔（默认每 100000 次调用）聚合打印一行汇总，避免日志刷屏。
-
-**启用**：计时探针需在编译你的 ejit 代码时开启：
-
-```bash
-clang -fembed-bitcode ... -mllvm -ejit-wrapper-timing process.c
-```
-
-运行时聚合 API 由插桩 wrapper 自动调用，一般无需手动调用：
-
-```c
-uint64_t ejit_taskpool_trace_now(void);   // 取当前时间戳
-void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
-                                 void *fnPtr, uint32_t bucketIndex,
-                                 uint64_t tBeforeLookup,
-                                 uint64_t tAfterLookup,
-                                 uint64_t tAfterFn,
-                                 uint64_t tAfterRelease);
-```
-
-> 仅当 wrapper 以 `-mllvm -ejit-wrapper-timing` 构建时才会产生计时；时间戳单位由平台决定。
-
-汇总行 `wrapper_timing_agg` 的字段含义：`func` 为 `funcIndex`，`status` 为本次聚合槽记录的 taskpool 返回状态，`fn` 为调用目标地址，`bucket` 为 cache bucket，`count` 为本窗口样本数；`get_fn_avg`、`fn_call_avg`、`release_avg` 和 `total_avg` 分别是查找目标、执行 JIT 函数、释放读令牌及 wrapper 总路径的平均耗时。先比较 `fn_call_avg` 与其余三段，才能区分业务函数变慢和分发框架开销。
+当前版本不再提供 wrapper / 函数体计时插桩。需要测量开销时，在相同业务输入下使用板端性能计数器，对比默认快表和显式 `-mllvm -ejit-inline-cache=false` 的构建。PGO 分支审计、采样及 taskpool 统计不受影响。
 
 ---
 
@@ -440,7 +418,7 @@ clang -fembed-bitcode ... -mllvm -ejit-dump-bitcode-dir=/tmp/ejit_bc process.c
 ### 10.4 命中率低 / 性能差
 
 1. `ejit_taskpool_get_stats()` 读 `cacheHits` / `asyncCompiles` / `alreadyPending`。
-2. 若 wrapper 开销可疑，对 ejit 代码加 `-mllvm -ejit-wrapper-timing`，观察周期汇总中查找 / 调用 / 释放各段耗时。
+2. 查 wrapper 开销时，使用第 5 节的对照测量。
 3. `ejit_get_stats()` 是已退役 LRU 的兼容接口，当前恒返回零，不能用于分析 taskpool 命中率。
 
 ### 10.5 代码内存趋紧 / 耗尽

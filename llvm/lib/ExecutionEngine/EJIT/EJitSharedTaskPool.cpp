@@ -720,6 +720,11 @@ bool gIcacheFillOkLogged;
 void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
                                     const EJitDimPair *dims, uint32_t numDims,
                                     uint64_t token) {
+#ifndef EJIT_SRE_SHARED_CODE_POINTERS
+  // A default-on wrapper can also be linked to a private-code runtime.
+  // Leave its slots at their miss value: peers cannot call private code.
+  return;
+#endif
   if (!icacheReclamationSafeShared()) {
     if (!gIcacheFillRejectLogged[kFillRejectReclaim]) {
       gIcacheFillRejectLogged[kFillRejectReclaim] = true;
@@ -3143,8 +3148,7 @@ EJitSharedTaskPool::CompileOrGetResult EJitSharedTaskPool::tryCacheHit(
 // Fixed-dimension fast cache-hit entries (§5.2 steps 0-1, unrolled). Each
 // shares the Ready gate + classifyHit() with tryCacheHit() but the
 // instance-enabled check is unrolled and the dim identity is built directly on
-// the stack, so the C ABI fixed-dimension entries reach the shared
-// cacheLookup() without a numDims loop or variable-length array setup.
+// the stack, avoiding variable-length dimension setup.
 // Semantics are identical to tryCacheHit() with the matching numDims.
 //===----------------------------------------------------------------------===//
 EJitSharedTaskPool::CompileOrGetResult

@@ -86,13 +86,6 @@ typedef enum {
   EJIT_ERR_DISABLED = -9,
   EJIT_ERR_INSTANCE_DISABLED = -10,
   EJIT_PENDING = 1,
-  /* RESERVED sentinel, NOT a real status: the AOT wrapper-timing path passes
-   * this value to ejit_taskpool_trace_wrapper to tag icache-hit samples (see
-   * kEJitIcacheHitTimingStatus in EJitCommon.h, locked to this enumerator by
-   * static_assert in EJitRuntime.cpp). Assigning this value to any real
-   * status is a duplicate-enumerator compile error, so the reservation is
-   * structural, not comment-only. */
-  EJIT_STATUS_ICACHE_HIT_SENTINEL = 0xFE,
 } ejit_status_t;
 
 /// Register the allocation behind a pointer-valued period global before
@@ -293,35 +286,6 @@ ejit_status_t ejit_taskpool_compile_or_get_bound_v(
     const ejit_bound_ptr_t *bounds, uint32_t boundCount, void **outFn,
     uint32_t *outBucket);
 
-// Fixed-dimension fast paths (0-4 dims). Additive alternatives to
-// ejit_taskpool_compile_or_get that pass the dim identity as scalar arguments
-// instead of an ejit_dim_pair_t* + numDims pair, trimming the cache-hit path
-// (no numDims bound/null checks, no variable-length validation loop, dims built
-// directly on the stack). Return status and outFn/outBucket semantics are
-// identical to ejit_taskpool_compile_or_get with the matching numDims; on a
-// cache hit the caller still owns the read token and must call
-// ejit_taskpool_release_read(*outBucket). 4 dims is the maximum; callers with
-// more dims use the generic entry above.
-ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
-                                              uint32_t *outBucket);
-ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
-                                              uint32_t inst0, void **outFn,
-                                              uint32_t *outBucket);
-ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
-                                              uint32_t inst0, uint32_t dim1,
-                                              uint32_t inst1, void **outFn,
-                                              uint32_t *outBucket);
-ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
-                                              uint32_t inst0, uint32_t dim1,
-                                              uint32_t inst1, uint32_t dim2,
-                                              uint32_t inst2, void **outFn,
-                                              uint32_t *outBucket);
-ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
-                                              uint32_t inst0, uint32_t dim1,
-                                              uint32_t inst1, uint32_t dim2,
-                                              uint32_t inst2, uint32_t dim3,
-                                              uint32_t inst3, void **outFn,
-                                              uint32_t *outBucket);
 void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
                                         uint32_t enabled);
 void ejit_taskpool_release_read(uint32_t bucketIndex);
@@ -336,52 +300,6 @@ unsigned ejit_taskpool_pending_count(void);
 /// EJIT_OK guarantees enable_ex completed and the shared cache / inline-cache
 /// entries were backfilled by the owner worker.
 ejit_status_t ejit_publish_pending_code(void);
-
-// Diagnostic wrapper timing helpers. AOT wrappers only call these when built
-// with -ejit-wrapper-timing. Runtime aggregates repeated calls and prints one
-// summary per EJIT_WRAPPER_TIMING_REPORT_EVERY samples (default 10000; set to 0
-// to suppress periodic output) to avoid flooding board logs. The timestamp unit
-// is platform-defined: SRE/freestanding builds use SRE_CycleCountGet64(), host
-// fallback uses steady_clock nanoseconds.
-uint64_t ejit_taskpool_trace_now(void);
-void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
-                                 void *fnPtr, uint32_t bucketIndex,
-                                 uint64_t tBeforeLookup, uint64_t tAfterLookup,
-                                 uint64_t tAfterFn, uint64_t tAfterRelease);
-
-// Function-body and wrapper cycle profiler. AOT wrappers emit calls to the
-// recorder only when built with -ejit-function-body-timing. Body timestamps
-// tightly bracket the original AOT body or selected JIT function call. Wrapper
-// timestamps additionally include lookup, dispatch, and read-token release;
-// aggregation remains outside both measured intervals. SRE builds report
-// SRE_CycleCountGet64() cycles; host tests use steady_clock nanoseconds.
-// Storage is fixed-capacity and allocation-free.
-typedef enum {
-  EJIT_FUNCTION_BODY_AOT = 0,
-  EJIT_FUNCTION_BODY_JIT = 1
-} ejit_function_body_path_t;
-
-typedef struct {
-  uint64_t count;
-  uint64_t total;
-  uint64_t min;
-  uint64_t max;
-  uint64_t wrapper_total;
-  uint64_t wrapper_min;
-  uint64_t wrapper_max;
-  uint64_t overhead_total;
-  uint64_t overhead_min;
-  uint64_t overhead_max;
-} ejit_function_body_cycles_t;
-
-void ejit_function_body_cycles_record(const char *funcName, uint32_t path,
-                                      uint64_t wrapperBegin, uint64_t bodyBegin,
-                                      uint64_t bodyEnd, uint64_t wrapperEnd);
-// Returns 1 and copies a snapshot when samples exist, otherwise returns 0.
-unsigned ejit_function_body_cycles_get(const char *funcName, uint32_t path,
-                                       ejit_function_body_cycles_t *out);
-void ejit_function_body_cycles_print(void);
-void ejit_function_body_cycles_reset(void);
 
 #ifdef EJIT_SRE_TASKPOOL_TESTING
 unsigned ejit_taskpool_poll_one(void);

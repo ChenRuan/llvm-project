@@ -200,7 +200,6 @@ ALL_TESTS=(
   ejit_baremetal_link_test
   ejit_new_attr_test
   ejit_sync_mode_test
-  ejit_fixed_dim_test
   ejit_perf_bench
   ejit_ptr_period_test
   ejit_pointer_period_bounds_test
@@ -220,7 +219,6 @@ COMPILE_FLAGS[ejit_manual_register_test]="-mllvm -enable-ejit-global-ctors=false
 # Bare-metal link test: no global ctors -> registration must use the static
 # registry tables walked via linker-script-provided __start_/__stop_ symbols.
 COMPILE_FLAGS[ejit_baremetal_link_test]="-mllvm -enable-ejit-global-ctors=false"
-COMPILE_FLAGS[ejit_fixed_dim_test]=""
 # Sentinel-wrapper smoke: icache ON so the wrapper takes the branchless
 # (NumDims <= 2, cell table defined pre-filled with &MissFn) form.
 COMPILE_FLAGS[ejit_sentinel_smoke_test]="-mllvm -ejit-inline-cache"
@@ -275,7 +273,6 @@ TEST_ARGS[ejit_multi_tu_test]="0 3"
 TEST_ARGS[ejit_baremetal_link_test]="0 3"
 TEST_ARGS[ejit_sync_mode_test]="0"
 TEST_ARGS[ejit_new_attr_test]="0"
-TEST_ARGS[ejit_fixed_dim_test]="0 1"
 
 if [[ ${#SELECTED[@]} -eq 0 ]]; then
   SELECTED=("${ALL_TESTS[@]}")

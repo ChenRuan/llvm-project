@@ -400,12 +400,8 @@ public:
   CompileOrGetResult tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
                                  uint32_t numDims);
 
-  /// Fixed-dimension fast cache-hit entries (0-4 dims). Same terminal
-  /// semantics as tryCacheHit() but the instance-enabled check is unrolled and
-  /// the dim identity is built directly on the stack (no numDims loop), so the
-  /// C ABI fixed-dimension entries (ejit_taskpool_compile_or_get_Nd) reach the
-  /// shared cache lookup with the least overhead. 4 is the maximum dimension
-  /// count; higher-dimension callers keep using tryCacheHit().
+  /// Internal fixed-arity cache queries for 0-4 dimensions. Their terminal
+  /// results and token ownership match tryCacheHit() for the same identity.
   CompileOrGetResult tryCacheHit0D(uint32_t funcIndex);
   CompileOrGetResult tryCacheHit1D(uint32_t funcIndex, uint32_t dim0,
                                    uint32_t inst0);
