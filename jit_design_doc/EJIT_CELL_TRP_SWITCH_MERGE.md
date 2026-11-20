@@ -98,18 +98,35 @@ still fail closed. No new load is frozen just because its base is bound.
   with headroom for 8 x 8 (64). This is not a restriction on the numeric IDs.
   These final-member limits are separate from `EJIT_SWITCH_CASE_MAX_ARMS`,
   which controls #244's original runtime-dimension remainder/mask transform.
-- Budgets: 64,000 combined entry instructions; unchanged 8,000 instructions
-  and 512 KiB artifact/constants per member. Retained artifacts stay capped
-  at 64 PER DRIVER (across all entries), now with a 32 MiB aggregate byte cap;
-  allocation remains on demand, not an upfront reservation. The 64 merged
-  emission-attempt cap per driver lifetime is unchanged (failures count).
-  Thus tuple capacity is not a guarantee for arbitrary code size or unlimited
-  simultaneous entry groups. Ineligible/over-budget members stay independent.
+- Budgets: 64,000 combined entry instructions; 8,000 instructions and 512 KiB
+  artifact/constants per member. The 64-tuple limit is **per cohort**, not
+  across functions. Driver-wide build defaults are 8,192 retained member
+  records (`EJIT_FINAL_MERGE_MAX_MEMBERS`), 8,192 pending T1 fallback records
+  (`EJIT_FINAL_MERGE_MAX_FALLBACKS`), 32 MiB of serialized optimized bitcode
+  (`EJIT_FINAL_MERGE_MAX_ARTIFACT_BYTES`), and 4,096 lifetime emission attempts
+  (`EJIT_FINAL_MERGE_MAX_EMISSION_ATTEMPTS`, including failed emissions).
+  These are ceilings, not reservations. The byte cap does not include indexes,
+  temporary LLVM working memory or executable code. Exhaustion preserves
+  independent T2; it does not imply eviction and replay. Shared cache slots
+  and executable pool size remain independent constraints.
 - Reject unbound private writable/TLS state, unbound observable private object
   identity, observable function identity, aliases/ifuncs/module asm, entry recursion, incompatible ABI/targets,
   and indirect calls without verified target remapping. These use independent
   T2, not unsafe sharing. Imported helpers/constants are member-namespaced.
 - No verifier initializer or runtime is required by this branch.
+
+### Possible follow-up: retain inputs instead of every optimized member
+
+Today a late join imports the already optimized member bodies. A smaller
+cache could evict those bodies and replay from the registered source bitcode.
+An entry name, dimension tuple and pointer addresses alone are insufficient:
+replay needs the same generation, bindings, specialization inputs and PGO
+observations as the original T2. A retired generation must not be reconstructed
+by rereading current configuration or expired T1/VP counters. Where replay
+cannot be validated, keep the published independent T2. Coalesce late joins
+to avoid repeatedly rebuilding a growing cohort. Measure peak retained data,
+worker time and retained executable bytes separately before adopting this path;
+it is not implemented here.
 
 ## 6/16/6 example
 

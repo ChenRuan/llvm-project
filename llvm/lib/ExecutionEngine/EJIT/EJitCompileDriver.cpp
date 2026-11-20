@@ -31,7 +31,12 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
-#if defined(EJIT_SWITCH_CASE) && defined(EJIT_SRE_SHARED_TASKPOOL)
+#if defined(EJIT_SWITCH_CASE) && defined(EJIT_SRE_SHARED_TASKPOOL) &&          \
+    defined(EJIT_SRE_CODE_POOL) && defined(EJIT_SRE_TASKPOOL_NO_RECLAIM)
+#define EJIT_DRIVER_FINAL_MERGE
+#endif
+
+#ifdef EJIT_DRIVER_FINAL_MERGE
 namespace {
 bool sameFinalIdentity(const EJitCompileRequest &A,
                        const EJitCompileRequest &B) {
@@ -52,56 +57,93 @@ bool EJitCompileDriver::sharedFinalMergeService(void *Ctx) {
   return static_cast<EJitCompileDriver *>(Ctx)->serviceFinalMerge();
 }
 
-bool EJitCompileDriver::serviceFinalMerge() {
-#ifndef EJIT_SRE_CODE_POOL
-  return false;
-#else
-  if (!config_.enableFinalVersionMerge || !jitEngine_)
+void EJitCompileDriver::eraseFinalMember(
+    std::map<uint64_t, FinalMember>::iterator I) {
+  auto Group = finalCohorts_.find(I->second.cohort());
+  Group->second.erase(llvm::find(Group->second, I->first));
+  if (Group->second.empty())
+    finalCohorts_.erase(Group);
+  finalArtifactBytes_ -= I->second.bitcode.size();
+  finalDirty_.erase(I->first);
+  finalMembers_.erase(I);
+}
+
+bool EJitCompileDriver::cohortFull(const FinalCohort &C) {
+  auto Group = finalCohorts_.find(C);
+  if (Group == finalCohorts_.end() ||
+      Group->second.size() < kEJitFinalMergeMaxArms)
     return false;
-  bool Dirty = false;
-  for (const auto &M : finalMembers_)
-    Dirty |= M.ready && M.dirty;
-  if (!Dirty)
-    return false;
-  // Revalidate artifacts against the actual cache, never against a stale
-  // compilation-success flag. Failed/evicted/retired members cannot rejoin.
-  for (auto I = finalMembers_.begin(); I != finalMembers_.end();) {
-    if (I->ready && !sharedPool_.finalVersionCurrent(I->request, I->published)) {
-      finalArtifactBytes_ -= I->bitcode.size();
-      I = finalMembers_.erase(I);
-    } else {
-      ++I;
+  // Make room only for stale tuples, never displace a live earlier arm.
+  for (uint64_t Key : Group->second) {
+    auto I = finalMembers_.find(Key);
+    auto &M = I->second;
+    if (M.ready && !sharedPool_.finalVersionCurrent(M.request, M.published)) {
+      eraseFinalMember(I);
+      return false;
     }
   }
-  for (auto &Trigger : finalMembers_) {
-    if (!Trigger.ready || !Trigger.dirty)
-      continue;
-    Trigger.dirty = false;
+  return true;
+}
+
+void EJitCompileDriver::pruneFinalMembers() {
+  // Eviction has no driver callback. Amortize stale discovery across
+  // admissions, including rejected ones, without scanning on idle polls.
+  auto I = finalMembers_.lower_bound(finalSweepKey_);
+  size_t Checks = std::min<size_t>(8, finalMembers_.size());
+  while (Checks-- && !finalMembers_.empty()) {
+    if (I == finalMembers_.end())
+      I = finalMembers_.begin();
+    auto Candidate = I++;
+    auto &M = Candidate->second;
+    if (M.ready && !sharedPool_.finalVersionCurrent(M.request, M.published))
+      eraseFinalMember(Candidate);
+  }
+  finalSweepKey_ = I == finalMembers_.end() ? 0 : I->first;
+}
+
+bool EJitCompileDriver::serviceFinalMerge() {
+  if (!config_.enableFinalVersionMerge || !jitEngine_)
+    return false;
+  if (!finalDirty_.empty()) {
+    auto T = finalMembers_.find(*finalDirty_.begin());
+    finalDirty_.erase(finalDirty_.begin());
+    auto &Trigger = T->second;
+    if (!sharedPool_.finalVersionCurrent(Trigger.request, Trigger.published)) {
+      eraseFinalMember(T);
+      return false;
+    }
     SmallVector<FinalMember *, 8> Members;
     SmallVector<EJitFinalModuleArm, 8> Arms;
-    for (auto &M : finalMembers_) {
-      if (!M.ready || M.entry != Trigger.entry || M.args != Trigger.args ||
-          M.request.fallbackPtr != Trigger.request.fallbackPtr ||
-          M.request.generation != Trigger.request.generation)
+    // Snapshot the bounded key list: removing a stale member edits the group.
+    auto Keys = finalCohorts_.find(Trigger.cohort())->second;
+    for (uint64_t Key : Keys) {
+      auto Candidate = finalMembers_.find(Key);
+      auto &M = Candidate->second;
+      if (!M.ready)
         continue;
-      if (Members.size() == kEJitFinalMergeMaxArms)
-        break;
+      if (Candidate != T &&
+          !sharedPool_.finalVersionCurrent(M.request, M.published)) {
+        eraseFinalMember(Candidate);
+        continue;
+      }
       Members.push_back(&M);
       Arms.push_back({M.bitcode, M.dimensions});
     }
     if (Members.size() < 2)
-      continue;
+      return false;
     bool SamePointer = true;
     for (auto *M : Members) {
-      M->dirty = false;
+      finalDirty_.erase(M->key);
       SamePointer &= M->published == Members.front()->published;
     }
     if (SamePointer)
-      continue;
+      return false;
     // NO_RECLAIM includes failed allocations. Limit emission attempts too;
     // repeated invalidation must not create unbounded retained generations.
-    if (finalMergeSerial_ >= 64) {
-      EJIT_DIAG("final-merge emission budget: retaining independent T2");
+    if (finalUsage_.emissionAttempts >= config_.finalMergeMaxEmissionAttempts) {
+      EJIT_DIAG("final-merge emission attempt budget entry=%s limit=%zu: "
+                "retaining independent T2",
+                Trigger.entry.c_str(), config_.finalMergeMaxEmissionAttempts);
       return true;
     }
     auto Prepared = assembleFinalVersionModules(
@@ -113,7 +155,7 @@ bool EJitCompileDriver::serviceFinalMerge() {
     }
     SpecializationContext C;
     C.fnName = Trigger.entry;
-    C.cacheKey = (uint64_t{1} << 63) | ++finalMergeSerial_;
+    C.cacheKey = (uint64_t{1} << 63) | ++finalUsage_.emissionAttempts;
     C.tier = CompileTier::PGOUse;
     C.optLevel = config_.optLevel;
     C.preparedFinalMerge = true;
@@ -121,26 +163,28 @@ bool EJitCompileDriver::serviceFinalMerge() {
     auto E = jitEngine_->loadBitcodeModule(*Prepared, C.cacheKey, C.fnName);
     if (E) {
       jitEngine_->setActiveContext(nullptr);
-      EJIT_DIAG("final-merge emission failed: %s", toString(std::move(E)).c_str());
+      EJIT_DIAG("final-merge emission failed entry=%s: %s", C.fnName.c_str(),
+                toString(std::move(E)).c_str());
       return true;
     }
     auto Address = jitEngine_->lookup(C.cacheKey, C.fnName);
     jitEngine_->setActiveContext(nullptr);
     if (!Address) {
-      EJIT_DIAG("final-merge lookup failed: %s",
+      EJIT_DIAG("final-merge lookup failed entry=%s: %s", C.fnName.c_str(),
                 toString(Address.takeError()).c_str());
       return true;
     }
     EJitCompiledCodeInfo Info;
     // Use the normal pool's seal/publication operation, not a parallel mapper.
     if (auto FlushError = jitEngine_->flushPendingCode()) {
-      EJIT_DIAG("final-merge seal failed: %s",
+      EJIT_DIAG("final-merge seal failed entry=%s: %s", C.fnName.c_str(),
                 toString(std::move(FlushError)).c_str());
       return true;
     }
     if (!jitEngine_->isCodeReady(*Address) ||
         !jitEngine_->findCodeRange(*Address, Info)) {
-      EJIT_DIAG("final-merge missing finalized code range");
+      EJIT_DIAG("final-merge missing finalized code range entry=%s",
+                C.fnName.c_str());
       return true;
     }
     unsigned Published = 0;
@@ -149,13 +193,15 @@ bool EJitCompileDriver::serviceFinalMerge() {
         M->published = *Address;
         ++Published;
       }
-    EJIT_DIAG("final-merge entry=%s arms=%zu published=%u fn=%p generation=%llu",
-              C.fnName.c_str(), Members.size(), Published, *Address,
-              static_cast<unsigned long long>(finalMergeSerial_));
+    if (Published)
+      ++finalUsage_.publishedDispatchers;
+    EJIT_DIAG(
+        "final-merge entry=%s arms=%zu published=%u fn=%p generation=%llu",
+        C.fnName.c_str(), Members.size(), Published, *Address,
+        static_cast<unsigned long long>(finalUsage_.emissionAttempts));
     return true;
   }
   return false;
-#endif
 }
 #endif
 
@@ -371,7 +417,7 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   sharedPool_.bind(&gEJitSharedTaskPoolState);
   sharedPool_.setCompiler(&taskpoolCompileThunk, this);
   sharedPool_.setPublishCallback(&taskpoolPublishThunk, this);
-#ifdef EJIT_SWITCH_CASE
+#ifdef EJIT_DRIVER_FINAL_MERGE
   if (config_.enableFinalVersionMerge)
     sharedPool_.setFinalMergeService(&EJitCompileDriver::sharedFinalMergeService,
                                     this);
@@ -556,7 +602,9 @@ bool EJitCompileDriver::ensureJitEngine() {
 }
 
 void EJitCompileDriver::releaseJitEngine() {
-#if defined(EJIT_SWITCH_CASE) && defined(EJIT_SRE_SHARED_TASKPOOL)
+#ifdef EJIT_DRIVER_FINAL_MERGE
+  finalCohorts_.clear();
+  finalDirty_.clear();
   finalMembers_.clear();
   finalArtifactBytes_ = 0;
   finalFallbacks_.clear();
@@ -568,8 +616,14 @@ void EJitCompileDriver::releaseJitEngine() {
 }
 
 void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
-#if defined(EJIT_SWITCH_CASE) && defined(EJIT_SRE_SHARED_TASKPOOL)
+#ifdef EJIT_DRIVER_FINAL_MERGE
+  if (StringRef(name).starts_with(FINAL_MERGE_AOT_PREFIX))
+    finalAotSymbols_.emplace(
+        name.substr(StringRef(FINAL_MERGE_AOT_PREFIX).size()),
+        reinterpret_cast<uintptr_t>(addr));
   // Never combine artifacts captured against different external bindings.
+  finalCohorts_.clear();
+  finalDirty_.clear();
   finalMembers_.clear();
   finalArtifactBytes_ = 0;
   finalFallbacks_.clear();
@@ -833,20 +887,24 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     return nullptr;
   }
 
-#if defined(EJIT_SWITCH_CASE) && defined(EJIT_SRE_SHARED_TASKPOOL)
+#ifdef EJIT_DRIVER_FINAL_MERGE
   std::string FinalBitcode;
   SmallVector<unsigned, 2> FinalArgs;
   uintptr_t FinalAot = request ? request->fallbackPtr : 0;
   if (config_.enableFinalVersionMerge && request) {
-    if (!FinalAot)
-      for (const auto &Symbol : userSymbols_)
-        if (Symbol.first == std::string(FINAL_MERGE_AOT_PREFIX) + funcName) {
-          FinalAot = reinterpret_cast<uintptr_t>(Symbol.second);
-          break;
-        }
-    if (ctx.tier == CompileTier::Instrumented && FinalAot &&
-        finalFallbacks_.size() < 64)
-      finalFallbacks_[cacheKey] = {FinalAot, *request};
+    if (!FinalAot) {
+      auto S = finalAotSymbols_.find(funcName);
+      if (S != finalAotSymbols_.end())
+        FinalAot = S->second;
+    }
+    if (ctx.tier == CompileTier::Instrumented && FinalAot) {
+      if (finalFallbacks_.size() < config_.finalMergeMaxFallbacks ||
+          finalFallbacks_.count(cacheKey))
+        finalFallbacks_[cacheKey] = {FinalAot, *request};
+      else
+        EJIT_DIAG("final-merge pending fallback budget entry=%s limit=%zu",
+                  funcName.c_str(), config_.finalMergeMaxFallbacks);
+    }
     if (ctx.tier == CompileTier::PGOUse) {
       auto I = finalFallbacks_.find(cacheKey);
       if (I != finalFallbacks_.end()) {
@@ -900,20 +958,26 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   }
 
   void *funcPtr = *addrOrErr;
-#if defined(EJIT_SWITCH_CASE) && defined(EJIT_SRE_SHARED_TASKPOOL)
+#ifdef EJIT_DRIVER_FINAL_MERGE
   if (request && !FinalBitcode.empty() && FinalArgs.size() == dimCount) {
-    for (auto I = finalMembers_.begin(); I != finalMembers_.end();) {
-      if (I->key == cacheKey ||
-          (I->ready && !sharedPool_.finalVersionCurrent(I->request, I->published))) {
-        finalArtifactBytes_ -= I->bitcode.size();
-        I = finalMembers_.erase(I);
-      } else {
-        ++I;
-      }
-    }
-    if (finalMembers_.size() < 64 &&
-        finalArtifactBytes_ + FinalBitcode.size() <=
-            kEJitFinalMergeMaxArtifactBytes) {
+    auto Old = finalMembers_.find(cacheKey);
+    if (Old != finalMembers_.end())
+      eraseFinalMember(Old);
+    pruneFinalMembers();
+    FinalCohort Group{funcIdx, request->generation, FinalAot, FinalArgs};
+    if (cohortFull(Group)) {
+      EJIT_DIAG("final-merge cohort arm budget entry=%s limit=%u: retaining "
+                "independent T2",
+                funcName.c_str(), kEJitFinalMergeMaxArms);
+    } else if (finalMembers_.size() >= config_.finalMergeMaxMembers) {
+      EJIT_DIAG("final-merge member budget entry=%s limit=%zu",
+                funcName.c_str(), config_.finalMergeMaxMembers);
+    } else if (FinalBitcode.size() > config_.finalMergeMaxArtifactBytes ||
+               finalArtifactBytes_ >
+                   config_.finalMergeMaxArtifactBytes - FinalBitcode.size()) {
+      EJIT_DIAG("final-merge retained byte budget entry=%s limit=%zu",
+                funcName.c_str(), config_.finalMergeMaxArtifactBytes);
+    } else {
       FinalMember M;
       M.request = *request;
       M.request.fallbackPtr = FinalAot;
@@ -928,9 +992,12 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         M.dimensions.push_back(dims[I]);
       M.published = funcPtr;
       finalArtifactBytes_ += M.bitcode.size();
-      finalMembers_.push_back(std::move(M));
-    } else {
-      EJIT_DIAG("final-merge artifact budget: retaining independent T2");
+      finalCohorts_[std::move(Group)].push_back(cacheKey);
+      finalMembers_.emplace(cacheKey, std::move(M));
+      finalUsage_.peakMembers =
+          std::max(finalUsage_.peakMembers, finalMembers_.size());
+      finalUsage_.peakArtifactBytes =
+          std::max(finalUsage_.peakArtifactBytes, finalArtifactBytes_);
     }
   }
 #endif
@@ -1051,20 +1118,13 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
 }
 
 #ifdef EJIT_SRE_TASKPOOL
-void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
-  // PGO tier rides in req.funcIndex's top 2 bits (EJitSreQueue.h). Strip it to
-  // recover the real funcIndex - the loader lookup and cacheKey must NOT carry
-  // tier (Tier-1 and Tier-2 of the same (funcIndex, dims) share one cacheKey,
-  // EJIT_ONLINE_PGO.md §2). tier is passed to compileCold, gated by enablePgo.
-  uint32_t tier = decodeReqTier(req.funcIndex);
+static bool packRequestKey(EJitModuleLoader &Loader,
+                           const EJitCompileRequest &req, uint64_t &cacheKey) {
   uint32_t funcIdx = stripReqTier(req.funcIndex);
-
-  EJIT_DIAG("compileNow begin func=%u dims=%u tier=%u", funcIdx, req.numDims,
-            tier);
   if (req.numDims > 4) {
     EJIT_DIAG("compileNow reject func=%u: numDims=%u > 4", funcIdx,
               req.numDims);
-    return nullptr;
+    return false;
   }
 
   // Validate the request: instanceIds must be encodable in the legacy 8-bit
@@ -1077,14 +1137,14 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
     if (req.dims[i].instanceId > 255u) {
       EJIT_DIAG("compileNow reject func=%u: instanceId=%u > 255 (dim[%u])",
                 funcIdx, req.dims[i].instanceId, i);
-      return nullptr;
+      return false;
     }
 
     for (uint32_t j = 0; j < seenCount; ++j)
       if (seenDimTypes[j] == req.dims[i].dimType) {
         EJIT_DIAG("compileNow reject func=%u: duplicate dimType=%u (dim[%u])",
                   funcIdx, req.dims[i].dimType, i);
-        return nullptr;
+        return false;
       }
 
     assert(seenCount < 4 && "seenDimTypes overflow: numDims guard broken");
@@ -1094,14 +1154,14 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
   // meta.dimTypes[i] is the explicit dimType slot the loader read back BY NAME
   // from the process-global EJitLifecycleRegistry - the SAME slot the wrapper
   // baked into req.dims via its per-lifecycle global.
-  const auto &meta = loader_.getOrCacheFuncMeta(funcIdx);
+  const auto &meta = Loader.getOrCacheFuncMeta(funcIdx);
   uint8_t packedDims[4] = {0, 0, 0, 0};
   for (unsigned i = 0; i < meta.dimCount && i < 4; ++i) {
     uint32_t wantedType = meta.dimTypes[i];
     if (wantedType == kEJitInvalidDimType) {
       EJIT_DIAG("compileNow reject func=%u: meta dim[%u] dimType invalid",
                 funcIdx, i);
-      return nullptr;
+      return false;
     }
     bool found = false;
     for (uint32_t j = 0; j < req.numDims; ++j) {
@@ -1114,43 +1174,61 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
     if (!found) {
       EJIT_DIAG("compileNow reject func=%u: no request dim for meta dimType=%u",
                 funcIdx, wantedType);
-      return nullptr;
+      return false;
     }
   }
 
-  uint64_t cacheKey = (static_cast<uint64_t>(funcIdx) << 32) |
-                      static_cast<uint64_t>(packedDims[0]) |
-                      (static_cast<uint64_t>(packedDims[1]) << 8) |
-                      (static_cast<uint64_t>(packedDims[2]) << 16) |
-                      (static_cast<uint64_t>(packedDims[3]) << 24);
-  EJIT_DIAG("compileNow dispatch func=%u key=0x%016lx dims=[%u,%u,%u,%u]",
-            funcIdx, cacheKey, packedDims[0], packedDims[1], packedDims[2],
-            packedDims[3]);
+  cacheKey = (static_cast<uint64_t>(funcIdx) << 32) |
+             static_cast<uint64_t>(packedDims[0]) |
+             (static_cast<uint64_t>(packedDims[1]) << 8) |
+             (static_cast<uint64_t>(packedDims[2]) << 16) |
+             (static_cast<uint64_t>(packedDims[3]) << 24);
+  EJIT_DIAG_DEBUG("packed request func=%u key=0x%016lx dims=[%u,%u,%u,%u]",
+                  funcIdx, cacheKey, packedDims[0], packedDims[1],
+                  packedDims[2], packedDims[3]);
+  return true;
+}
+
+void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
+  // PGO tier rides in req.funcIndex's top 2 bits (EJitSreQueue.h). Strip it to
+  // recover the real funcIndex - the loader lookup and cacheKey must NOT carry
+  // tier (Tier-1 and Tier-2 of the same (funcIndex, dims) share one cacheKey,
+  // EJIT_ONLINE_PGO.md §2). tier is passed to compileCold, gated by enablePgo.
+  uint32_t tier = decodeReqTier(req.funcIndex);
+  uint32_t funcIdx = stripReqTier(req.funcIndex);
+
+  EJIT_DIAG("compileNow begin func=%u dims=%u tier=%u", funcIdx, req.numDims,
+            tier);
+  uint64_t cacheKey;
+  if (!packRequestKey(loader_, req, cacheKey))
+    return nullptr;
   return compileCold(cacheKey, tier, /*storeLru=*/false, &req);
 }
 
 void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
                                                 bool published) {
-#if defined(EJIT_SWITCH_CASE) && defined(EJIT_SRE_SHARED_TASKPOOL)
-  if (!published)
-    for (auto I = finalFallbacks_.begin(); I != finalFallbacks_.end();) {
-      if (sameFinalIdentity(I->second.request, req))
-        I = finalFallbacks_.erase(I);
-      else
-        ++I;
+#ifdef EJIT_DRIVER_FINAL_MERGE
+  if (!finalMembers_.empty() || (!published && !finalFallbacks_.empty())) {
+    uint64_t K;
+    if (packRequestKey(loader_, req, K)) {
+      if (!published) {
+        auto F = finalFallbacks_.find(K);
+        if (F != finalFallbacks_.end() &&
+            sameFinalIdentity(F->second.request, req))
+          finalFallbacks_.erase(F);
+      }
+      auto I = finalMembers_.find(K);
+      if (I != finalMembers_.end() &&
+          I->second.request.funcIndex == req.funcIndex &&
+          sameFinalIdentity(I->second.request, req)) {
+        if (published) {
+          I->second.ready = true;
+          finalDirty_.insert(K);
+        } else {
+          eraseFinalMember(I);
+        }
+      }
     }
-  for (auto I = finalMembers_.begin(); I != finalMembers_.end(); ++I) {
-    if (I->request.funcIndex != req.funcIndex ||
-        !sameFinalIdentity(I->request, req))
-      continue;
-    if (published) {
-      I->ready = true;
-      I->dirty = true;
-    } else {
-      finalArtifactBytes_ -= I->bitcode.size();
-      finalMembers_.erase(I);
-    }
-    break;
   }
 #endif
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)

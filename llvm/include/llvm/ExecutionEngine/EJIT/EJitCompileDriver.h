@@ -27,8 +27,11 @@
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #endif
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -97,6 +100,17 @@ public:
   /// instead of the per-instance taskPool_.
   EJitSharedTaskPool *sharedTaskPool() { return &sharedPool_; }
   const EJitSharedTaskPool *sharedTaskPool() const { return &sharedPool_; }
+
+#ifdef EJIT_SWITCH_CASE
+  struct FinalMergeUsage {
+    size_t peakMembers = 0;
+    size_t peakArtifactBytes = 0;
+    uint64_t emissionAttempts = 0;
+    uint64_t publishedDispatchers = 0;
+  };
+  // Owner worker only, or read with the worker quiescent.
+  FinalMergeUsage finalMergeUsage() const { return finalUsage_; }
+#endif
 
   /// Run owner election over the shared state and, if this core becomes the
   /// owner, start the ONE shared worker. Returns false on a clean init failure
@@ -173,6 +187,8 @@ private:
   /// Owner-release hook: the counterpart of sharedOwnerElected.
   static void sharedOwnerReleased(void *ctx);
 #ifdef EJIT_SWITCH_CASE
+  using FinalCohort =
+      std::tuple<uint32_t, uint32_t, uintptr_t, SmallVector<unsigned, 2>>;
   struct FinalMember {
     EJitCompileRequest request{};
     uint64_t key = 0;
@@ -182,16 +198,28 @@ private:
     SmallVector<uint32_t, 2> dimensions;
     void *published = nullptr;
     bool ready = false;
-    bool dirty = false;
+    FinalCohort cohort() const {
+      return {stripReqTier(request.funcIndex), request.generation,
+              request.fallbackPtr, args};
+    }
   };
-  std::vector<FinalMember> finalMembers_;
+  // Cohorts hold only admitted tuples; cache keys index callbacks and coalesce
+  // work.
+  std::map<FinalCohort, SmallVector<uint64_t, 2>> finalCohorts_;
+  bool cohortFull(const FinalCohort &C);
+  std::map<uint64_t, FinalMember> finalMembers_;
+  std::set<uint64_t> finalDirty_;
+  std::unordered_map<std::string, uintptr_t> finalAotSymbols_;
+  uint64_t finalSweepKey_ = 0;
+  void eraseFinalMember(std::map<uint64_t, FinalMember>::iterator I);
+  void pruneFinalMembers();
   struct FinalFallback {
     uintptr_t pointer = 0;
     EJitCompileRequest request{};
   };
   std::unordered_map<uint64_t, FinalFallback> finalFallbacks_;
   size_t finalArtifactBytes_ = 0;
-  uint64_t finalMergeSerial_ = 0;
+  FinalMergeUsage finalUsage_;
   static bool sharedFinalMergeService(void *ctx);
   bool serviceFinalMerge();
 #endif

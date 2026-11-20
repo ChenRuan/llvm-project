@@ -9,9 +9,18 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITOPTIONS_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITOPTIONS_H
 
+#include "llvm/Config/llvm-config.h"
 #include <cstddef>
 #include <cstdint>
 #include <string>
+
+// Standalone harnesses can use an older installed LLVM configuration header.
+#ifndef EJIT_FINAL_MERGE_MAX_MEMBERS
+#define EJIT_FINAL_MERGE_MAX_MEMBERS 8192
+#define EJIT_FINAL_MERGE_MAX_FALLBACKS 8192
+#define EJIT_FINAL_MERGE_MAX_ARTIFACT_BYTES 33554432
+#define EJIT_FINAL_MERGE_MAX_EMISSION_ATTEMPTS 4096
+#endif
 
 namespace llvm {
 namespace ejit {
@@ -56,6 +65,11 @@ struct Config {
 #else
   bool enableProfileAudit = false;
 #endif
+  // Owner-private bounds. These never enlarge the executable pool or a cohort.
+  size_t finalMergeMaxMembers = EJIT_FINAL_MERGE_MAX_MEMBERS;
+  size_t finalMergeMaxFallbacks = EJIT_FINAL_MERGE_MAX_FALLBACKS;
+  size_t finalMergeMaxArtifactBytes = EJIT_FINAL_MERGE_MAX_ARTIFACT_BYTES;
+  size_t finalMergeMaxEmissionAttempts = EJIT_FINAL_MERGE_MAX_EMISSION_ATTEMPTS;
 };
 
 } // namespace ejit

@@ -671,6 +671,24 @@ function(ejit_require_numeric var)
   endif()
 endfunction()
 
+set(EJIT_FINAL_MERGE_MAX_MEMBERS "8192" CACHE STRING
+  "Final-version merge: maximum member records")
+set(EJIT_FINAL_MERGE_MAX_FALLBACKS "8192" CACHE STRING
+  "Final-version merge: maximum pending fallback records")
+set(EJIT_FINAL_MERGE_MAX_ARTIFACT_BYTES "33554432" CACHE STRING
+  "Final-version merge: maximum bytes of retained bitcode")
+set(EJIT_FINAL_MERGE_MAX_EMISSION_ATTEMPTS "4096" CACHE STRING
+  "Final-version merge: maximum lifetime emission attempts per driver")
+foreach(limit IN ITEMS EJIT_FINAL_MERGE_MAX_MEMBERS
+                       EJIT_FINAL_MERGE_MAX_FALLBACKS
+                       EJIT_FINAL_MERGE_MAX_ARTIFACT_BYTES
+                       EJIT_FINAL_MERGE_MAX_EMISSION_ATTEMPTS)
+  ejit_require_numeric(${limit})
+  if("${${limit}}" MATCHES "^0[0-9]" OR ${limit} GREATER 4294967295)
+    message(FATAL_ERROR "${limit} must be a canonical decimal uint32 value")
+  endif()
+endforeach()
+
 # Per-pool size in bytes (must be a multiple of the 2MiB enable_ex granularity).
 set(EJIT_SRE_CODE_POOL_SIZE "2097152" CACHE STRING
   "EmbeddedJIT SRE code pool size in bytes (default 2MiB)")

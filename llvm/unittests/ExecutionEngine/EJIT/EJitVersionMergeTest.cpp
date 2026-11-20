@@ -680,3 +680,173 @@ TEST(EJitVersionMerge, ImportRejectsOversizedOrMissingCohortBeforeEmission) {
 }
 
 #endif
+
+#if defined(EJIT_SWITCH_CASE) && defined(EJIT_SRE_SHARED_TASKPOOL) &&          \
+    defined(EJIT_SRE_TASKPOOL_NO_RECLAIM) && defined(EJIT_SRE_CODE_POOL)
+namespace {
+void exerciseCapacity(Config Cfg, unsigned Count, unsigned ExpectedMerges,
+                      bool ExplicitFallback = false, bool Overflow = false) {
+  EJitFuncRegistry::instance().reset();
+  EJitLifecycleRegistry::instance().reset();
+  LLVMContext C;
+  SMDiagnostic D;
+  auto M = parseAssemblyString(R"(
+    define i32 @entry(i8 %cell, i8 %trp, i32 %x) !ejit.metadata !0 {
+      %c = zext i8 %cell to i32
+      %t = zext i8 %trp to i32
+      %a = mul i32 %c, 100
+      %b = mul i32 %t, 10
+      %s = add i32 %a, %b
+      %r = add i32 %s, %x
+      ret i32 %r
+    }
+    !0 = !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !3 = !{!"ejit_period_arr_ind", !"trp", i32 1}
+  )",
+                               D, C);
+  ASSERT_TRUE(M);
+  auto *Entry = M->getFunction("entry");
+  std::vector<std::string> Bitcode(Count);
+  std::vector<uint32_t> Indices;
+  EJitModuleLoader Loader;
+  EJitRuntimeState State;
+  Cfg.enablePgo = Cfg.enableFinalVersionMerge = true;
+  EJitCompileDriver Driver(Cfg, State, Loader);
+  for (unsigned I = 0; I != Count; ++I) {
+    std::string Name = "capacity_" + std::to_string(I);
+    Entry->setName(Name);
+    raw_string_ostream OS(Bitcode[I]);
+    WriteBitcodeToFile(*M, OS);
+    ASSERT_TRUE(Loader.registerBitcode(
+        Name, reinterpret_cast<const uint8_t *>(Bitcode[I].data()),
+        Bitcode[I].size()));
+    Indices.push_back(EJitFuncRegistry::instance().resolveAssign(Name));
+    if (!ExplicitFallback)
+      Driver.registerSymbol(std::string(FINAL_MERGE_AOT_PREFIX) + Name,
+                            reinterpret_cast<void *>(&runtimeMergeAot));
+  }
+  const auto Cell = EJitLifecycleRegistry::instance().resolveAssign("cell");
+  const auto Trp = EJitLifecycleRegistry::instance().resolveAssign("trp");
+  auto *Pool = Driver.sharedTaskPool();
+  Pool->setWorkerHooks(nullptr, nullptr, nullptr);
+  ASSERT_TRUE(Driver.startSharedTaskPool());
+  Pool->setPgoEnabled(true, 2);
+  Pool->setInstanceEnabled(Cell, 0, true);
+  Pool->setInstanceEnabled(Cell, 3, true);
+  Pool->setInstanceEnabled(Trp, 2, true);
+  if (Overflow)
+    for (unsigned V = 0; V <= 8; ++V) {
+      Pool->setInstanceEnabled(Cell, V, true);
+      Pool->setInstanceEnabled(Trp, V, true);
+    }
+  using Fn = decltype(&runtimeMergeAot);
+  for (unsigned I = 0; I != Count; ++I) {
+    SCOPED_TRACE(I);
+    auto Lookup = [&](unsigned V, unsigned W = 2) {
+      EJitDimPair Ds[] = {{Cell, V}, {Trp, W}};
+      auto R = Pool->compileOrGet(
+          Indices[I], Ds, 2,
+          ExplicitFallback ? reinterpret_cast<void *>(&runtimeMergeAot)
+                           : nullptr);
+      if (R.hasReadToken)
+        Pool->releaseRead(R.bucketIndex);
+      return reinterpret_cast<Fn>(R.fnPtr);
+    };
+    auto Train = [&](unsigned V, unsigned W) {
+      for (unsigned Poll = 0; Poll != 12; ++Poll) {
+        if (auto F = Lookup(V, W))
+          ASSERT_EQ(F(V, W, 9), runtimeMergeAot(V, W, 9));
+        Pool->workerPollOnce();
+        ASSERT_TRUE(Pool->flushCodeBatch());
+      }
+    };
+    if (Overflow) {
+      for (unsigned V = 1; V <= 8; ++V)
+        for (unsigned W = 1; W <= 8; ++W)
+          Train(V, W);
+      auto Full = Lookup(8, 8);
+      ASSERT_NE(Full, nullptr);
+      Train(0, 0); // numerically smaller than all 64 admitted cache keys
+      auto Independent = Lookup(0, 0);
+      ASSERT_NE(Independent, nullptr);
+      ASSERT_NE(Independent, Full);
+      ASSERT_EQ(Independent(0, 0, 7), 7u);
+      for (unsigned V = 1; V <= 8; ++V)
+        for (unsigned W = 1; W <= 8; ++W)
+          ASSERT_EQ(Full, Lookup(V, W));
+      ASSERT_EQ(Driver.finalMergeUsage().emissionAttempts, 63u);
+      break;
+    }
+    Train(0, 2);
+    Train(3, 2);
+    auto A = Lookup(0), B = Lookup(3);
+    ASSERT_NE(A, nullptr);
+    ASSERT_NE(B, nullptr);
+    ASSERT_EQ(A == B, I < ExpectedMerges);
+    ASSERT_EQ(A(0, 2, 8), 28u);
+    ASSERT_EQ(B(3, 2, 8), 328u);
+    if (A == B)
+      ASSERT_EQ(B(9, 7, 8), 978u); // untrained tuple reaches AOT
+  }
+  unsigned ResidentT2 = 0;
+  Pool->forEachCompiled(
+      [](const EJitSharedCacheSlot &S, void *Ctx) {
+        if (S.tier.loadRelaxed() == kEJitTierPgoUse)
+          ++*static_cast<unsigned *>(Ctx);
+      },
+      &ResidentT2);
+  ::testing::Test::RecordProperty("resident_t2_slots", ResidentT2);
+  auto Usage = Driver.finalMergeUsage();
+  ::testing::Test::RecordProperty("peak_retained_members",
+                                  std::to_string(Usage.peakMembers));
+  ::testing::Test::RecordProperty("peak_retained_bitcode_bytes",
+                                  std::to_string(Usage.peakArtifactBytes));
+  ::testing::Test::RecordProperty("emission_attempts",
+                                  std::to_string(Usage.emissionAttempts));
+  ::testing::Test::RecordProperty("published_dispatchers",
+                                  std::to_string(Usage.publishedDispatchers));
+  EXPECT_EQ(Usage.publishedDispatchers, ExpectedMerges);
+  if (Overflow)
+    EXPECT_EQ(ResidentT2, 65u);
+  else if (Count <= 2 ||
+           (kEJitSharedCacheSlots >= 128 && kEJitSharedCacheBuckets >= 32))
+    EXPECT_EQ(ResidentT2, Count * 2);
+  Pool->ownerShutdown();
+  EJitFuncRegistry::instance().reset();
+  EJitLifecycleRegistry::instance().reset();
+}
+} // namespace
+
+TEST(EJitFinalCapacity, ThousandDistinctEntriesPublishTwoArmDispatchers) {
+  exerciseCapacity(Config{}, 1025, 1025);
+}
+
+TEST(EJitFinalCapacity, LateLowTupleDoesNotDisplaceActiveSixtyFour) {
+  exerciseCapacity(Config{}, 1, 63, false, true);
+}
+
+TEST(EJitFinalCapacity, MemberAndByteQuotasKeepIndependentBodies) {
+  Config Cfg;
+  Cfg.finalMergeMaxMembers = 1;
+  exerciseCapacity(Cfg, 1, 0);
+  Cfg.finalMergeMaxMembers = 2;
+  Cfg.finalMergeMaxArtifactBytes = 1;
+  exerciseCapacity(Cfg, 1, 0);
+}
+
+TEST(EJitFinalCapacity, PendingFallbackQuotaAppliesToExplicitT1Pointer) {
+  Config Cfg;
+  Cfg.finalMergeMaxFallbacks = 1;
+  exerciseCapacity(Cfg, 1, 1, true);
+  Cfg.finalMergeMaxFallbacks = 0;
+  exerciseCapacity(Cfg, 1, 0, true);
+}
+
+TEST(EJitFinalCapacity, LifetimeAttemptLimitKeepsLaterBodiesIndependent) {
+  Config Cfg;
+  Cfg.finalMergeMaxEmissionAttempts = 1;
+  exerciseCapacity(Cfg, 2, 1);
+}
+#endif
