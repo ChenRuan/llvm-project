@@ -561,7 +561,7 @@ emitIcacheSlotRegistration(Module &M,
 
 } // anonymous namespace
 
-static cl::opt<bool> EJitFinalVersionMerge(
+cl::opt<bool> EJitFinalVersionMerge(
     "ejit-final-version-merge", cl::init(false),
     cl::desc("Retain and register an ABI-identical AOT fallback for final cell/TRP merging"));
 

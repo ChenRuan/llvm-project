@@ -561,7 +561,7 @@ TEST(EJitVersionMerge, RecursiveMemberIsNotDisguisedAsOneMergedBody) {
 TEST(EJitVersionMerge, ModuleImportKeepsPrivateHelpersAndConstantsSeparate) {
   auto Make = [](unsigned Value) {
     LLVMContext C;
-    auto M = parse(C, "@data = internal unnamed_addr constant i32 " +
+    auto M = parse(C, "@data = internal constant i32 " +
         std::to_string(Value) + R"(
       define internal i32 @helper() {
         %v = load i32, ptr @data
@@ -630,7 +630,6 @@ TEST(EJitVersionMerge, ModuleImportPreservesScalarAbiOnAotEdge) {
 
 TEST(EJitVersionMerge, MutableAndAddressObservablePrivateStateStayIndependent) {
   for (StringRef Decl : {"@g = internal global i32 0",
-                        "@g = internal constant i32 0",
                         "@g = external thread_local global i32"}) {
     LLVMContext C;
     auto M = parse(C, (Decl + R"(
@@ -641,6 +640,27 @@ TEST(EJitVersionMerge, MutableAndAddressObservablePrivateStateStayIndependent) {
     Error E = validateFinalVersionModule(*M, "entry");
     EXPECT_TRUE(bool(E));
     consumeError(std::move(E));
+  }
+}
+
+TEST(EJitVersionMerge, FunctionLocalLookupDoesNotRequireUnnamedAddr) {
+  for (StringRef Use : {"%r = load i32, ptr %p",
+                        "%r = load volatile i32, ptr %p",
+                        "%r = ptrtoint ptr %p to i32",
+                        "store ptr %p, ptr %out\n %r = add i32 %idx, 1"}) {
+    LLVMContext C;
+    auto M = parse(C, (R"(
+      @Foo.xxx = private constant [3 x i32] [i32 7, i32 3, i32 9]
+      define i32 @entry(i32 %idx, ptr %out) {
+        %p = getelementptr i32, ptr getelementptr (i8, ptr @Foo.xxx, i64 4), i32 %idx
+      )" + Use + "\n ret i32 %r\n}").str());
+    auto E = validateFinalVersionModule(*M, "entry");
+    if (Use == "%r = load i32, ptr %p")
+      EXPECT_FALSE(bool(E)) << toString(std::move(E));
+    else {
+      ASSERT_TRUE(bool(E)) << Use.str();
+      EXPECT_NE(toString(std::move(E)).find("Foo.xxx"), std::string::npos);
+    }
   }
 }
 

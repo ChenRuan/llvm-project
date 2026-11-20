@@ -59,6 +59,25 @@ does not enable merging. Old compiler output without the registered AOT body
 keeps independent T2 with `final-merge no AOT fallback`, not silent success.
 The compiler opt-in costs an additional retained AOT body.
 
+### Global objects and AOT identity
+
+An ordinary external data declaration continues to refer to its AOT storage.
+With the merge compiler option, the extractor also registers the original
+address for supported address-sensitive constant definitions and qualifies
+unannotated private writable objects by translation unit. Both constructor
+and static-section registration carry the same binding. Local data keys use
+a strong hidden registration string: a collision at firmware link must fail
+rather than silently bind one TU's object to another's. This is not an SDK
+callback or a new source annotation. Recompile the entry TU to get the binding;
+the runtime will not guess the address of an old private definition by name.
+
+A private immutable lookup table without `unnamed_addr` is also eligible if
+all uses of its address are simple loads through GEPs or bitcasts. Taking the
+address out of this chain (for example returning it, storing it, or converting
+it to an integer) requires an original-object binding; it is not permission
+to copy an observable object. TLS and unbound observable/writable definitions
+still fail closed. No new load is frozen just because its base is bound.
+
 ## Publication and bounds
 
 - Use the existing worker, near-code pool, sealing and peer permissions.
@@ -86,8 +105,8 @@ The compiler opt-in costs an additional retained AOT body.
   emission-attempt cap per driver lifetime is unchanged (failures count).
   Thus tuple capacity is not a guarantee for arbitrary code size or unlimited
   simultaneous entry groups. Ineligible/over-budget members stay independent.
-- Reject private writable/TLS state, observable private object/function
-  identity, aliases/ifuncs/module asm, entry recursion, incompatible ABI/targets,
+- Reject unbound private writable/TLS state, unbound observable private object
+  identity, observable function identity, aliases/ifuncs/module asm, entry recursion, incompatible ABI/targets,
   and indirect calls without verified target remapping. These use independent
   T2, not unsafe sharing. Imported helpers/constants are member-namespaced.
 - No verifier initializer or runtime is required by this branch.
@@ -106,6 +125,9 @@ core[6]  -> test_ejit_cell_trp_merge_print
 Expected: WORKER_READY, four PHASE lines (single, pair merge, late third,
 deactivate/change/retrain), OWNER_DONE, FUNCTIONAL_PASS. It checks numerical
 results, live stores, equal entry pointers, and an unvisited tuple's AOT default.
+It also records the address of a function-local object on the first AOT call:
+T1, independent T2, merged generations and the default arm must report that same
+address, and a separate local table must still give the right live-index value.
 Inspect the merged IR/ASM as well.
 
 `MERGE_WAIT_ROUNDS` defaults to zero (unlimited); only the host runner sets a

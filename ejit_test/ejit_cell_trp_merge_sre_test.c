@@ -32,15 +32,21 @@ struct MergeConfig {
 MERGE_SHARED struct MergeConfig merge_cells[16], merge_trps[16];
 MERGE_SHARED ejit_period_arr(cell) struct MergeConfig *merge_cell = merge_cells;
 MERGE_SHARED ejit_period_arr(trp) struct MergeConfig *merge_trp = merge_trps;
+MERGE_SHARED const uint8_t *volatile merge_observed;
+static const uint8_t *aot_identity;
 
 ejit_entry uint32_t cell_trp_merge_entry(ejit_period_arr_ind(cell) uint8_t cell,
                                         ejit_period_arr_ind(trp) uint8_t trp,
                                         uint32_t live) {
+  static const uint8_t identity = 17;
+  static const uint8_t lut[] = {3, 1, 4, 1, 5, 9, 2};
+  merge_observed = &identity;
+  uint32_t extra = lut[live % 7u];
   ++merge_cell[cell].visits;
   uint32_t bias = merge_cell[cell].bias;
   if (bias & 1u)
-    return bias + merge_trp[trp].bias + live;
-  return bias * 3u + merge_trp[trp].bias + live;
+    return bias + merge_trp[trp].bias + live + extra;
+  return bias * 3u + merge_trp[trp].bias + live + extra;
 }
 typedef uint32_t (*merge_fn)(uint8_t, uint8_t, uint32_t);
 static merge_fn volatile merge_wrapper = cell_trp_merge_entry;
@@ -65,14 +71,19 @@ static int delay(void) {
   return SRE_TaskDelay(1u) ? fail("SRE_TaskDelay") : 0;
 }
 static uint32_t expected(unsigned cell, unsigned trp, uint32_t live) {
+  static const uint8_t lut[] = {3, 1, 4, 1, 5, 9, 2};
   uint32_t bias = merge_cells[cell].bias;
-  return ((bias & 1u) ? bias : bias * 3u) + merge_trps[trp].bias + live;
+  return ((bias & 1u) ? bias : bias * 3u) + merge_trps[trp].bias + live +
+         lut[live % 7u];
 }
 static int wrapper_call(unsigned cell, unsigned trp, uint32_t live) {
   uint32_t before = merge_cells[cell].visits;
+  merge_observed = 0;
   if (merge_wrapper(cell, trp, live) != expected(cell, trp, live) ||
       merge_cells[cell].visits != before + 1u)
     return fail("wrapper result or live-store mismatch");
+  if (!merge_observed || (aot_identity && merge_observed != aot_identity))
+    return fail("wrapper changed AOT object identity");
   ++merge_result.checked;
   return 0;
 }
@@ -88,11 +99,14 @@ static int query_call(unsigned member, uint32_t live, void **address) {
   if (rc != EJIT_OK || !fn)
     return fail("runtime lookup failed");
   uint32_t before = merge_cells[cells[member]].visits;
+  merge_observed = 0;
   uint32_t result = ((merge_fn)fn)(cells[member], trps[member], live);
   ejit_taskpool_release_read(bucket);
   if (result != expected(cells[member], trps[member], live) ||
       merge_cells[cells[member]].visits != before + 1u)
     return fail("JIT result or live-store mismatch");
+  if (!aot_identity || merge_observed != aot_identity)
+    return fail("JIT changed AOT object identity");
   *address = fn;
   ++merge_result.checked;
   return 1;
@@ -193,6 +207,7 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   // Inactive calls must remain correct AOT and must not enqueue compilation.
   if (wrapper_call(0, 2, 1) || stats(&s) || s.asyncEnqueues)
     return fail("inactive call compiled");
+  aot_identity = merge_observed;
   for (unsigned i = 0; i < 3; ++i) {
     ejit_activate("cell", cells[i]);
     ejit_activate("trp", trps[i]);
@@ -204,8 +219,9 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   // Directly exercise the merged function's unvisited-tuple default without
   // training that member. Same original arguments, real live store.
   unsigned before = merge_cells[7].visits;
+  merge_observed = 0;
   if (((merge_fn)merge_result.first_shared)(7, 9, 23) != expected(7, 9, 23) ||
-      merge_cells[7].visits != before + 1u)
+      merge_cells[7].visits != before + 1u || merge_observed != aot_identity)
     return fail("unvisited tuple did not preserve AOT behavior");
   if (phase(2, 3, 3, &merge_result.late_shared))
     return -1;

@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitVersionMerge.h"
+#include "llvm/ExecutionEngine/EJIT/EJitGlobalValueReads.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
@@ -38,7 +39,8 @@ Error llvm::ejit::validateFinalVersionModule(const Module &M, StringRef Entry) {
   for (const GlobalVariable &G : M.globals())
     if (G.isThreadLocal() ||
         (!G.isDeclaration() && (!G.isConstant() || !G.hasLocalLinkage() ||
-                                !G.hasGlobalUnnamedAddr())))
+                                (!G.hasGlobalUnnamedAddr() &&
+                                 !isValueOnlyFinalTable(G)))))
       return make_error<StringError>("private state or observable global: " +
                                         G.getName(),
                                     inconvertibleErrorCode());
