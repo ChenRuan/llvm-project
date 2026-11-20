@@ -102,12 +102,12 @@ still fail closed. No new load is frozen just because its base is bound.
   artifact/constants per member. The 64-tuple limit is **per cohort**, not
   across functions. Driver-wide build defaults are 8,192 retained member
   records (`EJIT_FINAL_MERGE_MAX_MEMBERS`), 8,192 pending T1 fallback records
-  (`EJIT_FINAL_MERGE_MAX_FALLBACKS`), 32 MiB of serialized optimized bitcode
+  (`EJIT_FINAL_MERGE_MAX_FALLBACKS`), 32 MiB total for recipes and retained bitcode
   (`EJIT_FINAL_MERGE_MAX_ARTIFACT_BYTES`), and 4,096 lifetime emission attempts
   (`EJIT_FINAL_MERGE_MAX_EMISSION_ATTEMPTS`, including failed emissions).
   These are ceilings, not reservations. The byte cap does not include indexes,
   temporary LLVM working memory or executable code. Exhaustion preserves
-  independent T2; it does not imply eviction and replay. Shared cache slots
+  the currently published T2. Shared cache slots
   and executable pool size remain independent constraints.
 - Reject unbound private writable/TLS state, unbound observable private object
   identity, observable function identity, aliases/ifuncs/module asm, entry recursion, incompatible ABI/targets,
@@ -115,18 +115,34 @@ still fail closed. No new load is frozen just because its base is bound.
   T2, not unsafe sharing. Imported helpers/constants are member-namespaced.
 - No verifier initializer or runtime is required by this branch.
 
-### Possible follow-up: retain inputs instead of every optimized member
+### On-demand member rebuild (ordinary cell/TRP, online PGO)
 
-Today a late join imports the already optimized member bodies. A smaller
-cache could evict those bodies and replay from the registered source bitcode.
-An entry name, dimension tuple and pointer addresses alone are insufficient:
-replay needs the same generation, bindings, specialization inputs and PGO
-observations as the original T2. A retired generation must not be reconstructed
-by rereading current configuration or expired T1/VP counters. Where replay
-cannot be validated, keep the published independent T2. Coalesce late joins
-to avoid repeatedly rebuilding a growing cohort. Measure peak retained data,
-worker time and retained executable bytes separately before adopting this path;
-it is not implemented here.
+The worker records the indexed profile, scalar VP selections, bound argument
+size/index facts and successful field substitutions from each specialization
+pass. The journal contains typed literal bits, **not** borrowed configuration
+objects, T1 counters or an LLVM context. The registered source bitcode is shared.
+If a recipe is smaller than the final bitcode, it is admitted instead of
+requiring a permanent full body. Recent replayable bodies may also occupy a
+FIFO cache within the same total budget: `EJIT_FINAL_MERGE_IR_CACHE_BYTES`
+defaults to 1 MiB. Set this **runtime-package CMake cache variable** to `0`
+to force replay for replayable members. No business-Clang or init change.
+
+On a cache miss the owner worker re-runs the member's T2 IR pipeline from
+the matching source, substituting the recorded folds without accessing live
+business data. Both source and serialized final IR must match their original
+SHA-256 digests. No sampling, independent executable emission, ORC member
+replacement or business-core callback occurs during replay. Only a successful
+cohort is emitted, using the existing version/pointer publication gates.
+Already-ready dirty members in a cohort are considered together; staggered
+late arrivals can still incur repeated worker work. This is a space/time
+trade-off, not executable-code reclamation.
+
+For runtime-dimension key discovery, unrepresentable folds, oversized journals
+or recipes not smaller than IR, admission retains the original full body if
+budget permits. A source/IR mismatch or an exhausted budget keeps the previous
+published code; it does not substitute current configuration. A successful
+`final-merge entry=...` line reports `rebuilt` (this emission),
+`recipe_bytes` and `full_ir_bytes` (driver-wide current retention).
 
 ## 6/16/6 example
 

@@ -325,6 +325,77 @@ TEST(EJitVersionMerge, OneNativeEntryExecutesBothArmsAndExactTupleFallback) {
       }
 }
 
+TEST(EJitVersionMerge, ReplayUsesFrozenFieldWithoutOriginalBoundObject) {
+  LLVMContext LC;
+  auto M = parse(LC, R"(
+    define i32 @replay_bound(i32 %cell, ptr %cfg) !ejit.metadata !0 {
+      %field = getelementptr i8, ptr %cfg, i64 4
+      %v = load i32, ptr %field, !ejit.may_const !5
+      %live = getelementptr i8, ptr %cfg, i64 8
+      %d = load i32, ptr %live
+      %r = add i32 %v, %d
+      ret i32 %r
+    }
+    !0 = distinct !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 12, !4}
+    !4 = !{i64 0, i64 8}
+    !5 = !{}
+  )");
+  std::string Source, Original;
+  raw_string_ostream OS(Source);
+  WriteBitcodeToFile(*M, OS);
+  EJitRuntimeState State;
+  auto Engine = EJitOrcEngine::Create(Config{}, State.getRegistry(), State);
+  ASSERT_TRUE(bool(Engine)) << toString(Engine.takeError());
+  EJitFinalReplay Recipe;
+  SpecializationContext C;
+  C.fnName = "replay_bound";
+  C.cacheKey = 371;
+  C.tier = CompileTier::PGOUse;
+  C.dimensions.push_back({"cell", 3});
+  SmallVector<unsigned, 2> Args;
+  C.finalMergeBitcode = &Original;
+  C.finalMergeDimensionArgs = &Args;
+  C.captureFolds = &Recipe;
+  {
+    uint32_t Borrowed[] = {3, 17, 99};
+    C.boundPointers.push_back(
+        {reinterpret_cast<const uint8_t *>(Borrowed), sizeof(Borrowed), 1});
+    (*Engine)->setActiveContext(&C);
+    auto Err = (*Engine)->loadBitcodeModule(Source, C.cacheKey, C.fnName);
+    ASSERT_FALSE(bool(Err)) << toString(std::move(Err));
+    auto Address = (*Engine)->lookup(C.cacheKey, C.fnName);
+    ASSERT_TRUE(bool(Address)) << toString(Address.takeError());
+    (*Engine)->setActiveContext(nullptr);
+  }
+  ASSERT_FALSE(Original.empty());
+  ASSERT_TRUE(Recipe.usable);
+  ASSERT_FALSE(Recipe.folds.empty());
+  Recipe.bounds.push_back({1, 12});
+  Recipe.sourceHash = EJitFinalReplay::digest(Source);
+  Recipe.outputHash = EJitFinalReplay::digest(Original);
+  SpecializationContext Fresh;
+  Fresh.cacheKey = C.cacheKey;
+  Fresh.fnName = C.fnName;
+  Fresh.dimensions = C.dimensions;
+  Fresh.tier = CompileTier::PGOUse;
+  auto Rebuilt = (*Engine)->rebuildFinalMember(Source, Fresh, Recipe);
+  ASSERT_TRUE(bool(Rebuilt)) << toString(Rebuilt.takeError());
+  EXPECT_EQ(*Rebuilt, Original);
+  auto WrongSource =
+      (*Engine)->rebuildFinalMember("not that module", Fresh, Recipe);
+  ASSERT_FALSE(bool(WrongSource));
+  EXPECT_NE(toString(WrongSource.takeError()).find("source mismatch"),
+            std::string::npos);
+  Recipe.folds.front().bits ^= 1;
+  auto WrongValue = (*Engine)->rebuildFinalMember(Source, Fresh, Recipe);
+  ASSERT_FALSE(bool(WrongValue));
+  EXPECT_NE(toString(WrongValue.takeError()).find("digest mismatch"),
+            std::string::npos);
+}
+
 TEST(EJitVersionMerge, SixtyFourModuleArmsExecuteAndSixtyFiveReject) {
   LLVMContext C;
   std::vector<std::string> Storage;
@@ -802,7 +873,19 @@ void exerciseCapacity(Config Cfg, unsigned Count, unsigned ExpectedMerges,
   ::testing::Test::RecordProperty("peak_retained_members",
                                   std::to_string(Usage.peakMembers));
   ::testing::Test::RecordProperty("peak_retained_bitcode_bytes",
+                                  std::to_string(Usage.peakFullIRBytes));
+  ::testing::Test::RecordProperty("peak_retained_recipe_bytes",
+                                  std::to_string(Usage.peakRecipeBytes));
+  ::testing::Test::RecordProperty("peak_retained_total_bytes",
                                   std::to_string(Usage.peakArtifactBytes));
+  ::testing::Test::RecordProperty("rebuilt_members",
+                                  std::to_string(Usage.rebuiltMembers));
+  EXPECT_EQ(Usage.replayFailures, 0u);
+  EXPECT_LE(Usage.peakArtifactBytes, Cfg.finalMergeMaxArtifactBytes);
+  if (!Cfg.finalMergeIRCacheBytes && ExpectedMerges) {
+    EXPECT_GT(Usage.rebuiltMembers, 0u);
+    EXPECT_EQ(Usage.peakFullIRBytes, 0u);
+  }
   ::testing::Test::RecordProperty("emission_attempts",
                                   std::to_string(Usage.emissionAttempts));
   ::testing::Test::RecordProperty("published_dispatchers",
@@ -821,6 +904,21 @@ void exerciseCapacity(Config Cfg, unsigned Count, unsigned ExpectedMerges,
 
 TEST(EJitFinalCapacity, ThousandDistinctEntriesPublishTwoArmDispatchers) {
   exerciseCapacity(Config{}, 1025, 1025);
+}
+
+TEST(EJitFinalCapacity, ColdRecipesRebuildAfterT1CountersAreReleased) {
+  Config Cfg;
+  Cfg.finalMergeIRCacheBytes = 0;
+  exerciseCapacity(Cfg, 3, 3);
+}
+
+TEST(EJitFinalCapacity, ReclaimOptionalIRToAdmitSecondRecipe) {
+  Config Cfg;
+  // Enough for one cached body plus its recipe, not two bodies. Mandatory
+  // replay inputs take precedence over opportunistically cached full IR.
+  Cfg.finalMergeMaxArtifactBytes = 4000;
+  Cfg.finalMergeIRCacheBytes = 4000;
+  exerciseCapacity(Cfg, 1, 1);
 }
 
 TEST(EJitFinalCapacity, LateLowTupleDoesNotDisplaceActiveSixtyFour) {

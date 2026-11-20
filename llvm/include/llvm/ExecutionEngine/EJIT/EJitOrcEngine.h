@@ -44,6 +44,8 @@ class PeriodArrayRegistry;
 class EJitRuntimeState;
 struct EJitSharedTaskPoolState;
 struct EJitVpFunctionInfo; // defined in EJitOptimizer.h (value-profile capture)
+struct EJitFinalReplay;
+struct EJitFinalReplayCursor;
 enum class CompileTier : uint8_t;
 
 namespace detail {
@@ -124,6 +126,8 @@ struct SpecializationContext {
   SmallVector<unsigned, 2> *finalMergeDimensionArgs = nullptr;
   /// Already optimized member bodies: never specialize/profile them again.
   bool preparedFinalMerge = false;
+  EJitFinalReplay *captureFolds = nullptr;
+  EJitFinalReplayCursor *replayFolds = nullptr;
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
   /// Runtime hit snapshot from the temporary Instrumented tier. Populated by
   /// the compile driver before the final compile starts.
@@ -158,6 +162,11 @@ public:
   /// Look up a compiled function symbol in the specialization JITDylib
   /// identified by cacheKey.
   Expected<void *> lookup(uint64_t cacheKey, const std::string &name);
+#ifdef EJIT_SWITCH_CASE
+  Expected<std::string> rebuildFinalMember(StringRef Source,
+                                           SpecializationContext &Ctx,
+                                           const EJitFinalReplay &Recipe);
+#endif
 
   /// Set the active specialization context (used during compilation).
   void setActiveContext(const SpecializationContext *ctx);

@@ -1,6 +1,9 @@
 //===-- EJitOptimizer.cpp - JIT Optimization Pipeline ---------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
+#ifdef EJIT_SWITCH_CASE
+#include "llvm/ExecutionEngine/EJIT/EJitFinalReplay.h"
+#endif
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
 #include "llvm/ADT/DenseSet.h"
@@ -345,43 +348,45 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
           IntrusiveRefCntPtr<vfs::FileSystem>(InMemFS)));
       UseMPM.run(*ProfileModule, MAM_);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-      auto Summaries = analyzeBranchProfiles(*ProfileModule, ctx.fnName);
-      uint64_t Instructions = 0;
-      uint32_t Branches = 0;
-      uint32_t Profiled = 0;
-      uint32_t Biased = 0;
-      uint32_t Balanced = 0;
-      uint32_t ZeroEdges = 0;
-      uint64_t RootEntries = 0;
-      for (const auto &Summary : Summaries) {
-        Instructions += Summary.instructionCount;
-        Branches += Summary.branchSites;
-        Profiled += Summary.profiledSites;
-        Biased += Summary.biasedSites95;
-        Balanced += Summary.balancedSites60;
-        ZeroEdges += Summary.zeroCountEdges;
-        if (Summary.isRoot) {
-          RootEntries = Summary.entryCount;
-          AuditSampledEntries = Summary.entryCount;
+      if (!ctx.replayFolds) {
+        auto Summaries = analyzeBranchProfiles(*ProfileModule, ctx.fnName);
+        uint64_t Instructions = 0;
+        uint32_t Branches = 0;
+        uint32_t Profiled = 0;
+        uint32_t Biased = 0;
+        uint32_t Balanced = 0;
+        uint32_t ZeroEdges = 0;
+        uint64_t RootEntries = 0;
+        for (const auto &Summary : Summaries) {
+          Instructions += Summary.instructionCount;
+          Branches += Summary.branchSites;
+          Profiled += Summary.profiledSites;
+          Biased += Summary.biasedSites95;
+          Balanced += Summary.balancedSites60;
+          ZeroEdges += Summary.zeroCountEdges;
+          if (Summary.isRoot) {
+            RootEntries = Summary.entryCount;
+            AuditSampledEntries = Summary.entryCount;
+          }
+          EJIT_DIAG_DEBUG(
+              "branch-audit-fn entry=%s fn=%s root=%u entries=%llu insts=%llu "
+              "branches=%u profiled=%u biased95=%u balanced60=%u zero_edges=%u",
+              ctx.fnName.c_str(), Summary.functionName.c_str(), Summary.isRoot,
+              static_cast<unsigned long long>(Summary.entryCount),
+              static_cast<unsigned long long>(Summary.instructionCount),
+              Summary.branchSites, Summary.profiledSites, Summary.biasedSites95,
+              Summary.balancedSites60, Summary.zeroCountEdges);
         }
-        EJIT_DIAG_DEBUG(
-            "branch-audit-fn entry=%s fn=%s root=%u entries=%llu insts=%llu "
-            "branches=%u profiled=%u biased95=%u balanced60=%u zero_edges=%u",
-            ctx.fnName.c_str(), Summary.functionName.c_str(), Summary.isRoot,
-            static_cast<unsigned long long>(Summary.entryCount),
-            static_cast<unsigned long long>(Summary.instructionCount),
-            Summary.branchSites, Summary.profiledSites, Summary.biasedSites95,
-            Summary.balancedSites60, Summary.zeroCountEdges);
+        EJIT_DIAG(
+            "branch-audit entry=%s key=0x%016llx root_entries=%llu funcs=%u "
+            "insts=%llu branches=%u profiled=%u biased95=%u balanced60=%u "
+            "zero_edges=%u",
+            ctx.fnName.c_str(), static_cast<unsigned long long>(ctx.cacheKey),
+            static_cast<unsigned long long>(RootEntries),
+            static_cast<unsigned>(Summaries.size()),
+            static_cast<unsigned long long>(Instructions), Branches, Profiled,
+            Biased, Balanced, ZeroEdges);
       }
-      EJIT_DIAG(
-          "branch-audit entry=%s key=0x%016llx root_entries=%llu funcs=%u "
-          "insts=%llu branches=%u profiled=%u biased95=%u balanced60=%u "
-          "zero_edges=%u",
-          ctx.fnName.c_str(), static_cast<unsigned long long>(ctx.cacheKey),
-          static_cast<unsigned long long>(RootEntries),
-          static_cast<unsigned>(Summaries.size()),
-          static_cast<unsigned long long>(Instructions), Branches, Profiled,
-          Biased, Balanced, ZeroEdges);
 #endif
     }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
@@ -454,9 +459,11 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
 #endif
     runOptimizationPipeline(M, ctx, ctx.tier);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-    auto FinalSites = collectMayConstSites(M, registry_);
-    recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
-                          FinalSites, AuditSampledEntries);
+    if (!ctx.replayFolds) {
+      auto FinalSites = collectMayConstSites(M, registry_);
+      recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
+                            FinalSites, AuditSampledEntries);
+    }
 #endif
     EJIT_DIAG_VERBOSE("pipeline done (Tier-2) func=%s key=0x%016lx",
                       ctx.fnName.c_str(), ctx.cacheKey);
@@ -792,7 +799,7 @@ static MaybeAlign boundPointeeAlign(const Function &F, unsigned ArgIndex) {
 /// now also produce miscompiled code.
 void EJitOptimizer::applyBoundPointerFacts(Module &M,
                                            const SpecializationContext &ctx) {
-  if (ctx.boundPointers.empty())
+  if (ctx.boundPointers.empty() && !ctx.replayFolds)
     return;
   Function *Root = M.getFunction(ctx.fnName);
   if (!Root)
@@ -800,31 +807,36 @@ void EJitOptimizer::applyBoundPointerFacts(Module &M,
 
   LLVMContext &Ctx = M.getContext();
   [[maybe_unused]] unsigned Applied = 0;
-  for (const EJitBoundPointerView &View : ctx.boundPointers) {
-    // A view without a live pointer or size promises nothing.
-    if (!View.rawPtr || View.size == 0)
-      continue;
-    if (View.argIndex >= Root->arg_size())
-      continue;
-    Argument *Arg = Root->getArg(View.argIndex);
+  auto Apply = [&](unsigned ArgIndex, uint32_t Size) {
+    if (!Size || ArgIndex >= Root->arg_size())
+      return;
+    Argument *Arg = Root->getArg(ArgIndex);
     if (!Arg->getType()->isPointerTy())
-      continue;
+      return;
     // Merge, never overwrite: addAttr REPLACES an integer attribute, so a
     // parameter already carrying a stronger fact -- align_value(64) from the
     // source, or a wider dereferenceable -- would be weakened by the
     // ABI-derived one. Keep whichever is stronger.
     Arg->addAttr(Attribute::NonNull);
-    if (View.size > Arg->getDereferenceableBytes())
-      Arg->addAttr(Attribute::getWithDereferenceableBytes(Ctx, View.size));
+    if (Size > Arg->getDereferenceableBytes())
+      Arg->addAttr(Attribute::getWithDereferenceableBytes(Ctx, Size));
     // Both halves matter: speculating a load needs
     // isDereferenceableAndAlignedPointer, and size alone leaves it false.
-    if (MaybeAlign A = boundPointeeAlign(*Root, View.argIndex)) {
+    if (MaybeAlign A = boundPointeeAlign(*Root, ArgIndex)) {
       MaybeAlign Cur = Arg->getParamAlign();
       if (!Cur || *A > *Cur)
         Arg->addAttr(Attribute::getWithAlignment(Ctx, *A));
     }
     ++Applied;
-  }
+  };
+  for (const auto &View : ctx.boundPointers)
+    if (View.rawPtr)
+      Apply(View.argIndex, View.size);
+#ifdef EJIT_SWITCH_CASE
+  if (ctx.replayFolds)
+    for (const auto &Fact : ctx.replayFolds->recipe.bounds)
+      Apply(Fact.arg, Fact.size);
+#endif
   EJIT_DIAG_VERBOSE("bound-ptr facts func=%s applied=%u of %zu",
                     ctx.fnName.c_str(), Applied, ctx.boundPointers.size());
 }
@@ -945,11 +957,22 @@ EJitOptimizer::boundPointerViews(Module &M, const SpecializationContext &ctx) {
 
 void EJitOptimizer::runStructFieldPass(Module &M,
                                        const SpecializationContext &ctx) {
+#ifdef EJIT_SWITCH_CASE
+  if (ctx.replayFolds) {
+    for (Function &F : M)
+      if (!F.isDeclaration() && ctx.replayFolds->apply(F))
+        FAM_.invalidate(F, PreservedAnalyses::none());
+    return;
+  }
+#endif
   SmallVector<EJitLocalWitnessPeriod, 4> LocalPeriods;
   for (const auto &Dim : ctx.dimensions)
     LocalPeriods.push_back({Dim.periodName, Dim.cellIdx});
   EJitStructFieldPass structField(registry_, boundPointerViews(M, ctx),
                                   ctx.fnName, LocalPeriods);
+#ifdef EJIT_SWITCH_CASE
+  structField.captureFinalFolds = ctx.captureFolds;
+#endif
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration()) {
@@ -963,6 +986,14 @@ void EJitOptimizer::runSwitchCase(Module &M, const SpecializationContext &ctx) {
   Function *Root = M.getFunction(ctx.fnName);
   if (!Root || Root->isDeclaration() || !getEJitRuntimeDim(*Root))
     return;
+  // Runtime-dimension key discovery may dereference live objects. Until it
+  // has its own complete journal, keep the captured final body for this case.
+  if (ctx.captureFolds)
+    ctx.captureFolds->usable = false;
+  if (ctx.replayFolds) {
+    ctx.replayFolds->valid = false;
+    return;
+  }
   // Every tier builds arms here, in the prefix PGO Gen and Use share; Tier-2
   // replays Tier-1's keys so both see the same CFG (§10).
   const EJitSwitchCaseDecision *Replay =

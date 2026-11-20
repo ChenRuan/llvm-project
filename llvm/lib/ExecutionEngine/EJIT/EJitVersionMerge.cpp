@@ -7,16 +7,18 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitVersionMerge.h"
-#include "llvm/ExecutionEngine/EJIT/EJitGlobalValueReads.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/ExecutionEngine/EJIT/EJitFinalReplay.h"
+#include "llvm/ExecutionEngine/EJIT/EJitGlobalValueReads.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Support/MemoryBufferRef.h"
+#include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <map>
@@ -28,6 +30,110 @@ using namespace llvm::ejit;
 
 namespace {
 AttributeList scalarABI(const Function &F);
+}
+
+std::array<uint8_t, 32> EJitFinalReplay::digest(StringRef Bytes) {
+  SHA256 Hash;
+  Hash.update(Bytes);
+  return Hash.final();
+}
+
+static unsigned replayWidth(Type *T, const DataLayout &DL) {
+  if (T->isPointerTy())
+    return DL.getPointerSizeInBits(T->getPointerAddressSpace());
+  if (T->isIntegerTy() || T->isFloatTy() || T->isDoubleTy())
+    return T->getScalarSizeInBits();
+  return 0;
+}
+
+void EJitFinalReplay::record(Function &F, ArrayRef<Replacement> Roots,
+                             ArrayRef<Replacement> Fields) {
+  const uint32_t Frame = frames++;
+  if (!usable || (Roots.empty() && Fields.empty()))
+    return;
+  if (Roots.size() + Fields.size() >
+      kEJitFinalMergeMaxMemberBytes / sizeof(Fold) - folds.size()) {
+    usable = false;
+    return;
+  }
+  DenseMap<LoadInst *, Constant *> Values;
+  for (auto R : Roots)
+    Values.try_emplace(R.LI, R.ConstVal);
+  for (auto R : Fields)
+    Values.try_emplace(R.LI, R.ConstVal);
+  uint32_t Ordinal = 0;
+  for (Instruction &I : instructions(F)) {
+    auto *L = dyn_cast<LoadInst>(&I);
+    if (!L)
+      continue;
+    auto N = Ordinal++;
+    Constant *C = Values.lookup(L);
+    if (!C)
+      continue;
+    Type *T = L->getType();
+    unsigned W = replayWidth(T, F.getParent()->getDataLayout());
+    if (!L->isSimple() || !W || W > 64) {
+      usable = false;
+      return;
+    }
+    uint64_t V;
+    if (auto *CI = dyn_cast<ConstantInt>(C))
+      V = CI->getZExtValue();
+    else if (auto *CF = dyn_cast<ConstantFP>(C))
+      V = CF->getValueAPF().bitcastToAPInt().getZExtValue();
+    else if (isa<ConstantPointerNull>(C))
+      V = 0;
+    else if (auto *CE = dyn_cast<ConstantExpr>(C);
+             CE && CE->getOpcode() == Instruction::IntToPtr &&
+             isa<ConstantInt>(CE->getOperand(0)) &&
+             CE->getOperand(0)->getType()->getIntegerBitWidth() <= 64)
+      V = cast<ConstantInt>(CE->getOperand(0))->getZExtValue();
+    else {
+      usable = false;
+      return;
+    }
+    folds.push_back({Frame, N, V, T->getTypeID(), W});
+  }
+}
+
+bool EJitFinalReplayCursor::apply(Function &F) {
+  const unsigned Frame = frame++;
+  if (!valid || next == recipe.folds.size() ||
+      recipe.folds[next].frame != Frame)
+    return false;
+  SmallVector<LoadInst *, 8> Erase;
+  uint32_t Ordinal = 0;
+  for (Instruction &I : instructions(F)) {
+    auto *L = dyn_cast<LoadInst>(&I);
+    if (!L)
+      continue;
+    const auto &R = recipe.folds[next];
+    if (Ordinal++ != R.ordinal)
+      continue;
+    Type *T = L->getType();
+    if (!L->isSimple() || T->getTypeID() != R.typeID ||
+        replayWidth(T, F.getParent()->getDataLayout()) != R.width) {
+      valid = false;
+      break;
+    }
+    APInt Bits(R.width, R.bits);
+    Constant *C;
+    if (T->isIntegerTy())
+      C = ConstantInt::get(T, Bits);
+    else if (T->isPointerTy())
+      C = ConstantExpr::getIntToPtr(ConstantInt::get(T->getContext(), Bits), T);
+    else
+      C = ConstantFP::get(T->getContext(), APFloat(T->getFltSemantics(), Bits));
+    L->replaceAllUsesWith(C);
+    Erase.push_back(L);
+    if (++next == recipe.folds.size() || recipe.folds[next].frame != Frame)
+      break;
+  }
+  if (next != recipe.folds.size() && recipe.folds[next].frame == Frame)
+    valid = false;
+  for (auto *L : Erase)
+    L->eraseFromParent();
+  return !Erase.empty();
 }
 
 Error llvm::ejit::validateFinalVersionModule(const Module &M, StringRef Entry) {

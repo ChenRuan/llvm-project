@@ -57,6 +57,40 @@ bool EJitCompileDriver::sharedFinalMergeService(void *Ctx) {
   return static_cast<EJitCompileDriver *>(Ctx)->serviceFinalMerge();
 }
 
+void EJitCompileDriver::noteFinalBytes() {
+  finalUsage_.peakArtifactBytes =
+      std::max(finalUsage_.peakArtifactBytes, finalArtifactBytes_);
+  finalUsage_.peakRecipeBytes =
+      std::max(finalUsage_.peakRecipeBytes, finalRecipeBytes_);
+  finalUsage_.peakFullIRBytes = std::max(
+      finalUsage_.peakFullIRBytes, finalArtifactBytes_ - finalRecipeBytes_);
+}
+
+void EJitCompileDriver::evictHotIR() {
+  FinalMember &M = finalMembers_.find(finalHot_.front())->second;
+  finalHot_.pop_front();
+  finalHotBytes_ -= M.bitcode.size();
+  finalArtifactBytes_ -= M.bitcode.size();
+  std::string().swap(M.bitcode);
+}
+
+void EJitCompileDriver::cacheHotIR(FinalMember &M, std::string &IR) {
+  const size_t N = IR.size(), Max = config_.finalMergeMaxArtifactBytes;
+  if (!N || !M.recipe || !M.bitcode.empty() ||
+      N > config_.finalMergeIRCacheBytes ||
+      N > Max - (finalArtifactBytes_ - finalHotBytes_))
+    return;
+  while (finalHotBytes_ > config_.finalMergeIRCacheBytes - N ||
+         finalArtifactBytes_ > Max - N)
+    evictHotIR();
+  finalHot_.push_back(M.key);
+  M.hotPosition = std::prev(finalHot_.end());
+  M.bitcode = std::move(IR);
+  finalArtifactBytes_ += N;
+  finalHotBytes_ += N;
+  noteFinalBytes();
+}
+
 void EJitCompileDriver::eraseFinalMember(
     std::map<uint64_t, FinalMember>::iterator I) {
   auto Group = finalCohorts_.find(I->second.cohort());
@@ -64,6 +98,15 @@ void EJitCompileDriver::eraseFinalMember(
   if (Group->second.empty())
     finalCohorts_.erase(Group);
   finalArtifactBytes_ -= I->second.bitcode.size();
+  if (auto &M = I->second; M.recipe) {
+    size_t Bytes = M.recipe->bytes();
+    finalArtifactBytes_ -= Bytes;
+    finalRecipeBytes_ -= Bytes;
+    if (!M.bitcode.empty()) {
+      finalHotBytes_ -= M.bitcode.size();
+      finalHot_.erase(M.hotPosition);
+    }
+  }
   finalDirty_.erase(I->first);
   finalMembers_.erase(I);
 }
@@ -127,7 +170,6 @@ bool EJitCompileDriver::serviceFinalMerge() {
         continue;
       }
       Members.push_back(&M);
-      Arms.push_back({M.bitcode, M.dimensions});
     }
     if (Members.size() < 2)
       return false;
@@ -146,11 +188,71 @@ bool EJitCompileDriver::serviceFinalMerge() {
                 Trigger.entry.c_str(), config_.finalMergeMaxEmissionAttempts);
       return true;
     }
+    std::vector<std::string> Scratch(Members.size());
+    unsigned Rebuilt = 0;
+    for (size_t I = 0; I < Members.size(); ++I) {
+      auto &M = *Members[I];
+      if (!M.bitcode.empty()) {
+        Arms.push_back({M.bitcode, M.dimensions});
+        continue;
+      }
+      const unsigned Id = stripReqTier(M.request.funcIndex);
+      auto Source = loader_.getBitcodeByFuncIdx(Id);
+      if (!Source) {
+        consumeError(Source.takeError());
+        ++finalUsage_.replayFailures;
+        EJIT_DIAG("final-merge replay missing source entry=%s",
+                  M.entry.c_str());
+        return true;
+      }
+      SpecializationContext Ctx;
+      Ctx.fnName = M.entry;
+      Ctx.cacheKey = M.key;
+      Ctx.optLevel = config_.optLevel;
+      Ctx.tier = CompileTier::PGOUse;
+      const auto &Meta = loader_.getOrCacheFuncMeta(Id);
+      if (Meta.dimCount != M.dimensions.size()) {
+        ++finalUsage_.replayFailures;
+        EJIT_DIAG("final-merge replay dimension mismatch entry=%s",
+                  M.entry.c_str());
+        return true;
+      }
+      for (size_t J = 0; J < Meta.dimCount; ++J)
+        Ctx.dimensions.push_back(
+            {Meta.periodNames[J], uint8_t(M.dimensions[J])});
+      auto Bytes = jitEngine_->rebuildFinalMember(*Source, Ctx, *M.recipe);
+      if (!Bytes) {
+        ++finalUsage_.replayFailures;
+        EJIT_DIAG(
+            "final-merge replay rejected entry=%s: %s; keeping current T2",
+            M.entry.c_str(), toString(Bytes.takeError()).c_str());
+        return true;
+      }
+      ++finalUsage_.rebuiltMembers;
+      ++Rebuilt;
+      Scratch[I] = std::move(*Bytes);
+      Arms.push_back({Scratch[I], M.dimensions});
+    }
     auto Prepared = assembleFinalVersionModules(
         Trigger.entry, Trigger.request.fallbackPtr, Trigger.args, Arms);
     if (!Prepared) {
       EJIT_DIAG("final-merge rejected entry=%s: %s", Trigger.entry.c_str(),
                 toString(Prepared.takeError()).c_str());
+      return true;
+    }
+    // Arms borrow cached strings until assembly completes. Only now may FIFO
+    // admission evict another arm's cached body.
+    for (size_t I = 0; I < Members.size(); ++I)
+      cacheHotIR(*Members[I], Scratch[I]);
+    Scratch.clear();
+    auto CohortCurrent = [&] {
+      return llvm::all_of(Members, [&](const FinalMember *M) {
+        return sharedPool_.finalVersionCurrent(M->request, M->published);
+      });
+    };
+    if (!CohortCurrent()) {
+      EJIT_DIAG("final-merge stale cohort before emission entry=%s",
+                Trigger.entry.c_str());
       return true;
     }
     SpecializationContext C;
@@ -187,6 +289,11 @@ bool EJitCompileDriver::serviceFinalMerge() {
                 C.fnName.c_str());
       return true;
     }
+    if (!CohortCurrent()) {
+      EJIT_DIAG("final-merge stale cohort before publish entry=%s",
+                Trigger.entry.c_str());
+      return true;
+    }
     unsigned Published = 0;
     for (auto *M : Members)
       if (sharedPool_.replaceFinalVersion(M->request, M->published, *Address, Info)) {
@@ -196,9 +303,11 @@ bool EJitCompileDriver::serviceFinalMerge() {
     if (Published)
       ++finalUsage_.publishedDispatchers;
     EJIT_DIAG(
-        "final-merge entry=%s arms=%zu published=%u fn=%p generation=%llu",
+        "final-merge entry=%s arms=%zu published=%u fn=%p generation=%llu "
+        "rebuilt=%u recipe_bytes=%zu full_ir_bytes=%zu",
         C.fnName.c_str(), Members.size(), Published, *Address,
-        static_cast<unsigned long long>(finalUsage_.emissionAttempts));
+        static_cast<unsigned long long>(finalUsage_.emissionAttempts), Rebuilt,
+        finalRecipeBytes_, finalArtifactBytes_ - finalRecipeBytes_);
     return true;
   }
   return false;
@@ -607,6 +716,8 @@ void EJitCompileDriver::releaseJitEngine() {
   finalDirty_.clear();
   finalMembers_.clear();
   finalArtifactBytes_ = 0;
+  finalHot_.clear();
+  finalHotBytes_ = finalRecipeBytes_ = 0;
   finalFallbacks_.clear();
 #endif
   if (!jitEngine_)
@@ -626,6 +737,8 @@ void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
   finalDirty_.clear();
   finalMembers_.clear();
   finalArtifactBytes_ = 0;
+  finalHot_.clear();
+  finalHotBytes_ = finalRecipeBytes_ = 0;
   finalFallbacks_.clear();
 #endif
   userSymbols_.emplace_back(name, addr);
@@ -889,6 +1002,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
 
 #ifdef EJIT_DRIVER_FINAL_MERGE
   std::string FinalBitcode;
+  EJitFinalReplay Recipe;
   SmallVector<unsigned, 2> FinalArgs;
   uintptr_t FinalAot = request ? request->fallbackPtr : 0;
   if (config_.enableFinalVersionMerge && request) {
@@ -919,6 +1033,8 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       dimCount >= 1 && dimCount <= 2) {
     ctx.finalMergeBitcode = &FinalBitcode;
     ctx.finalMergeDimensionArgs = &FinalArgs;
+    if (config_.enablePgo)
+      ctx.captureFolds = &Recipe;
   }
   if (config_.enableFinalVersionMerge && ctx.tier == CompileTier::PGOUse &&
       !FinalAot)
@@ -965,6 +1081,15 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       eraseFinalMember(Old);
     pruneFinalMembers();
     FinalCohort Group{funcIdx, request->generation, FinalAot, FinalArgs};
+    bool UseRecipe = ctx.captureFolds && Recipe.usable;
+    if (UseRecipe) {
+      Recipe.profile = std::move(ctx.profileData);
+      Recipe.scalars = std::move(ctx.scalarValueSites);
+      for (const auto &B : ctx.boundPointers)
+        Recipe.bounds.push_back({B.argIndex, B.size});
+      UseRecipe = Recipe.bytes() < FinalBitcode.size();
+    }
+    size_t Need = UseRecipe ? Recipe.bytes() : FinalBitcode.size();
     if (cohortFull(Group)) {
       EJIT_DIAG("final-merge cohort arm budget entry=%s limit=%u: retaining "
                 "independent T2",
@@ -972,12 +1097,14 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     } else if (finalMembers_.size() >= config_.finalMergeMaxMembers) {
       EJIT_DIAG("final-merge member budget entry=%s limit=%zu",
                 funcName.c_str(), config_.finalMergeMaxMembers);
-    } else if (FinalBitcode.size() > config_.finalMergeMaxArtifactBytes ||
-               finalArtifactBytes_ >
-                   config_.finalMergeMaxArtifactBytes - FinalBitcode.size()) {
+    } else if (Need > config_.finalMergeMaxArtifactBytes ||
+               finalArtifactBytes_ - finalHotBytes_ >
+                   config_.finalMergeMaxArtifactBytes - Need) {
       EJIT_DIAG("final-merge retained byte budget entry=%s limit=%zu",
                 funcName.c_str(), config_.finalMergeMaxArtifactBytes);
     } else {
+      while (finalArtifactBytes_ > config_.finalMergeMaxArtifactBytes - Need)
+        evictHotIR();
       FinalMember M;
       M.request = *request;
       M.request.fallbackPtr = FinalAot;
@@ -986,18 +1113,25 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         B = {};
       M.key = cacheKey;
       M.entry = funcName;
-      M.bitcode = std::move(FinalBitcode);
+      if (UseRecipe) {
+        Recipe.sourceHash = EJitFinalReplay::digest(bitcode);
+        Recipe.outputHash = EJitFinalReplay::digest(FinalBitcode);
+        M.recipe = std::make_unique<EJitFinalReplay>(std::move(Recipe));
+        finalRecipeBytes_ += Need;
+      } else {
+        M.bitcode = std::move(FinalBitcode);
+      }
       M.args = std::move(FinalArgs);
       for (unsigned I = 0; I < dimCount; ++I)
         M.dimensions.push_back(dims[I]);
       M.published = funcPtr;
-      finalArtifactBytes_ += M.bitcode.size();
+      finalArtifactBytes_ += Need;
       finalCohorts_[std::move(Group)].push_back(cacheKey);
-      finalMembers_.emplace(cacheKey, std::move(M));
+      auto Inserted = finalMembers_.emplace(cacheKey, std::move(M));
+      cacheHotIR(Inserted.first->second, FinalBitcode);
       finalUsage_.peakMembers =
           std::max(finalUsage_.peakMembers, finalMembers_.size());
-      finalUsage_.peakArtifactBytes =
-          std::max(finalUsage_.peakArtifactBytes, finalArtifactBytes_);
+      noteFinalBytes();
     }
   }
 #endif

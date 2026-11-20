@@ -21,6 +21,9 @@
 #define EJIT_FINAL_MERGE_MAX_ARTIFACT_BYTES 33554432
 #define EJIT_FINAL_MERGE_MAX_EMISSION_ATTEMPTS 4096
 #endif
+#ifndef EJIT_FINAL_MERGE_IR_CACHE_BYTES
+#define EJIT_FINAL_MERGE_IR_CACHE_BYTES 1048576
+#endif
 
 namespace llvm {
 namespace ejit {
@@ -69,6 +72,7 @@ struct Config {
   size_t finalMergeMaxMembers = EJIT_FINAL_MERGE_MAX_MEMBERS;
   size_t finalMergeMaxFallbacks = EJIT_FINAL_MERGE_MAX_FALLBACKS;
   size_t finalMergeMaxArtifactBytes = EJIT_FINAL_MERGE_MAX_ARTIFACT_BYTES;
+  size_t finalMergeIRCacheBytes = EJIT_FINAL_MERGE_IR_CACHE_BYTES;
   size_t finalMergeMaxEmissionAttempts = EJIT_FINAL_MERGE_MAX_EMISSION_ATTEMPTS;
 };
 

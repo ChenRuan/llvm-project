@@ -1,6 +1,9 @@
 //===-- EJitStructFieldPass.cpp - JIT Constant Substitution ---------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
+#ifdef EJIT_SWITCH_CASE
+#include "llvm/ExecutionEngine/EJIT/EJitFinalReplay.h"
+#endif
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
@@ -2450,7 +2453,11 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   //    initFromModule(), reused across all function runs).
 
   // 2. Give legacy and strict paths their existing first attempt.
+#ifdef EJIT_SWITCH_CASE
+  using Replacement = EJitFinalReplay::Replacement;
+#else
   struct Replacement { LoadInst *LI; Constant *ConstVal; };
+#endif
   SmallVector<Replacement, 8> Roots;
   SmallVector<LoadInst *, 16> PendingFields;
   SmallVector<Replacement, 16> replacements;
@@ -2560,6 +2567,10 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       logReplaceFailure(LI, gvPeriodMap_, registry_, DL, freeDimAssumptions_);
 #endif
   }
+#ifdef EJIT_SWITCH_CASE
+  if (captureFinalFolds)
+    captureFinalFolds->record(F, Roots, replacements);
+#endif
   for (auto &R : Roots)
     R.LI->eraseFromParent();
 

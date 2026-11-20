@@ -10,6 +10,9 @@
 #define LLVM_EXECUTIONENGINE_EJIT_EJITCOMPILEDRIVER_H
 
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
+#ifdef EJIT_SWITCH_CASE
+#include "llvm/ExecutionEngine/EJIT/EJitFinalReplay.h"
+#endif
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
@@ -27,6 +30,7 @@
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #endif
+#include <list>
 #include <map>
 #include <memory>
 #include <set>
@@ -105,6 +109,10 @@ public:
   struct FinalMergeUsage {
     size_t peakMembers = 0;
     size_t peakArtifactBytes = 0;
+    size_t peakRecipeBytes = 0;
+    size_t peakFullIRBytes = 0;
+    uint64_t rebuiltMembers = 0;
+    uint64_t replayFailures = 0;
     uint64_t emissionAttempts = 0;
     uint64_t publishedDispatchers = 0;
   };
@@ -194,6 +202,8 @@ private:
     uint64_t key = 0;
     std::string entry;
     std::string bitcode;
+    std::unique_ptr<EJitFinalReplay> recipe;
+    std::list<uint64_t>::iterator hotPosition;
     SmallVector<unsigned, 2> args;
     SmallVector<uint32_t, 2> dimensions;
     void *published = nullptr;
@@ -219,6 +229,11 @@ private:
   };
   std::unordered_map<uint64_t, FinalFallback> finalFallbacks_;
   size_t finalArtifactBytes_ = 0;
+  size_t finalHotBytes_ = 0, finalRecipeBytes_ = 0;
+  std::list<uint64_t> finalHot_;
+  void evictHotIR();
+  void cacheHotIR(FinalMember &M, std::string &IR);
+  void noteFinalBytes();
   FinalMergeUsage finalUsage_;
   static bool sharedFinalMergeService(void *ctx);
   bool serviceFinalMerge();

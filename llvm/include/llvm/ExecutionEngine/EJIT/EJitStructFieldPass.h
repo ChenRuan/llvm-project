@@ -31,6 +31,7 @@ class DataLayout;
 class LoadInst;
 class PHINode;
 namespace ejit {
+struct EJitFinalReplay;
 
 struct GVPeriodInfo {
   std::string periodName;
@@ -121,6 +122,7 @@ public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 
 #ifdef EJIT_SWITCH_CASE
+  EJitFinalReplay *captureFinalFolds = nullptr;
   /// Switch-case key selection (EJIT_SWITCH_CASE.md §4.3): evaluate a load as
   /// run() would, with the arguments in \p Extra also assumed to take their
   /// mapped values. Never changes the IR.

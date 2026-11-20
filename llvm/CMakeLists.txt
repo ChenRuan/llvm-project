@@ -676,12 +676,15 @@ set(EJIT_FINAL_MERGE_MAX_MEMBERS "8192" CACHE STRING
 set(EJIT_FINAL_MERGE_MAX_FALLBACKS "8192" CACHE STRING
   "Final-version merge: maximum pending fallback records")
 set(EJIT_FINAL_MERGE_MAX_ARTIFACT_BYTES "33554432" CACHE STRING
-  "Final-version merge: maximum bytes of retained bitcode")
+  "Final-version merge: maximum bytes of retained recipes and bitcode")
+set(EJIT_FINAL_MERGE_IR_CACHE_BYTES "1048576" CACHE STRING
+  "Final-version merge: optional hot IR within the retention budget (zero: always replay)")
 set(EJIT_FINAL_MERGE_MAX_EMISSION_ATTEMPTS "4096" CACHE STRING
   "Final-version merge: maximum lifetime emission attempts per driver")
 foreach(limit IN ITEMS EJIT_FINAL_MERGE_MAX_MEMBERS
                        EJIT_FINAL_MERGE_MAX_FALLBACKS
                        EJIT_FINAL_MERGE_MAX_ARTIFACT_BYTES
+                       EJIT_FINAL_MERGE_IR_CACHE_BYTES
                        EJIT_FINAL_MERGE_MAX_EMISSION_ATTEMPTS)
   ejit_require_numeric(${limit})
   if("${${limit}}" MATCHES "^0[0-9]" OR ${limit} GREATER 4294967295)

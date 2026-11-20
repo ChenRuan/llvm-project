@@ -5,6 +5,7 @@
 #include "llvm/Bitcode/BitcodeReader.h"
 #ifdef EJIT_SWITCH_CASE
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/ExecutionEngine/EJIT/EJitFinalReplay.h"
 #include "llvm/ExecutionEngine/EJIT/EJitVersionMerge.h"
 #endif
 #include "llvm/Config/Targets.h"
@@ -1035,15 +1036,13 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   return engine;
 }
 
-Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
-                                       const std::string &origFnName) {
-  EJIT_DIAG_VERBOSE("loadBitcode key=0x%016lx func=%s size=%zu", cacheKey,
-                    origFnName.c_str(), bitcodeData.size());
-  auto Ctx = std::make_unique<LLVMContext>();
+static Expected<std::unique_ptr<Module>>
+parseMemberSource(LLVMContext &Ctx, StringRef bitcodeData, uint64_t cacheKey,
+                  StringRef origFnName) {
   auto Buf = MemoryBuffer::getMemBuffer(
       bitcodeData, ("spec_" + std::to_string(cacheKey) + ".bc"),
       /*RequiresNullTerminator=*/false);
-  auto ModuleOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *Ctx);
+  auto ModuleOrErr = parseBitcodeFile(Buf->getMemBufferRef(), Ctx);
   if (!ModuleOrErr) {
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: parse bitcode error", cacheKey);
     return ModuleOrErr.takeError();
@@ -1083,6 +1082,62 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
   if (Function *EntryF = (*ModuleOrErr)->getFunction(origFnName))
     if (!EntryF->isDeclaration() && EntryF->hasLocalLinkage())
       EntryF->setLinkage(GlobalValue::ExternalLinkage);
+
+  return ModuleOrErr;
+}
+
+#ifdef EJIT_SWITCH_CASE
+Expected<std::string>
+EJitOrcEngine::rebuildFinalMember(StringRef Source, SpecializationContext &Ctx,
+                                  const EJitFinalReplay &Recipe) {
+  if (!Recipe.usable || Ctx.tier != CompileTier::PGOUse ||
+      !Ctx.boundPointers.empty() || Ctx.captureFolds ||
+      Ctx.preparedFinalMerge ||
+      EJitFinalReplay::digest(Source) != Recipe.sourceHash)
+    return make_error<StringError>("replay source mismatch",
+                                   inconvertibleErrorCode());
+  LLVMContext LC;
+  auto M = parseMemberSource(LC, Source, Ctx.cacheKey, Ctx.fnName);
+  if (!M)
+    return M.takeError();
+  if ((*M)->getDataLayout().isDefault())
+    (*M)->setDataLayout(P->J->getDataLayout());
+  if ((*M)->getDataLayout() != P->J->getDataLayout())
+    return make_error<StringError>("replay data layout mismatch",
+                                   inconvertibleErrorCode());
+  EJitFinalReplayCursor Cursor{Recipe};
+  Ctx.replayFolds = &Cursor;
+  Ctx.profileData = Recipe.profile;
+  Ctx.scalarValueSites = Recipe.scalars;
+  // IR only: never create or remove a member JITDylib, allocate executable
+  // memory, publish a member, read T1 counters, or re-enter compileCold.
+  P->optimizer->clearAnalyses();
+  P->optimizer->runPipeline(**M, Ctx);
+  Ctx.replayFolds = nullptr;
+  if (!Cursor.complete())
+    return make_error<StringError>("fold replay mismatch",
+                                   inconvertibleErrorCode());
+  if (auto E = validateFinalVersionModule(**M, Ctx.fnName))
+    return std::move(E);
+  std::string Bytes;
+  raw_string_ostream OS(Bytes);
+  WriteBitcodeToFile(**M, OS);
+  if (Bytes.size() > kEJitFinalMergeMaxMemberBytes ||
+      EJitFinalReplay::digest(Bytes) != Recipe.outputHash)
+    return make_error<StringError>("final IR digest mismatch",
+                                   inconvertibleErrorCode());
+  return Bytes;
+}
+#endif
+
+Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
+                                       const std::string &origFnName) {
+  EJIT_DIAG_VERBOSE("loadBitcode key=0x%016lx func=%s size=%zu", cacheKey,
+                    origFnName.c_str(), bitcodeData.size());
+  auto Ctx = std::make_unique<LLVMContext>();
+  auto ModuleOrErr = parseMemberSource(*Ctx, bitcodeData, cacheKey, origFnName);
+  if (!ModuleOrErr)
+    return ModuleOrErr.takeError();
 
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
   // Value-profile target capture (EJIT_VALUE_PROFILE.md §5.1): the Tier-1
