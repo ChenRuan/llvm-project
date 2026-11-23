@@ -15,9 +15,9 @@ struct Cfg3 {
   EJIT_PERIOD_CONST uint32_t kind;
 };
 
-ejit_group(p1) struct Cfg3 g_q1[4];
-ejit_group(p2) struct Cfg3 g_q2[4];
-ejit_group(p3) struct Cfg3 g_q3[4];
+EJIT_GROUP(p1) struct Cfg3 g_q1[4];
+EJIT_GROUP(p2) struct Cfg3 g_q2[4];
+EJIT_GROUP(p3) struct Cfg3 g_q3[4];
 
 void sentinel_smoke_set_3d(uint8_t i, uint32_t kind) {
   g_q1[i].kind = kind;
@@ -26,7 +26,7 @@ void sentinel_smoke_set_3d(uint8_t i, uint32_t kind) {
 }
 
 // 3-dim: all-on -> 7, all-off -> 0.
-ejit_entry __attribute__((noinline)) uint32_t
+EJIT_ENTRY __attribute__((noinline)) uint32_t
 guarded_3d(EJIT_DIM(p1) uint8_t i1,
            EJIT_DIM(p2) uint8_t i2,
            EJIT_DIM(p3) uint8_t i3) {

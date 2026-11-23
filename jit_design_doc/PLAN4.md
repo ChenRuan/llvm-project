@@ -133,7 +133,7 @@ clang/lib/CodeGen/CodeGenModule.cpp
 │  └──────────────────────────────────────────────────────────────────┘   │
 │                                   ↓                                      │
 │  ┌──────────────────────────────────────────────────────────────────┐   │
-│  │ 用户调用 ejit_entry 函数                                          │   │
+│  │ 用户调用 EJIT_ENTRY 函数                                          │   │
 │  │ - 实际执行 Wrapper 插桩代码                                        │   │
 │  │ - 查询 taskpool Cache (封装在 ejit_taskpool_compile_or_get 内部)   │   │
 │  │ - 命中 → 直接调用特化函数                                          │   │
@@ -180,7 +180,7 @@ process_task_multi(idx, iter);  →  Wrapper 构建 dims
 
 - Cache 查询封装在 `ejit_taskpool_compile_or_get` 内部，调用者不感知缓存逻辑
 - 根据 **funcIdx（FNV-1a hash）** + **ejit_dim 参数值** 构建 Cache key
-- **常量读取时机**：JIT 编译时按需读取 `ejit_period_const` 字段值，从进程内存直接读取
+- **常量读取时机**：JIT 编译时按需读取 `EJIT_PERIOD_CONST` 字段值，从进程内存直接读取
 - 用户调用原函数名，实际执行 Wrapper 插桩代码
 
 ---
@@ -280,10 +280,10 @@ struct PeriodInstance {
 
 | 时间窗类型  | 标记                      | 激活方式                           | 说明         |
 | ------ | ----------------------- | ------------------------------ | ---------- |
-| static | `ejit_group(static)`   | 永远激活                           | 运行期不变的全局变量 |
-| 数组     | `ejit_group(name)` | `ejit_activate(name, cellIdx)` | 独立控制的数组实例  |
+| static | `EJIT_GROUP(static)`   | 永远激活                           | 运行期不变的全局变量 |
+| 数组     | `EJIT_GROUP(name)` | `ejit_activate(name, cellIdx)` | 独立控制的数组实例  |
 
-注：自定义 `ejit_group(name)` 标量变量为未来扩展，当前版本不支持。参见 SPEC4.md §2.2.1。
+注：自定义 `EJIT_GROUP(name)` 标量变量为未来扩展，当前版本不支持。参见 SPEC4.md §2.2.1。
 
 **激活流程**:
 
@@ -371,11 +371,11 @@ uint64_t buildCacheKey(uint32_t funcIdx,
 
 ### 3.2.1 运行时 Wrapper 调用模型
 
-根据 SPEC4.md §4.1，Wrapper 由 AOT 编译时生成，每个 `ejit_entry` 函数有独立的 Wrapper 插桩代码。
+根据 SPEC4.md §4.1，Wrapper 由 AOT 编译时生成，每个 `EJIT_ENTRY` 函数有独立的 Wrapper 插桩代码。
 
 **Wrapper 生成方式**：
 
-- `EJitWrapperGenPass` 在 AOT 编译时为每个 `ejit_entry` 函数生成独立的 Wrapper
+- `EJitWrapperGenPass` 在 AOT 编译时为每个 `EJIT_ENTRY` 函数生成独立的 Wrapper
 - Wrapper 包含 Cache 查询和 `ejit_taskpool_compile_or_get()` 调用逻辑
 - 用户直接调用原函数名，实际执行的是 Wrapper 代码
 - `PFN_xxx` 是 Pass 生成的函数指针 typedef，签名与原函数一致，用于类型安全地转换 `ejit_taskpool_compile_or_get` 通过 `outFn` 返回的 `void*`
@@ -450,7 +450,7 @@ void process_static_data(void) {
 | 项目         | 说明                                        |
 | ---------- | ----------------------------------------- |
 | Wrapper 生成 | AOT 编译时由 `EJitWrapperGenPass` 生成，单函数混合方案  |
-| Wrapper 数量 | 每个 `ejit_entry` 函数只有一个函数                  |
+| Wrapper 数量 | 每个 `EJIT_ENTRY` 函数只有一个函数                  |
 | 参数传递       | Wrapper 从 per-lifecycle globals 加载 dimType，构造 [{dimType,instanceId}] 对，mem2reg 优化为零栈分配 |
 | 用户调用       | 直接调用原函数名，实际执行 wrapper + 原函数逻辑             |
 | Fallback   | 单函数混合方案：JIT 失败时继续执行原函数逻辑，无需单独 fallback 函数 |
@@ -500,19 +500,19 @@ struct EjitFuncMeta {
 
 | 属性                          | 标记位置  | 说明               |
 | --------------------------- | ----- | ---------------- |
-| `ejit_period_const`            | 结构体成员 | 时间窗内可视为常量的成员     |
-| `ejit_group(static)`       | 全局变量  | 运行期不变的全局变量       |
-| `ejit_group(name)`     | 全局数组  | 按索引独立控制的时间窗数组    |
-| `ejit_entry`                | 函数    | JIT 优化入口函数       |
+| `EJIT_PERIOD_CONST`            | 结构体成员 | 时间窗内可视为常量的成员     |
+| `EJIT_GROUP(static)`       | 全局变量  | 运行期不变的全局变量       |
+| `EJIT_GROUP(name)`     | 全局数组  | 按索引独立控制的时间窗数组    |
+| `EJIT_ENTRY`                | 函数    | JIT 优化入口函数       |
 | `ejit_dim(name)` | 函数参数  | 特化维度参数，关联对应时间窗数组 |
-| `ejit_guard(name)`      | 函数    | 时间窗生命周期管理函数      |
+| `EJIT_GUARD(name)`      | 函数    | 时间窗生命周期管理函数      |
 
-### 3.5 ejit_period_const 识别模型
+### 3.5 EJIT_PERIOD_CONST 识别模型
 
-`ejit_period_const` 通过 `load` 指令上的 metadata 标注识别（仿造 `volatile` 的传参链，但用 metadata 而非 instruction bit）：
+`EJIT_PERIOD_CONST` 通过 `load` 指令上的 metadata 标注识别（仿造 `volatile` 的传参链，但用 metadata 而非 instruction bit）：
 
 ```llvm
-; Clang CodeGen 为 ejit_period_const 字段的 load 标注 !ejit.period_const
+; Clang CodeGen 为 EJIT_PERIOD_CONST 字段的 load 标注 !ejit.period_const
 %v = load i32, ptr %field, !ejit.period_const !{}
 ```
 
@@ -593,14 +593,14 @@ JIT Pipeline (ejit_taskpool_compile_or_get 内部执行):
 
 | Pass 名称               | 类型          | 职责                                           |
 | --------------------- | ----------- | -------------------------------------------- |
-| `EJitRegisterBitcode` | Module Pass | 提取 ejit_entry 函数 bitcode，运行 AOT 预优化（Inline+Mem2Reg+EarlyCSE+InstCombine+SimplifyCFG），随后 `reAnnotatePeriodConst` 依据 GV 级 `ejit_period_const_field` 偏移列表重新标注被预优化丢弃的 per-load `!ejit.period_const`（配合 PASS6 的 GV 偏移回退，见 §3.5），自动注册外部符号。注：预优化仅在 Release(NDEBUG) 构建启用 |
+| `EJitRegisterBitcode` | Module Pass | 提取 EJIT_ENTRY 函数 bitcode，运行 AOT 预优化（Inline+Mem2Reg+EarlyCSE+InstCombine+SimplifyCFG），随后 `reAnnotatePeriodConst` 依据 GV 级 `ejit_period_const_field` 偏移列表重新标注被预优化丢弃的 per-load `!ejit.period_const`（配合 PASS6 的 GV 偏移回退，见 §3.5），自动注册外部符号。注：预优化仅在 Release(NDEBUG) 构建启用 |
 
 **PASS2-4 — AOT (非LTO: 优化前; LTO: 优化后)**:
 
 | Pass 名称               | 类型          | 职责                                           |
 | --------------------- | ----------- | -------------------------------------------- |
 | `EJitRegisterPeriod`  | Module Pass | 生成 period 数组/static 变量注册代码 (已移除 layout 注册) |
-| `EJitWrapperGen`      | Module Pass | 为 ejit_entry 函数生成 Wrapper 插桩代码               |
+| `EJitWrapperGen`      | Module Pass | 为 EJIT_ENTRY 函数生成 Wrapper 插桩代码               |
 | `EJitPeriodHandler`   | Module Pass | 为 ejit_guard 函数插入 deactivate/activate 调用 |
 | `EJitAotModulePass`   | Module Pass | 协调上述 3 个子 Pass，按序执行                          |
 
@@ -611,10 +611,10 @@ JIT Pipeline (ejit_taskpool_compile_or_get 内部执行):
 | 1   | 参数预处理 (非 Pass)        | `replaceAllUsesWith` 替换 ejit_dim 参数为实际值     |
 | 2   | InstCombine           | 折叠 `zext`/GEP 常量链，消除 PHI 节点                            |
 | 3   | Inline                | 内联被调用函数，使 PASS6 可追溯到全局变量的 GEP 链                       |
-| 4   | `EJitStructFieldPass` | 替换 ejit_period_const 字段 load 为运行时常量                       |
+| 4   | `EJitStructFieldPass` | 替换 EJIT_PERIOD_CONST 字段 load 为运行时常量                       |
 | 5   | 标准 LLVM Pass 编排       | 按 L1/L2/L3 等级运行 SCCP、DCE、CFGSimplify、LoopUnroll         |
 
-> **为什么 Inline 在 PASS6 之前**: 被调用函数内部的 `ejit_period_const` load 的指针操作数是函数参数而非全局变量，PASS6 无法直接追溯到根 GV。Inline 后 GEP 链展开为 `@g_cellCfg → GEP 0, constIdx → ...`，可被 PASS6 正常处理。
+> **为什么 Inline 在 PASS6 之前**: 被调用函数内部的 `EJIT_PERIOD_CONST` load 的指针操作数是函数参数而非全局变量，PASS6 无法直接追溯到根 GV。Inline 后 GEP 链展开为 `@g_cellCfg → GEP 0, constIdx → ...`，可被 PASS6 正常处理。
 
 > **为什么 InstCombine 在 PASS6 之前**: 参数替换 (`replaceAllUsesWith(ConstantInt)`) 后，`zext i8 3 to i64` 等指令仍是变量形式。InstCombine 将它们折叠为常量，使 `accumulateConstantOffset` 计算可靠。
 
@@ -950,7 +950,7 @@ class SpecializationContext;
 
 // ===== 早期 AOT Pipeline (标准优化之前) =====
 
-// EJitRegisterBitcodePass - 在标准优化前提取 ejit_entry 函数 bitcode
+// EJitRegisterBitcodePass - 在标准优化前提取 EJIT_ENTRY 函数 bitcode
 // 作为独立早期 Pass 注册，不包含在 EJitAotModulePass 内
 class EJitRegisterBitcodePass : public PassInfoMixin<EJitRegisterBitcodePass> {
 public:
@@ -969,7 +969,7 @@ public:
     static StringRef name() { return "ejit-register-group"; }
 };
 
-// 2. EJitWrapperGenPass - 为 ejit_entry 函数生成 Wrapper 插桩代码
+// 2. EJitWrapperGenPass - 为 EJIT_ENTRY 函数生成 Wrapper 插桩代码
 class EJitWrapperGenPass : public PassInfoMixin<EJitWrapperGenPass> {
 public:
     PreservedAnalyses run(Module& M, ModuleAnalysisManager& AM);
@@ -1032,7 +1032,7 @@ private:
    e. 替换: loadInst->replaceAllUsesWith(constant)
    f. 删除: loadInst->eraseFromParent()
 
-输出: 所有 ejit_period_const 字段的 load 被替换为运行时常量值
+输出: 所有 EJIT_PERIOD_CONST 字段的 load 被替换为运行时常量值
 ```
 
 **Pass 执行顺序** (对应 §3.6):
@@ -1041,14 +1041,14 @@ private:
 
 | 顺序  | Pass                      | 说明                                           |
 | --- | ------------------------- | -------------------------------------------- |
-| 1   | `EJitRegisterBitcodePass` | 在标准优化前提取 ejit_entry 函数 bitcode，确保 metadata 完整 |
+| 1   | `EJitRegisterBitcodePass` | 在标准优化前提取 EJIT_ENTRY 函数 bitcode，确保 metadata 完整 |
 
 **PASS2-4 — AOT** (非LTO: 标准优化之前; LTO: 标准优化之后):
 
 | 顺序  | Pass                      | 说明                                           |
 | --- | ------------------------- | -------------------------------------------- |
 | 1   | `EJitRegisterGroupPass`  | 生成 period 数组/static 变量注册代码                    |
-| 2   | `EJitWrapperGenPass`      | 为 ejit_entry 函数生成 Wrapper 插桩代码               |
+| 2   | `EJitWrapperGenPass`      | 为 EJIT_ENTRY 函数生成 Wrapper 插桩代码               |
 | 3   | `EJitGuardHandlerPass`   | 为 ejit_guard 函数插入 deactivate/activate 调用 |
 
 **JIT Pipeline**:
@@ -1058,7 +1058,7 @@ private:
 | 1   | 参数预处理                 | 替换 ejit_dim 参数为实际值 (非 Pass)                 |
 | 2   | InstCombine           | 折叠 zext/GEP 常量链，清理 PHI 节点                             |
 | 3   | Inline                | 内联被调用函数，展开跨函数 GEP 链                                    |
-| 4   | `EJitStructFieldPass` | 替换 ejit_period_const 字段 load 为运行时常量                       |
+| 4   | `EJitStructFieldPass` | 替换 EJIT_PERIOD_CONST 字段 load 为运行时常量                       |
 | 5   | 标准 LLVM 优化            | 按 L1/L2/L3 等级运行 SCCP、DCE、CFGSimplify、LoopUnroll         |
 
 ### 4.4 Clang 属性接口
@@ -1070,7 +1070,7 @@ private:
 ```cpp
 // include/clang/Basic/Attr.td - Attribute definitions (伪代码)
 
-// 1. ejit_period_const - 结构体成员属性
+// 1. EJIT_PERIOD_CONST - 结构体成员属性
 class EjitPeriodConst : InheritableAttr {
     string Spellings = [Clang<"ejit_period_const">];
     string Subjects = [SubjectList<"FieldDecl", Error>];
@@ -1117,7 +1117,7 @@ class EjitPeriodIdx : InheritableAttr {
     string DocComment = "标记 JIT 特化维度参数，关联对应时间窗数组";
 };
 
-// 5. ejit_entry - JIT 优化入口函数标记
+// 5. EJIT_ENTRY - JIT 优化入口函数标记
 class EjitEntry : InheritableAttr {
     string Spellings = [Clang<"ejit_entry">];
     string Subjects = [SubjectList<"FunctionDecl", Error>];
@@ -1153,7 +1153,7 @@ namespace clang::sema {
 
 class EJitAttributeHandler {
 public:
-    // 处理 ejit_period_const
+    // 处理 EJIT_PERIOD_CONST
     void HandleEjitPeriodConst(Decl* D, const ParsedAttr& AL) {
         // 1. 检查是否标记在 FieldDecl 上
         // 2. 检查类型：仅支持整型、布尔型、浮点型、嵌套结构体
@@ -1184,7 +1184,7 @@ public:
         // 4. 验证该时间窗数组已定义
     }
 
-    // 处理 ejit_entry
+    // 处理 EJIT_ENTRY
     void HandleEjitEntry(Decl* D, const ParsedAttr& AL) {
         // 1. 检查是否标记在 FunctionDecl 上
         // 2. 检查递归调用
@@ -1213,7 +1213,7 @@ namespace clang::cg {
 
 class CodeGenEJIT {
 public:
-    // 生成 ejit_period_const metadata
+    // 生成 EJIT_PERIOD_CONST metadata
     void emitPeriodConstMetadata(llvm::Module& M, const FieldDecl* FD) {
         // 生成类似：!ejit.period_const = !{!{i32 偏移，字符串 "fieldName"}}
     }
@@ -1233,7 +1233,7 @@ public:
         // 生成类似：!ejit.period_idx = !{!{字符串 "funcName", i32 参数索引，字符串 "periodName"}}
     }
 
-    // 生成 ejit_entry metadata
+    // 生成 EJIT_ENTRY metadata
     void emitEntryMetadata(llvm::Module& M, const FunctionDecl* FD) {
         // 生成类似：!ejit.entry = !{!{字符串 "funcName", !bitcode_ref}}
     }
@@ -1253,27 +1253,27 @@ public:
 
 | 属性                          | 可标记位置         | 类型约束           | 特殊规则                                     |
 | --------------------------- | ------------- | -------------- | ---------------------------------------- |
-| `ejit_period_const`            | FieldDecl     | 整型、布尔、浮点、嵌套结构体 | volatile 不视为常量                           |
-| `ejit_group(static)`       | VarDecl (非数组) | 任意结构体/基本类型     | static 时间窗永远激活                           |
-| `ejit_group(name)`     | VarDecl (数组)  | 数组类型           | 数组大小固定且 < 100                            |
+| `EJIT_PERIOD_CONST`            | FieldDecl     | 整型、布尔、浮点、嵌套结构体 | volatile 不视为常量                           |
+| `EJIT_GROUP(static)`       | VarDecl (非数组) | 任意结构体/基本类型     | static 时间窗永远激活                           |
+| `EJIT_GROUP(name)`     | VarDecl (数组)  | 数组类型           | 数组大小固定且 < 100                            |
 | `ejit_dim(name)` | ParmVarDecl   | 整数类型           | 最多 4 个参数，需验证 name 对应已定义的 ejit_group |
-| `ejit_entry`                | FunctionDecl  | 函数             | 不支持递归                                    |
-| `ejit_guard(name)`      | FunctionDecl  | 函数             | 必须有对应的 ejit_dim 参数            |
+| `EJIT_ENTRY`                | FunctionDecl  | 函数             | 不支持递归                                    |
+| `EJIT_GUARD(name)`      | FunctionDecl  | 函数             | 必须有对应的 ejit_dim 参数            |
 
 ### 防呆设计实现方案 (对应 SPEC3 §9)
 
 | 检查项 | 级别 | 实现位置 | 说明 |
 |--------|------|---------|------|
 | 全局变量归属冲突 | 错误 (阻止编译) | Clang Sema (`SemaEJIT.cpp`) | 同一 VarDecl 被多个 `ejit_group`/`ejit_group` 标记时报错 |
-| 时间窗修改点检测 | 警告 | Clang Sema (`SemaEJIT.cpp`) | 修改 `ejit_period_const` 字段但所在函数未标记 `ejit_guard` 时发出警告 |
+| 时间窗修改点检测 | 警告 | Clang Sema (`SemaEJIT.cpp`) | 修改 `EJIT_PERIOD_CONST` 字段但所在函数未标记 `ejit_guard` 时发出警告 |
 | 生命周期调用链检测 | 暂不支持 | — | SPEC3 §9.3 明确标注暂不支持 |
-| 元数据一致性检测 | 警告 | LLVM Pass (`EJitAotModulePass` 末尾) | 检查 `ejit_entry` 函数实际引用的全局变量是否与其声明的 `ejit_dim` 一致 |
+| 元数据一致性检测 | 警告 | LLVM Pass (`EJitAotModulePass` 末尾) | 检查 `EJIT_ENTRY` 函数实际引用的全局变量是否与其声明的 `ejit_dim` 一致 |
 
 **实现要点**:
 
 1. **归属冲突**: 在 `HandleEjitPeriod` / `HandleEjitPeriodArr` 中维护已注册变量表，重复注册时报错
-2. **修改点检测**: 在 AST 遍历中识别对 `ejit_period_const` 字段的写操作，检查所在函数是否标记了 `ejit_guard`
-3. **元数据一致性**: Pass 阶段分析 `ejit_entry` 函数的 IR，收集实际引用的 `@global_var`，与 metadata 中声明的依赖做交叉校验
+2. **修改点检测**: 在 AST 遍历中识别对 `EJIT_PERIOD_CONST` 字段的写操作，检查所在函数是否标记了 `ejit_guard`
+3. **元数据一致性**: Pass 阶段分析 `EJIT_ENTRY` 函数的 IR，收集实际引用的 `@global_var`，与 metadata 中声明的依赖做交叉校验
 
 ---
 
@@ -1315,7 +1315,7 @@ public:
 | 周次  | 任务                                                   | 交付物                   | 复用/新增      |
 | --- | ---------------------------------------------------- | --------------------- | ---------- |
 | 8   | Bitcode 加载器实现，按需加载                                   | EJitModuleLoader.cpp  | **新增** |
-| 9   | EJitWrapperGenPass 实现 (为 ejit_entry 生成 Wrapper)      | WrapperGenPass.cpp    | **新增**     |
+| 9   | EJitWrapperGenPass 实现 (为 EJIT_ENTRY 生成 Wrapper)      | WrapperGenPass.cpp    | **新增**     |
 | 10  | EJitGuardHandlerPass 实现 (插入 activate/deactivate 调用) | PeriodHandlerPass.cpp | **新增**     |
 | 11  | EJitRegisterBitcodePass + EJitRegisterGroupPass 实现  | RegisterPasses.cpp    | **新增** |
 | 12  | EJitStructFieldPass 实现 (g_pdc[idx].field 替换为常量)      | StructFieldPass.cpp   | **新增**     |

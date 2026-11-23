@@ -11,7 +11,7 @@ struct SlotConfig {
 struct CellConfig {
   struct SlotConfig slots[10];
 };
-ejit_group(cell) struct CellConfig *automatic_cells;
+EJIT_GROUP(cell) struct CellConfig *automatic_cells;
 
 // A synthetic allocator record. A board adapter would query its common
 // allocator's records here, without knowing any period-global names.
@@ -26,8 +26,8 @@ static uint64_t allocation_size(const void *base, void *context) {
   return base == allocation_base ? allocation_bytes : 0;
 }
 
-ejit_entry unsigned probe_automatic(EJIT_DIM(cell) unsigned char cell,
-                                    ejit_free_dim unsigned short slot) {
+EJIT_ENTRY unsigned probe_automatic(EJIT_DIM(cell) unsigned char cell,
+                                    EJIT_FREE_DIM unsigned short slot) {
   struct SlotConfig *selected = &automatic_cells[cell].slots[slot % 10];
   ++selected->live;
   return selected->enabled ? 11 : 7;

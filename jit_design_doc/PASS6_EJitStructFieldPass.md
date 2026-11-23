@@ -14,13 +14,13 @@
 >
 > **v1.3 变更**: JIT Pipeline 重排，Inline 移到本 Pass 之前。新增直接 GlobalVariable load（无 GEP）。
 >
-> **v1.2 变更**: `ejit_period_const` 识别从 byte offset + LayoutRegistry 匹配改为 `load` 指令上的 `!ejit.period_const` metadata 标注。
+> **v1.2 变更**: `EJIT_PERIOD_CONST` 识别从 byte offset + LayoutRegistry 匹配改为 `load` 指令上的 `!ejit.period_const` metadata 标注。
 
 ---
 
 ## 1. 概述
 
-EJitStructFieldPass 是 JIT 编译 Pipeline 中的核心特化 Pass。它在 JIT 编译时运行，负责扫描加载的 Bitcode Module 中所有 Load 指令，识别访问 `ejit_period_const` 字段的模式，从进程内存中读取运行时实际值，并将 Load 指令替换为编译期常量。从而启用后续的常量传播、死代码消除和分支折叠等优化。
+EJitStructFieldPass 是 JIT 编译 Pipeline 中的核心特化 Pass。它在 JIT 编译时运行，负责扫描加载的 Bitcode Module 中所有 Load 指令，识别访问 `EJIT_PERIOD_CONST` 字段的模式，从进程内存中读取运行时实际值，并将 Load 指令替换为编译期常量。从而启用后续的常量传播、死代码消除和分支折叠等优化。
 
 ### 1.1 核心职责
 
@@ -31,7 +31,7 @@ EJitStructFieldPass 是 JIT 编译 Pipeline 中的核心特化 Pass。它在 JIT
 - 将 Load 指令替换为 LLVM Constant 值
 - 删除已替换的死指令
 
-> **v1.2 设计变更**: `ejit_period_const` 识别不再通过 offset + LayoutRegistry 匹配。改为由 Clang CodeGen 在 `load` 指令上直接标注 `!ejit.period_const` metadata（仿造 `volatile` 的传参链，但用 metadata 而非 instruction bit）。LayoutRegistry 已废弃。
+> **v1.2 设计变更**: `EJIT_PERIOD_CONST` 识别不再通过 offset + LayoutRegistry 匹配。改为由 Clang CodeGen 在 `load` 指令上直接标注 `!ejit.period_const` metadata（仿造 `volatile` 的传参链，但用 metadata 而非 instruction bit）。LayoutRegistry 已废弃。
 
 ### 1.2 前置条件
 
@@ -44,7 +44,7 @@ EJitStructFieldPass 是 JIT 编译 Pipeline 中的核心特化 Pass。它在 JIT
 | SpecializationContext 可用 | 包含当前的 periodName → cellIdx 映射 |
 | 时间窗状态为 Active | 若未激活则不执行特化（调用方提前检查） |
 
-> **v1.3**: 新增 InstCombine + Inline 前置条件。Inline 在 PASS6 之前运行，确保被调用函数内部的 `ejit_period_const` load 已在入口函数体内展开，GEP 链可直接追溯到全局变量。
+> **v1.3**: 新增 InstCombine + Inline 前置条件。Inline 在 PASS6 之前运行，确保被调用函数内部的 `EJIT_PERIOD_CONST` load 已在入口函数体内展开，GEP 链可直接追溯到全局变量。
 >
 > **v1.2**: `LayoutRegistry` 已移除。period_const 识别通过 `load->hasMetadata("ejit.period_const")` 完成，无需 LayoutRegistry。
 
@@ -54,15 +54,15 @@ EJitStructFieldPass 是 JIT 编译 Pipeline 中的核心特化 Pass。它在 JIT
 
 ### 2.0 `!ejit.period_const` Load Metadata（v1.2 新增）
 
-`ejit_period_const` 标注在 `load` 指令上，而非放在命名 metadata 中通过 offset 间接匹配：
+`EJIT_PERIOD_CONST` 标注在 `load` 指令上，而非放在命名 metadata 中通过 offset 间接匹配：
 
 ```llvm
-; Clang CodeGen 生成: ejit_period_const 字段的 load 携带 metadata
+; Clang CodeGen 生成: EJIT_PERIOD_CONST 字段的 load 携带 metadata
 @g_boardCfg = dso_local global %struct.BoardConfig zeroinitializer
 
 define void @jit_entry() {
   %field = getelementptr %struct.BoardConfig, ptr @g_boardCfg, i32 0, i32 0
-  ; ejit_period_const 字段 boardType → load 标注 !ejit.period_const
+  ; EJIT_PERIOD_CONST 字段 boardType → load 标注 !ejit.period_const
   %val = load i32, ptr %field, !ejit.period_const !{}   ; ← 目标
 }
 ```
@@ -83,7 +83,7 @@ define void @jit_entry() {
 ### 2.1 基本识别模式
 
 ```llvm
-; 模式 1: 标量 ejit_group(static) 全局变量字段访问 (通过 GEP)
+; 模式 1: 标量 EJIT_GROUP(static) 全局变量字段访问 (通过 GEP)
 @g_boardCfg = dso_local global %struct.BoardConfig zeroinitializer
 
 define void @jit_entry() {
@@ -93,8 +93,8 @@ define void @jit_entry() {
   %val = load i32, ptr %field, !ejit.period_const !{}     ; ← 目标: 替换为运行时常量
 }
 
-; 模式 1b: 标量 ejit_group(static) 直接 load (无 GEP, v1.3 新增)
-@g_simple_flag = dso_local global i32 0  ; ejit_group(static)
+; 模式 1b: 标量 EJIT_GROUP(static) 直接 load (无 GEP, v1.3 新增)
+@g_simple_flag = dso_local global i32 0  ; EJIT_GROUP(static)
 ; !ejit.metadata = !{!"ejit_group", !"static"}
 
 define void @jit_entry() {
@@ -140,8 +140,8 @@ define void @jit_entry(i32 %cellIdx) {
 
 ; 模式 5: 指针全局变量间接访问 (v1.5 新增)
 ; C 源码:
-;   ejit_group(static) struct BoardConfig* g_pBoardCfg;
-;   ... = g_pBoardCfg->boardType;  // boardType 是 ejit_period_const
+;   EJIT_GROUP(static) struct BoardConfig* g_pBoardCfg;
+;   ... = g_pBoardCfg->boardType;  // boardType 是 EJIT_PERIOD_CONST
 @g_pBoardCfg = dso_local global ptr null  ; 存的是指针值
 
 define void @jit_entry() {
@@ -152,7 +152,7 @@ define void @jit_entry() {
 ; 处理: *(void**)&g_pBoardCfg → 得到 &BoardConfig → + offsetof(boardType) → 常量
 
 ; 模式 5b: 指针数组 (v1.5 新增)
-;   ejit_group(cell) struct CellConfig* g_cellPtrs[N];
+;   EJIT_GROUP(cell) struct CellConfig* g_cellPtrs[N];
 ;   ... = g_cellPtrs[cellIndex]->cellType;
 @g_cellPtrs = dso_local global [16 x ptr] zeroinitializer
 
@@ -212,7 +212,7 @@ GEP 指令的模式提供了完整的信息用于替换：
 
 ```
 输入: Module M (bitcode), PeriodArrayRegistry, SpecializationContext
-输出: Module M (ejit_period_const Load 替换为常量)
+输出: Module M (EJIT_PERIOD_CONST Load 替换为常量)
 
 步骤:
 1. BuildGVPeriodMap(M) → 构建全局变量 → periodName 映射
@@ -378,7 +378,7 @@ bool analyzeGEPChain(GlobalVariable* GV, GEPOperator* GEP,
 ### 3.4 指针间接访问解析 (resolveIndirectLoad) — v1.5 新增
 
 ```cpp
-// v1.5: 处理通过指针全局变量间接访问 ejit_period_const 字段
+// v1.5: 处理通过指针全局变量间接访问 EJIT_PERIOD_CONST 字段
 // IR 模式: %ptr = load ptr, ptr @g_pCfg / @g_ptrArr[idx]
 //           %field = GEP %S, ptr %ptr, ...
 //           %val = load, !ejit.period_const
@@ -421,7 +421,7 @@ bool resolveIndirectLoad(LoadInst* PtrLoad, GEPOperator* FieldGEP,
 }
 ```
 
-**为什么只有一层间接**: SPEC 约束 `ejit_group` 只标记一级指针。`ejit_period_const` 不支持指针字段。不存在 `g_pCfg->pInner->field` 这样的多层间接。
+**为什么只有一层间接**: SPEC 约束 `ejit_group` 只标记一级指针。`EJIT_PERIOD_CONST` 不支持指针字段。不存在 `g_pCfg->pInner->field` 这样的多层间接。
 
 **GEPAnalysis 扩展** (v1.5):
 
@@ -604,7 +604,7 @@ define void @process_task(i32 %cellIdx) {
 
 ```llvm
 ; 场景 1: 非 period_const 字段 → 保留原 load
-; CellConfig.xx 不是 ejit_period_const
+; CellConfig.xx 不是 EJIT_PERIOD_CONST
 %field = getelementptr %struct.CellConfig, ptr %elem, i32 0, i32 1
 %val = load i32, ptr %field          ; ← 保留不变 (不是 period_const)
 
@@ -644,7 +644,7 @@ struct GVPeriodMap {
     struct Info {
         std::string periodName;
         bool isArray;             // true = ejit_group
-        bool isStatic;            // true = ejit_group(static)
+        bool isStatic;            // true = EJIT_GROUP(static)
         StructType* elementType;
         size_t arraySize;
     };
@@ -716,7 +716,7 @@ EJitStructFieldPass 本身不受优化等级影响 — 常量替换是基础操�
 ```
 方式: 直接从进程内存读取 (memcpy / dereference)
 耗时: 纳秒级 (L1 cache hit)
-频率: 每个 ejit_period_const 字段一次读取
+频率: 每个 EJIT_PERIOD_CONST 字段一次读取
 总计: 通常 < 10 个字段 / 函数 → < 100ns
 ```
 
@@ -794,7 +794,7 @@ EJitStructFieldPass 本身不受优化等级影响 — 常量替换是基础操�
 ### 9.2 集成测试
 
 ```
-1. 编译 C 源文件 (含 ejit_entry + ejit_group + ejit_period_const)
+1. 编译 C 源文件 (含 EJIT_ENTRY + ejit_group + EJIT_PERIOD_CONST)
 2. AOT 编译 + bitcode 嵌入
 3. 运行时: ejit_init → ejit_activate → 调用函数
 4. 触发 JIT 编译 (含本 Pass)
@@ -823,7 +823,7 @@ EJitStructFieldPass 本身不受优化等级影响 — 常量替换是基础操�
 
 7. **内存屏障**: 读取进程内存中的全局变量值时，在 JIT 线程中通常不需要内存屏障（因 activate/deactivate 的同步已由 runtime 保证）。但如果是在异步编译模式下，需确保读取到最新值。
 
-8. **递归结构体**: 若结构体中包含自身类型的指针 (`struct Node { Node* next; }`)，不会标记 ejit_period_const 在指针字段上，Pass 无需处理。
+8. **递归结构体**: 若结构体中包含自身类型的指针 (`struct Node { Node* next; }`)，不会标记 EJIT_PERIOD_CONST 在指针字段上，Pass 无需处理。
 
 9. **ABI 兼容**: `accumulateConstantOffset` 使用 DataLayout 计算偏移，与 AOT 编译时的布局一致。确保 JIT 编译时使用的 DataLayout 与 AOT 相同。
 

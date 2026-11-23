@@ -37,17 +37,17 @@ struct CellCfg {
   uint32_t trafficLoad;
 };
 
-ejit_group(static) uint32_t g_sysVer;
+EJIT_GROUP(static) uint32_t g_sysVer;
 
 #define N_CELL 8
-ejit_group(cell) struct CellCfg g_cellCfg[N_CELL];
+EJIT_GROUP(cell) struct CellCfg g_cellCfg[N_CELL];
 
 //===-- 场景 A: 分支折叠验证 ------------------------------------------------===//
 // 调用: process_cell_a(cellIdx)
 // 验证: g_cellCfg[cellIdx].cellType 被常量替换后分支正确折叠
 //       trafficLoad 的变化 = (cellType==特定值 ? 100 : 200)
 
-ejit_entry
+EJIT_ENTRY
 void process_cell_a(
     EJIT_DIM(cell) uint8_t cellIdx)
 {
@@ -66,12 +66,12 @@ struct TrpCfg {
 };
 
 #define M_TRP 8
-ejit_group(trp) struct TrpCfg g_trpCfg[M_TRP];
+EJIT_GROUP(trp) struct TrpCfg g_trpCfg[M_TRP];
 
 // 调用: process_cell_trp(cellIdx, trpIdx)
 // 验证: 两个 period_const 字段都被替换，复合条件被折叠
 
-ejit_entry
+EJIT_ENTRY
 uint32_t process_cell_trp(
     EJIT_DIM(cell) uint8_t cellIdx,
     EJIT_DIM(trp)  uint8_t trpIdx)
@@ -104,12 +104,12 @@ struct OuterCfg {
 };
 
 #define N_OUTER 4
-ejit_group(outer) struct OuterCfg g_outerCfg[N_OUTER];
+EJIT_GROUP(outer) struct OuterCfg g_outerCfg[N_OUTER];
 
 // 调用: process_outer(cellIdx)
 // 验证: 外层和内层 period_const 字段都能被正确替换
 
-ejit_entry
+EJIT_ENTRY
 uint32_t process_outer(
     EJIT_DIM(outer) uint8_t idx)
 {

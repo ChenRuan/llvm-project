@@ -2,8 +2,8 @@
  * EJIT __builtin_expect (MC_LIKELY) 回归测试
  *
  * 背景:
- *   业务在 ejit_entry 函数中使用 #define MC_LIKELY(x) (__builtin_expect((!!(x)),1)),
- *   编译器在 lower-expect pass 崩溃。根因是 PASS3 (EJitWrapperGen) 重写 ejit_entry
+ *   业务在 EJIT_ENTRY 函数中使用 #define MC_LIKELY(x) (__builtin_expect((!!(x)),1)),
+ *   编译器在 lower-expect pass 崩溃。根因是 PASS3 (EJitWrapperGen) 重写 EJIT_ENTRY
  *   入口块时, replaceAllUsesWith 无法更新 PHI incoming block (它不在 BasicBlock 的
  *   use list 里), erase 原入口块后 PHI incoming 变悬空指针, lower-expect 的
  *   handlePhiDef 解引用崩溃。
@@ -42,12 +42,12 @@ struct CellCfg {
 };
 
 #define N_CELL 16
-ejit_group(cell) struct CellCfg g_cellCfg[N_CELL];
+EJIT_GROUP(cell) struct CellCfg g_cellCfg[N_CELL];
 
-//===-- ejit_entry 函数 (均使用 __builtin_expect) -------------------------===//
+//===-- EJIT_ENTRY 函数 (均使用 __builtin_expect) -------------------------===//
 
 // 1. 短路 && — bug 最小复现: merge block 的 PHI incoming 含入口块
-ejit_entry
+EJIT_ENTRY
 uint32_t likely_and(
     EJIT_DIM(cell) uint8_t cellIdx)
 {
@@ -58,7 +58,7 @@ uint32_t likely_and(
 }
 
 // 2. 短路 || — 同样产生 merge PHI
-ejit_entry
+EJIT_ENTRY
 uint32_t likely_or(
     EJIT_DIM(cell) uint8_t cellIdx)
 {
@@ -69,7 +69,7 @@ uint32_t likely_or(
 }
 
 // 3. MC_UNLIKELY — expect 的第二参数为 0
-ejit_entry
+EJIT_ENTRY
 uint32_t unlikely_branch(
     EJIT_DIM(cell) uint8_t cellIdx)
 {
@@ -79,7 +79,7 @@ uint32_t unlikely_branch(
 }
 
 // 4. 循环条件使用 MC_LIKELY
-ejit_entry
+EJIT_ENTRY
 uint32_t likely_loop(
     EJIT_DIM(cell) uint8_t cellIdx)
 {
@@ -91,7 +91,7 @@ uint32_t likely_loop(
 }
 
 // 5. 嵌套 MC_LIKELY — 多层短路
-ejit_entry
+EJIT_ENTRY
 uint32_t likely_nested(
     EJIT_DIM(cell) uint8_t cellIdx)
 {

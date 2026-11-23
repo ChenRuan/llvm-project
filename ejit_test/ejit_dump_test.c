@@ -29,11 +29,11 @@ typedef struct {
 
 //===--- Period variables --------------------------------------------------===//
 
-ejit_group(cell) CellCfg g_cells[16];
+EJIT_GROUP(cell) CellCfg g_cells[16];
 
 //===--- JIT entry functions -----------------------------------------------===//
 
-ejit_entry int check_cell(EJIT_DIM(cell) uint8_t idx) {
+EJIT_ENTRY int check_cell(EJIT_DIM(cell) uint8_t idx) {
   if (g_cells[idx].mode == MODE_A)
     return g_cells[idx].threshold * 10 + g_cells[idx].gain;
   else if (g_cells[idx].mode == MODE_B)
@@ -42,7 +42,7 @@ ejit_entry int check_cell(EJIT_DIM(cell) uint8_t idx) {
     return g_cells[idx].threshold * 5 + g_cells[idx].gain;
 }
 
-ejit_entry int simple_return(EJIT_DIM(cell) uint8_t idx) {
+EJIT_ENTRY int simple_return(EJIT_DIM(cell) uint8_t idx) {
   return g_cells[idx].threshold + g_cells[idx].gain;
 }
 

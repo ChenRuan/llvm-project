@@ -30,11 +30,11 @@ struct CellCfg {
 };
 
 #define N 16
-ejit_group(cell) struct CellCfg g_cells[N];
+EJIT_GROUP(cell) struct CellCfg g_cells[N];
 
 //===-- JIT entry: 分支依赖 period_const 字段 -----------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 uint32_t classify_cell(
     EJIT_DIM(cell) uint8_t ci)
 {

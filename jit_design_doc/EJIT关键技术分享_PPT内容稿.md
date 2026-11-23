@@ -23,7 +23,7 @@
 
 | 引导词 | 说明 |
 |---|---|
-| 用户声明 | `ejit_period_const`(字段) · `ejit_group`(数据组) · `ejit_dim`(维度) · `ejit_entry`(可特化函数) |
+| 用户声明 | `EJIT_PERIOD_CONST`(字段) · `ejit_group`(数据组) · `ejit_dim`(维度) · `EJIT_ENTRY`(可特化函数) |
 | 运行时协议 | `ejit_activate` 开窗 → 窗口内数据视为编译期常量 → `ejit_deactivate` 关窗 → 版本失效回到 AOT |
 | 特化手段 | JIT 编译期从进程内存读实际值，标记 load 替换为常量 → 常量传播 / 分支折叠 / 死代码消除 |
 

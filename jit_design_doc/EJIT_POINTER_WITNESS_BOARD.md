@@ -67,7 +67,7 @@ Do not run constructors twice or only on core6.
 
 ## What Must Fold
 
-All entries use `cell=1` and an `ejit_free_dim` slot. The original four use a
+All entries use `cell=1` and an `EJIT_FREE_DIM` slot. The original four use a
 parameter; the fifth reads a local slot from an unbound input structure.
 Cell0 deliberately has
 different marked values. Within a cell and generation, the marked fields are
@@ -86,7 +86,7 @@ The 64-bit field is invariant in its entirety, not merely bit 17.
 The added entry uses the existing spelling on an initialized, read-only local:
 
 ```c
-const uint16_t slot ejit_free_dim = input->slot;
+const uint16_t slot EJIT_FREE_DIM = input->slot;
 ```
 
 The input is not a bound pointer, and its real value need not be constant.

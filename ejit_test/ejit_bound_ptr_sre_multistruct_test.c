@@ -29,11 +29,10 @@ typedef _Bool bool;
 #define UINTPTR_MAX (~(uintptr_t)0)
 
 #define EJIT_PERIOD_CONST __attribute__((ejit_period_const))
-#define ejit_group(x) __attribute__((ejit_group(#x)))
+#define EJIT_GROUP(x) __attribute__((ejit_group(#x)))
 #define EJIT_DIM(x) __attribute__((ejit_dim(#x)))
 #define EJIT_BOUND_PTR(x) __attribute__((ejit_bound_ptr(#x)))
-#define ejit_entry __attribute__((ejit_entry))
-#define EJIT_ENTRY ejit_entry
+#define EJIT_ENTRY __attribute__((ejit_entry))
 
 
 typedef enum {
@@ -159,9 +158,9 @@ enum BoundMultiStage {
   BOUND_MULTI_PRINTED = 3,
 };
 
-EJIT_SHARED_SECTION_ATTR ejit_group(cell)
+EJIT_SHARED_SECTION_ATTR EJIT_GROUP(cell)
 uint32_t g_bound_multi_cells[8];
-EJIT_SHARED_SECTION_ATTR ejit_group(trp)
+EJIT_SHARED_SECTION_ATTR EJIT_GROUP(trp)
 uint32_t g_bound_multi_trps[8];
 EJIT_SHARED_SECTION_ATTR EJitBoundMultiCellConfig
     g_bound_multi_cell_configs[8] = {
@@ -177,7 +176,7 @@ EJIT_SHARED_SECTION_ATTR volatile uint64_t g_bound_multi_sink;
 
 // The helper owns an independent cell/trp identity and repeats both borrowed
 // pointer contracts so its wrapper can carry descriptors on direct calls.
-ejit_entry uint32_t bound_multi_helper(
+EJIT_ENTRY uint32_t bound_multi_helper(
     EJIT_DIM(cell) uint8_t cellIndex, EJIT_DIM(trp) uint8_t trpIndex,
     EJIT_BOUND_PTR(cell) const EJitBoundMultiCellConfig *cellConfig,
     EJIT_BOUND_PTR(trp) const EJitBoundMultiTrpConfig *trpConfig,
@@ -189,7 +188,7 @@ ejit_entry uint32_t bound_multi_helper(
          trpConfig->offset + trpConfig->runtimeTag + cellIndex + trpIndex;
 }
 
-ejit_entry uint32_t bound_multi_root0(
+EJIT_ENTRY uint32_t bound_multi_root0(
     EJIT_DIM(cell) uint8_t cellIndex, EJIT_DIM(trp) uint8_t trpIndex,
     EJIT_BOUND_PTR(cell) const EJitBoundMultiCellConfig *cellConfig,
     EJIT_BOUND_PTR(trp) const EJitBoundMultiTrpConfig *trpConfig,
@@ -198,7 +197,7 @@ ejit_entry uint32_t bound_multi_root0(
 }
 
 #define DEFINE_BOUND_MULTI_ROOT(N)                                             \
-  ejit_entry uint32_t bound_multi_root##N(                                     \
+  EJIT_ENTRY uint32_t bound_multi_root##N(                                     \
       EJIT_DIM(cell) uint8_t cellIndex, EJIT_DIM(trp) uint8_t trpIndex,        \
       EJIT_BOUND_PTR(cell) const EJitBoundMultiCellConfig *cellConfig,         \
       EJIT_BOUND_PTR(trp) const EJitBoundMultiTrpConfig *trpConfig,            \

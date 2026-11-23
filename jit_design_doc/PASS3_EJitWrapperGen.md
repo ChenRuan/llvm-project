@@ -10,7 +10,7 @@
 
 ## 1. 概述
 
-EJitWrapperGenPass 为所有 `ejit_entry` 函数生成 Wrapper 插桩代码。采用单函数混合方案：Wrapper 逻辑直接插入原函数入口，JIT 成功时调用特化函数并返回，JIT 失败时继续执行原函数体（Fallback）。用户调用原函数名即自动经过 JIT 编译路径。
+EJitWrapperGenPass 为所有 `EJIT_ENTRY` 函数生成 Wrapper 插桩代码。采用单函数混合方案：Wrapper 逻辑直接插入原函数入口，JIT 成功时调用特化函数并返回，JIT 失败时继续执行原函数体（Fallback）。用户调用原函数名即自动经过 JIT 编译路径。
 
 ### 1.1 核心职责
 
@@ -29,13 +29,13 @@ EJitWrapperGenPass 为所有 `ejit_entry` 函数生成 Wrapper 插桩代码。�
 | 参数识别 | 通过函数级 `ejit.metadata` 中的 `ejit_dim` 条目（`{tag, periodName, argIndex}`） |
 | 类型安全 | 生成 PFN 函数指针 typedef 用于类型转换 |
 | 最大维度 | 单个函数最多 4 个 `ejit_dim` 参数 |
-| static 依赖 | 所有 ejit_entry 函数隐式依赖 static 时间窗，无需显式参数 |
+| static 依赖 | 所有 EJIT_ENTRY 函数隐式依赖 static 时间窗，无需显式参数 |
 
 ---
 
 ## 2. 输入 IR 格式
 
-### 2.1 ejit_entry 函数 Metadata
+### 2.1 EJIT_ENTRY 函数 Metadata
 
 ```llvm
 ; 无 period_arr_ind 参数 (仅依赖 static 时间窗)
@@ -80,11 +80,11 @@ define void @process_multi(i32 %cellIdx, i32 %trpIdx, i32 %iterations) #0 {
 ### 3.1 主流程
 
 ```
-输入: Module M (含 ejit_entry + period_arr_ind 参数函数)
+输入: Module M (含 EJIT_ENTRY + period_arr_ind 参数函数)
 输出: Module M (函数入口插入 Wrapper 代码)
 
 步骤:
-1. CollectEjitEntryFunctions(M) → 收集所有 ejit_entry 函数
+1. CollectEjitEntryFunctions(M) → 收集所有 EJIT_ENTRY 函数
 2. ForEach entryFunc:
      ParseParamDimensions(entryFunc) → 提取 period_arr_ind 参数列表
      SplitFunctionAtEntry(entryFunc) → 分离原函数体到 fallback 块
@@ -437,7 +437,7 @@ EJitGuardHandlerPass    →  处理生命周期函数
 
 | 依赖项 | 说明 |
 |--------|------|
-| ejit.metadata (ejit_entry) | 来自 Clang CodeGen，定位需要 wrapper 的函数 |
+| ejit.metadata (EJIT_ENTRY) | 来自 Clang CodeGen，定位需要 wrapper 的函数 |
 | ejit_dim 参数信息 | 来自函数级 `ejit.metadata`（`!{"ejit_dim", !"periodName", i32 argIndex}`） |
 | @ejit_taskpool_compile_or_get | ExternalLinkage 声明，由运行时库提供 |
 | dimType 加载 | 从 per-lifecycle globals 加载，mem2reg 后零栈分配 |
@@ -487,7 +487,7 @@ EJitGuardHandlerPass    →  处理生命周期函数
 | Fallback 路径可达 | FileCheck 匹配 CFG 分支 |
 | 原函数体完整性 | 与原 IR 比较 (jit_fallback 块内容) |
 | 参数传递完整性 | pfn 调用参数列表匹配原始参数 |
-| 无 ejit_entry 函数的 Module | FileCheck: not check |
+| 无 EJIT_ENTRY 函数的 Module | FileCheck: not check |
 
 ---
 
@@ -540,7 +540,7 @@ define internal noinline void @funcA_miss(args...) {  ; 慢路径（自带栈帧
 - 命中路径**不调任何 runtime 函数**：直接 GEP + load + null-check + 尾调用。
 - `llvm.expect(hit, true)` 提示命中分支，使 regalloc / shrink-wrapping 对所有维度（含 0 维）保持 frame-less。
 - **musttail 仅在 `!EJitWrapperTiming` 时设置**：hit/miss 两条尾调用标 `TCK_MustTail`，降低成 `br`（复用调用方栈帧），故 wrapper 无栈帧。`-ejit-wrapper-timing` 开启时 hit 路径在 call 与 ret 之间插 `trace_now`/`trace_wrapper`，违反 musttail 规则，改用普通带帧 call + trace + ret（hit 路径不再 frame-less，但 IR 合法、功能不变；miss 路径仍 musttail）。
-- **MissFn 必须继承 F 的 target 属性**：`Function::Create` 新建的 MissFn 只继承 module 默认的 `uwtable`/`frame-pointer`，丢 F 的 `target-cpu`/`target-features`/`tune-cpu`。这会让 `TTI::areInlineCompatible` 判 MissFn 不是 helper 的 subtarget 超集 -> CGSCC InlinerPass 对所有 helper 报 `conflicting attributes` -> MissFn 零内联（AOT fallback 体积异常缩水）。修复：`MissFn->setAttributes(F->getAttributes())` 复制 F 全部属性，再 `addFnAttr(NoInline)`；同时 `setSection(F->getSection())` 让 MissFn 与 F 同段。`!ejit.metadata` 是 metadata（不在 `AttributeList` 里），不会被复制——MissFn 不应被当 ejit_entry 处理。
+- **MissFn 必须继承 F 的 target 属性**：`Function::Create` 新建的 MissFn 只继承 module 默认的 `uwtable`/`frame-pointer`，丢 F 的 `target-cpu`/`target-features`/`tune-cpu`。这会让 `TTI::areInlineCompatible` 判 MissFn 不是 helper 的 subtarget 超集 -> CGSCC InlinerPass 对所有 helper 报 `conflicting attributes` -> MissFn 零内联（AOT fallback 体积异常缩水）。修复：`MissFn->setAttributes(F->getAttributes())` 复制 F 全部属性，再 `addFnAttr(NoInline)`；同时 `setSection(F->getSection())` 让 MissFn 与 F 同段。`!ejit.metadata` 是 metadata（不在 `AttributeList` 里），不会被复制——MissFn 不应被当 EJIT_ENTRY 处理。
 - 跨函数 splice 修正：原函数体搬到 MissFn 后，把 `F->getArg(i)` 引用重映射到 `MissFn->getArg(i)`，否则跨函数参数引用会让 SelectionDAG 崩溃。
 - 幂等：`isAlreadyWrapped` 识别 entry 块中对 `@__ejit_icache_fn_<name>` 的 `LoadInst`/`GetElementPtrInst`（以及 `@__ejit_funcidx_<name>`），重复运行不会复制探针。
 

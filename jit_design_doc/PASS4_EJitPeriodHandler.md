@@ -31,7 +31,7 @@ EJitGuardHandlerPass 负责处理 `ejit_guard` (lifecycle) 属性标记的函数
 | 异常处理 | C 语言无异常，不考虑 exception handling |
 | 多出口 | C 函数可有多处 return，均需插入 activate 调用 |
 | ejit_guard 必须与 ejit_dim 配对 | Sema 已检查，Pass 不做验证 |
-| static 时间窗 | `ejit_group(static)` 永远激活，不参与 activate/deactivate |
+| static 时间窗 | `EJIT_GROUP(static)` 永远激活，不参与 activate/deactivate |
 
 ---
 

@@ -9,9 +9,9 @@
 #ifndef __has_attribute
 #define __has_attribute(x) 0
 #endif
-#if !__has_attribute(ejit_entry) || !__has_attribute(ejit_dim) ||              \
+#if !__has_attribute(EJIT_ENTRY) || !__has_attribute(ejit_dim) ||              \
     !__has_attribute(ejit_period_const) ||                                     \
-    !__has_attribute(ejit_group) || !__has_attribute(ejit_free_dim)
+    !__has_attribute(ejit_group) || !__has_attribute(EJIT_FREE_DIM)
 #error "Use the matching EJIT Clang; unknown annotations invalidate this test"
 #endif
 #ifdef EJIT_DISABLE
@@ -110,42 +110,42 @@ PW_SHARED struct WitnessWideCell g_pr256_wide_cells[2];
 PW_SHARED struct WitnessFlatCell g_pr256_flat_cells[2];
 PW_SHARED struct WitnessLargeCell g_pr256_large_cells[2];
 PW_SHARED struct WitnessLocalCell g_pr256_local_cells[2];
-PW_SHARED ejit_group(cell)
+PW_SHARED EJIT_GROUP(cell)
 struct WitnessNestedCell *g_pr256_nested = g_pr256_nested_cells;
-PW_SHARED ejit_group(cell)
+PW_SHARED EJIT_GROUP(cell)
 struct WitnessWideCell *g_pr256_wide = g_pr256_wide_cells;
-PW_SHARED ejit_group(cell)
+PW_SHARED EJIT_GROUP(cell)
 struct WitnessFlatCell *g_pr256_flat = g_pr256_flat_cells;
-PW_SHARED ejit_group(cell)
+PW_SHARED EJIT_GROUP(cell)
 struct WitnessLargeCell *g_pr256_large = g_pr256_large_cells;
-PW_SHARED ejit_group(cell)
+PW_SHARED EJIT_GROUP(cell)
 struct WitnessLocalCell *g_pr256_local = g_pr256_local_cells;
 
-ejit_entry uint64_t pr256_witness_nested(EJIT_DIM(cell) uint8_t cell,
-                                         ejit_free_dim uint16_t slot) {
+EJIT_ENTRY uint64_t pr256_witness_nested(EJIT_DIM(cell) uint8_t cell,
+                                         EJIT_FREE_DIM uint16_t slot) {
   struct WitnessNestedCell *p = &g_pr256_nested[cell];
   struct WitnessNestedSlot *live = &p->slot[slot % 10u];
   ++live->visits;
   return p->slot[slot % 5u].field9 * 100u + live->field344 * 10000u +
          live->payload;
 }
-ejit_entry uint64_t pr256_witness_wide(EJIT_DIM(cell) uint8_t cell,
-                                       ejit_free_dim uint16_t slot) {
+EJIT_ENTRY uint64_t pr256_witness_wide(EJIT_DIM(cell) uint8_t cell,
+                                       EJIT_FREE_DIM uint16_t slot) {
   struct WitnessWideSlot *p = &g_pr256_wide[cell].slot[slot % 5u];
   ++p->visits;
   uint64_t bits = p->bits;
   return (bits ^ ((bits & 131072u) ? 16777216u : 0u)) + p->payload;
 }
-ejit_entry uint64_t pr256_witness_flat128(EJIT_DIM(cell)
+EJIT_ENTRY uint64_t pr256_witness_flat128(EJIT_DIM(cell)
                                               uint8_t cell,
-                                          ejit_free_dim uint16_t slot) {
+                                          EJIT_FREE_DIM uint16_t slot) {
   struct WitnessFlatSlot *p = &g_pr256_flat[cell].slot[slot % 5u];
   ++p->visits;
   return p->field9 * 100u + p->field31 * 10000u + p->payload;
 }
-ejit_entry uint64_t pr256_witness_mul1240(EJIT_DIM(cell)
+EJIT_ENTRY uint64_t pr256_witness_mul1240(EJIT_DIM(cell)
                                               uint8_t cell,
-                                          ejit_free_dim uint16_t slot) {
+                                          EJIT_FREE_DIM uint16_t slot) {
   struct WitnessLargeCell *cellp = &g_pr256_large[cell];
   uint16_t offset = (uint16_t)((slot % 5u) * 1240u);
   struct WitnessLargeSlot *p =
@@ -154,10 +154,10 @@ ejit_entry uint64_t pr256_witness_mul1240(EJIT_DIM(cell)
   return p->field9 * 100u + p->payload;
 }
 
-ejit_entry uint64_t pr256_witness_local184(EJIT_DIM(cell)
+EJIT_ENTRY uint64_t pr256_witness_local184(EJIT_DIM(cell)
                                                uint8_t cell,
                                            const struct WitnessInput *input) {
-  const uint16_t slot ejit_free_dim = input->slot;
+  const uint16_t slot EJIT_FREE_DIM = input->slot;
   struct WitnessLocalCell *cellp = &g_pr256_local[cell];
   uint16_t offset = (uint16_t)((slot % 5u) * 184u);
   struct WitnessLocalSlot *p =

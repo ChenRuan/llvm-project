@@ -28,7 +28,7 @@ struct CellCfg {
   EJIT_PERIOD_CONST uint32_t cellType;
   uint32_t traffic;
 };
-ejit_group(cell) struct CellCfg g_cells[16];
+EJIT_GROUP(cell) struct CellCfg g_cells[16];
 
 //===-- helpers -----------------------------------------------------------===//
 
@@ -75,7 +75,7 @@ static inline uint32_t hint_helper(uint32_t x) { return x * 7 + 3; }
 
 //===-- entries -----------------------------------------------------------===//
 
-ejit_entry uint32_t entry1(EJIT_DIM(cell) uint8_t ci) {
+EJIT_ENTRY uint32_t entry1(EJIT_DIM(cell) uint8_t ci) {
   uint32_t r = ext_helper_big(ci);
   r += st_helper_big(r);
   r += st_helper_small(r);
@@ -84,7 +84,7 @@ ejit_entry uint32_t entry1(EJIT_DIM(cell) uint8_t ci) {
   return r;
 }
 
-ejit_entry uint32_t entry2(EJIT_DIM(cell) uint8_t ci) {
+EJIT_ENTRY uint32_t entry2(EJIT_DIM(cell) uint8_t ci) {
   uint32_t r = st_helper_big(ci);
   r = ext_helper_big(r);
   r += st_helper_period_const(ci);

@@ -42,17 +42,17 @@ struct TrpConfig {
 
 //===-- 全局变量 -------------------------------------------------------------===//
 
-ejit_group(static) struct BoardConfig g_boardCfg;
+EJIT_GROUP(static) struct BoardConfig g_boardCfg;
 
 #define N_CELL 16
-ejit_group(cell) struct CellConfig g_cellCfg[N_CELL];
+EJIT_GROUP(cell) struct CellConfig g_cellCfg[N_CELL];
 
 #define M_TRP 8
-ejit_group(trp) struct TrpConfig g_trpCfg[M_TRP];
+EJIT_GROUP(trp) struct TrpConfig g_trpCfg[M_TRP];
 
 //===-- 场景 1: 仅 static 时间窗 ----------------------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 void process_board(void)
 {
     if (g_boardCfg.boardType == 0x01) {
@@ -64,7 +64,7 @@ void process_board(void)
 
 //===-- 场景 2: static + cell -----------------------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 void process_cell(
     EJIT_DIM(cell) uint8_t cellIdx)
 {
@@ -75,7 +75,7 @@ void process_cell(
     }
 }
 
-ejit_guard(cell)
+EJIT_GUARD(cell)
 void update_cell_config(
     EJIT_DIM(cell) uint8_t cellIdx)
 {
@@ -85,7 +85,7 @@ void update_cell_config(
 
 //===-- 场景 3: static + cell + trp -----------------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 void process_trp_task(
     EJIT_DIM(cell) uint8_t cellIdx,
     EJIT_DIM(trp)  uint8_t trpIdx)
@@ -99,8 +99,8 @@ void process_trp_task(
     }
 }
 
-ejit_guard(cell)
-ejit_guard(trp)
+EJIT_GUARD(cell)
+EJIT_GUARD(trp)
 void update_all_config(
     EJIT_DIM(cell) uint8_t cellIdx,
     EJIT_DIM(trp)  uint8_t trpIdx)
@@ -158,8 +158,8 @@ int main(int argc, char **argv)
     printf("    ejit_activate(\"trp\", %u)  => %d, is_active=%d\n\n",
            ti, rc, ejit_is_active("trp", ti));
 
-    // --- 4. 调用 ejit_entry 函数 (JIT dispatch) ---
-    printf("[4] 调用 ejit_entry 函数 (首次触发 JIT dispatch)...\n");
+    // --- 4. 调用 EJIT_ENTRY 函数 (JIT dispatch) ---
+    printf("[4] 调用 EJIT_ENTRY 函数 (首次触发 JIT dispatch)...\n");
 
     printf("    process_board()...\n");
     process_board();

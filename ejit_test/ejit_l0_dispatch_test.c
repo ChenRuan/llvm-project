@@ -24,11 +24,11 @@ struct Cfg {
   EJIT_PERIOD_CONST uint32_t mode;
   uint32_t counter;
 };
-ejit_group(cell) struct Cfg g_cfg[N];
+EJIT_GROUP(cell) struct Cfg g_cfg[N];
 
 /* The specialization folds g_cfg[ci].mode, so the returned value identifies
  * which specialization ran. */
-ejit_entry uint32_t l0_probe(EJIT_DIM(cell) uint8_t ci, uint32_t seed)
+EJIT_ENTRY uint32_t l0_probe(EJIT_DIM(cell) uint8_t ci, uint32_t seed)
 {
   return g_cfg[ci].mode * 1000u + seed;
 }

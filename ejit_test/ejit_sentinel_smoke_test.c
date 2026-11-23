@@ -43,7 +43,7 @@
 // rip-relative Delta32). One entry shape per TU is also the embedded
 // deployment shape. The 0-dim source is a plain (non-period) struct, not a
 // bare scalar: EJIT_PERIOD_CONST applies to struct FIELDS only - Sema drops
-// it on a VarDecl - and ejit_group(static) registers the struct so the
+// it on a VarDecl - and EJIT_GROUP(static) registers the struct so the
 // JIT can resolve its address when freezing the field.
 //
 //===----------------------------------------------------------------------===//
@@ -71,13 +71,13 @@ extern void sentinel_smoke_set_3d(uint8_t i, uint32_t kind);
 struct ScalarCfg {
   EJIT_PERIOD_CONST uint32_t kind; // 1 -> "on" branch, 0 -> "off"
 };
-ejit_group(static) struct ScalarCfg g_scalar = {1};
+EJIT_GROUP(static) struct ScalarCfg g_scalar = {1};
 
 //===-- Entry (0-dim) -------------------------------------------------------===//
 // noinline keeps the wrapper dispatch out of the callers.
 
 // 0-dim: scalar sentinel cell. on -> 10, off -> 20.
-ejit_entry __attribute__((noinline)) uint32_t sentinel_0d(void) {
+EJIT_ENTRY __attribute__((noinline)) uint32_t sentinel_0d(void) {
   return (g_scalar.kind == 1u) ? 10u : 20u;
 }
 

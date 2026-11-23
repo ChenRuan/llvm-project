@@ -47,7 +47,7 @@ Clang CodeGen → [PASS1] → O2/O3 优化 → [本 Pass] → 目标代码生成
 非 LTO 路径放在优化之前的原因：
 
 1. **Wrapper IR 被 O2 优化**：PASS3 生成的 wrapper IR（jit_entry/jit_dispatch/jit_fallback 块）会被后续 O2 优化，fallback 路径被优化（分支变 select、PHI 合并返回值等），生成更高效的机器码
-2. **noinline 属性提前生效**：PASS3 为 ejit_entry 函数添加 `noinline` 属性，在 inliner 运行前生效，防止 wrapper 被内联到 caller 中
+2. **noinline 属性提前生效**：PASS3 为 EJIT_ENTRY 函数添加 `noinline` 属性，在 inliner 运行前生效，防止 wrapper 被内联到 caller 中
 3. **Period 变量注册**依赖函数级 `ejit.metadata`，函数级 metadata 一般不会被优化 Pass 移除
 
 LTO 路径放在优化之后的原因：LTO 已经完成了完整的优化流程，PASS2-4 在优化后插入 wrapper，此时 IR 已是最终形态，无需再次优化。
@@ -64,13 +64,13 @@ LTO 路径放在优化之后的原因：LTO 已经完成了完整的优化流程
 
 - LLVM Module（非 LTO: 未优化; LTO: 经标准优化后）
 - 已嵌入 `@__ejit_bitcode` 全局变量（由早期 `EJitRegisterBitcodePass` 生成）
-- 包含 `ejit_entry` / `ejit_guard` 函数（可能已被内联/优化，但 `ejit.metadata` 保留）
+- 包含 `EJIT_ENTRY` / `ejit_guard` 函数（可能已被内联/优化，但 `ejit.metadata` 保留）
 - 包含 `ejit_group` / `ejit_group` 全局变量
 
 ### 2.2 输出
 
 - Module 含扩展的 `ejit_auto_register()` 函数（追加变量注册调用）
-- ejit_entry 函数被改写为单函数混合 Wrapper
+- EJIT_ENTRY 函数被改写为单函数混合 Wrapper
 - ejit_guard 函数入口/出口添加 activate/deactivate 调用
 
 ---
@@ -169,7 +169,7 @@ bool hasAnyEjitMetadata(Module& M) {
 
 ```cpp
 void runDiagnosticCheck(Module& M) {
-    // 检查 ejit_entry 函数实际引用的全局变量
+    // 检查 EJIT_ENTRY 函数实际引用的全局变量
     // 是否与其声明的 ejit_dim 一致
 
     for (Function& F : M.functions()) {

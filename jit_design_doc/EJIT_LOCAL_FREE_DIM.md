@@ -1,4 +1,4 @@
-# Local ejit_free_dim value boundary (issue 246, v1)
+# Local EJIT_FREE_DIM value boundary (issue 246, v1)
 
 Baseline: e09df842062735ba9f6279ae7d1c5b43fd723bec.
 

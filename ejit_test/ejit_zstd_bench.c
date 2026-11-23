@@ -4,8 +4,8 @@
 //
 // Design:
 //   - Compression parameters (level, windowLog, etc.) are EJIT_PERIOD_CONST
-//     fields in a global struct marked ejit_group(static).
-//   - The compress() function is ejit_entry — JIT specializes it for the
+//     fields in a global struct marked EJIT_GROUP(static).
+//   - The compress() function is EJIT_ENTRY — JIT specializes it for the
 //     current parameter values, replacing loads with constants.
 //   - After InstCombine + Inline, the constant values propagate into
 //     zstd's internal code, eliminating dead branches.
@@ -40,7 +40,7 @@ typedef struct {
   int EJIT_PERIOD_CONST strategy;           // ZSTD_fast..ZSTD_btultra2
 } CompressCfg;
 
-ejit_group(static) CompressCfg g_cfg;
+EJIT_GROUP(static) CompressCfg g_cfg;
 
 // Pre-allocated compression context (reused across calls).
 // Not annotated — this is runtime mutable state.
@@ -48,7 +48,7 @@ static ZSTD_CCtx *g_cctx = NULL;
 
 //===--- EJIT entry: compress with specialized parameters -----------------===//
 
-ejit_entry size_t compress_specialized(
+EJIT_ENTRY size_t compress_specialized(
     const void *src, size_t srcSize,
     void *dst, size_t dstCapacity)
 {

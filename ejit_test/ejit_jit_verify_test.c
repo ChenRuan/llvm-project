@@ -34,18 +34,18 @@ struct TrpCfg {
   uint32_t activeBeams;
 };
 
-ejit_group(static) uint32_t g_sysVer;
+EJIT_GROUP(static) uint32_t g_sysVer;
 
 #define N_CELL 16
-ejit_group(cell) struct CellCfg g_cellCfg[N_CELL];
+EJIT_GROUP(cell) struct CellCfg g_cellCfg[N_CELL];
 
 #define M_TRP 8
-ejit_group(trp) struct TrpCfg g_trpCfg[M_TRP];
+EJIT_GROUP(trp) struct TrpCfg g_trpCfg[M_TRP];
 
 //===-- JIT entry 函数 -----------------------------------------------------===//
 
 // 单维 cellIdx: 分支依赖于 period_const 字段
-ejit_entry
+EJIT_ENTRY
 uint32_t jit_cell_check(
     EJIT_DIM(cell) uint8_t cellIdx)
 {
@@ -57,7 +57,7 @@ uint32_t jit_cell_check(
 }
 
 // 多维 cellIdx + trpIdx: 复合条件
-ejit_entry
+EJIT_ENTRY
 uint32_t jit_cell_trp_check(
     EJIT_DIM(cell) uint8_t cellIdx,
     EJIT_DIM(trp)  uint8_t trpIdx)

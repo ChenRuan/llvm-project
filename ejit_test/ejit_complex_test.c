@@ -64,7 +64,7 @@ struct SliceConfig {
 
 //===-- 全局变量: 多数组共享同一时间窗名 -----------------------------------------===//
 
-ejit_group(static) struct PhyConfig g_phyCfg;
+EJIT_GROUP(static) struct PhyConfig g_phyCfg;
 
 #define N_CELL  16
 #define M_TRP   8
@@ -72,12 +72,12 @@ ejit_group(static) struct PhyConfig g_phyCfg;
 #define P_CARRIER 4
 
 // cell 时间窗: 两个数组共享 "cell" 名称
-ejit_group(cell) struct CellConfig  g_cellCfg[N_CELL];
-ejit_group(cell) struct PhyConfig   g_cellPhy[N_CELL];
+EJIT_GROUP(cell) struct CellConfig  g_cellCfg[N_CELL];
+EJIT_GROUP(cell) struct PhyConfig   g_cellPhy[N_CELL];
 
-ejit_group(trp)  struct TrpConfig   g_trpCfg[M_TRP];
-ejit_group(slice) struct SliceConfig g_sliceCfg[K_SLICE];
-ejit_group(carrier) struct PhyConfig  g_carrierCfg[P_CARRIER];
+EJIT_GROUP(trp)  struct TrpConfig   g_trpCfg[M_TRP];
+EJIT_GROUP(slice) struct SliceConfig g_sliceCfg[K_SLICE];
+EJIT_GROUP(carrier) struct PhyConfig  g_carrierCfg[P_CARRIER];
 
 //===-- 场景 A: 4 维度 max (cell + trp + slice + carrier) ---------------------===//
 
@@ -85,7 +85,7 @@ ejit_group(carrier) struct PhyConfig  g_carrierCfg[P_CARRIER];
  * 极限测试: 同时依赖 4 个时间窗数组 (SPEC4 规定的最大值)。
  * JIT 时 4 个维度参数的运行值确定，对应的 period_const 字段全部特化。
  */
-ejit_entry
+EJIT_ENTRY
 int process_multi_dim(
     EJIT_DIM(cell)    uint8_t cellIdx,
     EJIT_DIM(trp)     uint8_t trpIdx,
@@ -153,7 +153,7 @@ int process_multi_dim(
 
 //===-- 场景 B: 循环 + switch + early return ---------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 uint32_t process_all_trps(
     EJIT_DIM(cell) uint8_t cellIdx)
 {
@@ -188,7 +188,7 @@ uint32_t process_all_trps(
 /**
  * 小循环 + period_const 界限: JIT 在 L3 优化等级可完全展开。
  */
-ejit_entry
+EJIT_ENTRY
 uint32_t process_slice_loop(
     EJIT_DIM(slice) uint8_t sliceIdx)
 {
@@ -220,8 +220,8 @@ uint32_t process_slice_loop(
  * 生命周期函数有多个 return 点。
  * PASS4 必须在每个 return 前插入 activate (逆序)。
  */
-ejit_guard(cell)
-ejit_guard(trp)
+EJIT_GUARD(cell)
+EJIT_GUARD(trp)
 int reconfig_cell_trp(
     EJIT_DIM(cell) uint8_t cellIdx,
     EJIT_DIM(trp)  uint8_t trpIdx,
@@ -252,7 +252,7 @@ int reconfig_cell_trp(
  * 即使只修改非 period_const 字段，如果标记了 ejit_guard，
  * 仍然触发 deactivate/activate。
  */
-ejit_guard(trp)
+EJIT_GUARD(trp)
 void update_trp_power(
     EJIT_DIM(trp) uint8_t trpIdx,
     uint32_t power)

@@ -10,7 +10,7 @@
 
 ## 1. 概述
 
-EJitRegisterBitcodePass 负责从编译单元中提取所有 `ejit_entry` 标记的函数及其传递依赖（调用的内部函数），序列化为 LLVM Bitcode，并将 Bitcode 数据嵌入到最终可执行文件的独立段中。在序列化前，对提取的 bitcode 运行轻量优化管线（`preOptimizeBitcode`），减少 JIT 编译时的开销和内存压力。运行时 JIT 编译器按需加载这些 Bitcode 进行特化编译。
+EJitRegisterBitcodePass 负责从编译单元中提取所有 `EJIT_ENTRY` 标记的函数及其传递依赖（调用的内部函数），序列化为 LLVM Bitcode，并将 Bitcode 数据嵌入到最终可执行文件的独立段中。在序列化前，对提取的 bitcode 运行轻量优化管线（`preOptimizeBitcode`），减少 JIT 编译时的开销和内存压力。运行时 JIT 编译器按需加载这些 Bitcode 进行特化编译。
 
 ### 1.1 核心职责
 
@@ -70,7 +70,7 @@ AlwaysInline → ModuleInliner(O2) → Mem2Reg → EarlyCSE+InstCombine → Simp
 ### 2.1 函数 Metadata
 
 ```llvm
-; ejit_entry 函数
+; EJIT_ENTRY 函数
 define void @process_task(i32 %idx) #0 {
   ; ...
 }
@@ -79,16 +79,16 @@ define void @process_task(i32 %idx) #0 {
 ; !ejit.metadata = distinct !{!0}
 ; !0 = !{!"ejit_entry"}
 
-; 含 ejit_dim 参数的 ejit_entry 函数
+; 含 ejit_dim 参数的 EJIT_ENTRY 函数
 define void @process_multi(i32 %cellIdx, i32 %trpIdx) #0 {
   ; ...
 }
-; metadata 同上 (ejit_entry 仍然是 !{!"ejit_entry"})
+; metadata 同上 (EJIT_ENTRY 仍然是 !{!"ejit_entry"})
 ```
 
 ### 2.2 从 metadata 推断依赖
 
-ejit_entry 函数本身在 IR 中不含 period 依赖的直接声明。依赖通过函数参数上的 `ejit_dim` 属性的 debug info / metadata 推导，但 Bitcode 提取不需要此信息。Bitcode 提取阶段仅关注函数调用图。
+EJIT_ENTRY 函数本身在 IR 中不含 period 依赖的直接声明。依赖通过函数参数上的 `ejit_dim` 属性的 debug info / metadata 推导，但 Bitcode 提取不需要此信息。Bitcode 提取阶段仅关注函数调用图。
 
 ---
 
@@ -101,7 +101,7 @@ ejit_entry 函数本身在 IR 中不含 period 依赖的直接声明。依赖通
 输出: Module M (插入 bitcode 全局变量和注册调用)
 
 步骤:
-1. CollectEntryFunctions(M) → 收集所有 ejit_entry 函数
+1. CollectEntryFunctions(M) → 收集所有 EJIT_ENTRY 函数
 2. ComputeTransitiveClosure(entryFuncs) → 计算依赖函数集
 3. ExtractModule(fullFuncSet) → 提取独立的 bitcode Module
 4. SerializeToBitcode(extractedModule) → 序列化为字节数组
@@ -113,7 +113,7 @@ ejit_entry 函数本身在 IR 中不含 period 依赖的直接声明。依赖通
 
 ```cpp
 PreservedAnalyses EJitRegisterBitcodePass::run(Module& M, ModuleAnalysisManager& AM) {
-    // Step 1: 收集所有 ejit_entry 函数
+    // Step 1: 收集所有 EJIT_ENTRY 函数
     std::vector<Function*> entryFuncs;
     for (Function& F : M.functions()) {
         if (isEjitEntry(F))
@@ -155,7 +155,7 @@ PreservedAnalyses EJitRegisterBitcodePass::run(Module& M, ModuleAnalysisManager&
     //   ejit_register_bitcode("func_name", bitcode_ptr, bitcode_size);
     insertBitcodeRegisterCall(M, GV, entryFuncs);
 
-    // 清理: 删除 entryFuncs 的 ejit_entry metadata (防止被后续 Pass 重复处理)
+    // 清理: 删除 entryFuncs 的 EJIT_ENTRY metadata (防止被后续 Pass 重复处理)
     for (Function* F : entryFuncs) {
         // 保留 metadata 供其他 Pass 使用 (EJitWrapperGenPass 需要)
         // 仅标记已处理
@@ -312,7 +312,7 @@ void insertBitcodeRegisterCall(Module& M, GlobalVariable* bitcodeGV,
     Builder.SetInsertPoint(BB);
 
     for (Function* F : entryFuncs) {
-        // 每个 ejit_entry 函数注册一次，但指向同一份 bitcode 数据
+        // 每个 EJIT_ENTRY 函数注册一次，但指向同一份 bitcode 数据
         // 运行时 BitcodeTracker 维护 funcName → bitcode 映射
         // JIT 编译时按 funcName 从 bitcode Module 中定位目标函数
         Constant* nameStr = Builder.CreateGlobalStringPtr(F->getName());
@@ -348,7 +348,7 @@ entry:
     call void @ejit_register_bitcode(i8* getelementptr(...) @".str.process_task",
                                      i8* bitcast ([N x i8]* @__ejit_bitcode to i8*),
                                      i64 <bitcode_size>)
-    ; ... 每个 ejit_entry 函数一条注册调用
+    ; ... 每个 EJIT_ENTRY 函数一条注册调用
     ret void
 }
 
@@ -360,7 +360,7 @@ entry:
 
 ### 4.2 保持不变
 
-- ejit_entry 函数的函数体（由后续 EJitWrapperGenPass 修改）
+- EJIT_ENTRY 函数的函数体（由后续 EJitWrapperGenPass 修改）
 - ejit.metadata（后续 Pass 仍需读取）
 - 其他函数和全局变量
 
@@ -372,13 +372,13 @@ entry:
 // Bitcode 提取结果
 struct BitcodeExtractResult {
     GlobalVariable* bitcodeVar;         // 嵌入的 bitcode 全局变量
-    std::vector<Function*> entryFuncs;  // 所有 ejit_entry 函数列表
+    std::vector<Function*> entryFuncs;  // 所有 EJIT_ENTRY 函数列表
     size_t bitcodeSize;                 // bitcode 字节数
 };
 
 // 运行时注册 API (在 libejit 中实现)
 // void ejit_register_bitcode(const char* funcName, void* bitcodePtr, size_t bitcodeSize);
-//   - funcName: ejit_entry 函数名
+//   - funcName: EJIT_ENTRY 函数名
 //   - bitcodePtr: bitcode 数据指针
 //   - bitcodeSize: bitcode 数据大小
 // 运行时维护 funcName → bitcode 的映射表，JIT 编译时按需解析
@@ -390,7 +390,7 @@ struct BitcodeExtractResult {
 
 | 错误场景 | 处理策略 |
 |---------|---------|
-| 无 ejit_entry 函数 | 直接返回 PreservedAnalyses::all()，不做任何修改 |
+| 无 EJIT_ENTRY 函数 | 直接返回 PreservedAnalyses::all()，不做任何修改 |
 | Bitcode 序列化失败 | report_fatal_error — 这是 LLVM 内部错误，不应发生 |
 | 空依赖函数集 | 仍然生成 bitcode（仅含入口函数声明） |
 | 外部函数调用 | 仅声明不克隆，运行时 JIT 编译时这些符号从进程加载 |
@@ -442,8 +442,8 @@ EJitGuardHandlerPass    (晚期: 生命周期处理)
 ; CHECK: call void @ejit_register_bitcode
 
 ; 验证:
-; 1. 无 ejit_entry 函数的 Module 不做修改
-; 2. ejit_entry 函数及其调用链被正确提取
+; 1. 无 EJIT_ENTRY 函数的 Module 不做修改
+; 2. EJIT_ENTRY 函数及其调用链被正确提取
 ; 3. bitcode 全局变量正确创建
 ; 4. 注册函数正确生成
 ; 5. 外部函数声明被保留
@@ -456,7 +456,7 @@ EJitGuardHandlerPass    (晚期: 生命周期处理)
 | Bitcode 序列化正确性 | 将嵌入的 bitcode 重新反序列化，验证函数列表一致 |
 | 传递闭包完整性 | 检查调用链中所有内部函数都在提取结果中 |
 | 注册调用参数正确性 | FileCheck 匹配函数名、指针、大小 |
-| 无 ejit_entry 的 Module | FileCheck: not check |
+| 无 EJIT_ENTRY 的 Module | FileCheck: not check |
 
 ---
 
@@ -472,9 +472,9 @@ EJitGuardHandlerPass    (晚期: 生命周期处理)
 
 5. **与 easyJIT 的关系**: easyJIT 的 `RegisterBitcodePass` 可作为参考实现，但 EmbeddedJIT 的提取条件不同（基于 metadata 而非参数属性）。
 
-6. **多 Module 支持**: 若链接时优化 (LTO) 启用，多个编译单元合并为一个 Module，此时所有 ejit_entry 函数在一个 Module 中，一次提取即可。若为普通编译（每个 .c 文件独立 Module），则每个 Module 有独立的 bitcode 段，运行时按需加载。
+6. **多 Module 支持**: 若链接时优化 (LTO) 启用，多个编译单元合并为一个 Module，此时所有 EJIT_ENTRY 函数在一个 Module 中，一次提取即可。若为普通编译（每个 .c 文件独立 Module），则每个 Module 有独立的 bitcode 段，运行时按需加载。
 
-7. **多 ejit_entry 函数的 Bitcode 合并**: 当前设计将所有 ejit_entry 函数（含传递闭包）放入一个 `@__ejit_bitcode` 全局变量。运行时通过 `ejit_register_bitcode(funcName, ptr, size)` 为每个函数名注册同一份 bitcode。JIT 编译时，从 bitcode 中按函数名定位目标函数，仅编译该函数及其依赖。
+7. **多 EJIT_ENTRY 函数的 Bitcode 合并**: 当前设计将所有 EJIT_ENTRY 函数（含传递闭包）放入一个 `@__ejit_bitcode` 全局变量。运行时通过 `ejit_register_bitcode(funcName, ptr, size)` 为每个函数名注册同一份 bitcode。JIT 编译时，从 bitcode 中按函数名定位目标函数，仅编译该函数及其依赖。
 
 8. **自动符号注册 (v1.6)**: `ejit_auto_register` 函数中除了 `ejit_register_bitcode` 调用外，还自动生成 `ejit_register_symbol` 调用。PASS1 扫描闭包中所有外部函数调用（`isDeclaration() && !isIntrinsic()`）和全局变量引用，为每个唯一符号生成注册代码。这使 JIT 在裸核环境无需 dlsym 即可解析外部符号。符号地址暂存于 `EJitRegistrationStore`，在 `ejit_init` 时消费。
 

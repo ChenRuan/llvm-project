@@ -5,7 +5,7 @@
 //      starts the single shared worker, prints "worker ready", and returns.
 //   2. From three core sessions, run test_ejit_period on cores 18, 19 and 20.
 //      They attach to core 8's shared taskpool and wait at a shared start gate.
-//   3. The three cores then exercise three distinct ejit_entry functions. With
+//   3. The three cores then exercise three distinct EJIT_ENTRY functions. With
 //      EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=2, two functions profile while the
 //      third stays on AOT; it receives a slot after either Tier-2 completes.
 //
@@ -45,7 +45,7 @@ struct PgoMcCfg {
   uint32_t salt;
 };
 
-EJIT_SHARED_SECTION_ATTR ejit_group(cell)
+EJIT_SHARED_SECTION_ATTR EJIT_GROUP(cell)
 struct PgoMcCfg g_pgo_mc_cfg[PGO_PRODUCER_COUNT];
 EJIT_SHARED_SECTION_ATTR volatile uint32_t g_pgo_mc_ready_mask;
 EJIT_SHARED_SECTION_ATTR volatile uint32_t g_pgo_mc_done_mask;
@@ -64,17 +64,17 @@ EJIT_SHARED_SECTION_ATTR volatile uint64_t g_pgo_mc_sink;
     return _v;                                                                 \
   } while (0)
 
-ejit_entry uint32_t
+EJIT_ENTRY uint32_t
 pgo_mc_func0(EJIT_DIM(cell) uint8_t cell, uint32_t seed) {
   PGO_MC_BODY(cell, seed, 0x101u);
 }
 
-ejit_entry uint32_t
+EJIT_ENTRY uint32_t
 pgo_mc_func1(EJIT_DIM(cell) uint8_t cell, uint32_t seed) {
   PGO_MC_BODY(cell, seed, 0x202u);
 }
 
-ejit_entry uint32_t
+EJIT_ENTRY uint32_t
 pgo_mc_func2(EJIT_DIM(cell) uint8_t cell, uint32_t seed) {
   PGO_MC_BODY(cell, seed, 0x303u);
 }

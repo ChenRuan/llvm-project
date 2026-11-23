@@ -31,13 +31,13 @@ struct CellCfg {
 };
 
 #define N 16
-ejit_group(cell) struct CellCfg g_cfg[N];
+EJIT_GROUP(cell) struct CellCfg g_cfg[N];
 
 //===-- JIT entry: 循环中大量访问 period_const 字段 -----------------------------===//
 
 #define LOOP_ITERS 20000000ULL  // 20M 次迭代
 
-ejit_entry
+EJIT_ENTRY
 uint64_t compute_cell(
     EJIT_DIM(cell) uint8_t ci)
 {
@@ -103,7 +103,7 @@ static uint64_t cell_step(uint8_t ci, uint64_t sum)
   return sum;
 }
 
-ejit_entry
+EJIT_ENTRY
 uint64_t compute_cell_ip(
     EJIT_DIM(cell) uint8_t ci)
 {

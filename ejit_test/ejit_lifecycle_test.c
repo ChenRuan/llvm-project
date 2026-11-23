@@ -36,22 +36,22 @@ struct SingleCfg {
 };
 
 #define N 8
-ejit_group(cell) struct CellCfg g_cellCfg[N];
-ejit_group(cell) struct CellPhy g_cellPhy[N];
-ejit_group(single) struct SingleCfg g_singleCfg[N];
+EJIT_GROUP(cell) struct CellCfg g_cellCfg[N];
+EJIT_GROUP(cell) struct CellPhy g_cellPhy[N];
+EJIT_GROUP(single) struct SingleCfg g_singleCfg[N];
 
-ejit_group(static) uint32_t g_sysVer;
+EJIT_GROUP(static) uint32_t g_sysVer;
 
 //===-- JIT entry: 访问两个数组的 period_const ---------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 uint32_t read_both(
     EJIT_DIM(cell) uint8_t ci)
 {
   return g_cellCfg[ci].cellType + g_cellPhy[ci].phyCellId;
 }
 
-ejit_entry
+EJIT_ENTRY
 uint32_t read_single(
     EJIT_DIM(single) uint8_t ci)
 {

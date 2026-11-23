@@ -4,7 +4,7 @@
 //
 // Types, attribute macros, enums, and runtime API declarations all come from
 // llvm/include/llvm/ExecutionEngine/EJIT/EJitRuntime.h (the canonical header).
-// Tests use the macro attribute form (ejit_entry, ejit_group(cell), ...)
+// Tests use the macro attribute form (EJIT_ENTRY, EJIT_GROUP(cell), ...)
 // exclusively — never the raw __attribute__((...)) form — so including
 // EJitRuntime.h (which #defines those macros) does not cause double-expansion.
 //

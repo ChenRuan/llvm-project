@@ -3,7 +3,7 @@
  *
  * 编译时通过 -mllvm -enable-ejit-global-ctors=false 禁用构造器。
  * ejit_init() 从 __ejit_registry_*[] 静态表加载 bitcode 和 period。
- * 验证直接调用 ejit_entry 函数能触发 JIT 编译并返回正确结果。
+ * 验证直接调用 EJIT_ENTRY 函数能触发 JIT 编译并返回正确结果。
  */
 
 #include <stdint.h>
@@ -19,10 +19,10 @@ struct CellCfg {
   uint32_t trafficLoad;
 };
 
-ejit_group(cell)
+EJIT_GROUP(cell)
 struct CellCfg g_cellCfg[4] = {{1,100},{2,200},{3,300},{4,400}};
 
-ejit_entry
+EJIT_ENTRY
 uint32_t jit_check_cell_type(
     EJIT_DIM(cell) uint8_t cellIndex)
 {

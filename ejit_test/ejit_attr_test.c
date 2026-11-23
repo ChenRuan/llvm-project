@@ -62,20 +62,20 @@ struct SensorConfig {
 //===-- 全局变量声明 ----------------------------------------------------------===//
 
 // static 时间窗: JIT 运行期不变 (SPEC4 §2.2.1)
-ejit_group(static) struct BoardConfig g_boardCfg;
+EJIT_GROUP(static) struct BoardConfig g_boardCfg;
 
 // 时间窗数组: cell (SPEC4 §2.2.2, §5 场景 2)
-ejit_group(cell) struct CellConfig g_cellCfg[16];
+EJIT_GROUP(cell) struct CellConfig g_cellCfg[16];
 
 // 时间窗数组: trp (SPEC4 §2.2.2, §5 场景 3)
-ejit_group(trp) struct TrpConfig g_trpCfg[8];
+EJIT_GROUP(trp) struct TrpConfig g_trpCfg[8];
 
 // static 时间窗: sensor
-ejit_group(static) struct SensorConfig g_sensorCfg;
+EJIT_GROUP(static) struct SensorConfig g_sensorCfg;
 
 //===-- 场景 1: 仅依赖 static 时间窗 (SPEC4 §5) -------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 void process_board(void)
 {
     // JIT 时 g_boardCfg.boardType 被视为常量 → 分支折叠
@@ -86,7 +86,7 @@ void process_board(void)
     }
 }
 
-ejit_entry
+EJIT_ENTRY
 void process_sensor(void)
 {
     if (g_sensorCfg.enabled) {
@@ -98,7 +98,7 @@ void process_sensor(void)
 
 //===-- 场景 2: 单时间窗依赖 (static + cell) (SPEC4 §5) -----------------------===//
 
-ejit_entry
+EJIT_ENTRY
 void process_cell(
     EJIT_DIM(cell) uint8_t cellIdx)
 {
@@ -113,7 +113,7 @@ void process_cell(
 }
 
 // 生命周期管理: 修改 cell 时间窗数据 (SPEC4 §2.3.3)
-ejit_guard(cell)
+EJIT_GUARD(cell)
 void update_cell_config(
     EJIT_DIM(cell) uint8_t cellIdx)
 {
@@ -123,7 +123,7 @@ void update_cell_config(
 
 //===-- 场景 3: 多时间窗依赖 (static + cell + trp) (SPEC4 §5) ------------------===//
 
-ejit_entry
+EJIT_ENTRY
 void process_trp_task(
     EJIT_DIM(cell) uint8_t cellIdx,
     EJIT_DIM(trp)  uint8_t trpIdx)
@@ -139,8 +139,8 @@ void process_trp_task(
 }
 
 // 同时管理多个时间窗生命周期 (CLANG_ATTR_DESIGN §4.4.6 Model 1: 允许多实例)
-ejit_guard(cell)
-ejit_guard(trp)
+EJIT_GUARD(cell)
+EJIT_GUARD(trp)
 void update_all_config(
     EJIT_DIM(cell) uint8_t cellIdx,
     EJIT_DIM(trp)  uint8_t trpIdx)
@@ -150,14 +150,14 @@ void update_all_config(
 }
 
 // 分别管理 (SPEC4 §5 场景 3 方式二)
-ejit_guard(cell)
+EJIT_GUARD(cell)
 void change_cell_only(
     EJIT_DIM(cell) uint8_t cellIdx)
 {
     g_cellCfg[cellIdx].cellType = 0xEC;
 }
 
-ejit_guard(trp)
+EJIT_GUARD(trp)
 void change_trp_only(
     EJIT_DIM(trp) uint8_t trpIdx)
 {
@@ -174,9 +174,9 @@ struct NestedCell {
     } sub;
 };
 
-ejit_group(nested) struct NestedCell g_nestedCells[32];
+EJIT_GROUP(nested) struct NestedCell g_nestedCells[32];
 
-ejit_entry
+EJIT_ENTRY
 void process_nested(
     EJIT_DIM(nested) uint8_t idx)
 {
@@ -215,7 +215,7 @@ int main(int argc, char **argv)
     ejit_activate("trp", ti);
     ejit_activate("nested", ni);
 
-    // 调用 ejit_entry 函数 (首次触发 JIT 编译，idx 来自外部输入)
+    // 调用 EJIT_ENTRY 函数 (首次触发 JIT 编译，idx 来自外部输入)
     process_board();
     process_sensor();
     process_cell(ci);

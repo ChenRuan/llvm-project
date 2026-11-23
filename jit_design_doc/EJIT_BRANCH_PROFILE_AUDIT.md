@@ -23,7 +23,7 @@ ICP or module inlining changes the original function boundaries. It reports:
 - zero-count edges.
 
 Independently of applying PGO optimizations, it instruments only loads
-recognized by `EJitStructFieldPass` as `ejit_period_const`, using the same per-load
+recognized by `EJitStructFieldPass` as `EJIT_PERIOD_CONST`, using the same per-load
 metadata and global field-offset fallback as the real replacement pass. One
 monotonic atomic counter is inserted at each original load site before EJIT
 constant specialization. The load may then disappear, but the temporary T0
@@ -85,7 +85,7 @@ needed. Audit sampling requires Async mode; Sync and Off keep their normal
 Baseline/off behavior because there is no later hit-triggered publication.
 
 After the sampling windows and final compilations have completed, explicitly
-print the per-`ejit_entry` ranking from any attached core:
+print the per-`EJIT_ENTRY` ranking from any attached core:
 
 ```c
 ejit_print_period_const_ranking();
@@ -134,7 +134,7 @@ request/completion sequence and a boolean result cross shared memory.
 ## Coverage boundary
 
 Tier-1 instruments every defined function in the extracted module, so callees
-are included even when they are not separate `ejit_entry` roots. The scheduler
+are included even when they are not separate `EJIT_ENTRY` roots. The scheduler
 eventually profiles every *executed* EJIT entry specialization in batches; the
 concurrency limit only controls how many are active at once. A never-called
 entry or specialization has no dynamic profile and cannot appear in this audit.

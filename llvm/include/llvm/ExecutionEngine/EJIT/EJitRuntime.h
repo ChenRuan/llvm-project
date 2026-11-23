@@ -25,40 +25,34 @@
 //   typedef struct {
 //     int EJIT_PERIOD_CONST threshold;
 //   } Config;
-//   ejit_group(static) Config g_config;
-//   ejit_entry void process(EJIT_DIM(cell) uint8_t idx) { ... }
+//   EJIT_GROUP(static) Config g_config;
+//   EJIT_ENTRY void process(EJIT_DIM(cell) uint8_t idx) { ... }
 //===----------------------------------------------------------------------===//
 
 #ifdef EJIT_DISABLE
 #define EJIT_PERIOD_CONST
-#define ejit_group(x)
+#define EJIT_GROUP(x)
 #define EJIT_DIM(x)
 #define EJIT_BOUND_PTR(x)
-#define ejit_free_dim
+#define EJIT_FREE_DIM
 #define EJIT_ENTRY
-#define ejit_entry
-#define ejit_guard(x)
+#define EJIT_GUARD(x)
 #else
-// New names (preferred)
+// UPPERCASE-only on purpose. A lowercase macro whose name equals the
+// attribute spelling (e.g. ejit_group) is only safe as a self-referential
+// define, and the two case forms can never coexist: the form that does NOT
+// collide with the spelling re-expands the inner token (EJIT_GROUP(cell)
+// would produce __attribute__((EJIT_GROUP("cell"))), verified by
+// preprocessing). With lowercase macros gone, every macro below expands
+// directly to the attribute spelling, which is not itself a macro name, so
+// every spelling is safe in both spellings of use.
 #define EJIT_PERIOD_CONST __attribute__((ejit_period_const))
-#define EJIT_DIM(x)             __attribute__((ejit_dim(#x)))
-#define EJIT_BOUND_PTR(x) __attribute__((ejit_bound_ptr(#x)))
-// Self-referential on purpose, and deliberately WITHOUT EJIT_FREE_DIM /
-// EJIT_GROUP / EJIT_GUARD twins that expand to a raw __attribute__: the
-// macro name matches the attribute spelling, so the expansion is stopped by
-// the "macro is not replaced inside its own expansion" rule. A second macro
-// expanding to the same __attribute__ would not be protected — its inner
-// token is not painted when it arrives from a different macro's expansion,
-// so EJIT_GROUP(cell) would expand to __attribute__((EJIT_GROUP("cell")))
-// (verified by preprocessing). The workaround for names that need BOTH
-// forms (currently EJIT_ENTRY): the spelling-colliding name is the
-// self-referential base, and the other name aliases INTO it — that
-// direction is safe in both directions of use.
-#define ejit_free_dim __attribute__((ejit_free_dim))
-#define ejit_group(x) __attribute__((ejit_group(#x)))
-#define ejit_guard(x) __attribute__((ejit_guard(#x)))
-#define ejit_entry __attribute__((ejit_entry))
-#define EJIT_ENTRY ejit_entry
+#define EJIT_GROUP(x)      __attribute__((ejit_group(#x)))
+#define EJIT_DIM(x)        __attribute__((ejit_dim(#x)))
+#define EJIT_BOUND_PTR(x)  __attribute__((ejit_bound_ptr(#x)))
+#define EJIT_FREE_DIM      __attribute__((ejit_free_dim))
+#define EJIT_ENTRY         __attribute__((ejit_entry))
+#define EJIT_GUARD(x)      __attribute__((ejit_guard(#x)))
 #endif
 
 #ifdef __cplusplus

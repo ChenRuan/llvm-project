@@ -3,7 +3,7 @@
  *
  * Verifies the full Tier-1 -> Tier-2 PGO cycle end-to-end:
  *   1. PGO enabled, init in Async mode (starts background std::thread worker).
- *   2. Activate period instance, call ejit_entry function (cache miss).
+ *   2. Activate period instance, call EJIT_ENTRY function (cache miss).
  *   3. Tier-1 (Instrumented) compiles with __profc_/__profd_ counters.
  *   4. Hit the function to cross the PGO threshold (default=3).
  *      The background worker's pollOne() processes the deferred Tier-2
@@ -24,9 +24,9 @@ struct CellCfg {
   EJIT_PERIOD_CONST uint32_t cellType;
   uint32_t data;
 };
-ejit_group(cell) struct CellCfg g_cells[4];
+EJIT_GROUP(cell) struct CellCfg g_cells[4];
 
-ejit_entry uint32_t pgo_branch(EJIT_DIM(cell) uint8_t ci) {
+EJIT_ENTRY uint32_t pgo_branch(EJIT_DIM(cell) uint8_t ci) {
   if (g_cells[ci].cellType == 0xFF)
     return g_cells[ci].data + 100;
   else

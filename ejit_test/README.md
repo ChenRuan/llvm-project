@@ -33,11 +33,11 @@ Integration tests for the EmbeddedJIT JIT compilation system.
 | `ejit_complex_test` | 4-dimension, multi-array, external cellIdx, early-return |
 | `ejit_config_api_test` | Config, stats, cache, compile-mode API validation |
 | `ejit_external_idx_test` | External cellIdx with multi-dim arrays |
-| `ejit_inline_asm_test` | AArch64 inline asm inside an `ejit_entry` function |
+| `ejit_inline_asm_test` | AArch64 inline asm inside an `EJIT_ENTRY` function |
 | `ejit_jit_verify_test` | JIT correctness: constant folding, dead branch elimination |
 | `ejit_lifecycle_test` | ejit_guard: deactivate/activate pairing |
 | `ejit_multidim_test` | 2D multi-dim array with external cellIdx |
-| `ejit_multi_tu_test` | Two TUs each with ejit_entry + period globals, linked together (registry no-duplicate-symbol regression) |
+| `ejit_multi_tu_test` | Two TUs each with EJIT_ENTRY + period globals, linked together (registry no-duplicate-symbol regression) |
 | `ejit_baremetal_link_test` | Bare-metal path: global ctors disabled + custom linker script (`ejit_baremetal.ld`) defining `__start_/__stop_` so the static registry tables drive registration |
 | `ejit_multiversion_test` | Multi-version JIT specialization per cellIdx |
 | `ejit_nested_struct_test` | 2-level and 3-level nested struct may_const |
@@ -77,7 +77,7 @@ After compilation, check these LLVM IR features:
 
 | Check | grep command | Expected |
 |-------|-------------|----------|
-| Wrapper jit_entry block | `jit_entry:` | One per ejit_entry function |
+| Wrapper jit_entry block | `jit_entry:` | One per EJIT_ENTRY function |
 | jit_fallback block | `jit_fallback:` | Original function body moved here |
 | jit_dispatch block | `jit_dispatch:` | JIT-compiled function call |
 | ejit_compile_or_get call | `ejit_compile_or_get` | In jit_entry block |

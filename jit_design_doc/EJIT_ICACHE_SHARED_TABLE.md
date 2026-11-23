@@ -13,7 +13,7 @@
 
 ## 1. Problem
 
-The probe is four instructions inside `ejit_entry`, so it **cannot ask whether
+The probe is four instructions inside `EJIT_ENTRY`, so it **cannot ask whether
 the cell is still valid** without ceasing to be four instructions. Invalidation
 has to happen *to the cell*, from outside.
 
@@ -158,7 +158,7 @@ Nothing in the runtime can check it: a cell carries no record of which core wrot
 it, and adding one puts a per-core gate back on the probe.
 
 > **Contract:** each core drives its own `ejit_guard` instance indices, and
-> no two cores call one `ejit_entry` with the same `ejit_dim` values.
+> no two cores call one `EJIT_ENTRY` with the same `ejit_dim` values.
 
 **P1a — the 0-dim exception, which IS enforced.** An entry with no `ejit_dim`
 params has one cell and no identity to partition it by, so P1 cannot cover it:

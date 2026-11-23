@@ -7,8 +7,8 @@
 //
 // Design:
 //   - Compression level (1-9) and strategy are EJIT_PERIOD_CONST fields in
-//     a global struct marked ejit_group(static).
-//   - The compress() function is ejit_entry — JIT specializes it for the
+//     a global struct marked EJIT_GROUP(static).
+//   - The compress() function is EJIT_ENTRY — JIT specializes it for the
 //     current parameters.
 //   - After JIT compilation, constant-parameter branches are eliminated.
 //
@@ -32,11 +32,11 @@ typedef struct {
   int EJIT_PERIOD_CONST windowBits;    // 9..15
 } CompressCfg;
 
-ejit_group(static) CompressCfg g_cfg;
+EJIT_GROUP(static) CompressCfg g_cfg;
 
 //===--- EJIT entry: compress with specialized parameters -----------------===//
 
-ejit_entry int compress_specialized(
+EJIT_ENTRY int compress_specialized(
     const unsigned char *src, size_t srcLen,
     unsigned char *dst, size_t *dstLen)
 {

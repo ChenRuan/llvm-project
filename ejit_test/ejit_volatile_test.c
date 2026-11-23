@@ -26,7 +26,7 @@ struct Cfg {
   EJIT_PERIOD_CONST uint32_t norm;         /* plain -> folding is expected */
 };
 #define N 8
-ejit_group(cell) struct Cfg g_cfg[N];
+EJIT_GROUP(cell) struct Cfg g_cfg[N];
 
 /* Union members alias, so a period_const member shares its offset with a mutable
    sibling. Folding a load of the mutable member would be a miscompile. */
@@ -35,19 +35,19 @@ union Sel {
   uint32_t mut;
 };
 struct UCfg { union Sel u; };
-ejit_group(ucell) struct UCfg g_ucfg[N];
+EJIT_GROUP(ucell) struct UCfg g_ucfg[N];
 
-ejit_entry
+EJIT_ENTRY
 uint32_t read_vol(EJIT_DIM(cell) uint8_t ci) {
   return g_cfg[ci].vol + g_cfg[ci].norm;
 }
 
-ejit_entry
+EJIT_ENTRY
 uint32_t read_atomic(EJIT_DIM(cell) uint8_t ci) {
   return __atomic_load_n(&g_cfg[ci].atom, __ATOMIC_RELAXED) + g_cfg[ci].norm;
 }
 
-ejit_entry
+EJIT_ENTRY
 uint32_t read_union_mut(EJIT_DIM(ucell) uint8_t ci) {
   return g_ucfg[ci].u.mut; /* the MUTABLE member: must NOT be folded */
 }

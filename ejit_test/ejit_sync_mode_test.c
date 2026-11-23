@@ -18,9 +18,9 @@ struct CellCfg {
   EJIT_PERIOD_CONST uint32_t cellType;
   uint32_t xx;
 };
-ejit_group(cell) struct CellCfg g_cells[4];
+EJIT_GROUP(cell) struct CellCfg g_cells[4];
 
-ejit_entry uint32_t check_cell(EJIT_DIM(cell) uint8_t ci) {
+EJIT_ENTRY uint32_t check_cell(EJIT_DIM(cell) uint8_t ci) {
   if (g_cells[ci].cellType == 0xFF)
     return 300;
   if (g_cells[ci].cellType == 0xFD)

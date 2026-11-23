@@ -30,11 +30,11 @@ struct LoopFoldCfg {
 };
 
 #define N 16
-ejit_group(loopfold) struct LoopFoldCfg g_loopfold[N];
+EJIT_GROUP(loopfold) struct LoopFoldCfg g_loopfold[N];
 
 //===-- JIT entry: 嵌套循环，应折叠为常量 -----------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 uint64_t fold_loop(
     EJIT_DIM(loopfold) uint8_t ci)
 {

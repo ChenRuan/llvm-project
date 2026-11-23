@@ -9,7 +9,7 @@
 
 ## 1. 背景与问题
 
-PASS1(`EJitRegisterBitcodePass`)按**传递闭包**提取:从所有 `ejit_entry` 出发,沿 call 图收集全部可达函数与它们引用的全局变量,整包序列化进 bitcode。helper 多的模块,bitcode 体积随闭包线性膨胀。
+PASS1(`EJitRegisterBitcodePass`)按**传递闭包**提取:从所有 `EJIT_ENTRY` 出发,沿 call 图收集全部可达函数与它们引用的全局变量,整包序列化进 bitcode。helper 多的模块,bitcode 体积随闭包线性膨胀。
 
 已有的相关工作:
 
@@ -67,7 +67,7 @@ PASS1(`EJitRegisterBitcodePass`)按**传递闭包**提取:从所有 `ejit_entry`
 |---|---|---|
 | 内联消化 | inlinehint 且 cost ≤ 阈值 | 体进 entry,standalone 定义消失(已有) |
 | 外链 + 注册 | 非 entry 且函数体 ≥ 阈值 | declaration + AOT 侧注册 |
-| 单独特化 | 用户标 `ejit_entry` | 保留定义,自带 wrapper/注册/周期配置 |
+| 单独特化 | 用户标 `EJIT_ENTRY` | 保留定义,自带 wrapper/注册/周期配置 |
 
 ## 4. 关键设计决策
 
@@ -77,7 +77,7 @@ inliner 的 cost 分析就是"哪些函数值得保留函数体"的决策;内联
 
 ### 4.2 无 period_const 豁免
 
-读 period_const 全局的 helper 默认也外链化(正确性不受影响:外链 helper 读活值,entry 侧 guard 保证值与特化常量一致)。需要 helper 内部特化的场景,用户把它标成 `ejit_entry` 做独立特化——现有机制已验证支撑:
+读 period_const 全局的 helper 默认也外链化(正确性不受影响:外链 helper 读活值,entry 侧 guard 保证值与特化常量一致)。需要 helper 内部特化的场景,用户把它标成 `EJIT_ENTRY` 做独立特化——现有机制已验证支撑:
 
 - entry 不被 internalize(EJitRegisterBitcode.cpp internalize 步骤跳过 `TAG_EJIT_ENTRY`)
 - static 的 entry 也能被 JIT 强制外链(EJitOrcEngine.cpp:903-905)

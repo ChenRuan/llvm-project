@@ -28,7 +28,7 @@ struct SlotCfg {
 
 #define N_ROWS  4
 #define N_COLS  8
-ejit_group(cell) struct SlotCfg g_slots[N_ROWS][N_COLS];
+EJIT_GROUP(cell) struct SlotCfg g_slots[N_ROWS][N_COLS];
 
 //===-- 2D 嵌套结构体数组 -----------------------------------------------------===//
 
@@ -42,11 +42,11 @@ struct Outer2D {
   uint32_t flags;
 };
 
-ejit_group(cell) struct Outer2D g_outer2d[N_ROWS][N_COLS];
+EJIT_GROUP(cell) struct Outer2D g_outer2d[N_ROWS][N_COLS];
 
 //===-- JIT entry: 2D flat struct access ------------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 uint32_t classify_slot(
     EJIT_DIM(cell) uint8_t ci)
 {
@@ -65,7 +65,7 @@ uint32_t classify_slot(
 
 //===-- JIT entry: 2D nested struct access ----------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 uint32_t check_outer2d(
     EJIT_DIM(cell) uint8_t ci)
 {

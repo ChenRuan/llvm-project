@@ -5,10 +5,10 @@
  * naming convention exclusively (no legacy compat aliases):
  *
  *   EJIT_PERIOD_CONST       (attribute ejit_period_const)
- *   ejit_group(x)           (merged period / period_arr)
+ *   EJIT_GROUP(x)           (merged period / period_arr)
  *   EJIT_DIM(x)             (attribute ejit_dim)
  *   EJIT_ENTRY              (attribute ejit_entry)
- *   ejit_guard(x)           (attribute ejit_guard)
+ *   EJIT_GUARD(x)           (attribute ejit_guard)
  */
 
 #include <stdint.h>
@@ -30,12 +30,12 @@ struct CellCfg {
     uint32_t traffic;
 };
 
-//===-- Globals using ejit_group ---------------===//
+//===-- Globals using EJIT_GROUP ---------------===//
 
-ejit_group(static)  struct BoardCfg g_board;
-ejit_group(cell) struct CellCfg g_cells[8];
+EJIT_GROUP(static)  struct BoardCfg g_board;
+EJIT_GROUP(cell) struct CellCfg g_cells[8];
 
-//===-- JIT functions using EJIT_ENTRY / EJIT_DIM / ejit_guard -----===//
+//===-- JIT functions using EJIT_ENTRY / EJIT_DIM / EJIT_GUARD -----===//
 
 EJIT_ENTRY uint32_t check_cell(EJIT_DIM(cell) uint8_t ci) {
     if (g_cells[ci].cellType == 42) return 100;
@@ -43,7 +43,7 @@ EJIT_ENTRY uint32_t check_cell(EJIT_DIM(cell) uint8_t ci) {
     return 0;
 }
 
-ejit_guard(cell)
+EJIT_GUARD(cell)
 void update_cell(EJIT_DIM(cell) uint8_t ci) {
     g_cells[ci].cellType = 99;
 }
@@ -74,15 +74,15 @@ int main(int argc, char **argv) {
     else printf("  OK: check_cell=%u\n", r);
 
     // Test 2: ejit_guard with EJIT_DIM
-    printf("\n--- 2. ejit_guard + EJIT_DIM ---\n");
+    printf("\n--- 2. EJIT_GUARD + EJIT_DIM ---\n");
     update_cell(ci);
     ejit_drain_taskpool();
     r = check_cell(ci);
     if (r != 200) { printf("  FAIL: after guard, check_cell=%u (expected 200)\n", r); failures++; }
     else printf("  OK: after guard, check_cell=%u\n", r);
 
-    // Test 3: ejit_group static always active
-    printf("\n--- 3. ejit_group(static) ---\n");
+    // Test 3: EJIT_GROUP static always active
+    printf("\n--- 3. EJIT_GROUP(static) ---\n");
     g_board.boardType = 7;
     // static period is always active — no explicit activate needed
     // This just verifies the attribute compiles and the global is accessible

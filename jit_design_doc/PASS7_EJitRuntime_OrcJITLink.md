@@ -800,12 +800,12 @@ void runInstCombine(Module& M) {
 }
 ```
 
-**`runInterproceduralPropagation`** — 内部化所有非 `ejit_entry` 定义后运行 IPSCCP，把 1a–1c 在每个调用点变成常量的实参推进 callee 函数体（并把常量返回值推回调用点）。JIT 侧**不再单独运行 Inline**：callee 已在 AOT 预优化（`EJitRegisterBitcodePass`：AlwaysInline + ModuleInliner(O2)）内联。
+**`runInterproceduralPropagation`** — 内部化所有非 `EJIT_ENTRY` 定义后运行 IPSCCP，把 1a–1c 在每个调用点变成常量的实参推进 callee 函数体（并把常量返回值推回调用点）。JIT 侧**不再单独运行 Inline**：callee 已在 AOT 预优化（`EJitRegisterBitcodePass`：AlwaysInline + ModuleInliner(O2)）内联。
 
 ```cpp
 void EJitOptimizer::runInterproceduralPropagation(Module& M) {
     // IPSCCP 仅能推理 local linkage 且未被取地址函数的实参；
-    // 特化模块自包含（只对外查找 ejit_entry 符号），因此把每个
+    // 特化模块自包含（只对外查找 EJIT_ENTRY 符号），因此把每个
     // 非 entry 定义内部化，使 IPSCCP 能枚举其所有调用点。
     for (Function& F : M.functions()) {
         if (F.isDeclaration() || F.hasLocalLinkage())
@@ -1368,7 +1368,7 @@ host 测试适配层可以使用 `std::thread` 模拟 worker，但 target core �
 
 ### 3.4 异步编译的内存序保证
 
-异步模式下，用户线程和编译线程共享全局变量数据（`ejit_period_const` 字段值）。必须确保以下 happens-before 关系成立：
+异步模式下，用户线程和编译线程共享全局变量数据（`EJIT_PERIOD_CONST` 字段值）。必须确保以下 happens-before 关系成立：
 
 ```
 用户线程                          编译线程
@@ -1680,8 +1680,8 @@ llvm/include/llvm/ExecutionEngine/EJIT/
 ```c
 // test_ejit_integration.c
 // 场景 1: 端到端同步编译
-//   定义 struct + ejit_period_const + ejit_group
-//   定义 ejit_entry 函数
+//   定义 struct + EJIT_PERIOD_CONST + ejit_group
+//   定义 EJIT_ENTRY 函数
 //   AOT 编译 + bitcode 嵌入
 //   运行时: init → activate → 调用 → 验证特化结果与预期一致
 
@@ -1697,7 +1697,7 @@ llvm/include/llvm/ExecutionEngine/EJIT/
 //   验证 queue-full dedup rollback、publish gate、generation/version 失效
 
 // 场景 5: 多时间窗
-//   ejit_entry 依赖 cell+trp
+//   EJIT_ENTRY 依赖 cell+trp
 //   不同 (cellIdx, trpIdx) 组合生成不同的特化版本
 ```
 

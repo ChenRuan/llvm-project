@@ -53,10 +53,10 @@ struct CarrCfg {
 
 //===-- 全局变量 -------------------------------------------------------------===//
 
-ejit_group(static) struct DevInfo g_dev;
+EJIT_GROUP(static) struct DevInfo g_dev;
 
 #define N_CARR 8
-ejit_group(carrier) struct CarrCfg g_carr[N_CARR];
+EJIT_GROUP(carrier) struct CarrCfg g_carr[N_CARR];
 
 //===-- always_inline helper (L2 内敛目标) ----------------------------------===//
 
@@ -70,9 +70,9 @@ static inline uint32_t mimo_gain(uint32_t pwr, bool mimo) {
     return mimo ? pwr + 6 : pwr;
 }
 
-//===-- ejit_entry ----------------------------------------------------------===//
+//===-- EJIT_ENTRY ----------------------------------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 uint32_t process_carr(
     EJIT_DIM(carrier) uint8_t ci)
 {

@@ -26,9 +26,9 @@ struct CellCfg {
   uint32_t counter;
 };
 #define N 8
-ejit_group(cell) struct CellCfg g_cells[N];
+EJIT_GROUP(cell) struct CellCfg g_cells[N];
 
-ejit_entry
+EJIT_ENTRY
 uint32_t check_cell(
     EJIT_DIM(cell) uint8_t ci)
 {

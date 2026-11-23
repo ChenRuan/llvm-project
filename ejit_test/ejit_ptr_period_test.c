@@ -38,22 +38,22 @@ typedef struct {
 // Single pointer to struct array — period_arr on a pointer variable.
 // The actual array is malloc'd at runtime. User guarantees the pointer
 // is assigned before ejit_activate and that indices are within bounds.
-ejit_group(cell) CellCfg *g_cell_ptr;
+EJIT_GROUP(cell) CellCfg *g_cell_ptr;
 
 //===--- Pointer-type ejit_period (static time-window) --------------------===//
 
 // Pointer to a single struct — period (static time-window).
 // Changed infrequently; JIT specializes based on its fields.
-ejit_group(static) BoardCfg *g_board_ptr;
+EJIT_GROUP(static) BoardCfg *g_board_ptr;
 
 //===--- Static period array for comparison testing -----------------------===//
 
-ejit_group(cell) CellCfg g_cell_arr[16];
+EJIT_GROUP(cell) CellCfg g_cell_arr[16];
 
 //===--- Pointer-array type period_arr ------------------------------------===//
 
 // Array of pointers — each element points to a CellCfg.
-ejit_group(cell) CellCfg *g_cell_ptrs[8];
+EJIT_GROUP(cell) CellCfg *g_cell_ptrs[8];
 
 //===--- Helper ------------------------------------------------------------===//
 
@@ -65,7 +65,7 @@ static int g_failures = 0;
 
 //===--- Test 1: Pointer period_arr JIT specialization --------------------===//
 
-ejit_entry int test_ptr_period_arr(EJIT_DIM(cell) uint8_t idx) {
+EJIT_ENTRY int test_ptr_period_arr(EJIT_DIM(cell) uint8_t idx) {
   if (g_cell_ptr[idx].mode == MODE_A)
     return g_cell_ptr[idx].threshold * 10 + g_cell_ptr[idx].gain;
   else if (g_cell_ptr[idx].mode == MODE_B)
@@ -76,7 +76,7 @@ ejit_entry int test_ptr_period_arr(EJIT_DIM(cell) uint8_t idx) {
 
 //===--- Test 2: Static pointer period JIT specialization -----------------===//
 
-ejit_entry int test_ptr_period(void) {
+EJIT_ENTRY int test_ptr_period(void) {
   if (g_board_ptr->version >= 2)
     return g_board_ptr->max_cells * 100;
   else
@@ -85,7 +85,7 @@ ejit_entry int test_ptr_period(void) {
 
 //===--- Test 3: Static array period_arr (existing behavior) ---------------===//
 
-ejit_entry int test_arr_period_arr(EJIT_DIM(cell) uint8_t idx) {
+EJIT_ENTRY int test_arr_period_arr(EJIT_DIM(cell) uint8_t idx) {
   if (g_cell_arr[idx].mode == MODE_A)
     return g_cell_arr[idx].threshold * 10 + g_cell_arr[idx].gain;
   else
@@ -94,7 +94,7 @@ ejit_entry int test_arr_period_arr(EJIT_DIM(cell) uint8_t idx) {
 
 //===--- Test 4: Pointer-array period_arr JIT specialization --------------===//
 
-ejit_entry int test_ptr_arr_period_arr(EJIT_DIM(cell) uint8_t idx) {
+EJIT_ENTRY int test_ptr_arr_period_arr(EJIT_DIM(cell) uint8_t idx) {
   if (g_cell_ptrs[idx]->mode == MODE_A)
     return g_cell_ptrs[idx]->threshold * 10 + g_cell_ptrs[idx]->gain;
   else
@@ -103,7 +103,7 @@ ejit_entry int test_ptr_arr_period_arr(EJIT_DIM(cell) uint8_t idx) {
 
 //===--- Test 5: Multiple calls with different cell indices ----------------===//
 
-ejit_entry int test_multi_index(EJIT_DIM(cell) uint8_t idx) {
+EJIT_ENTRY int test_multi_index(EJIT_DIM(cell) uint8_t idx) {
   return g_cell_ptr[idx].threshold * 2 + g_cell_ptr[idx].gain;
 }
 
@@ -114,9 +114,9 @@ typedef struct {
   CellCfg EJIT_PERIOD_CONST cfg;
 } CompoundCfg;
 
-ejit_group(cell) CompoundCfg *g_compound_ptr;
+EJIT_GROUP(cell) CompoundCfg *g_compound_ptr;
 
-ejit_entry int test_nested_ptr(EJIT_DIM(cell) uint8_t idx) {
+EJIT_ENTRY int test_nested_ptr(EJIT_DIM(cell) uint8_t idx) {
   if (g_compound_ptr[idx].cfg.mode == MODE_A)
     return g_compound_ptr[idx].cfg.threshold + g_compound_ptr[idx].id;
   else
@@ -125,7 +125,7 @@ ejit_entry int test_nested_ptr(EJIT_DIM(cell) uint8_t idx) {
 
 //===--- Lifecycle test ----------------------------------------------------===//
 
-ejit_guard(cell) void test_lifecycle(EJIT_DIM(cell) uint8_t idx) {
+EJIT_GUARD(cell) void test_lifecycle(EJIT_DIM(cell) uint8_t idx) {
   g_cell_ptr[idx].gain = 42;
 }
 
@@ -268,7 +268,7 @@ int main(int argc, char **argv) {
   CHECK(r8a == expect8, "recompile ptr_period_arr");
 
   // --- Test 9: ejit_period on pointer (static, always active) ---
-  // ejit_group(static) is implicitly active; no explicit ejit_activate needed.
+  // EJIT_GROUP(static) is implicitly active; no explicit ejit_activate needed.
   printf("\n--- Test 9: Static pointer period (always active) ---\n");
   ejit_clear_cache();
   int r9 = test_ptr_period();

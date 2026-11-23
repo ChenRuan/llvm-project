@@ -12,10 +12,10 @@ typedef struct {
   uint32_t runtimeBias;
 } CellRelated;
 
-ejit_group(cell) uint32_t g_cells[8];
-ejit_group(trp) uint32_t g_trps[8];
+EJIT_GROUP(cell) uint32_t g_cells[8];
+EJIT_GROUP(trp) uint32_t g_trps[8];
 
-ejit_entry uint32_t bound_cell_config(EJIT_DIM(cell)
+EJIT_ENTRY uint32_t bound_cell_config(EJIT_DIM(cell)
                                           uint8_t cellIndex,
                                       EJIT_DIM(trp) uint8_t trpIndex,
                                       EJIT_BOUND_PTR(cell)
@@ -31,7 +31,7 @@ ejit_entry uint32_t bound_cell_config(EJIT_DIM(cell)
    condition inside a loop is the shape that only folds once the bound pointer
    is known nonnull, dereferenceable and aligned: without those the load cannot
    be speculated out of its guard and the loop survives. */
-ejit_entry uint32_t bound_conditional_load(EJIT_DIM(cell)
+EJIT_ENTRY uint32_t bound_conditional_load(EJIT_DIM(cell)
                                                uint8_t cellIndex,
                                            EJIT_BOUND_PTR(cell)
                                                const CellRelated *cellRelated,

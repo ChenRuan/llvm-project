@@ -31,18 +31,18 @@ struct CellCfg {
 };
 
 #define N 16
-ejit_group(cell) struct CellCfg g_cfg[N];
+EJIT_GROUP(cell) struct CellCfg g_cfg[N];
 
 //===-- JIT entry (简单函数，减少自身计算对测量的干扰) ----------------------===//
 
 // 场景 A: 无维度参数 (仅依赖 static)
-ejit_entry
+EJIT_ENTRY
 uint32_t simple_jit(void) {
   return 42;
 }
 
 // 场景 B: 单维度参数
-ejit_entry
+EJIT_ENTRY
 uint32_t cell_jit(
     EJIT_DIM(cell) uint8_t ci)
 {
@@ -58,9 +58,9 @@ struct TrpCfg {
   uint32_t status;
 };
 #define M 8
-ejit_group(trp) struct TrpCfg g_trp[M];
+EJIT_GROUP(trp) struct TrpCfg g_trp[M];
 
-ejit_entry
+EJIT_ENTRY
 uint32_t multi_jit(
     EJIT_DIM(cell) uint8_t ci,
     EJIT_DIM(trp)  uint8_t ti)

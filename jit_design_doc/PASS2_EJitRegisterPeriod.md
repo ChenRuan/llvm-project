@@ -6,15 +6,15 @@
 **类型**: AOT Module Pass
 **顺序**: AOT Pipeline 第 2 步
 
-> **v2.0 重大变更**: 从 `EJitRegisterLayoutPass` 重命名为 `EJitRegisterGroupPass`。移除了结构体布局计算 (`StructLayoutInfo`/`FieldLayout`/`computeStructLayout`)、`!ejit.period_const_offsets` 加载、DW_TAG 交叉校验、`ejit_register_layout` 调用生成。仅保留时间窗变量注册功能。`ejit_period_const` 识别已迁移至 PASS6 的 `load->hasMetadata("ejit.period_const")` 机制（v1.2）。
+> **v2.0 重大变更**: 从 `EJitRegisterLayoutPass` 重命名为 `EJitRegisterGroupPass`。移除了结构体布局计算 (`StructLayoutInfo`/`FieldLayout`/`computeStructLayout`)、`!ejit.period_const_offsets` 加载、DW_TAG 交叉校验、`ejit_register_layout` 调用生成。仅保留时间窗变量注册功能。`EJIT_PERIOD_CONST` 识别已迁移至 PASS6 的 `load->hasMetadata("ejit.period_const")` 机制（v1.2）。
 
 ---
 
 ## 1. 概述
 
-EJitRegisterGroupPass 负责扫描 Module 中所有与 EmbeddedJIT 时间窗关联的全局变量，生成运行时注册代码。这些注册信息在 JIT 编译阶段（PASS6）用于获取全局变量的运行时基地址，从而从进程内存中读取 `ejit_period_const` 字段的运行时值。
+EJitRegisterGroupPass 负责扫描 Module 中所有与 EmbeddedJIT 时间窗关联的全局变量，生成运行时注册代码。这些注册信息在 JIT 编译阶段（PASS6）用于获取全局变量的运行时基地址，从而从进程内存中读取 `EJIT_PERIOD_CONST` 字段的运行时值。
 
-> 注意: `ejit_period_const` 字段的**识别**由 PASS6 通过 `load` 指令上的 `!ejit.period_const` metadata 直接完成。本 Pass 不参与 period_const 识别，仅负责为全局变量注册运行时基地址。
+> 注意: `EJIT_PERIOD_CONST` 字段的**识别**由 PASS6 通过 `load` 指令上的 `!ejit.period_const` metadata 直接完成。本 Pass 不参与 period_const 识别，仅负责为全局变量注册运行时基地址。
 
 ### 1.1 核心职责
 
@@ -28,7 +28,7 @@ EJitRegisterGroupPass 负责扫描 Module 中所有与 EmbeddedJIT 时间窗关�
 | 约束项 | 说明 |
 |--------|------|
 | 类型推导 | 不需要 — 不分析结构体类型 |
-| ejit_period_const 识别 | 不在本 Pass 处理 — 由 PASS6 的 `!ejit.period_const` load metadata 完成 |
+| EJIT_PERIOD_CONST 识别 | 不在本 Pass 处理 — 由 PASS6 的 `!ejit.period_const` load metadata 完成 |
 | 结构体布局 | 不需要 — LayoutRegistry 已移除 |
 | 嵌套结构体 | 不需要 |
 | 注册时机 | `ejit_auto_register()` 中（constructor 阶段执行） |
@@ -40,17 +40,17 @@ EJitRegisterGroupPass 负责扫描 Module 中所有与 EmbeddedJIT 时间窗关�
 ### 2.1 全局变量 Metadata
 
 ```llvm
-; ejit_group(static) 标量变量
+; EJIT_GROUP(static) 标量变量
 @g_boardCfg = dso_local global %struct.BoardConfig zeroinitializer
 ; !ejit.metadata = distinct !{!0}
 ; !0 = !{!"ejit_group", !"static"}
 
-; ejit_group(cell) 数组变量
+; EJIT_GROUP(cell) 数组变量
 @g_cellCfg = dso_local global [16 x %struct.CellConfig] zeroinitializer
 ; !ejit.metadata = distinct !{!1}
 ; !1 = !{!"ejit_group_indexed", !"cell", i32 16}
 
-; ejit_group(trp) 数组变量
+; EJIT_GROUP(trp) 数组变量
 @g_trpCfg = dso_local global [8 x %struct.TrpConfig] zeroinitializer
 ; !ejit.metadata = distinct !{!2}
 ; !2 = !{!"ejit_group_indexed", !"trp", i32 8}
@@ -78,7 +78,7 @@ PreservedAnalyses EJitRegisterGroupPass::run(Module& M, ModuleAnalysisManager& A
     // Step 1: 收集所有 ejit_group / ejit_group 全局变量
     struct PeriodVarInfo {
         GlobalVariable* GV;
-        bool isPeriodArr;           // true: ejit_group, false: ejit_group(static)
+        bool isPeriodArr;           // true: ejit_group, false: EJIT_GROUP(static)
         std::string periodName;
         uint64_t arraySize;         // 仅 ejit_group 有效
     };
@@ -222,7 +222,7 @@ entry:
 // PeriodVarInfo — 时间窗变量信息（本 Pass 内部使用）
 struct PeriodVarInfo {
     GlobalVariable* GV;
-    bool isPeriodArr;           // true: ejit_group, false: ejit_group(static)
+    bool isPeriodArr;           // true: ejit_group, false: EJIT_GROUP(static)
     std::string periodName;
     uint64_t arraySize;         // 仅 ejit_group 有效
 };

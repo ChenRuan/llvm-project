@@ -42,7 +42,7 @@ struct OuterCfg {
 };
 
 #define N 8
-ejit_group(cell) struct OuterCfg g_outer[N];
+EJIT_GROUP(cell) struct OuterCfg g_outer[N];
 
 //===-- 3 层嵌套 -------------------------------------------------------------===//
 
@@ -64,11 +64,11 @@ struct RootCfg {
   struct Level1 l1;
 };
 
-ejit_group(cell) struct RootCfg g_root[N];
+EJIT_GROUP(cell) struct RootCfg g_root[N];
 
 //===-- JIT entry: 2 层嵌套访问 3 个 period_const -------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 uint32_t check_2level(
     EJIT_DIM(cell) uint8_t ci)
 {
@@ -86,7 +86,7 @@ uint32_t check_2level(
 
 //===-- JIT entry: 3 层嵌套访问 ---------------------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 uint32_t check_3level(
     EJIT_DIM(cell) uint8_t ci)
 {

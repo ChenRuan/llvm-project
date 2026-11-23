@@ -78,7 +78,7 @@ struct PgoBenchCfg {
   uint32_t salt;
 };
 
-EJIT_SHARED_SECTION_ATTR ejit_group(cell)
+EJIT_SHARED_SECTION_ATTR EJIT_GROUP(cell)
 struct PgoBenchCfg g_pgo_bench_cfg[1];
 EJIT_SHARED_SECTION_ATTR volatile uint32_t g_pgo_bench_samples[SAMPLE_COUNT];
 EJIT_SHARED_SECTION_ATTR volatile uint64_t g_pgo_bench_sink;
@@ -126,7 +126,7 @@ __attribute__((noinline)) static uint32_t pgo_layout_aot(uint8_t cell,
   PGO_BENCH_BODY(cell, seed);
 }
 
-ejit_entry __attribute__((noinline)) uint32_t
+EJIT_ENTRY __attribute__((noinline)) uint32_t
 pgo_layout_bench(EJIT_DIM(cell) uint8_t cell, uint32_t seed) {
   PGO_BENCH_BODY(cell, seed);
 }

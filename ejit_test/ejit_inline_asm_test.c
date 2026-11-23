@@ -1,7 +1,7 @@
 /**
  * EJIT AArch64 inline-asm regression test.
  *
- * This covers ejit_entry functions whose IR contains InlineAsm.  On AArch64,
+ * This covers EJIT_ENTRY functions whose IR contains InlineAsm.  On AArch64,
  * ORC codegen must have the AArch64 asm parser initialized, otherwise
  * AsmPrinterInlineAsm reports that inline asm is not supported by the streamer.
  */
@@ -18,7 +18,7 @@ struct CellCfg {
   uint32_t noise;
 };
 
-ejit_group(cell) struct CellCfg g_cellCfg[4] = {
+EJIT_GROUP(cell) struct CellCfg g_cellCfg[4] = {
     {10, 3, 100},
     {20, 5, 200},
     {30, 7, 300},
@@ -37,7 +37,7 @@ static int g_failures = 0;
     }                                                                          \
   } while (0)
 
-ejit_entry uint32_t inline_asm_add(EJIT_DIM(cell) uint8_t cellIdx,
+EJIT_ENTRY uint32_t inline_asm_add(EJIT_DIM(cell) uint8_t cellIdx,
                                    uint32_t dynamic) {
   uint32_t base = g_cellCfg[cellIdx].base;
   uint32_t bonus = g_cellCfg[cellIdx].bonus;

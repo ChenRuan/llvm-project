@@ -11,7 +11,7 @@
 >
 > | 旧（本文档时代） | 现行 | Attr.td def / 语义类名 |
 > |---|---|---|
-> | `ejit_may_const` | `ejit_period_const` | EjitPeriodConst / EjitPeriodConstAttr |
+> | `ejit_may_const` | `EJIT_PERIOD_CONST` | EjitPeriodConst / EjitPeriodConstAttr |
 > | `ejit_period` + `ejit_period_arr`（两个属性） | `ejit_group`（合并为一个属性，标量/数组形式由变量类型推断） | EjitGroup / EjitGroupAttr（+ fake BoolArgument `Indexed`） |
 > | `ejit_period_arr_ind` | `ejit_dim` | EjitDim / EjitDimAttr |
 > | `ejit_period_lc` | `ejit_guard` | EjitGuard / EjitGuardAttr |
@@ -22,7 +22,7 @@
 
 ## 1. 概述
 
-为 EmbeddedJIT 系统在 Clang 前端实现 6 种属性：`ejit_period_const`（旧 `ejit_may_const`）、`ejit_group`（旧 `ejit_period`/`ejit_period_arr`，已合并）、`ejit_dim`（旧 `ejit_period_arr_ind`）、`ejit_entry`、`ejit_guard`（旧 `ejit_period_lc`）。覆盖属性 TableGen 定义、Sema 语义检查、AST 分析（防呆检测）和 LLVM IR CodeGen 全流程。
+为 EmbeddedJIT 系统在 Clang 前端实现 6 种属性：`EJIT_PERIOD_CONST`（旧 `ejit_may_const`）、`ejit_group`（旧 `ejit_period`/`ejit_period_arr`，已合并）、`ejit_dim`（旧 `ejit_period_arr_ind`）、`EJIT_ENTRY`、`ejit_guard`（旧 `ejit_period_lc`）。覆盖属性 TableGen 定义、Sema 语义检查、AST 分析（防呆检测）和 LLVM IR CodeGen 全流程。
 
 ### 1.1 参考文档
 
@@ -37,12 +37,12 @@
 
 | 属性 | 标记对象 | 参数 | 继承性 | 说明 |
 |------|---------|------|--------|------|
-| `ejit_period_const` | FieldDecl | 无 | Inheritable | 标记结构体成员在时间窗内可视为常量 |
-| `ejit_group(name)` | VarDecl (标量) | 1 个 String | Inheritable | 标记全局变量所属时间窗 |
-| `ejit_group(name)` | VarDecl (数组) | 1 个 String | Inheritable | 标记全局数组所属时间窗数组 |
+| `EJIT_PERIOD_CONST` | FieldDecl | 无 | Inheritable | 标记结构体成员在时间窗内可视为常量 |
+| `EJIT_GROUP(name)` | VarDecl (标量) | 1 个 String | Inheritable | 标记全局变量所属时间窗 |
+| `EJIT_GROUP(name)` | VarDecl (数组) | 1 个 String | Inheritable | 标记全局数组所属时间窗数组 |
 | `ejit_dim(name)` | ParmVarDecl | 1 个 String | InheritableParam | 标记函数参数为特化维度 |
-| `ejit_entry` | FunctionDecl | 无 | Inheritable | 标记函数为 JIT 优化入口 |
-| `ejit_guard(name)` | FunctionDecl | 1 个 String | Inheritable | 标记函数为时间窗生命周期管理函数 |
+| `EJIT_ENTRY` | FunctionDecl | 无 | Inheritable | 标记函数为 JIT 优化入口 |
+| `EJIT_GUARD(name)` | FunctionDecl | 1 个 String | Inheritable | 标记函数为时间窗生命周期管理函数 |
 
 ---
 
@@ -64,7 +64,7 @@
 
 以下定义应添加到 `clang/include/clang/Basic/Attr.td` 中，建议放在 EmbeddedJIT 相关注释块内。
 
-#### 2.2.1 ejit_period_const
+#### 2.2.1 EJIT_PERIOD_CONST
 
 ```tablegen
 // EmbeddedJIT: 标记结构体成员在时间窗内可视为常量
@@ -134,7 +134,7 @@ def EjitPeriodArrInd : InheritableParamAttr {
 - `SubjectList<[ParmVar]>`：限制标记在函数参数上
 - `HasCustomParsing = 1`：Sema handler 检查参数为整数类型、最多 4 个等
 
-#### 2.2.5 ejit_entry
+#### 2.2.5 EJIT_ENTRY
 
 ```tablegen
 // EmbeddedJIT: 标记函数将进行 JIT 优化
@@ -172,33 +172,33 @@ def EjitPeriodLc : InheritableAttr {
 根据以上定义，TableGen 自动生成以下 C/C++ 拼写：
 
 ```c
-// 1. ejit_period_const - 无参属性
+// 1. EJIT_PERIOD_CONST - 无参属性
 __attribute__((ejit_period_const))
 
-// 2. ejit_group(static) - 单字符串参数
+// 2. EJIT_GROUP(static) - 单字符串参数
 __attribute__((ejit_group("static")))
 
-// 3. ejit_group(cell) - 单字符串参数
+// 3. EJIT_GROUP(cell) - 单字符串参数
 __attribute__((ejit_group("cell")))
 
 // 4. ejit_dim(cell) - 单字符串参数
 __attribute__((ejit_dim("cell")))
 
-// 5. ejit_entry - 无参属性
+// 5. EJIT_ENTRY - 无参属性
 __attribute__((ejit_entry))
 
-// 6. ejit_guard(cell) - 单字符串参数
+// 6. EJIT_GUARD(cell) - 单字符串参数
 __attribute__((ejit_guard("cell")))
 ```
 
 用户常用的宏定义封装（不在编译器实现范围内，由用户或 SDK 头文件提供）：
 
 ```c
-#define ejit_period_const          __attribute__((ejit_period_const))
-#define ejit_group(x)          __attribute__((ejit_group(#x)))
+#define EJIT_PERIOD_CONST          __attribute__((ejit_period_const))
+#define EJIT_GROUP(x)          __attribute__((ejit_group(#x)))
 #define ejit_dim(x)  __attribute__((ejit_dim(#x)))
-#define ejit_entry              __attribute__((ejit_entry))
-#define ejit_guard(x)       __attribute__((ejit_guard(#x)))
+#define EJIT_ENTRY              __attribute__((ejit_entry))
+#define EJIT_GUARD(x)       __attribute__((ejit_guard(#x)))
 ```
 
 ---
@@ -236,7 +236,7 @@ def err_ejit_dim_too_many : Error<
   "function %0 has %1 ejit_dim parameters, "
   "which exceeds the maximum of 4">;
 
-// [错误] ejit_entry 函数不支持递归
+// [错误] EJIT_ENTRY 函数不支持递归
 def err_ejit_entry_recursive : Error<
   "ejit_entry function %0 cannot be recursive">;
 
@@ -244,9 +244,9 @@ def err_ejit_entry_recursive : Error<
 def err_ejit_guard_no_index : Error<
   "ejit_guard(%0) requires a corresponding ejit_dim(%0) parameter">;
 
-// [警告] 修改 ejit_period_const 字段但未标记 ejit_guard
+// [警告] 修改 EJIT_PERIOD_CONST 字段但未标记 ejit_guard
 def warn_ejit_period_const_modified_without_guard : Warning<
-  "modifying ejit_period_const field %0 of %1 without ejit_guard attribute">,
+  "modifying EJIT_PERIOD_CONST field %0 of %1 without ejit_guard attribute">,
   InGroup<EmbeddedJIT>;
 
 // [警告] 函数引用 period_arr 但未通过 ejit_dim 声明依赖
@@ -259,7 +259,7 @@ def warn_ejit_undeclared_period_dep : Warning<
 def note_ejit_group_defined_here : Note<
   "ejit_group '%0' defined here">;
 
-// [备注] ejit_entry 定义位置
+// [备注] EJIT_ENTRY 定义位置
 def note_ejit_entry_defined_here : Note<
   "ejit_entry function %0 defined here">;
 ```
@@ -300,7 +300,7 @@ def EmbeddedJIT : DiagGroup<"embedded-jit">;
 ```cpp
 // SemaEJIT.cpp
 
-/// handleEjitPeriodConstAttr - 处理 ejit_period_const 属性
+/// handleEjitPeriodConstAttr - 处理 EJIT_PERIOD_CONST 属性
 /// 语义检查:
 ///   1. 仅可标记在 FieldDecl 上 (由 TableGen Subjects 保证)
 ///   2. 检查字段类型: 仅支持整型、布尔型、浮点型、嵌套结构体
@@ -332,7 +332,7 @@ static void handleEjitPeriodConstAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 #### 4.3.2 handleEjitPeriodAttr
 
 ```cpp
-/// handleEjitPeriodAttr - 处理 ejit_group(name) 属性
+/// handleEjitPeriodAttr - 处理 EJIT_GROUP(name) 属性
 /// 语义检查:
 ///   1. 仅可标记在 VarDecl (非数组) 上
 ///   2. 检查是否有重复的 period/period_arr 标记
@@ -367,7 +367,7 @@ static void handleEjitPeriodAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   // 对于非 static 的自定义标量时间窗，当前版本标记为未来扩展
   // （不阻止编译，但 CodeGen 发出警告或备注）
   if (periodName != "static") {
-    // 自定义 ejit_group(name) 为未来扩展，当前仅支持 "static"
+    // 自定义 EJIT_GROUP(name) 为未来扩展，当前仅支持 "static"
     // 此处不报错，仅在后端处理时记录
   }
 
@@ -378,7 +378,7 @@ static void handleEjitPeriodAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 #### 4.3.3 handleEjitPeriodArrAttr
 
 ```cpp
-/// handleEjitPeriodArrAttr - 处理 ejit_group(name) 属性
+/// handleEjitPeriodArrAttr - 处理 EJIT_GROUP(name) 属性
 /// 语义检查:
 ///   1. 仅可标记在数组 VarDecl 上
 ///   2. 数组长度固定且 < 100
@@ -473,7 +473,7 @@ static void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 #### 4.3.5 handleEjitEntryAttr
 
 ```cpp
-/// handleEjitEntryAttr - 处理 ejit_entry 属性
+/// handleEjitEntryAttr - 处理 EJIT_ENTRY 属性
 /// 语义检查:
 ///   1. 仅可标记在 FunctionDecl 上 (由 Subjects 保证)
 ///   2. 不支持递归函数
@@ -503,7 +503,7 @@ static void handleEjitEntryAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 #### 4.3.6 handleEjitPeriodLcAttr
 
 ```cpp
-/// handleEjitPeriodLcAttr - 处理 ejit_guard(name) 属性
+/// handleEjitPeriodLcAttr - 处理 EJIT_GUARD(name) 属性
 /// 语义检查:
 ///   1. 仅可标记在 FunctionDecl 上
 ///   2. 必须有对应的 ejit_dim(name) 参数——该检查不在 handler
@@ -513,7 +513,7 @@ static void handleEjitEntryAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 ///      处的 checkEjitPeriodLcIndexNewAttrs 检查。注意：显式实例化声明器上
 ///      的参数属性会被 clang 静默丢弃，所以 arr_ind 必须写在模板 pattern
 ///      的参数上
-///   3. 不能与 ejit_entry 同时标记（见 4.3.5 检查 3；同一函数可标记多个
+///   3. 不能与 EJIT_ENTRY 同时标记（见 4.3.5 检查 3；同一函数可标记多个
 ///      ejit_guard，这是 multi-period 入口的正常形态）
 static void handleEjitPeriodLcAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   auto *FD = cast<FunctionDecl>(D);
@@ -593,7 +593,7 @@ void handleEjitPeriodLcAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 
 但默认情况下 `InheritableAttr` 的同种属性在 Clang 中可多次出现（例如 `annotate` 属性）。需要考虑两种模型：
 
-- **Model 1 多 attribute 实例**: 允许同一函数多次标记 `ejit_guard(cell)` 和 `ejit_guard(trp)`——两个独立的属性实例
+- **Model 1 多 attribute 实例**: 允许同一函数多次标记 `EJIT_GUARD(cell)` 和 `EJIT_GUARD(trp)`——两个独立的属性实例
 - **Model 2 单 attribute 实例**: 仅允许一次标记
 
 对于 `ejit_guard`，采用 **Model 1**（允许多实例）。Clang 的 `InheritableAttr` 默认允许同类属性多次出现在不同拼写下，对于相同拼写需要验证。若存在限制，可在 TableGen 中添加：
@@ -622,16 +622,16 @@ let Inherited = 0; // 暂不需要，Clang InheritableAttr 默认可多次出现
 每种 EJIT 属性在**函数级别**附加一个统一的 `!ejit.metadata` Named Metadata Node。示例：
 
 ```llvm
-; ejit_entry 函数（无 period_arr_ind 参数，仅依赖 static）
+; EJIT_ENTRY 函数（无 period_arr_ind 参数，仅依赖 static）
 ; !ejit.metadata = distinct !{!0}
 ; !0 = !{!"ejit_entry"}
 
-; ejit_entry 函数（单 period_arr_ind 参数）
+; EJIT_ENTRY 函数（单 period_arr_ind 参数）
 ; !ejit.metadata = distinct !{!0, !1}
 ; !0 = !{!"ejit_entry"}
 ; !1 = !{!"ejit_dim", !"cell", i32 0}
 
-; ejit_entry 函数（无参数，不依赖 static 之外的时间窗）
+; EJIT_ENTRY 函数（无参数，不依赖 static 之外的时间窗）
 ; !ejit.metadata = distinct !{!0}
 ; !0 = !{!"ejit_entry"}
 ```
@@ -649,7 +649,7 @@ let Inherited = 0; // 暂不需要，Clang InheritableAttr 默认可多次出现
 #### 5.2.3 Load metadata: `!ejit.period_const`
 
 ```llvm
-; 非 volatile 的 ejit_period_const 字段 load → 标注 !ejit.period_const
+; 非 volatile 的 EJIT_PERIOD_CONST 字段 load → 标注 !ejit.period_const
 %v = load i32, ptr %field, !ejit.period_const !{}
 ```
 
@@ -659,7 +659,7 @@ let Inherited = 0; // 暂不需要，Clang InheritableAttr 默认可多次出现
 
 #### 5.3.1 修改 CGExpr.cpp — EmitLoadOfScalar / EmitLoadOfLValue
 
-在 `CGExpr.cpp` 中，load 指令生成位置（约第 1700–2100 行之间），对于 `ejit_period_const` 字段的 load 添加 metadata：
+在 `CGExpr.cpp` 中，load 指令生成位置（约第 1700–2100 行之间），对于 `EJIT_PERIOD_CONST` 字段的 load 添加 metadata：
 
 ```cpp
 // 在 EmitLoadOfScalar 或同等位置
@@ -703,7 +703,7 @@ public:
 namespace clang {
 namespace CodeGen {
 
-/// 为 ejit_entry / ejit_guard 函数生成 !ejit.metadata
+/// 为 EJIT_ENTRY / ejit_guard 函数生成 !ejit.metadata
 void emitEjitFunctionMetadata(CodeGenModule &CGM,
                               const FunctionDecl *FD,
                               llvm::Function *F) {
@@ -817,7 +817,7 @@ if (VD->hasAttr<EjitPeriodAttr>() || VD->hasAttr<EjitPeriodArrAttr>()) {
 
 ### 6.1 检测目标
 
-在 Sema 阶段检测：对 `ejit_period_const` 字段的写操作是否在 `ejit_guard` 标记的函数中进行。
+在 Sema 阶段检测：对 `EJIT_PERIOD_CONST` 字段的写操作是否在 `ejit_guard` 标记的函数中进行。
 
 ### 6.2 实现方案
 
@@ -885,7 +885,7 @@ def EjitPeriodConstDocs : Documentation {
   let Content = [{
 EmbeddedJIT: 标记结构体成员在时间窗内可视为常量。
 
-当全局变量属于某个时间窗且时间窗处于激活状态时，标记了 ``ejit_period_const``
+当全局变量属于某个时间窗且时间窗处于激活状态时，标记了 ``EJIT_PERIOD_CONST``
 的成员可被视为编译期常量，JIT 编译器会将其替换为运行时实际值并执行常量传播、
 死代码消除和分支折叠等优化。
 
@@ -1044,8 +1044,8 @@ __attribute__((ejit_group("cell"))) int g_ok_scalar;
 __attribute__((ejit_group("one"))) // expected-error {{variable g_conflict cannot have multiple}}
 __attribute__((ejit_group("two"))) int g_conflict;
 
-// ejit_entry 递归
-__attribute__((ejit_entry)) // expected-error {{ejit_entry function 'recursive_func' cannot be recursive}}
+// EJIT_ENTRY 递归
+__attribute__((ejit_entry)) // expected-error {{EJIT_ENTRY function 'recursive_func' cannot be recursive}}
 void recursive_func() { recursive_func(); }
 
 // ejit_guard 无对应 ind

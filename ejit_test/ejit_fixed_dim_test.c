@@ -20,9 +20,9 @@ struct StaticCfg {
   EJIT_PERIOD_CONST uint32_t val;
   uint32_t _pad;
 };
-ejit_group(static) struct StaticCfg g_static_cfg;
+EJIT_GROUP(static) struct StaticCfg g_static_cfg;
 
-ejit_entry uint32_t static_check(void) {
+EJIT_ENTRY uint32_t static_check(void) {
   if (g_static_cfg.val == 77) return 700;
   return 0;
 }
@@ -33,9 +33,9 @@ struct CellCfg {
   EJIT_PERIOD_CONST uint32_t cellType;
   uint32_t traffic;
 };
-ejit_group(cell) struct CellCfg g_cells[8];
+EJIT_GROUP(cell) struct CellCfg g_cells[8];
 
-ejit_entry uint32_t cell_check(EJIT_DIM(cell) uint8_t ci) {
+EJIT_ENTRY uint32_t cell_check(EJIT_DIM(cell) uint8_t ci) {
   if (g_cells[ci].cellType == 42) return 100;
   if (g_cells[ci].cellType == 99) return 200;
   return 0;
@@ -47,9 +47,9 @@ struct TrpCfg {
   EJIT_PERIOD_CONST uint32_t trpType;
   uint32_t status;
 };
-ejit_group(trp) struct TrpCfg g_trps[4];
+EJIT_GROUP(trp) struct TrpCfg g_trps[4];
 
-ejit_entry uint32_t cell_trp_check(EJIT_DIM(cell) uint8_t ci,
+EJIT_ENTRY uint32_t cell_trp_check(EJIT_DIM(cell) uint8_t ci,
                                    EJIT_DIM(trp) uint8_t ti) {
   if (g_cells[ci].cellType == 42 && g_trps[ti].trpType == 3) return 999;
   return 0;

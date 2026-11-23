@@ -7,14 +7,14 @@
 
 > Extends the v2 sticky-monomorphic inline cache (`ejit_icache_design.md`) to
 > **polymorphic** specialization: one cached slot per `(instanceId…)` identity,
-> so an `ejit_entry` called with different `ejit_dim` parameter values serves
+> so an `EJIT_ENTRY` called with different `ejit_dim` parameter values serves
 > the correct specialization for each. Baseline is the `ejit-integrate-djq`
 > direct-load hit path (`@__ejit_icache_fn_<name>` + `gIcacheFnSlots`).
 
 ## 1. Problem
 
 v2 is **monomorphic**: one frozen slot per funcIndex, first resolver wins, read
-forever. It is correct only if every `ejit_entry` is always called with the same
+forever. It is correct only if every `EJIT_ENTRY` is always called with the same
 dim identity. If a function is called with different `ejit_dim` argument values
 (e.g. `funcA(ejit_dim(P0) x)` called with `x=0` then `x=1`), v2 serves the
 first-resolved specialization for **all** calls -> wrong code.
@@ -96,7 +96,7 @@ straight to the funcidx guard / `compile_or_get` (no icache).
 
 ### Lever B: frame-less wrapper + noinline MissFn
 
-The wrapper (`ejit_entry` itself) is a **frame-less hit path**: just the probe
+The wrapper (`EJIT_ENTRY` itself) is a **frame-less hit path**: just the probe
 (GEP + plain load + null-check) + two **tail calls** (`br spec` on hit, `br
 MissFn` on miss). No allocas, no calls, no frame setup -- the hot path never
 touches `sp`. The slow path (funcidx guard + `compile_or_get` + dispatch + AOT
@@ -165,7 +165,7 @@ no read-token, no `release_read`, no dimType load, no version compare, no frame.
 Counts above are the latest measured hit-path instruction totals (probe + tail-call).
 
 ### numDims > EJIT_ICACHE_MAX_DIMS (default 4) -> compile error
-An `ejit_entry` with more than `EJIT_ICACHE_MAX_DIMS` `ejit_dim` params is
+An `EJIT_ENTRY` with more than `EJIT_ICACHE_MAX_DIMS` `ejit_dim` params is
 **rejected at compile time** with a diagnostic; the wrapper emits no probe and
 does not wrap such a function. `EJIT_ICACHE_MAX_DIMS` defaults to 4, matching
 the existing taskpool `DimCount` cap - exceeding it is a programming error, not
@@ -272,7 +272,7 @@ is required**; a non-power-of-2 value is **rejected at CMake configure**.
 | 8 | 8B | 64B | 512B | 4KB | 32KB |
 | 16 | 8B | 128B | 2KB | 32KB | 512KB |
 
-× N `ejit_entry` functions (no longer × cores — the table is shared). D=16 +
+× N `EJIT_ENTRY` functions (no longer × cores — the table is shared). D=16 +
 maxDims=4 is a safe default (≤32KB/func at 4 dims); D=16 + maxDims=2 keeps every
 function ≤2KB. The product picks D + maxDims to fit the shared-region budget.
 
@@ -283,7 +283,7 @@ function ≤2KB. The product picks D + maxDims to fit the shared-region budget.
    `[D][D]…[D]` (numDims dims) `uintptr_t` array (scalar for numDims=0).
    numDims > `EJIT_ICACHE_MAX_DIMS` -> compile error.
 2. **Lever B -- frame-less wrapper + MissFn**: for icache ON, the wrapper
-   (`ejit_entry`) emits ONLY the probe (GEP + plain `ldr` + `expect` +
+   (`EJIT_ENTRY`) emits ONLY the probe (GEP + plain `ldr` + `expect` +
    `cbz`) + two tail calls (`br spec` on hit, `br MissFn` on miss). No
    allocas, no frame. The slow path (funcidx guard + `compile_or_get` +
    dispatch + AOT fallback) is extracted into a per-function `noinline

@@ -11,10 +11,10 @@ struct SlotConfig {
 struct CellConfig {
   struct SlotConfig slots[10];
 };
-ejit_group(cell) struct CellConfig *bounded_cells;
+EJIT_GROUP(cell) struct CellConfig *bounded_cells;
 
-ejit_entry unsigned probe_bounded(EJIT_DIM(cell) unsigned char cell,
-                                  ejit_free_dim unsigned short slot) {
+EJIT_ENTRY unsigned probe_bounded(EJIT_DIM(cell) unsigned char cell,
+                                  EJIT_FREE_DIM unsigned short slot) {
   struct SlotConfig *selected = &bounded_cells[cell].slots[slot % 10];
   ++selected->live;
   return selected->enabled ? 11 : 7;
