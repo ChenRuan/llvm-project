@@ -13,10 +13,13 @@ from types import SimpleNamespace
 
 
 SCRIPT = Path(__file__).with_name("lipo.py")
-DUMP_APIS = (
+OPTIONAL_APIS = (
     "ejit_dump_func",
     "ejit_print_dumped",
     "ejit_print_dumped_module",
+    "ejit_print_period_const_ranking",
+    "ejit_print_mayconst_ranking",
+    "ejit_vp_get_stats",
 )
 RETIRED_APIS = (
     "ejit_compile_or_get",
@@ -65,7 +68,9 @@ def build_archive(root, clang, ar, symbols, name):
     run(
         [
             clang,
-            "--target=x86_64-unknown-linux-gnu",
+            "--target=" + os.environ.get(
+                "EJIT_LIPO_TEST_TARGET", "x86_64-unknown-linux-gnu"
+            ),
             "-c",
             "-ffunction-sections",
             source,
@@ -112,6 +117,17 @@ def defined_symbols(nm, archive):
     return {line.split()[-1] for line in output.splitlines() if line.split()}
 
 
+def merge(lipo, root, archive, ld, name):
+    output = root / f"{name}.o"
+    with contextlib.redirect_stdout(io.StringIO()):
+        lipo.doit_merge(
+            SimpleNamespace(
+                input=str(archive), output=str(output), build_dir=str(root), ld=str(ld)
+            )
+        )
+    return output
+
+
 def main():
     clang = find_tool("clang")
     ar = find_tool("llvm-ar", "ar")
@@ -121,7 +137,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="ejit-lipo-roots-") as directory:
         root = Path(directory)
 
-        test_apis = DUMP_APIS + RETIRED_APIS
+        test_apis = OPTIONAL_APIS + RETIRED_APIS
         complete = build_archive(root, clang, ar, test_apis, "complete")
         input_symbols = defined_symbols(nm, complete)
         if set(test_apis) - input_symbols:
@@ -129,25 +145,27 @@ def main():
         complete_gc, complete_log = gc_merge(
             lipo, root, complete, ar, nm, ld, "complete"
         )
-        complete_symbols = defined_symbols(nm, complete_gc)
-        missing = set(DUMP_APIS) - complete_symbols
-        if missing:
-            raise AssertionError(
-                f"dump API roots were discarded: {sorted(missing)}; "
-                f"defined={sorted(complete_symbols)}; log={complete_log!r}"
-            )
-        if "deliberately_unrooted" in complete_symbols:
-            raise AssertionError("gc-merge retained an unrooted control symbol")
-        if set(RETIRED_APIS) & complete_symbols:
-            raise AssertionError("gc-merge retained a retired runtime API")
+        for output in (complete_gc, merge(lipo, root, complete_gc, ld, "complete")):
+            complete_symbols = defined_symbols(nm, output)
+            missing = set(OPTIONAL_APIS) - complete_symbols
+            if missing:
+                raise AssertionError(
+                    f"{output.name} discarded API roots: {sorted(missing)}; "
+                    f"defined={sorted(complete_symbols)}; log={complete_log!r}"
+                )
+            if "deliberately_unrooted" in complete_symbols:
+                raise AssertionError("lipo retained an unrooted control symbol")
+            if set(RETIRED_APIS) & complete_symbols:
+                raise AssertionError("lipo retained a retired runtime API")
 
         minimal = build_archive(root, clang, ar, (), "minimal")
         minimal_gc, _ = gc_merge(lipo, root, minimal, ar, nm, ld, "minimal")
-        minimal_symbols = defined_symbols(nm, minimal_gc)
-        if "ejit_init" not in minimal_symbols:
-            raise AssertionError("mandatory ejit_init root was discarded")
-        if set(DUMP_APIS) & minimal_symbols:
-            raise AssertionError("gc-merge fabricated missing optional symbols")
+        for output in (minimal_gc, merge(lipo, root, minimal_gc, ld, "minimal")):
+            minimal_symbols = defined_symbols(nm, output)
+            if "ejit_init" not in minimal_symbols:
+                raise AssertionError("mandatory ejit_init root was discarded")
+            if set(OPTIONAL_APIS) & minimal_symbols:
+                raise AssertionError("lipo fabricated missing optional symbols")
 
     print("lipo GC-root regression: PASS")
 

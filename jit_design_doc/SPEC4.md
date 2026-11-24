@@ -15,13 +15,13 @@ EmbeddedJIT 的核心思想：在 `ejit_activate` 与 `ejit_deactivate` 定义�
 
 > **属性拼写约定**: 所有带字符串参数的属性（`ejit_group`/`ejit_dim`/`ejit_bound_ptr`/`ejit_guard`）使用 `#x` 宏字符串化。用户代码通过宏使用无引号标识符（如 `EJIT_GROUP(static)`），宏展开后变为 `__attribute__((ejit_group("static")))`。代码示例中统一使用宏形式。
 >
-> **改名说明 (v1.9, 2026-11)**: 用户面拼写与 IR metadata 统一为现行词汇，**旧拼写已全部删除（不再接受，出现即 unknown attribute 警告并忽略）**：
+> **改名说明 (v1.9, 2026-11)**: 用户面拼写与 IR metadata 统一为现行词汇，**旧属性拼写不再接受（出现即 unknown attribute 警告并忽略）**：
 > - 属性：`ejit_period` + `ejit_period_arr` → `ejit_group`（合并为一个属性，标量/数组形式由变量类型推断）；`ejit_period_arr_ind` → `ejit_dim`；`ejit_period_lc` → `ejit_guard`；`ejit_may_const` → `EJIT_PERIOD_CONST`
 > - IR metadata：load 级 `!ejit.may_const` → `!ejit.period_const`；`!ejit.metadata` 子节点 tag `ejit_period`/`ejit_period_arr` → `ejit_group`/`ejit_group_indexed`、`ejit_period_arr_ind` → `ejit_dim`、`ejit_period_lc` → `ejit_guard`、`ejit_may_const_field` → `ejit_period_const_field`；注册段 `.ejit_period` → `.ejit_group`（`__start_ejit_group`/`__stop_ejit_group` 边界符号随段名）
 > - 宏：EJitRuntime.h 仅提供**大写**宏（`EJIT_PERIOD_CONST` / `EJIT_GROUP` / `EJIT_DIM` / `EJIT_BOUND_PTR` / `EJIT_FREE_DIM` / `EJIT_ENTRY` / `EJIT_GUARD`），小写宏与旧名宏均已删除（对外接口统一大写）
-> - 运行时 API `ejit_print_period_const_ranking`（原 `ejit_print_mayconst_ranking`）；opt 旗标 `-ejit-report-period-const` / `-ejit-warn-few-period-const`（原 mayconst 系列）；pass 注册名 `ejit-guard-handler` / `ejit-register-group`
+> - 运行时 API `ejit_print_period_const_ranking`（旧调测命令 `ejit_print_mayconst_ranking` 保留为兼容别名）；opt 旗标 `-ejit-report-period-const` / `-ejit-warn-few-period-const`（原 mayconst 系列）；pass 注册名 `ejit-guard-handler` / `ejit-register-group`
 >
-> **兼容性**: 旧版编译的存量二进制与新运行时**不兼容**（嵌入 bitcode 内的 metadata tag 字符串已改名，旧 tag 不再被识别——特化静默失效）。预产品阶段无存量部署，一次性切换。
+> **兼容性**: 旧版编译的存量二进制与新运行时**不兼容**（嵌入 bitcode 内的旧 metadata tag 不再被识别，`ejit_config_t` 的布局也已变更）。升级时用同一版本的 Clang、运行时和头文件重编业务对象，更新产品链接脚本的 `.ejit_group` 段及边界符号，再重新链接。
 
 ### 2.1 数据不变性标注：EJIT_PERIOD_CONST
 

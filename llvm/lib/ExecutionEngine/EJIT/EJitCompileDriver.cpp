@@ -17,6 +17,7 @@
 #endif
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
+#include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
 #ifndef EJIT_FREESTANDING
 #include <chrono>
 #endif
@@ -639,7 +640,8 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     PeriodConst.sites.assign(jitEngine_->getLastPeriodConstLoadSites().begin(),
                           jitEngine_->getLastPeriodConstLoadSites().end());
     if (!PeriodConst.sites.empty()) {
-      if (auto Addr = jitEngine_->lookup(cacheKey, "__ejit_group_const_hits"))
+      if (auto Addr = jitEngine_->lookup(
+              cacheKey, EJitStructFieldPass::PeriodConstCounterName))
         PeriodConst.counterBase = reinterpret_cast<uintptr_t>(*Addr);
       else
         consumeError(Addr.takeError());

@@ -383,8 +383,8 @@ ejit_log_level_t ejit_get_log_level(void);
 void ejit_print_registry(void);
 
 /// Print the !ejit.metadata of \p funcName (parsed from its registered
-/// bitcode): whether it is an ejit_entry, its period_arr_ind parameter slots,
-/// period arrays, and period_const field offsets. For diagnosing specialization
+/// bitcode): whether it is an ejit_entry, its ejit_dim parameter slots,
+/// groups, and period_const field offsets. For diagnosing specialization
 /// parameter binding and constant-substitution eligibility.
 void ejit_print_func_meta(const char *funcName);
 
@@ -410,6 +410,10 @@ void ejit_print_code_pool_stats(void);
 /// shared-taskpool build, a non-owner core forwards the request to the
 /// compile-owner worker and waits for printing to finish.
 void ejit_print_period_const_ranking(void);
+
+/// Compatibility entry point for existing board debug shells and scripts.
+/// New code should use ejit_print_period_const_ranking().
+void ejit_print_mayconst_ranking(void);
 
 /// Print the currently-active time-window instances through the platform log:
 /// for each registered period, every active (period, cell) is listed. Works

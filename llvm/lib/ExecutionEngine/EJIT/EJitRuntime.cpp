@@ -1209,6 +1209,8 @@ void ejit_print_period_const_ranking(void) {
   (void)gEJIT->printPeriodConstRanking();
 }
 
+void ejit_print_mayconst_ranking(void) { ejit_print_period_const_ranking(); }
+
 void ejit_print_active(void) {
   if (!gEJIT) {
     EJIT_DIAG_RAW("print_active: not initialized");

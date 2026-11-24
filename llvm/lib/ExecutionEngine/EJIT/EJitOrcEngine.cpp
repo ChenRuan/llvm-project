@@ -13,6 +13,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/Transforms/EmbeddedJIT/EJitFreeDim.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
@@ -988,8 +989,9 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
           }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
           if (!engine->P->optimizer->getLastPeriodConstLoadSites().empty())
-            symFlags[engine->P->J->mangleAndIntern("__ejit_period_const_hits")] =
-                JITSymbolFlags::Exported;
+            symFlags[engine->P->J->mangleAndIntern(
+                EJitStructFieldPass::PeriodConstCounterName)] =
+                    JITSymbolFlags::Exported;
 #endif
           if (!symFlags.empty())
             if (auto Err = R.defineMaterializing(std::move(symFlags)))

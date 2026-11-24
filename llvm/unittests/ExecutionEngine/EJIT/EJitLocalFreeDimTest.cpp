@@ -15,6 +15,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
 #include "llvm/IR/IRBuilder.h"
@@ -937,7 +938,27 @@ TEST(EJitLocalFreeDim, NormalOnlineWorkerPGOAndLifecycleRefresh) {
     }
     return false;
   };
-  EXPECT_TRUE(RunGeneration(11, 1)) << "normal queue never published Tier-2";
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE) &&           \
+    GTEST_HAS_STREAM_REDIRECTION
+  const auto OldLevel = ejit_get_log_level();
+  ejit_set_log_level(EJIT_LOG_INFO);
+  testing::internal::CaptureStdout();
+#endif
+  const bool Published = RunGeneration(11, 1);
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE) &&           \
+    GTEST_HAS_STREAM_REDIRECTION
+  const std::string AuditLog = testing::internal::GetCapturedStdout();
+  ejit_set_log_level(OldLevel);
+  StringRef AuditLine = StringRef(AuditLog)
+                            .split("period_const-audit entry=local_online_246 ")
+                            .second.split('\n').first;
+  uint64_t Hits = 0;
+  EXPECT_FALSE(AuditLine.split(" runtime_hits=").second.consumeInteger(10, Hits))
+      << AuditLine.str();
+  EXPECT_GT(Hits, 0u) << AuditLine.str();
+  RecordProperty("period_const_runtime_hits", std::to_string(Hits));
+#endif
+  EXPECT_TRUE(Published) << "normal queue never published Tier-2";
   EXPECT_GE(Executions, 64u);
   EXPECT_EQ(Shared->counters.asyncCompiles.loadAcquire(), 2u)
       << "offset introduced an unexpected specialization axis";
