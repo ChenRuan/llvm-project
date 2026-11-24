@@ -17,20 +17,20 @@
 typedef enum { MODE_A = 0, MODE_B = 1, MODE_C = 2 } Mode_t;
 
 typedef struct {
-  Mode_t ejit_may_const mode;
-  int ejit_may_const threshold;
+  Mode_t EJIT_PERIOD_CONST mode;
+  int EJIT_PERIOD_CONST threshold;
   int gain;
 } CellCfg;
 
 //===--- Period variables
 //--------------------------------------------------===//
 
-ejit_period_arr(cell) CellCfg g_cells[16];
+EJIT_GROUP(cell) CellCfg g_cells[16];
 
 //===--- JIT entry functions
 //-----------------------------------------------===//
 
-ejit_entry int check_cell(ejit_period_arr_ind(cell) uint8_t idx) {
+EJIT_ENTRY int check_cell(EJIT_DIM(cell) uint8_t idx) {
   if (g_cells[idx].mode == MODE_A)
     return g_cells[idx].threshold * 10 + g_cells[idx].gain;
   else if (g_cells[idx].mode == MODE_B)
@@ -39,7 +39,7 @@ ejit_entry int check_cell(ejit_period_arr_ind(cell) uint8_t idx) {
     return g_cells[idx].threshold * 5 + g_cells[idx].gain;
 }
 
-ejit_entry int simple_return(ejit_period_arr_ind(cell) uint8_t idx) {
+EJIT_ENTRY int simple_return(EJIT_DIM(cell) uint8_t idx) {
   return g_cells[idx].threshold + g_cells[idx].gain;
 }
 
@@ -136,14 +136,14 @@ static int verify_entry(const char *dir, const char *name, uint32_t index,
             !contains(pre, "define ", symbol) ||
             !contains(opt, "define ", symbol) ||
             !contains(pre, "", "load i32") || !contains(opt, "", "ret i32") ||
-            !contains(pre, "", "ejit_period_arr")) {
+            !contains(pre, "", "ejit_group_indexed")) {
           fprintf(stderr, "%s: missing or invalid pre/opt pair in %s\n", name,
                   dir);
           return 0;
         }
         if (!contains(opt, counter, "global")) {
           if (!strcmp(name, "check_cell") &&
-              !contains(pre, "", "ejit.may_const"))
+              !contains(pre, "", "ejit.period_const"))
             return 0;
           struct stat before, after;
           if (count_dumps(dir) != expectedFiles || stat(opt, &before) ||

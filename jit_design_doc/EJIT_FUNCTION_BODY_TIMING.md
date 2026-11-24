@@ -11,7 +11,7 @@ wrapper's entry through read-token release, but still excludes aggregation.
 ## Build
 
 Pass the hidden AOT option when compiling translation units that contain
-`ejit_entry` functions:
+`EJIT_ENTRY` functions:
 
 ```text
 -mllvm -ejit-function-body-timing

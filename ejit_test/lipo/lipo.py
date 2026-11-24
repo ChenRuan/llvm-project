@@ -384,13 +384,13 @@ def doit_gc_merge(args):
         "ejit_taskpool_get_stats", "ejit_taskpool_print_stats", "ejit_taskpool_get_worker_core",
         "ejit_taskpool_print_compiled", "ejit_dump_func", "ejit_print_dumped",
         "ejit_print_dumped_module",
-        "ejit_print_mayconst_ranking",
+        "ejit_print_period_const_ranking",
         # Inline-cache: ejit_register_icache_slot is called from
         # ejit_auto_register (AOT) when -ejit-inline-cache is on, not from the
         # runtime, so gc-merge's --gc-sections would discard it without this GC
         # root. The production wrapper reads @__ejit_icache_fn_<name> directly
         # (no ejit_icache_try call). ejitIcacheRegisterSlot/gIcacheFnSlots are
-        # reachable from this root + ejit_init's .ejit_period walk, no explicit
+        # reachable from this root + ejit_init's .ejit_group walk, no explicit
         # root needed.
         "ejit_register_icache_slot",
     ]

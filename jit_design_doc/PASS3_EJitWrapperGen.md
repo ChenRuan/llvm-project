@@ -12,12 +12,12 @@
 
 ## 1. 概述
 
-EJitWrapperGenPass 为所有 `ejit_entry` 函数生成 Wrapper 插桩代码。采用单函数混合方案：Wrapper 逻辑直接插入原函数入口，JIT 成功时调用特化函数并返回，JIT 失败时继续执行原函数体（Fallback）。用户调用原函数名即自动经过 JIT 编译路径。
+EJitWrapperGenPass 为所有 `EJIT_ENTRY` 函数生成 Wrapper 插桩代码。采用单函数混合方案：Wrapper 逻辑直接插入原函数入口，JIT 成功时调用特化函数并返回，JIT 失败时继续执行原函数体（Fallback）。用户调用原函数名即自动经过 JIT 编译路径。
 
 ### 1.1 核心职责
 
 - 定位所有带 `!{"ejit_entry"}` metadata 的函数
-- 识别函数参数中 `ejit_period_arr_ind` 标注的参数及其关联的时间窗名称
+- 识别函数参数中 `ejit_dim` 标注的参数及其关联的时间窗名称
 - 在函数入口加载 per-lifecycle dimType globals，构造 dim pairs
 - 插入 `ejit_taskpool_compile_or_get(funcIdx, dims, numDims, &fn, &bucket)` 调用
 - 插入结果判空、类型转换和特化函数调用逻辑
@@ -28,16 +28,16 @@ EJitWrapperGenPass 为所有 `ejit_entry` 函数生成 Wrapper 插桩代码。�
 | 约束项 | 说明 |
 |--------|------|
 | 插桩方案 | 单函数混合方案，不创建独立 wrapper 函数 |
-| 参数识别 | 通过函数级 `ejit.metadata` 中的 `ejit_period_arr_ind` 条目（`{tag, periodName, argIndex}`） |
+| 参数识别 | 通过函数级 `ejit.metadata` 中的 `ejit_dim` 条目（`{tag, periodName, argIndex}`） |
 | 类型安全 | 生成 PFN 函数指针 typedef 用于类型转换 |
-| 最大维度 | 单个函数最多 4 个 `ejit_period_arr_ind` 参数 |
-| static 依赖 | 所有 ejit_entry 函数隐式依赖 static 时间窗，无需显式参数 |
+| 最大维度 | 单个函数最多 4 个 `ejit_dim` 参数 |
+| static 依赖 | 所有 EJIT_ENTRY 函数隐式依赖 static 时间窗，无需显式参数 |
 
 ---
 
 ## 2. 输入 IR 格式
 
-### 2.1 ejit_entry 函数 Metadata
+### 2.1 EJIT_ENTRY 函数 Metadata
 
 ```llvm
 ; 无 period_arr_ind 参数 (仅依赖 static 时间窗)
@@ -53,7 +53,7 @@ define void @process_task(i32 %cellIdx) #0 {
 }
 ; !ejit.metadata = distinct !{!0, !1}
 ; !0 = !{!"ejit_entry"}
-; !1 = !{!"ejit_period_arr_ind", !"cell", i32 0}   ; 参数索引 0 → cell
+; !1 = !{!"ejit_dim", !"cell", i32 0}   ; 参数索引 0 → cell
 
 ; 多 period_arr_ind 参数
 define void @process_multi(i32 %cellIdx, i32 %trpIdx, i32 %iterations) #0 {
@@ -61,19 +61,19 @@ define void @process_multi(i32 %cellIdx, i32 %trpIdx, i32 %iterations) #0 {
 }
 ; !ejit.metadata = distinct !{!0, !1, !2}
 ; !0 = !{!"ejit_entry"}
-; !1 = !{!"ejit_period_arr_ind", !"cell", i32 0}   ; 参数索引 0 → cell
-; !2 = !{!"ejit_period_arr_ind", !"trp", i32 1}    ; 参数索引 1 → trp
+; !1 = !{!"ejit_dim", !"cell", i32 0}   ; 参数索引 0 → cell
+; !2 = !{!"ejit_dim", !"trp", i32 1}    ; 参数索引 1 → trp
 ```
 
 ### 2.2 period_arr_ind 参数识别
 
-`ejit_period_arr_ind` 参数通过函数级 `ejit.metadata` 编码，格式与 PASS4 共用：
+`ejit_dim` 参数通过函数级 `ejit.metadata` 编码，格式与 PASS4 共用：
 
 ```llvm
-!{!"ejit_period_arr_ind", !"periodName", i32 argIndex}
+!{!"ejit_dim", !"periodName", i32 argIndex}
 ```
 
-此 metadata 附加在函数上（`F.setMetadata("ejit.metadata", MD)`），Clang CodeGen 在 CodeGenFunction 时为每个 `ejit_period_arr_ind` 参数生成一条。不再依赖 debug info，`-g0` 模式下同样可用。
+此 metadata 附加在函数上（`F.setMetadata("ejit.metadata", MD)`），Clang CodeGen 在 CodeGenFunction 时为每个 `ejit_dim` 参数生成一条。不再依赖 debug info，`-g0` 模式下同样可用。
 
 ---
 
@@ -82,11 +82,11 @@ define void @process_multi(i32 %cellIdx, i32 %trpIdx, i32 %iterations) #0 {
 ### 3.1 主流程
 
 ```
-输入: Module M (含 ejit_entry + period_arr_ind 参数函数)
+输入: Module M (含 EJIT_ENTRY + period_arr_ind 参数函数)
 输出: Module M (函数入口插入 Wrapper 代码)
 
 步骤:
-1. CollectEjitEntryFunctions(M) → 收集所有 ejit_entry 函数
+1. CollectEjitEntryFunctions(M) → 收集所有 EJIT_ENTRY 函数
 2. ForEach entryFunc:
      ParseParamDimensions(entryFunc) → 提取 period_arr_ind 参数列表
      SplitFunctionAtEntry(entryFunc) → 分离原函数体到 fallback 块
@@ -220,7 +220,7 @@ WrapperResult insertWrapperPrologue(Function* F, const DimInfo& dims,
             // index 字段: 参数实际值
             Value* indexField = Builder.CreateConstGEP2_32(dimTy, dimPtr, 0, 1);
             Value* argVal = F->getArg(dims.params[i].argIdx);
-            // ejit_period_arr_ind 参数类型可能为 i8/i16/u8 等，统一 ZExt 到 i32
+            // ejit_dim 参数类型可能为 i8/i16/u8 等，统一 ZExt 到 i32
             Value* indexVal = Builder.CreateZExtOrTrunc(argVal, Type::getInt32Ty(Ctx));
             Builder.CreateStore(indexVal, indexField);
         }
@@ -393,7 +393,7 @@ jit_fallback:
 ## 5. 关键数据结构
 
 ```cpp
-// ejit_period_arr_ind 参数信息
+// ejit_dim 参数信息
 struct PeriodArrIndParam {
     unsigned argIdx;                // 参数在函数参数列表中的索引
     std::string periodName;         // 关联的时间窗名称 (如 "cell", "trp")
@@ -430,17 +430,17 @@ struct DimInfo {
 
 ```
 EJitRegisterBitcodePass  →  提取 bitcode 并嵌入
-EJitRegisterPeriodPass   →  注册时间窗变量
+EJitRegisterGroupPass   →  注册时间窗变量
         ↓
 EJitWrapperGenPass       →  插入 Wrapper 代码 (本 Pass)
         ↓
-EJitPeriodHandlerPass    →  处理生命周期函数
+EJitGuardHandlerPass    →  处理生命周期函数
 ```
 
 | 依赖项 | 说明 |
 |--------|------|
-| ejit.metadata (ejit_entry) | 来自 Clang CodeGen，定位需要 wrapper 的函数 |
-| ejit_period_arr_ind 参数信息 | 来自函数级 `ejit.metadata`（`!{"ejit_period_arr_ind", !"periodName", i32 argIndex}`） |
+| ejit.metadata (EJIT_ENTRY) | 来自 Clang CodeGen，定位需要 wrapper 的函数 |
+| ejit_dim 参数信息 | 来自函数级 `ejit.metadata`（`!{"ejit_dim", !"periodName", i32 argIndex}`） |
 | @ejit_taskpool_compile_or_get | ExternalLinkage 声明，由运行时库提供 |
 | dimType 加载 | 从 per-lifecycle globals 加载，mem2reg 后零栈分配 |
 
@@ -489,7 +489,7 @@ EJitPeriodHandlerPass    →  处理生命周期函数
 | Fallback 路径可达 | FileCheck 匹配 CFG 分支 |
 | 原函数体完整性 | 与原 IR 比较 (jit_fallback 块内容) |
 | 参数传递完整性 | pfn 调用参数列表匹配原始参数 |
-| 无 ejit_entry 函数的 Module | FileCheck: not check |
+| 无 EJIT_ENTRY 函数的 Module | FileCheck: not check |
 
 ---
 

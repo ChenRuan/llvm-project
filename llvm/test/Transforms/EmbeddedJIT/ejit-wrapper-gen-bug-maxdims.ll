@@ -10,10 +10,10 @@ entry:
 }
 
 !0 = distinct !{!{!"ejit_entry"},
-  !{!"ejit_period_arr_ind", !"d0", i32 0}, !{!"ejit_period_arr_ind", !"d1", i32 1},
-  !{!"ejit_period_arr_ind", !"d2", i32 2}, !{!"ejit_period_arr_ind", !"d3", i32 3},
-  !{!"ejit_period_arr_ind", !"d4", i32 4}, !{!"ejit_period_arr_ind", !"d5", i32 5},
-  !{!"ejit_period_arr_ind", !"d6", i32 6}, !{!"ejit_period_arr_ind", !"d7", i32 7},
-  !{!"ejit_period_arr_ind", !"d8", i32 8}}
+  !{!"ejit_dim", !"d0", i32 0}, !{!"ejit_dim", !"d1", i32 1},
+  !{!"ejit_dim", !"d2", i32 2}, !{!"ejit_dim", !"d3", i32 3},
+  !{!"ejit_dim", !"d4", i32 4}, !{!"ejit_dim", !"d5", i32 5},
+  !{!"ejit_dim", !"d6", i32 6}, !{!"ejit_dim", !"d7", i32 7},
+  !{!"ejit_dim", !"d8", i32 8}}
 
 ; CHECK: error: ejit-wrapper-gen: module references 9 distinct lifecycle dimensions but at most 8 are supported

@@ -1046,7 +1046,7 @@ typedef struct {
 
 ```c
 // ================= 核心编译接口 (AOT wrapper 调用) =================
-// funcIndex: ejit_entry 函数索引
+// funcIndex: EJIT_ENTRY 函数索引
 // dims: 维度对数组，描述此调用的特化维度 (如 [(0,3), (1,5)])
 // numDims: 维度对数量
 // outFn: 输出函数指针 (hit 或编译成功) / fallback

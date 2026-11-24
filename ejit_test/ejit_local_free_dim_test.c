@@ -14,11 +14,11 @@
 #include <time.h>
 
 struct HostSlot {
-  ejit_may_const unsigned mode;
+  EJIT_PERIOD_CONST unsigned mode;
   unsigned payload;
 };
 struct HostCell { struct HostSlot slots[10]; };
-ejit_period_arr(cell) struct HostCell local_host_cells[2];
+EJIT_GROUP(cell) struct HostCell local_host_cells[2];
 struct { unsigned slot; } local_host_runtime;
 volatile unsigned local_host_initializer_calls;
 
@@ -27,9 +27,9 @@ static __attribute__((always_inline)) size_t local_host_offset(void) {
   return (size_t)local_host_runtime.slot * sizeof(struct HostSlot);
 }
 
-ejit_entry unsigned
-local_host_work(ejit_period_arr_ind(cell) unsigned cell) {
-  const size_t offset ejit_free_dim = local_host_offset();
+EJIT_ENTRY unsigned
+local_host_work(EJIT_DIM(cell) unsigned cell) {
+  const size_t offset EJIT_FREE_DIM = local_host_offset();
   const struct HostSlot *p = (const struct HostSlot *)(
       (const char *)&local_host_cells[cell].slots[0] + offset);
   return p->mode * 100u + p->payload;

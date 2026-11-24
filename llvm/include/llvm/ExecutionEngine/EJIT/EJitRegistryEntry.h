@@ -11,10 +11,10 @@
 // definitions when several units contain ejit_entry functions. The linker
 // concatenates their entries into two ranges, with no terminator needed:
 //   .ejit_bitcode: PASS1 embedded bitcode and symbol registrations
-//   .ejit_period:  PASS2 period arrays and static variables; PASS3 lifecycle,
+//   .ejit_group:  PASS2 period arrays and static variables; PASS3 lifecycle,
 //                  dense function index, and inline cache slot fixups
 // Static registration walks [__start_ejit_bitcode, __stop_ejit_bitcode) and
-// [__start_ejit_period, __stop_ejit_period). Dotted section names are not C
+// [__start_ejit_group, __stop_ejit_group). Dotted section names are not C
 // identifiers, so a linker script must supply these boundaries. Hosted builds
 // use weak references so missing ranges are empty; freestanding builds use
 // strong references to avoid a GOT relocation and require the linker script.
