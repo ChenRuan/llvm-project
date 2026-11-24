@@ -365,6 +365,9 @@ ejit_status_t ejit_representative_get_stats(ejit_representative_stats_t *out);
 /// may straddle a reset. EJIT_PENDING means busy; retry, never spin in a caller.
 ejit_status_t ejit_reuse_diag_config(const char *entry, uint32_t level);
 ejit_status_t ejit_reuse_diag_print(void);
+/// Print aggregate reason counts for the capture window, without IR excerpts.
+/// Counts are observations (including retries), not unique requests.
+ejit_status_t ejit_reuse_diag_print_summary(void);
 ejit_status_t ejit_reuse_diag_reset(void);
 
 /// Scope of a deactivated lifecycle's compiler-source borrows. This is additive

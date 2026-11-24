@@ -12,8 +12,19 @@ No runtime preconfiguration is needed: detailed capture defaults to all entries.
 Run the existing workload, then on worker core 6 inspect retained records with:
 
 ```text
+ejit_reuse_diag_print_summary
 ejit_reuse_diag_print
 ```
+
+Start with `ejit_reuse_diag_print_summary()` on a large workload. It shows
+counts by stage, reason and action for the current capture window without
+printing IR. Counts include retries and survive eviction from the 16-record
+detail ring; they are **not** a unique member count or a reuse rate. Up to 48
+reason combinations are counted separately; `reason_overflow` and `dropped`
+are explicit. Use the detailed command with an entry filter for a specific
+split. The summary requires representative mode and diagnostics at INFO or
+higher. Both print commands and the config/reset commands are optional lipo
+roots, so shell-only use survives section GC.
 
 The C APIs are `ejit_reuse_diag_config(const char *entry, uint32_t level)`,
 `ejit_reuse_diag_print(void)` and `ejit_reuse_diag_reset(void)`. Use your shell's

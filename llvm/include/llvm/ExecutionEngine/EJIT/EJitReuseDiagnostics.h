@@ -30,6 +30,17 @@ class EJitReuseDiagnosticStore {
 public:
   static constexpr unsigned Capacity = 16;
   static constexpr unsigned DefaultLevel = 2;
+  static constexpr unsigned ReasonCapacity = 48;
+  struct ReasonCount {
+    uint64_t observations = 0;
+    char stage[24] = {}, reason[48] = {}, action[32] = {};
+  };
+  struct ReasonSummary {
+    ReasonCount reasons[ReasonCapacity];
+    uint32_t count = 0, level = 0;
+    uint64_t observations = 0, overflow = 0, dropped = 0;
+    char filter[96] = {};
+  };
   struct Snapshot {
     EJitReuseDiagnostic records[Capacity];
     uint32_t count = 0, level = 0;
@@ -59,6 +70,8 @@ public:
     // A new capture configuration starts a fresh bounded diagnostic window.
     count_ = next_ = 0;
     evicted_ = 0;
+    reasonCount_ = 0;
+    observations_ = reasonOverflow_ = 0;
     dropped_.storeRelaxed(0);
     unlock();
     return true;
@@ -75,6 +88,7 @@ public:
       unlock();
       return false;
     }
+    countReason(R);
     for (unsigned I = 0; I < count_; ++I) {
       auto &Old = records_[I];
       bool SameDims = Old.identity.numDims == R.identity.numDims;
@@ -119,15 +133,55 @@ public:
   bool reset() {
     if (!tryLock()) return false;
     count_ = next_ = 0; evicted_ = 0; dropped_.storeRelaxed(0);
+    reasonCount_ = 0;
+    observations_ = reasonOverflow_ = 0;
+    unlock();
+    return true;
+  }
+  bool summarize(ReasonSummary &Out) {
+    if (!tryLock())
+      return false;
+    Out.count = reasonCount_;
+    Out.level = level_;
+    Out.observations = observations_;
+    Out.overflow = reasonOverflow_;
+    Out.dropped = dropped_.loadRelaxed();
+    copyText(Out.filter, filter_);
+    for (unsigned I = 0; I < reasonCount_; ++I)
+      Out.reasons[I] = reasons_[I];
     unlock();
     return true;
   }
 private:
+  void countReason(const EJitReuseDiagnostic &R) {
+    ++observations_;
+    for (unsigned I = 0; I < reasonCount_; ++I) {
+      auto &C = reasons_[I];
+      if (!std::strcmp(C.stage, R.stage) &&
+          !std::strcmp(C.reason, R.reason) &&
+          !std::strcmp(C.action, R.action)) {
+        ++C.observations;
+        return;
+      }
+    }
+    if (reasonCount_ == ReasonCapacity) {
+      ++reasonOverflow_;
+      return;
+    }
+    auto &C = reasons_[reasonCount_++];
+    C.observations = 1;
+    copyText(C.stage, R.stage);
+    copyText(C.reason, R.reason);
+    copyText(C.action, R.action);
+  }
   bool tryLock() { uint32_t Expected = 0; return lock_.compareExchange(Expected, 1); }
   void unlock() { lock_.storeRelease(0); }
   EJitAtomicU32 lock_{0};
   EJitAtomicU64 dropped_{0};
   EJitReuseDiagnostic records_[Capacity];
+  ReasonCount reasons_[ReasonCapacity];
+  uint64_t observations_ = 0, reasonOverflow_ = 0;
+  uint32_t reasonCount_ = 0;
   uint64_t sequence_ = 0, evicted_ = 0;
   uint32_t count_ = 0, next_ = 0, level_ = DefaultLevel;
   char filter_[96] = "*";

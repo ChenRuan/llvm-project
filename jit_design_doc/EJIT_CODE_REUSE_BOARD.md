@@ -5,7 +5,8 @@ Replace the previous file defining `test_ejit_period`; do not link both demos.
 The companion `ejit_reuse_host_check.c` is a host-only mock, NOT a board source.
 For optional mismatch reasons and paired bounded IR excerpts on core 6, see
 [reuse diagnostics](EJIT_REUSE_DIAGNOSTICS.md). Capture is enabled by default;
-call `ejit_reuse_diag_print` on core 6 after testing, without preconfiguration.
+call `ejit_reuse_diag_print_summary` for reason counts or
+`ejit_reuse_diag_print` for individual differences on core 6 after testing.
 The smoke source need not change.
 
 ## Default lightweight mode
@@ -29,7 +30,8 @@ lookup/execute/release/yield discipline are unchanged. Reduced workload and
 omitting full dumps should shorten the run, but no board timing is promised.
 SRE dump-loop throttling applies to bulk dump lines, not every ordinary log.
 The new lipo GC roots must be used during `gc-merge`, before `merge.ld`;
-verify `ejit_reuse_diag_print/config/reset` exist in the final runtime object.
+verify `ejit_reuse_diag_print_summary` and
+`ejit_reuse_diag_print/config/reset` exist in the final runtime object.
 
 ## Build And Startup
 

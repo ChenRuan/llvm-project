@@ -1158,6 +1158,37 @@ ejit_status_t ejit_reuse_diag_print(void) {
   return EJIT_OK;
 }
 
+ejit_status_t ejit_reuse_diag_print_summary(void) {
+#if defined(EJIT_DIAG_ENABLE) && defined(EJIT_SRE_SHARED_TASKPOOL)
+  if (!reuseDiagOnOwner())
+    return EJIT_ERR_NOT_ACTIVE;
+  if (!gEJIT->compileDriver()->representativeSharingActive() ||
+      gEJitDiagLevel < EJIT_LOG_LVL_INFO)
+    return EJIT_ERR_DISABLED;
+  auto Storage = std::make_unique<EJitReuseDiagnosticStore::ReasonSummary>();
+  const auto &S = *Storage;
+  if (!reuseDiagnosticStore().summarize(*Storage))
+    return EJIT_PENDING;
+  EJIT_DIAG_RAW("[REUSE_SUMMARY] filter=%s level=%u observations=%llu "
+                "reason_overflow=%llu dropped=%llu",
+                S.filter, S.level,
+                static_cast<unsigned long long>(S.observations),
+                static_cast<unsigned long long>(S.overflow),
+                static_cast<unsigned long long>(S.dropped));
+  ejitDiagPrintThrottle();
+  for (unsigned I = 0; I < S.count; ++I) {
+    const auto &R = S.reasons[I];
+    EJIT_DIAG_RAW("[REUSE_SUMMARY] stage=%s reason=%s action=%s events=%llu",
+                  R.stage, R.reason, R.action,
+                  static_cast<unsigned long long>(R.observations));
+    ejitDiagPrintThrottle();
+  }
+  return EJIT_OK;
+#else
+  return EJIT_ERR_DISABLED;
+#endif
+}
+
 void ejit_dump_func(const char *name) {
 #ifdef EJIT_DUMP_SUPPORT
   // gDumpSharedState is bound once in ejit_init (and cleared in ejit_shutdown);

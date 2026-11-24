@@ -136,6 +136,43 @@ TEST(EJitReuseDiagnostics, RingBoundAndEvictionAreVisible) {
   EXPECT_EQ(Snap.records[0].identity.groupId, 5u);
   EXPECT_EQ(Snap.records[15].identity.groupId, 20u);
 }
+TEST(EJitReuseDiagnostics, SummarySurvivesDetailEvictionAndCountsRetries) {
+  EJitReuseDiagnosticStore S;
+  for (unsigned I = 1; I <= 20; ++I) {
+    auto R = event(I);
+    EXPECT_TRUE(S.record(R));
+    EXPECT_FALSE(S.record(R));
+  }
+  auto R = event(21);
+  EJitReuseDiagnosticStore::copyText(R.stage, "FINAL");
+  EJitReuseDiagnosticStore::copyText(R.action, "TRY_SEPARATE_CODE");
+  EXPECT_TRUE(S.record(R));
+  EJitReuseDiagnosticStore::ReasonSummary Summary;
+  ASSERT_TRUE(S.summarize(Summary));
+  EXPECT_EQ(Summary.observations, 41u);
+  ASSERT_EQ(Summary.count, 2u);
+  EXPECT_STREQ(Summary.reasons[0].stage, "CANDIDATE");
+  EXPECT_EQ(Summary.reasons[0].observations, 40u);
+  EXPECT_STREQ(Summary.reasons[1].stage, "FINAL");
+  EXPECT_EQ(Summary.reasons[1].observations, 1u);
+  ASSERT_TRUE(S.reset());
+  ASSERT_TRUE(S.summarize(Summary));
+  EXPECT_EQ(Summary.observations, 0u);
+  EXPECT_EQ(Summary.count, 0u);
+}
+TEST(EJitReuseDiagnostics, SummaryReasonOverflowIsExplicit) {
+  EJitReuseDiagnosticStore S;
+  for (unsigned I = 0; I <= S.ReasonCapacity; ++I) {
+    auto R = event();
+    EJitReuseDiagnosticStore::copyText(R.reason, std::to_string(I));
+    EXPECT_TRUE(S.record(R));
+  }
+  EJitReuseDiagnosticStore::ReasonSummary Summary;
+  ASSERT_TRUE(S.summarize(Summary));
+  EXPECT_EQ(Summary.count, S.ReasonCapacity);
+  EXPECT_EQ(Summary.overflow, 1u);
+  EXPECT_EQ(Summary.observations, S.ReasonCapacity + 1);
+}
 TEST(EJitReuseDiagnostics, ConcurrentCaptureAndSnapshotStayBounded) {
   EJitReuseDiagnosticStore S;
   std::thread Producer([&] {

@@ -21,6 +21,7 @@ OPTIONAL_APIS = (
     "ejit_print_mayconst_ranking",
     "ejit_vp_get_stats",
     "ejit_reuse_diag_print",
+    "ejit_reuse_diag_print_summary",
     "ejit_reuse_diag_config",
     "ejit_reuse_diag_reset",
 )
