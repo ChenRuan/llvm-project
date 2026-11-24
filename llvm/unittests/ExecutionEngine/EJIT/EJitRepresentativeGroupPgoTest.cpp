@@ -234,6 +234,11 @@ public:
                 Flags[J->mangleAndIntern("__profd_" + N)] =
                     JITSymbolFlags::Exported;
               }
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+              if (!Opt->getLastMayConstLoadSites().empty())
+                Flags[J->mangleAndIntern("__ejit_mayconst_hits")] =
+                    JITSymbolFlags::Exported;
+#endif
               ADD_FAILURE_IF_VERIFY_FAILS(Mod);
               Opt->clearAnalyses();
             });
@@ -316,6 +321,11 @@ public:
     Spec.cacheKey = uint64_t(FuncIndex) << 32;
     Spec.dimensions = {{"cell", 0}, {"trp", 1}};
     Spec.tier = CompileTier::Instrumented;
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_SRE_PGO_VALUE_PROFILE)
+    // This standalone fixture consumes edge profiles only. The separate
+    // production runtime tests cover the value-profile callbacks.
+    Spec.profileAuditOnly = true;
+#endif
     return Spec;
   }
 

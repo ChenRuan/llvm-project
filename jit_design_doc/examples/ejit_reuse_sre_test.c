@@ -4,6 +4,8 @@
 // Use a fresh, otherwise idle image. See EJIT_CODE_REUSE_BOARD.md.
 #ifdef REUSE_USE_RUNTIME_HEADER
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+// Use the raw Clang attribute spelling in the probes below.
+#undef ejit_entry
 #else
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;

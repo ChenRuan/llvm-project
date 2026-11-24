@@ -144,8 +144,8 @@ private:
   bool preserveDimensions_ = false;
   bool preservedContextValid_ = false;
   SmallVector<std::pair<std::string, uint8_t>, 4> preservedDimensions_;
-  AssumedArgMap preservedArgs_;
-  AssumedArgMap preservedLoadArgs_;
+  EJitFreeDimAssumptions preservedArgs_;
+  EJitFreeDimAssumptions preservedLoadArgs_;
   SmallPtrSet<const Function *, 16> preservedFunctions_;
   std::optional<uint8_t> preservedInstance(StringRef Period) const;
   void initPreservedDimensions(Module &M);

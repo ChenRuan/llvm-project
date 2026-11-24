@@ -2412,8 +2412,10 @@ EJitStructFieldPass::preservedInstance(StringRef Period) const {
 }
 
 void EJitStructFieldPass::initPreservedDimensions(Module &M) {
-  preservedArgs_.clear();
-  preservedLoadArgs_.clear();
+  preservedArgs_.values.clear();
+  preservedLoadArgs_.values.clear();
+  preservedLoadArgs_.phiInputs.clear();
+  preservedLoadArgs_.hasLocalMarkers = false;
   preservedFunctions_.clear();
   if (!preserveDimensions_ || !preservedContextValid_)
     return;
@@ -2467,22 +2469,23 @@ void EJitStructFieldPass::initPreservedDimensions(Module &M) {
     auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
     if (!Period || !Idx || Idx->getValue().getActiveBits() > 32 ||
         Idx->getZExtValue() >= Root->arg_size()) {
-      preservedArgs_.clear();
+      preservedArgs_.values.clear();
       return;
     }
     auto Instance = preservedInstance(Period->getString());
     if (!Instance)
       continue;
     Argument *Arg = Root->getArg(static_cast<unsigned>(Idx->getZExtValue()));
-    if (!Arg->getType()->isIntegerTy() || preservedArgs_.count(Arg) ||
-        is_contained(SeenPeriods, Period->getString()) || freeDimArgs_.count(Arg) ||
+    if (!Arg->getType()->isIntegerTy() || preservedArgs_.values.count(Arg) ||
+        is_contained(SeenPeriods, Period->getString()) ||
+        freeDimAssumptions_.values.count(Arg) ||
         APInt(8, *Instance).getActiveBits() >
             Arg->getType()->getIntegerBitWidth()) {
-      preservedArgs_.clear();
+      preservedArgs_.values.clear();
       return;
     }
     SeenPeriods.push_back(Period->getString());
-    preservedArgs_[Arg] = *Instance;
+    preservedArgs_.values[Arg] = *Instance;
   }
 
   // Establish a closed direct-call region. Address-taken or external helpers,
@@ -2528,13 +2531,13 @@ void EJitStructFieldPass::initPreservedDimensions(Module &M) {
       if (F == Root)
         continue;
       for (const Argument &Arg : F->args()) {
-        if (!Arg.getType()->isIntegerTy() || preservedArgs_.count(&Arg))
+        if (!Arg.getType()->isIntegerTy() || preservedArgs_.values.count(&Arg))
           continue;
         std::optional<APInt> Expected;
         bool Valid = !Callers[F].empty();
         for (CallBase *CB : Callers[F]) {
           if (!EdgeEvaluationsLeft) {
-            preservedArgs_.clear();
+            preservedArgs_.values.clear();
             preservedFunctions_.clear();
             return;
           }
@@ -2554,7 +2557,7 @@ void EJitStructFieldPass::initPreservedDimensions(Module &M) {
           Expected = std::move(Actual);
         }
         if (Valid && Expected) {
-          preservedArgs_[&Arg] = Expected->getZExtValue();
+          preservedArgs_.values[&Arg] = Expected->getZExtValue();
           Changed = true;
         }
       }
@@ -2562,9 +2565,18 @@ void EJitStructFieldPass::initPreservedDimensions(Module &M) {
   } while (Changed);
 
   preservedLoadArgs_ = preservedArgs_;
-  for (const auto &Arg : freeDimArgs_)
-    if (preservedFunctions_.count(Arg.first->getParent()))
-      preservedLoadArgs_.try_emplace(Arg.first, Arg.second);
+  // Authorized local markers can contribute to a load address, never to the
+  // real call-edge argument proofs above.
+  for (const auto &Witness : freeDimAssumptions_.values) {
+    const auto *Arg = dyn_cast<Argument>(Witness.first);
+    const auto *Inst = dyn_cast<Instruction>(Witness.first);
+    const Function *Parent =
+        Arg ? Arg->getParent() : Inst ? Inst->getFunction() : nullptr;
+    if (!preservedFunctions_.count(Parent))
+      continue;
+    preservedLoadArgs_.values.try_emplace(Witness.first, Witness.second);
+    preservedLoadArgs_.hasLocalMarkers |= Inst != nullptr;
+  }
 }
 
 // Checked displacement calculation for the preserved policy. Negative steps
@@ -2572,7 +2584,7 @@ void EJitStructFieldPass::initPreservedDimensions(Module &M) {
 // must not be laundered by a later negative GEP. No source IR is changed.
 static std::optional<std::pair<const Value *, uint64_t>>
 getPreservedOffset(const Value *Ptr, const DataLayout &DL,
-                   const AssumedArgMap &Assumed) {
+                   const EJitFreeDimAssumptions &Assumed) {
   if (DL.getPointerSizeInBits(0) != 64 || DL.getIndexSizeInBits(0) != 64 ||
       DL.isNonIntegralAddressSpace(0))
     return std::nullopt;
@@ -2656,7 +2668,8 @@ Constant *EJitStructFieldPass::tryReplacePreservedLoad(LoadInst *LI,
   if (!preservedFunctions_.count(LI->getFunction()) || LI->isVolatile() ||
       LI->isAtomic())
     return nullptr;
-  bool Authorized = isMayConstLoad(LI, mayConstFieldMap_, DL);
+  bool Authorized = isMayConstLoad(LI, mayConstFieldMap_, DL,
+                                   preservedLoadArgs_);
   for (const BoundPointerState &State : boundStates_)
     Authorized |= isBoundMayConstLoad(LI, State.boundArguments,
                                       State.mayConstFields, DL,
@@ -2677,7 +2690,7 @@ Constant *EJitStructFieldPass::tryReplacePreservedLoad(LoadInst *LI,
   if (const auto *GV = dyn_cast<GlobalVariable>(Address->first)) {
     auto It = gvPeriodMap_.find(GV);
     if (It == gvPeriodMap_.end() ||
-        !isMayConstLoad(LI, mayConstFieldMap_, DL))
+        !isMayConstLoad(LI, mayConstFieldMap_, DL, preservedLoadArgs_))
       return nullptr;
     const GVPeriodInfo &Info = It->second;
     auto Instance = preservedInstance(Info.periodName);
@@ -2808,7 +2821,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       if (preserveDimensions_) {
 #ifdef EJIT_DIAG_ENABLE
-        bool IsMayConst = isMayConstLoad(LI, mayConstFieldMap_, DL);
+        bool IsMayConst = isMayConstLoad(LI, mayConstFieldMap_, DL,
+                                        preservedLoadArgs_);
         for (const BoundPointerState &State : boundStates_)
           IsMayConst |= isBoundMayConstLoad(
               LI, State.boundArguments, State.mayConstFields, DL,
@@ -2922,10 +2936,11 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       // Legacy pointer-base substitutions are address plumbing, not mayconst
       // values. The preserved-dimension path replaces only proven load values.
       bool IsValue = preserveDimensions_ ||
-          isMayConstLoad(R.LI, mayConstFieldMap_, DL);
+          isMayConstLoad(R.LI, mayConstFieldMap_, DL, freeDimAssumptions_);
       for (const BoundPointerState &State : boundStates_)
         IsValue |= isBoundMayConstLoad(R.LI, State.boundArguments,
-                                      State.mayConstFields, DL, freeDimArgs_);
+                                      State.mayConstFields, DL,
+                                      freeDimAssumptions_);
       if (IsValue) {
         uint64_t Site = 0;
         StringRef Origin;

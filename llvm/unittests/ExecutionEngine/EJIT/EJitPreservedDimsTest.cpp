@@ -18,6 +18,7 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Transforms/EmbeddedJIT/EJitFreeDim.h"
 #include "gtest/gtest.h"
 #include <cstdint>
 #include <memory>
@@ -492,6 +493,32 @@ TEST_F(PreservedDimsTest, FreeDimWitnessIsLoadOnlyNotACallProof) {
   EXPECT_EQ(loads(*M->getFunction("f")), 0u);
   EXPECT_EQ(loads(*M->getFunction("helper")), 1u);
   EXPECT_FALSE(M->getFunction("f")->getArg(1)->use_empty());
+}
+
+TEST_F(PreservedDimsTest, LocalWitnessFoldsOnlyTheMarkedAddress) {
+  auto M = parse(C, R"(
+    %slot = call i64 @__ejit_local_free_dim_v1_i64(i64 %trp)
+    %base = getelementptr [6 x %Cfg], ptr @cfg, i64 0, i64 %cell, i32 0
+    %p = getelementptr i32, ptr %base, i64 %slot
+    %v = load i32, ptr %p, !ejit.may_const !7
+    store i64 %slot, ptr @observed
+    ret i32 %v
+  )", R"(
+    @observed = external global i64
+    declare i64 @__ejit_local_free_dim_v1_i64(i64) #0
+    attributes #0 = { nounwind willreturn memory(none) "ejit.local_free_dim"="v1" }
+  )");
+  ASSERT_TRUE(M);
+  auto Spec = context();
+  Spec.dimensions.pop_back();
+  replace(*M, R, Spec);
+  Function *F = M->getFunction("f");
+  EXPECT_EQ(loads(*F), 0u);
+  EXPECT_TRUE(lowerEJitLocalFreeDims(*M));
+  for (Instruction &I : instructions(*F))
+    if (auto *Store = dyn_cast<StoreInst>(&I))
+      EXPECT_EQ(Store->getValueOperand(), F->getArg(1));
+  EXPECT_FALSE(verifyModule(*M, &errs()));
 }
 
 #ifndef EJIT_FREESTANDING
