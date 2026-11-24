@@ -11,6 +11,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/AsmParser/Parser.h"
+#include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
@@ -25,6 +26,7 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/Threading.h"
+#include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
 #include "gtest/gtest.h"
 
 using namespace llvm;
@@ -715,6 +717,75 @@ TEST(EJitFinalCodeIdentity, RejectsIndependentOrAddressObservableState) {
   }
 }
 
+TEST(EJitFinalCodeIdentity, AotExtractedExternalConstLookupIsConservative) {
+  auto Aot = parse(R"(
+    @lut = dso_local constant [8 x i32]
+      [i32 29119416, i32 -9472851, i32 340682231, i32 1148365025,
+       i32 90081305, i32 -4723841, i32 1776803407, i32 -731575397]
+    define i32 @f(i64 %slot) !ejit.metadata !0 {
+      %idx = and i64 %slot, 7
+      %p = getelementptr inbounds [8 x i32], ptr @lut, i64 0, i64 %idx
+      %v = load i32, ptr %p, align 4
+      ret i32 %v
+    }
+    !0 = distinct !{!1}
+    !1 = !{!"ejit_entry"}
+  )");
+  ASSERT_TRUE(Aot);
+  std::string Bitcode;
+  Aot.withModuleDo([&](Module &M) {
+    ModuleAnalysisManager MAM;
+    EJitRegisterBitcodePass().run(M, MAM);
+    auto *Blob = M.getGlobalVariable("__ejit_bitcode", true);
+    ASSERT_NE(Blob, nullptr);
+    auto *Bytes = dyn_cast<ConstantDataArray>(Blob->getInitializer());
+    ASSERT_NE(Bytes, nullptr);
+    Bitcode = Bytes->getRawDataValues().str();
+  });
+  ASSERT_FALSE(Bitcode.empty());
+  auto Context = std::make_unique<LLVMContext>();
+  auto Extracted = parseBitcodeFile(MemoryBufferRef(Bitcode, "const-lookup"),
+                                   *Context);
+  ASSERT_TRUE(bool(Extracted)) << toString(Extracted.takeError());
+  auto &M = **Extracted;
+  auto *Table = M.getNamedGlobal("lut");
+  ASSERT_NE(Table, nullptr);
+  ASSERT_TRUE(Table->isConstant());
+  ASSERT_TRUE(Table->hasExternalLinkage());
+  ASSERT_FALSE(Table->isDeclaration());
+  ASSERT_FALSE(Table->use_empty());
+
+  // The same prefix can group, but the still-defined table keeps the final
+  // module from sharing even though the entry only reads it.
+  EJitCandidateDirectory Directory;
+  const PgoFunctionSchema Schema{"f", 1, 2, 1, 0, 0, 0};
+  auto First = Directory.classify(M, scope(), {}, {Schema});
+  ASSERT_TRUE(bool(First)) << toString(First.takeError());
+  auto Second = Directory.classify(M, scope(), {}, {Schema});
+  ASSERT_TRUE(bool(Second)) << toString(Second.takeError());
+  EXPECT_TRUE(Second->existing);
+
+  PeriodArrayRegistry Registry;
+  EJitOptimizer Optimizer(Registry, /*PreserveDimensions=*/true);
+  SpecializationContext Spec;
+  Spec.fnName = "f";
+  Spec.optLevel = OptimizationLevel::L2;
+  Spec.tier = CompileTier::PGOUse;
+  Optimizer.runPipeline(M, Spec);
+  Table = M.getNamedGlobal("lut");
+  ASSERT_NE(Table, nullptr);
+  ASSERT_FALSE(Table->use_empty());
+  ASSERT_FALSE(Table->isDeclaration());
+  auto Final = EJitPreparedCode::create(
+      orc::ThreadSafeModule(std::move(*Extracted), std::move(Context)), scope(),
+      {});
+  ASSERT_FALSE(bool(Final));
+  const std::string Reason = toString(Final.takeError());
+  EXPECT_TRUE(StringRef(Reason).contains(
+      "private state or address-observable defined global"));
+  RecordProperty("final_rejection", Reason);
+}
+
 TEST(EJitFinalCodeIdentity,
      RejectsMissingDuplicateNullBindingsAndSmallBudgets) {
   const char *IR = "@v = external global i32 define i32 @f() { %v = load i32, "
@@ -840,6 +911,55 @@ TEST_F(PreparedCodeNative, ExactHitSkipsClaimsTransformsAndCodegen) {
   EXPECT_EQ(Objects, 1u);
   EXPECT_EQ(UnexpectedTransforms, 0u);
   EXPECT_EQ(reinterpret_cast<int (*)(int)>(B.fn)(35), 42);
+}
+
+TEST_F(PreparedCodeNative, AotBoundConstLookupPreservesObjectIdentity) {
+  const uint32_t AotTable[] = {7, 11, 19, 23};
+  const uint32_t OtherTable[] = {7, 11, 19, 23};
+  constexpr StringLiteral IR = R"(
+    @lut = external constant [4 x i32]
+    define i32 @f(i64 %slot, ptr %out) {
+      %idx = and i64 %slot, 3
+      %p = getelementptr inbounds [4 x i32], ptr @lut, i64 0, i64 %idx
+      store ptr %p, ptr %out
+      %v = load i32, ptr %p, align 4
+      ret i32 %v
+    }
+  )";
+  auto Unbound = module(IR);
+  Unbound.withModuleDo([&](Module &M) {
+    auto *Table = M.getNamedGlobal("lut");
+    Table->setInitializer(
+        ConstantDataArray::get(M.getContext(), ArrayRef<uint32_t>(AotTable)));
+    Table->setLinkage(GlobalValue::InternalLinkage);
+  });
+  auto Rejected = EJitPreparedCode::create(std::move(Unbound), scope(), {});
+  ASSERT_FALSE(bool(Rejected));
+  const std::string Reason = toString(Rejected.takeError());
+  EXPECT_TRUE(StringRef(Reason).contains(
+      "private state or address-observable defined global"));
+
+  auto Emit = [&](const uint32_t *Table) {
+    return prepared(IR, {{"lut", reinterpret_cast<uintptr_t>(Table), false}});
+  };
+  EJitPreparedCodeEmitter E(*J, 1);
+  auto First = cantFail(E.link(Emit(AotTable)));
+  auto Same = cantFail(E.link(Emit(AotTable)));
+  auto Other = cantFail(E.link(Emit(OtherTable)));
+  EXPECT_TRUE(Same.reused);
+  EXPECT_EQ(Same.codeId, First.codeId);
+  EXPECT_EQ(Same.fn, First.fn);
+  EXPECT_FALSE(Other.reused);
+  EXPECT_NE(Other.codeId, First.codeId);
+  EXPECT_EQ(Objects, 2u);
+  using Fn = uint32_t (*)(uint64_t, const uint32_t **);
+  for (uint64_t Slot = 0; Slot < 8; ++Slot) {
+    const uint32_t *Seen = nullptr;
+    EXPECT_EQ(reinterpret_cast<Fn>(Same.fn)(Slot, &Seen), AotTable[Slot & 3]);
+    EXPECT_EQ(Seen, &AotTable[Slot & 3]);
+    EXPECT_EQ(reinterpret_cast<Fn>(Other.fn)(Slot, &Seen), OtherTable[Slot & 3]);
+    EXPECT_EQ(Seen, &OtherTable[Slot & 3]);
+  }
 }
 
 TEST_F(PreparedCodeNative, SreBigEndianNormalizationLinksAndReuses) {
