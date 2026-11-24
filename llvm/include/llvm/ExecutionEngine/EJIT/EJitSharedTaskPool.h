@@ -1058,7 +1058,10 @@ public:
   bool cancelRequestAttempt(
       uint64_t token,
       EJitRequestAttemptReason reason = EJitRequestAttemptReason::Cancelled);
-  bool requestAttemptStatus(uint64_t token, RequestAttemptSnapshot &out) const;
+  /// If busy is supplied, try the attempt lock once and set it on contention.
+  /// Observation callbacks must use this nonblocking form.
+  bool requestAttemptStatus(uint64_t token, RequestAttemptSnapshot &out,
+                            bool *busy = nullptr) const;
   /// Owner acknowledgement after the last compiler read of a logical source.
   bool completeRequestBorrow(uint64_t token);
   /// Keep only the source borrow after successful no-code prefix classification.

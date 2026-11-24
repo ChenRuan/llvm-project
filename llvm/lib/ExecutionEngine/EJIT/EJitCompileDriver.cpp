@@ -1508,8 +1508,15 @@ bool EJitCompileDriver::dispatchObserverThunk(
   if (!drv->repGroups_)
     return false;
   EJitSharedTaskPool::RequestAttemptSnapshot Attempt;
-  if (!drv->sharedPool_.requestAttemptStatus(Obs.attemptToken, Attempt) ||
-      !Attempt.live || Attempt.retained ||
+  // This callback can run with the bucket observation lock held. A writer
+  // may already own attemptLock and be waiting for that observation to end.
+  // Let the caller roll back the admission rather than wait for the writer.
+  bool Busy = false;
+  const bool Found =
+      drv->sharedPool_.requestAttemptStatus(Obs.attemptToken, Attempt, &Busy);
+  if (Busy)
+    return false;
+  if (!Found || !Attempt.live || Attempt.retained ||
       (Attempt.flags & EJitAttemptCancelRequested) ||
       Attempt.generation != Obs.generation) {
     // A dispatch observation is a lease on the exact pool attempt, not just

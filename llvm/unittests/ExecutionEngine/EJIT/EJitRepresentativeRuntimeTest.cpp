@@ -1699,6 +1699,9 @@ TEST_F(EJitRepresentativeRuntimeTest,
   EJitCoreId::setCurrentForTest(OriginalCore + 1);
   EXPECT_EQ(ejit_reuse_diag_config("*", 0), EJIT_ERR_NOT_ACTIVE);
   EXPECT_EQ(ejit_reuse_diag_print(), EJIT_ERR_NOT_ACTIVE);
+#ifdef EJIT_DIAG_ENABLE
+  EXPECT_EQ(ejit_reuse_diag_print_summary(), EJIT_ERR_NOT_ACTIVE);
+#endif
   EXPECT_EQ(ejit_reuse_diag_reset(), EJIT_ERR_NOT_ACTIVE);
   EJitCoreId::setCurrentForTest(OriginalCore);
   auto *Pool = static_cast<EJitSharedTaskPool *>(ejit_representative_test_pool());
@@ -1817,7 +1820,25 @@ TEST_F(EJitRepresentativeRuntimeTest,
   }
   EXPECT_TRUE(FoundUnequal) << "real unequal candidate must explain its split";
   EXPECT_EQ(ejit_reuse_diag_print(), EJIT_OK);
+#ifdef EJIT_DIAG_ENABLE
+  EXPECT_EQ(ejit_reuse_diag_print_summary(), EJIT_OK);
+#endif
   EXPECT_EQ(ejit_reuse_diag_reset(), EJIT_OK);
+}
+
+TEST(EJitCrossCoreRuntime, ObservationLookupDoesNotWaitForAttemptWriter) {
+  auto State = std::make_unique<EJitSharedTaskPoolState>();
+  EJitSharedTaskPool Pool;
+  Pool.bind(State.get());
+  EJitSharedTaskPool::RequestAttemptSnapshot Snapshot;
+  State->attemptLock.storeRelease(1);
+  bool Busy = false;
+  EXPECT_FALSE(Pool.requestAttemptStatus(1, Snapshot, &Busy));
+  EXPECT_TRUE(Busy);
+  EXPECT_EQ(State->attemptLock.loadAcquire(), 1u);
+  State->attemptLock.storeRelease(0);
+  EXPECT_FALSE(Pool.requestAttemptStatus(1, Snapshot, &Busy));
+  EXPECT_FALSE(Busy);
 }
 
 /// The default-off policy on the REAL runtime: an ordinary initialization never

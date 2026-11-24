@@ -226,9 +226,10 @@ void bucketWriteRelease(EJitSharedCacheBucket &b) {
 //   * enqueueTier2FromLookup: the coherent count/quotaEnd read.
 //
 // Lock order: bucket writeFlag -> observationLock. observationLock is a LEAF: a
-// holder performs only the bounded dispatch/reply handshake and never acquires
-// another lock, so a waiter cannot deadlock against a publish/cancel that holds
-// writeFlag. Token readers additionally hold their bucket read lease, which
+// holder performs only the bounded dispatch/reply handshake and never waits
+// for an earlier lock. In particular, the callback only tries attemptLock,
+// since publish/cancel can already hold it while waiting for observationLock.
+// Token readers additionally hold their bucket read lease, which
 // keeps slot identity stable while the reply is in flight.
 //===----------------------------------------------------------------------===//
 void bucketObservationLock(EJitSharedCacheBucket &b) {
@@ -1982,11 +1983,21 @@ void EJitSharedTaskPool::acknowledgeRequestAttemptQueueDrop(
 }
 
 bool EJitSharedTaskPool::requestAttemptStatus(
-    uint64_t Token, RequestAttemptSnapshot &Out) const {
+    uint64_t Token, RequestAttemptSnapshot &Out, bool *Busy) const {
   Out = {};
+  if (Busy)
+    *Busy = false;
   if (!state_ || !Token)
     return false;
-  requestAttemptLock(state_);
+  if (Busy) {
+    uint32_t Expected = 0;
+    if (!state_->attemptLock.compareExchange(Expected, 1)) {
+      *Busy = true;
+      return false;
+    }
+  } else {
+    requestAttemptLock(state_);
+  }
   if (EJitSharedRequestAttempt *A = findAttemptLocked(state_, Token)) {
     Out.token = Token;
     Out.generation = A->generation.loadRelaxed();
