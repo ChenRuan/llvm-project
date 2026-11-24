@@ -229,8 +229,8 @@ add_llvm_unittest(EJitRepresentativeGroupTests
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
   # Defines gEJitDiagLevel (the level gate behind every EJIT_DIAG* call in the
   # sources above); this target links no LLVMEJIT, which normally carries
-  # EJitLogger.cpp.
-  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
+  # EJitDiag.cpp.
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitDiag.cpp
 
   PARTIAL_SOURCES_INTENDED
   )
@@ -321,15 +321,11 @@ add_llvm_unittest(EJITRepresentativeRuntimeTests
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
-  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitTaskPool.cpp
-  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSreQueue.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSrePlatform.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSreTask_host.cpp
-  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitWorker.cpp
-  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitDiag.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLinkDiagPlugin.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLinkOptimizationPlugin.cpp
-  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitIpcLock.cpp
 
   PARTIAL_SOURCES_INTENDED
   )

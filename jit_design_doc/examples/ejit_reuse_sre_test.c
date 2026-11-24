@@ -1,11 +1,9 @@
-// PR230 on PR233. Replace the old test_ejit_period demo with this file.
+// PR230 on the spec5 integration branch. Recompile with its Clang and runtime.
 // Core 6: test_ejit_period; core 16: test_ejit_period;
 // core 6: test_ejit_reuse_print. All four shell arguments are ignored.
 // Use a fresh, otherwise idle image. See EJIT_CODE_REUSE_BOARD.md.
 #ifdef REUSE_USE_RUNTIME_HEADER
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
-// Use the raw Clang attribute spelling in the probes below.
-#undef ejit_entry
 #else
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
@@ -14,15 +12,14 @@ typedef __SIZE_TYPE__ size_t;
 typedef _Bool bool;
 typedef enum { EJIT_OK = 0, EJIT_PENDING = 1,
                EJIT_ERR_QUEUE_FULL = -7 } ejit_status_t;
-typedef enum { EJIT_COMPILE_SYNC = 0, EJIT_COMPILE_ASYNC = 1 }
+typedef enum { EJIT_COMPILE_ASYNC = 1, EJIT_COMPILE_OFF = 2 }
     ejit_compile_mode_t;
 typedef enum { EJIT_OPT_L1 = 1, EJIT_OPT_L2 = 2, EJIT_OPT_L3 = 3 }
     ejit_opt_level_t;
 typedef struct {
   ejit_compile_mode_t compileMode;
   ejit_opt_level_t optLevel;
-  size_t maxCodeMemory, maxDataMemory, maxCacheEntries, maxCacheSize;
-  bool enableLogger, forceStaticRegistry;
+  bool forceStaticRegistry;
   const char *dumpJITDir;
 } ejit_config_t;
 typedef struct { uint32_t dimType, instanceId; } ejit_dim_pair_t;
@@ -70,8 +67,8 @@ extern void ejit_print_dumped(const char *);
 extern void ejit_print_dumped_module(const char *);
 #endif
 
-_Static_assert(sizeof(void *) == 8 && sizeof(ejit_config_t) == 56,
-               "64-bit spec5 config ABI required");
+_Static_assert(sizeof(void *) == 8 && sizeof(ejit_config_t) == 24,
+               "64-bit spec5 integration config ABI required");
 _Static_assert(sizeof(ejit_taskpool_stats_t) == 88 &&
                sizeof(ejit_representative_stats_t) == 232 &&
                sizeof(ejit_borrow_fence_t) == 16, "Unexpected stats/fence ABI");
@@ -88,13 +85,13 @@ extern uint8_t g_ucLocalCoreID;
 #define REUSE_SHARED
 #else
 #if !__has_attribute(ejit_entry) || !__has_attribute(ejit_dim) || \
-    !__has_attribute(ejit_period_const) || !__has_attribute(ejit_in_period_array)
+    !__has_attribute(ejit_period_const) || !__has_attribute(ejit_group)
 #error "Compile with the EJIT Clang; do not ignore unknown EJIT attributes"
 #endif
 #define REUSE_ENTRY __attribute__((ejit_entry))
 #define REUSE_DIM(x) __attribute__((ejit_dim(#x)))
 #define REUSE_CONST __attribute__((ejit_period_const))
-#define REUSE_ARRAY(x) __attribute__((ejit_in_period_array(#x)))
+#define REUSE_ARRAY(x) __attribute__((ejit_group(#x)))
 #ifndef REUSE_SHARED
 #define REUSE_SHARED __attribute__((section(".mc_shared")))
 #endif
@@ -344,7 +341,7 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   ejit_config_t cfg = {0};
   cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
-  cfg.enableLogger = cfg.forceStaticRegistry = 1;
+  cfg.forceStaticRegistry = 1;
   if (ejit_init_representative(&cfg) != EJIT_OK)
     return reuse_fail("representative runtime initialization failed");
   if (ejit_taskpool_get_worker_core() != 6u) return reuse_fail("worker is not core 6");

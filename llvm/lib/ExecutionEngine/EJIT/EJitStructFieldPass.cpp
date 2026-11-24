@@ -50,7 +50,7 @@ void EJitStructFieldPass::tagFrozenSites(Module &M) {
           if (Root->hasName()) Origin += ":" + Root->getName().str();
           else Origin += ":unknown-base";
           const GlobalVariable *GV = nullptr;
-          if (auto Offset = ejitMayConstFieldOffset(
+          if (auto Offset = ejitPeriodConstFieldOffset(
                   LI->getPointerOperand(), M.getDataLayout(), GV))
             Origin += "+field_offset=" + std::to_string(*Offset);
           // Bounded metadata. Truncation remains explicit in the snapshot.
@@ -67,7 +67,7 @@ void EJitStructFieldPass::initFromModule(Module &M) {
   // Never preserve keys that point into old IR across a rebuild.
   mapsBuilt_ = false;
   gvPeriodMap_.clear();
-  mayConstFieldMap_.clear();
+  periodConstFieldMap_.clear();
   EJIT_DIAG_VERBOSE("struct-field initFromModule module=%s globals=%zu",
                     M.getName().str().c_str(), M.global_size());
   // Build GV period map.
@@ -2463,7 +2463,7 @@ void EJitStructFieldPass::initPreservedDimensions(Module &M) {
     if (!Sub || Sub->getNumOperands() < 3)
       continue;
     auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-    if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
+    if (!Tag || Tag->getString() != TAG_EJIT_DIM)
       continue;
     auto *Period = dyn_cast<MDString>(Sub->getOperand(1));
     auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
@@ -2668,11 +2668,11 @@ Constant *EJitStructFieldPass::tryReplacePreservedLoad(LoadInst *LI,
   if (!preservedFunctions_.count(LI->getFunction()) || LI->isVolatile() ||
       LI->isAtomic())
     return nullptr;
-  bool Authorized = isMayConstLoad(LI, mayConstFieldMap_, DL,
+  bool Authorized = isPeriodConstLoad(LI, periodConstFieldMap_, DL,
                                    preservedLoadArgs_);
   for (const BoundPointerState &State : boundStates_)
-    Authorized |= isBoundMayConstLoad(LI, State.boundArguments,
-                                      State.mayConstFields, DL,
+    Authorized |= isBoundPeriodConstLoad(LI, State.boundArguments,
+                                      State.periodConstFields, DL,
                                       preservedLoadArgs_);
   if (!Authorized)
     return nullptr;
@@ -2690,7 +2690,7 @@ Constant *EJitStructFieldPass::tryReplacePreservedLoad(LoadInst *LI,
   if (const auto *GV = dyn_cast<GlobalVariable>(Address->first)) {
     auto It = gvPeriodMap_.find(GV);
     if (It == gvPeriodMap_.end() ||
-        !isMayConstLoad(LI, mayConstFieldMap_, DL, preservedLoadArgs_))
+        !isPeriodConstLoad(LI, periodConstFieldMap_, DL, preservedLoadArgs_))
       return nullptr;
     const GVPeriodInfo &Info = It->second;
     auto Instance = preservedInstance(Info.periodName);
@@ -2701,8 +2701,8 @@ Constant *EJitStructFieldPass::tryReplacePreservedLoad(LoadInst *LI,
       if (auto *Sub = dyn_cast<MDNode>(Op.get()))
         if (Sub->getNumOperands() >= 2)
           if (auto *Tag = dyn_cast<MDString>(Sub->getOperand(0)))
-            PeriodTags += Tag->getString() == TAG_EJIT_PERIOD_ARR ||
-                          Tag->getString() == TAG_EJIT_PERIOD;
+            PeriodTags += Tag->getString() == TAG_EJIT_GROUP_INDEXED ||
+                          Tag->getString() == TAG_EJIT_GROUP;
     if (PeriodTags != 1 || !GV->getValueType()->isSized() ||
         GV->getValueType()->isPointerTy())
       return Reject("ambiguous-or-unbounded-registration");
@@ -2768,7 +2768,7 @@ Constant *EJitStructFieldPass::tryReplacePreservedLoad(LoadInst *LI,
     if (!Size || Size->getValue().getActiveBits() > 32 ||
         !Size->getZExtValue() || Size->getZExtValue() > State.view.size ||
         It->second > UINT64_MAX - Offset ||
-        !isBoundMayConstLoad(LI, State.boundArguments, State.mayConstFields,
+        !isBoundPeriodConstLoad(LI, State.boundArguments, State.periodConstFields,
                              DL, preservedLoadArgs_))
       return nullptr;
     return readPreservedConstant(State.view.rawPtr, Size->getZExtValue(),
@@ -2821,13 +2821,13 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       if (preserveDimensions_) {
 #ifdef EJIT_DIAG_ENABLE
-        bool IsMayConst = isMayConstLoad(LI, mayConstFieldMap_, DL,
+        bool IsMayConst = isPeriodConstLoad(LI, periodConstFieldMap_, DL,
                                         preservedLoadArgs_);
         for (const BoundPointerState &State : boundStates_)
-          IsMayConst |= isBoundMayConstLoad(
-              LI, State.boundArguments, State.mayConstFields, DL,
+          IsMayConst |= isBoundPeriodConstLoad(
+              LI, State.boundArguments, State.periodConstFields, DL,
               preservedLoadArgs_);
-        mayConstLoads += IsMayConst;
+        periodConstLoads += IsMayConst;
 #endif
         if (Constant *C = tryReplacePreservedLoad(LI, DL))
           replacements.push_back({LI, C});
@@ -2936,10 +2936,10 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       // Legacy pointer-base substitutions are address plumbing, not mayconst
       // values. The preserved-dimension path replaces only proven load values.
       bool IsValue = preserveDimensions_ ||
-          isMayConstLoad(R.LI, mayConstFieldMap_, DL, freeDimAssumptions_);
+          isPeriodConstLoad(R.LI, periodConstFieldMap_, DL, freeDimAssumptions_);
       for (const BoundPointerState &State : boundStates_)
-        IsValue |= isBoundMayConstLoad(R.LI, State.boundArguments,
-                                      State.mayConstFields, DL,
+        IsValue |= isBoundPeriodConstLoad(R.LI, State.boundArguments,
+                                      State.periodConstFields, DL,
                                       freeDimAssumptions_);
       if (IsValue) {
         uint64_t Site = 0;

@@ -2472,29 +2472,6 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
         } else {
           sampleIndex = Slot.hitCount.fetchAdd(1) + 1;
         }
-        uint32_t admissionSlot = kEJitSharedMaxConcurrentProfiles;
-        if (slotTier == kEJitTierInstrumented && threshold) {
-          const uint32_t encoded = Slot.funcIndex + 1;
-          for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
-            if (state_->pgoActiveFunctions[i].loadAcquire() == encoded) {
-              admissionSlot = i;
-              break;
-            }
-          }
-        }
-        if (admissionSlot != kEJitSharedMaxConcurrentProfiles) {
-          uint32_t quarter = static_cast<uint32_t>(
-              std::min<uint64_t>(4, (sampleIndex * 4) / threshold));
-          uint32_t oldQuarter =
-              state_->pgoProgressQuarters[admissionSlot].loadRelaxed();
-          while (quarter > oldQuarter &&
-                 !state_->pgoProgressQuarters[admissionSlot].compareExchange(
-                     oldQuarter, quarter)) {
-          }
-          if (quarter > oldQuarter)
-            EJIT_DIAG("PGO profile progress func=%u: %llu/%u", Slot.funcIndex,
-                      static_cast<unsigned long long>(sampleIndex), threshold);
-        }
         // >= (not ==): if the enqueue fails (queue full / already pending),
         // the next hit can still arm — a transient failure is not fatal (§7).
         if (threshold && sampleIndex >= threshold) {
@@ -2716,29 +2693,6 @@ void EJitSharedTaskPool::commitLegacyHit(SharedLookup &Hit) {
     sampleIndex = Slot.hitCount.fetchAdd(1) + 1;
   }
 
-  uint32_t admissionSlot = kEJitSharedMaxConcurrentProfiles;
-  if (Slot.tier.loadRelaxed() == kEJitTierInstrumented && threshold) {
-    const uint32_t encoded = Slot.funcIndex + 1;
-    for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
-      if (state_->pgoActiveFunctions[i].loadAcquire() == encoded) {
-        admissionSlot = i;
-        break;
-      }
-    }
-  }
-  if (admissionSlot != kEJitSharedMaxConcurrentProfiles) {
-    uint32_t quarter = static_cast<uint32_t>(
-        std::min<uint64_t>(4, (sampleIndex * 4) / threshold));
-    uint32_t oldQuarter =
-        state_->pgoProgressQuarters[admissionSlot].loadRelaxed();
-    while (quarter > oldQuarter &&
-           !state_->pgoProgressQuarters[admissionSlot].compareExchange(
-               oldQuarter, quarter)) {
-    }
-    if (quarter > oldQuarter)
-      EJIT_DIAG("PGO profile progress func=%u: %llu/%u", Slot.funcIndex,
-                static_cast<unsigned long long>(sampleIndex), threshold);
-  }
   if (threshold && sampleIndex >= threshold && !FailedPeerPreparation) {
     Hit.tier2Arm = true;
     Hit.tier2AttemptToken = Slot.attemptToken;
@@ -4425,25 +4379,6 @@ EJitSharedTaskPool::admitObservedT1DispatchLocked(const SharedLookup &Hit) {
       break;
   }
   const uint64_t Admitted = Cur + 1;
-  // Diagnostic progress quarter for this real admission (the legacy path
-  // updated it from the identity-hit counter; the observed count is the honest
-  // progress signal under the sharing contract).
-  const uint32_t Encoded = Slot.funcIndex + 1;
-  for (uint32_t I = 0; I < kEJitSharedMaxConcurrentProfiles; ++I) {
-    if (state_->pgoActiveFunctions[I].loadAcquire() != Encoded)
-      continue;
-    const uint32_t Quarter = static_cast<uint32_t>(
-        std::min<uint64_t>(4, (Admitted * 4) / Limit));
-    uint32_t Old = state_->pgoProgressQuarters[I].loadRelaxed();
-    while (Quarter > Old &&
-           !state_->pgoProgressQuarters[I].compareExchange(Old, Quarter)) {
-    }
-    if (Quarter > Old)
-      EJIT_DIAG("PGO profile progress func=%u: %llu/%llu", Slot.funcIndex,
-                static_cast<unsigned long long>(Admitted),
-                static_cast<unsigned long long>(Limit));
-    break;
-  }
   if (Admitted == Limit) {
     // The final allowed dispatch freezes the admission boundary exactly once:
     // the CAS above never admits another dispatch past the limit, no later
@@ -4896,14 +4831,14 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     return R;
   }
   return compileOrGetValidated(funcIndex, dims, numDims, fallback,
-                               boundPointers, boundCount);
+                               boundPointers, boundCount, outAttemptToken);
 }
 
 EJitSharedTaskPool::CompileOrGetResult
 EJitSharedTaskPool::compileOrGetValidated(
     uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
     void *fallback, const EJitBoundPtrDescriptor *boundPointers,
-    uint32_t boundCount) {
+    uint32_t boundCount, uint64_t *outAttemptToken) {
   EJIT_DIAG_VERBOSE("shared taskpool request func=%u dims=%u fallback=%p",
                     funcIndex, numDims, fallback);
   auto R =

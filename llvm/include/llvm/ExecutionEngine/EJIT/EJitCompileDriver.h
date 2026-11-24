@@ -210,6 +210,7 @@ private:
   static bool sharedOwnerElected(void *ctx);
   /// Owner-release hook: the counterpart of sharedOwnerElected.
   static void sharedOwnerReleased(void *ctx);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   /// Pool hook: in-flight sampling admission for one async PGO request. Denies
   /// a personal sampling admission to a member whose candidate group already
   /// owns its ONE representative sampling session.

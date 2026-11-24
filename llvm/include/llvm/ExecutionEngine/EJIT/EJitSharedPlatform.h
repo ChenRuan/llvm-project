@@ -56,7 +56,7 @@ namespace ejit {
 /// value so a partially-zeroed or foreign blob is rejected.
 constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 
-/// ABI v25. Bump on any layout change; peers must match the owner's ABI,
+/// ABI v26. Bump on any layout change; peers must match the owner's ABI,
 /// generation and registration fingerprint before resolving an entry.
 ///
 /// Published code and counters use separate page ranges. On a fixed RX
@@ -69,9 +69,10 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// v18 queue borrows bound-pointer descriptors, never pointee bytes or
 /// ownership. Each queued request and published slot carries its exact
 /// attempt token; the shared blob keeps bounded live and completed attempts.
-constexpr uint32_t kEJitSharedAbiVersion = 25u;
 /// Tier-1 dispatch counts and quota closure are tied to each published attempt.
-// Peer commands use incarnation-bound mailbox leases.
+/// Peer commands use incarnation-bound mailbox leases. v26 combines this
+/// protocol with the consolidated spec5 pool layout.
+constexpr uint32_t kEJitSharedAbiVersion = 26u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

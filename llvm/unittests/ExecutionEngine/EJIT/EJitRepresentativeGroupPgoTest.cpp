@@ -37,7 +37,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRepresentativeGroup.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
-#include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h"
+#include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ObjectTransformLayer.h"
@@ -86,7 +86,7 @@ std::string entryIR(StringRef Name) {
   IR += R"((i64 %cell, i64 %trp, i32 %x) !ejit.metadata !3 {
   entry:
     %gp = getelementptr [6 x %Cfg], ptr @cfg, i64 0, i64 %cell, i32 0
-    %gain = load i32, ptr %gp, !ejit.may_const !7
+    %gain = load i32, ptr %gp, !ejit.period_const !7
     %cmp = icmp ugt i32 %x, %gain
     br i1 %cmp, label %hot, label %cold
   hot:
@@ -115,12 +115,12 @@ std::string entryIR(StringRef Name) {
     ret i32 %result
   }
   !0 = !{!1, !2}
-  !1 = !{!"ejit_period_arr", !"cell", i64 6}
-  !2 = !{!"ejit_may_const_field", i64 0}
+  !1 = !{!"ejit_group_indexed", !"cell", i64 6}
+  !2 = !{!"ejit_period_const_field", i64 0}
   !3 = !{!4, !5, !6}
   !4 = !{!"ejit_entry"}
-  !5 = !{!"ejit_period_arr_ind", !"cell", i32 0}
-  !6 = !{!"ejit_period_arr_ind", !"trp", i32 1}
+  !5 = !{!"ejit_dim", !"cell", i32 0}
+  !6 = !{!"ejit_dim", !"trp", i32 1}
   !7 = !{}
 )";
   return IR;
@@ -235,8 +235,8 @@ public:
                     JITSymbolFlags::Exported;
               }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-              if (!Opt->getLastMayConstLoadSites().empty())
-                Flags[J->mangleAndIntern("__ejit_mayconst_hits")] =
+              if (!Opt->getLastPeriodConstLoadSites().empty())
+                Flags[J->mangleAndIntern("__ejit_period_const_hits")] =
                     JITSymbolFlags::Exported;
 #endif
               ADD_FAILURE_IF_VERIFY_FAILS(Mod);

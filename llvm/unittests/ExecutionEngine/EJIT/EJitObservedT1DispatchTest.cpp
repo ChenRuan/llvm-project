@@ -44,7 +44,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
-#include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h"
+#include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h"
 #include "gtest/gtest.h"
 #include <atomic>
 #include <cstdint>

@@ -33,18 +33,18 @@ namespace {
 
 static const char *Metadata = R"(
 !0 = !{!1, !2}
-!1 = !{!"ejit_period_arr", !"cell", i64 6}
-!2 = !{!"ejit_may_const_field", i64 0}
+!1 = !{!"ejit_group_indexed", !"cell", i64 6}
+!2 = !{!"ejit_period_const_field", i64 0}
 !3 = !{!4, !5, !6}
 !4 = !{!"ejit_entry"}
-!5 = !{!"ejit_period_arr_ind", !"cell", i32 0}
-!6 = !{!"ejit_period_arr_ind", !"trp", i32 1}
+!5 = !{!"ejit_dim", !"cell", i32 0}
+!6 = !{!"ejit_dim", !"trp", i32 1}
 !7 = !{}
 )";
 
 static const char *DynamicBody = R"(
   %gp = getelementptr [6 x %Cfg], ptr @cfg, i64 0, i64 %cell, i32 0
-  %gain = load i32, ptr %gp, !ejit.may_const !7
+  %gain = load i32, ptr %gp, !ejit.period_const !7
   %lp = getelementptr [6 x %Cfg], ptr @cfg, i64 0, i64 %cell, i32 1, i64 %trp
   %live = load i32, ptr %lp
   %product = mul i32 %x, %gain
@@ -87,7 +87,7 @@ static unsigned markedLoads(const Module &M) {
   for (const Function &F : M)
     for (const Instruction &I : instructions(F))
       if (const auto *LI = dyn_cast<LoadInst>(&I))
-        Count += LI->hasMetadata(MD_EJIT_MAY_CONST);
+        Count += LI->hasMetadata(MD_EJIT_PERIOD_CONST);
   return Count;
 }
 
@@ -156,7 +156,7 @@ TEST_F(PreservedDimsTest, SixCellsTwentyEntriesAndSingleFieldDifference) {
     for (uint8_t Cell = 0; Cell != 6; ++Cell) {
       auto M = parse(C, R"(
         %p = getelementptr [6 x %Cfg], ptr @cfg, i64 0, i64 %cell, i32 0
-        %v = load i32, ptr %p, !ejit.may_const !7
+        %v = load i32, ptr %p, !ejit.period_const !7
         ret i32 %v
       )");
       ASSERT_TRUE(M);
@@ -182,7 +182,7 @@ TEST_F(PreservedDimsTest, MissingDimensionAndOtherCellAreNotFolded) {
   auto Other = parse(C, R"(
     %next = add i64 %cell, 1
     %p = getelementptr [6 x %Cfg], ptr @cfg, i64 0, i64 %next, i32 0
-    %v = load i32, ptr %p, !ejit.may_const !7
+    %v = load i32, ptr %p, !ejit.period_const !7
     ret i32 %v
   )");
   ASSERT_TRUE(Other);
@@ -193,19 +193,19 @@ TEST_F(PreservedDimsTest, MissingDimensionAndOtherCellAreNotFolded) {
 TEST_F(PreservedDimsTest, AtomicVolatileUnknownAndPoisonRemainLoads) {
   const char *Bodies[] = {
       R"(%p = getelementptr [6 x %Cfg], ptr @cfg, i64 0, i64 %cell, i32 0
-         %v = load volatile i32, ptr %p, !ejit.may_const !7
+         %v = load volatile i32, ptr %p, !ejit.period_const !7
          ret i32 %v)",
       R"(%p = getelementptr [6 x %Cfg], ptr @cfg, i64 0, i64 %cell, i32 0
-         %v = load atomic i32, ptr %p monotonic, align 4, !ejit.may_const !7
+         %v = load atomic i32, ptr %p monotonic, align 4, !ejit.period_const !7
          ret i32 %v)",
       R"(%b = icmp eq i32 %x, 0
          %i = select i1 %b, i64 %cell, i64 5
          %p = getelementptr [6 x %Cfg], ptr @cfg, i64 0, i64 %i, i32 0
-         %v = load i32, ptr %p, !ejit.may_const !7
+         %v = load i32, ptr %p, !ejit.period_const !7
          ret i32 %v)",
       R"(%i = add nuw i64 %cell, -1
          %p = getelementptr [6 x %Cfg], ptr @cfg, i64 0, i64 %i, i32 0
-         %v = load i32, ptr %p, !ejit.may_const !7
+         %v = load i32, ptr %p, !ejit.period_const !7
          ret i32 %v)"};
   for (const char *Body : Bodies) {
     auto M = parse(C, Body);
@@ -219,7 +219,7 @@ TEST_F(PreservedDimsTest, PointerBaseAndUnboundedPointeeStayDynamic) {
   auto M = parse(C, R"(
     %base = load ptr, ptr @pointer
     %p = getelementptr i32, ptr %base, i64 %cell
-    %v = load i32, ptr %p, !ejit.may_const !7
+    %v = load i32, ptr %p, !ejit.period_const !7
     ret i32 %v
   )", "@pointer = external global ptr, !ejit.metadata !0\n");
   ASSERT_TRUE(M);
@@ -232,7 +232,7 @@ TEST_F(PreservedDimsTest, PointerBaseAndUnboundedPointeeStayDynamic) {
 static const char *Helper = R"(
 define internal i32 @helper(i64 %not_named_cell) noinline {
   %p = getelementptr [6 x %Cfg], ptr @cfg, i64 0, i64 %not_named_cell, i32 0
-  %v = load i32, ptr %p, !ejit.may_const !7
+  %v = load i32, ptr %p, !ejit.period_const !7
   ret i32 %v
 }
 )";
@@ -297,7 +297,7 @@ TEST_F(PreservedDimsTest, LastRoundAfterUnrollingRetainsContext) {
       %i = phi i64 [0, %entry], [%next, %loop]
       %sum = phi i32 [0, %entry], [%add, %loop]
       %p = getelementptr [6 x [2 x i32]], ptr @cfg, i64 0, i64 %cell, i64 %i
-      %v = load i32, ptr %p, !ejit.may_const !7
+      %v = load i32, ptr %p, !ejit.period_const !7
       %add = add i32 %sum, %v
       %next = add nuw i64 %i, 1
       %again = icmp ult i64 %next, 2
@@ -394,7 +394,7 @@ TEST_F(PreservedDimsTest, BigEndianFloatBitsAndNarrowIntegers) {
       define )") + Case.Type + R"( @f(i64 %cell, i64 %trp, i32 %x)
           !ejit.metadata !3 {
         %p = getelementptr [6 x i64], ptr @cfg, i64 0, i64 %cell
-        %v = load )" + Case.Type + R"(, ptr %p, !ejit.may_const !7
+        %v = load )" + Case.Type + R"(, ptr %p, !ejit.period_const !7
         ret )" + Case.Type + " %v\n}\n" + Metadata;
     auto M = parseIR(C, IR);
     ASSERT_TRUE(M);
@@ -415,17 +415,17 @@ TEST_F(PreservedDimsTest, BigEndianFloatBitsAndNarrowIntegers) {
 TEST_F(PreservedDimsTest, AmbiguousShapeAddressSpaceAndOverflowStayDynamic) {
   const char *Bodies[] = {
       R"(%p = getelementptr [6 x %Cfg], ptr @cfg, i64 0, i64 6, i32 0
-         %v = load i32, ptr %p, !ejit.may_const !7
+         %v = load i32, ptr %p, !ejit.period_const !7
          ret i32 %v)",
       R"(%p = getelementptr [6 x %Cfg], ptr @cfg, i64 9223372036854775807
-         %v = load i32, ptr %p, !ejit.may_const !7
+         %v = load i32, ptr %p, !ejit.period_const !7
          ret i32 %v)",
       R"(%p = addrspacecast ptr @cfg to ptr addrspace(1)
-         %v = load i32, ptr addrspace(1) %p, !ejit.may_const !7
+         %v = load i32, ptr addrspace(1) %p, !ejit.period_const !7
          ret i32 %v)",
       R"(%outer = getelementptr inbounds [6 x %Cfg], ptr @cfg, i64 100
          %p = getelementptr [6 x %Cfg], ptr %outer, i64 -100
-         %v = load i32, ptr %p, !ejit.may_const !7
+         %v = load i32, ptr %p, !ejit.period_const !7
          ret i32 %v)"};
   for (const char *Body : Bodies) {
     auto M = parse(C, Body);
@@ -464,7 +464,7 @@ TEST_F(PreservedDimsTest, FreeDimWitnessIsLoadOnlyNotACallProof) {
     @cfg = external global [6 x [2 x i32]], !ejit.metadata !0
     define i32 @f(i64 %cell, i64 %slot, i32 %x) !ejit.metadata !8 {
       %p = getelementptr [6 x [2 x i32]], ptr @cfg, i64 0, i64 %cell, i64 %slot
-      %v = load i32, ptr %p, !ejit.may_const !7
+      %v = load i32, ptr %p, !ejit.period_const !7
       store i32 %x, ptr %p
       call void @observe(i64 %slot)
       %c = call i32 @helper(i64 %slot)
@@ -474,7 +474,7 @@ TEST_F(PreservedDimsTest, FreeDimWitnessIsLoadOnlyNotACallProof) {
     declare void @observe(i64)
     define internal i32 @helper(i64 %unknown) noinline {
       %p = getelementptr [6 x [2 x i32]], ptr @cfg, i64 0, i64 2, i64 %unknown
-      %v = load i32, ptr %p, !ejit.may_const !7
+      %v = load i32, ptr %p, !ejit.period_const !7
       ret i32 %v
     }
     !8 = !{!4, !5, !9}
@@ -500,7 +500,7 @@ TEST_F(PreservedDimsTest, LocalWitnessFoldsOnlyTheMarkedAddress) {
     %slot = call i64 @__ejit_local_free_dim_v1_i64(i64 %trp)
     %base = getelementptr [6 x %Cfg], ptr @cfg, i64 0, i64 %cell, i32 0
     %p = getelementptr i32, ptr %base, i64 %slot
-    %v = load i32, ptr %p, !ejit.may_const !7
+    %v = load i32, ptr %p, !ejit.period_const !7
     store i64 %slot, ptr @observed
     ret i32 %v
   )", R"(
@@ -584,8 +584,8 @@ TEST(EJitPreservedDimsNative, RealGenUseAndDynamicStores) {
             T2MarkedLoads = markedLoads(M);
           }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-          if (!Optimizer.getLastMayConstLoadSites().empty())
-            Flags[J->mangleAndIntern("__ejit_mayconst_hits")] =
+          if (!Optimizer.getLastPeriodConstLoadSites().empty())
+            Flags[J->mangleAndIntern("__ejit_period_const_hits")] =
                 JITSymbolFlags::Exported;
 #endif
           Optimizer.clearAnalyses();

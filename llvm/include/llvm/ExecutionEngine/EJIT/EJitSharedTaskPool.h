@@ -505,7 +505,6 @@ public:
   /// Owner-private diagnostic callback. It runs only on the owner worker and
   /// may access owner-local optimizer state.
   using PeriodConstRankingCallback = bool (*)(void *ctx);
-#ifdef EJIT_SRE_TASKPOOL_TESTING
   using TestHookFn = void (*)(void *ctx);
   using IcacheFillMidpointHook = void (*)(void *ctx);
   using SeqRetryHook = void (*)(void *ctx, uint32_t bucketIndex);
@@ -1327,7 +1326,8 @@ private:
   compileOrGetValidated(uint32_t funcIndex, const EJitDimPair *dims,
                         uint32_t numDims, void *fallback,
                         const EJitBoundPtrDescriptor *boundPointers,
-                        uint32_t boundCount);
+                        uint32_t boundCount,
+                        uint64_t *outAttemptToken = nullptr);
   static void workerEntryThunk(void *ctx);
   /// Yield/delay the CPU (injected hook, or a reordering barrier). \p ticks=1
   /// is a single yield (idle/wait); \p ticks=MULT*DELAY_TICKS is the post-task

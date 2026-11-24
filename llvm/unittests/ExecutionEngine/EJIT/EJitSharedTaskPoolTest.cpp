@@ -8443,8 +8443,8 @@ TEST_F(SharedTaskPoolTest, RequestAttemptsRejectUnsupportedModesBeforeState) {
   EXPECT_EQ(state_->pgoEnabled.loadAcquire(), 0u);
   noPgo.ownerShutdown();
 
-  // Re-init with both prerequisites enabled, then prove Sync cannot be
-  // published over the immutable request-attempt policy.
+  // Re-init with both prerequisites enabled. Staging an Off mode for the next
+  // initialization does not mutate the current shared policy.
   EJitSharedTaskPool supported;
   supported.bind(state_.get());
   supported.setCompiler(&mockCompile, nullptr);
@@ -8452,10 +8452,8 @@ TEST_F(SharedTaskPoolTest, RequestAttemptsRejectUnsupportedModesBeforeState) {
   supported.setPgoEnabled(true, 1);
   ASSERT_TRUE(supported.setRequestAttemptsEnabled(true));
   ASSERT_EQ(supported.init(), EJitSharedTaskPool::InitResult::BecameOwner);
-  supported.setSharedMode(EJitCompileMode::Sync);
+  supported.setMode(EJitCompileMode::Off);
   EXPECT_EQ(supported.getSharedMode(), EJitCompileMode::Async);
-  EXPECT_FALSE(supported.publishSharedMode(EJitCompileMode::Sync,
-                                           state_->generation.loadAcquire()));
 }
 
 TEST_F(SharedTaskPoolTest,

@@ -142,10 +142,10 @@ static std::unique_ptr<Module> makeCandidateCellPgoModule(LLVMContext &Ctx) {
       new GlobalVariable(*M, CellsTy, false, GlobalValue::InternalLinkage,
                          ConstantAggregateZero::get(CellsTy),
                          "g_candidate_cells");
-  Metadata *PeriodOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+  Metadata *PeriodOps[] = {MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
                            MDString::get(Ctx, "cell"),
                            ConstantAsMetadata::get(ConstantInt::get(I32, 10))};
-  Metadata *FieldOps[] = {MDString::get(Ctx, TAG_EJIT_MAY_CONST_FIELD),
+  Metadata *FieldOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_CONST_FIELD),
                           ConstantAsMetadata::get(ConstantInt::get(I32, 0))};
   Cells->setMetadata(MD_EJIT_METADATA,
                      MDNode::get(Ctx, {MDNode::get(Ctx, PeriodOps),
@@ -174,7 +174,7 @@ static std::unique_ptr<Module> makeCandidateCellPgoModule(LLVMContext &Ctx) {
   Value *FrozenPtr = B.CreateStructGEP(CellTy, Elem, 0, "frozen.ptr");
   Value *DynamicPtr = B.CreateStructGEP(CellTy, Elem, 1, "dynamic.ptr");
   auto *Frozen = B.CreateLoad(I32, FrozenPtr, "frozen");
-  Frozen->setMetadata(MD_EJIT_MAY_CONST, MDNode::get(Ctx, {}));
+  Frozen->setMetadata(MD_EJIT_PERIOD_CONST, MDNode::get(Ctx, {}));
   Value *Dynamic = B.CreateLoad(I32, DynamicPtr, "dynamic");
   B.CreateStore(Live, DynamicPtr);
   Value *IsOdd =
@@ -189,7 +189,7 @@ static std::unique_ptr<Module> makeCandidateCellPgoModule(LLVMContext &Ctx) {
   B.SetInsertPoint(Exit);
   B.CreateRet(B.CreateAdd(Frozen, Dynamic));
 
-  Metadata *DimOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_ARR_IND),
+  Metadata *DimOps[] = {MDString::get(Ctx, TAG_EJIT_DIM),
                         MDString::get(Ctx, "cell"),
                         ConstantAsMetadata::get(ConstantInt::get(I32, 0))};
   F->setMetadata(
@@ -518,19 +518,19 @@ TEST(EJitCandidateDirectory, MultipleActualFrozenValuesAndUnchangedIdentity) {
     define i32 @f(i64 %cell, i32 %x) !ejit.metadata !4 {
       %p = getelementptr [2 x %Row], ptr @rows, i64 0, i64 %cell, i32 0
       %q = getelementptr [2 x %Row], ptr @rows, i64 0, i64 %cell, i32 1
-      %a = load i32, ptr %p, !ejit.may_const !7
-      %b = load i32, ptr %q, !ejit.may_const !7
+      %a = load i32, ptr %p, !ejit.period_const !7
+      %b = load i32, ptr %q, !ejit.period_const !7
       %v = mul i32 %a, %x
       %r = add i32 %v, %b
       ret i32 %r
     }
     !0 = !{!1, !2, !3}
-    !1 = !{!"ejit_period_arr", !"cell", i64 2}
-    !2 = !{!"ejit_may_const_field", i64 0}
-    !3 = !{!"ejit_may_const_field", i64 4}
+    !1 = !{!"ejit_group_indexed", !"cell", i64 2}
+    !2 = !{!"ejit_period_const_field", i64 0}
+    !3 = !{!"ejit_period_const_field", i64 4}
     !4 = !{!5, !6}
     !5 = !{!"ejit_entry"}
-    !6 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !6 = !{!"ejit_dim", !"cell", i32 0}
     !7 = !{}
   )";
   PeriodArrayRegistry Registry;
@@ -1176,8 +1176,8 @@ TEST_F(PreparedCodeNative, RepresentativeProfileSixCellsTwentyEntries) {
                 JITSymbolFlags::Exported;
           }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-          if (!Optimizer.getLastMayConstLoadSites().empty())
-            Flags[J->mangleAndIntern("__ejit_mayconst_hits")] =
+          if (!Optimizer.getLastPeriodConstLoadSites().empty())
+            Flags[J->mangleAndIntern("__ejit_period_const_hits")] =
                 JITSymbolFlags::Exported;
 #endif
           EXPECT_FALSE(verifyModule(M));
@@ -1199,7 +1199,7 @@ TEST_F(PreparedCodeNative, RepresentativeProfileSixCellsTwentyEntries) {
       define i32 @)" +
                      Name + R"((i64 %cell, i64 %trp, i32 %x) !ejit.metadata !3 {
         %gp = getelementptr [6 x %Cfg], ptr @cfg, i64 0, i64 %cell, i32 0
-        %gain = load i32, ptr %gp, !ejit.may_const !7
+        %gain = load i32, ptr %gp, !ejit.period_const !7
         %lp = getelementptr [6 x %Cfg], ptr @cfg, i64 0, i64 %cell, i32 1, i64 %trp
         %live = load i32, ptr %lp
         %product = mul i32 %x, %gain
@@ -1210,12 +1210,12 @@ TEST_F(PreparedCodeNative, RepresentativeProfileSixCellsTwentyEntries) {
         ret i32 %result
       }
       !0 = !{!1, !2}
-      !1 = !{!"ejit_period_arr", !"cell", i64 6}
-      !2 = !{!"ejit_may_const_field", i64 0}
+      !1 = !{!"ejit_group_indexed", !"cell", i64 6}
+      !2 = !{!"ejit_period_const_field", i64 0}
       !3 = !{!4, !5, !6}
       !4 = !{!"ejit_entry"}
-      !5 = !{!"ejit_period_arr_ind", !"cell", i32 0}
-      !6 = !{!"ejit_period_arr_ind", !"trp", i32 1}
+      !5 = !{!"ejit_dim", !"cell", i32 0}
+      !6 = !{!"ejit_dim", !"trp", i32 1}
       !7 = !{}
     )";
     Spec.fnName = Name;

@@ -1011,11 +1011,17 @@ TEST(EJitLocalFreeDim, UnsupportedBoundaryVersionFailsCleanlyToFallback) {
   auto Result = Pool->compileOrGet(Index, &Pair, 1, nullptr);
   EXPECT_EQ(Result.fnPtr, nullptr);
   EXPECT_EQ(Result.status, EJitCompileOrGetStatus::EnqueuedPending);
+#if defined(EJIT_SRE_CODE_POOL) && defined(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  // Baseline work waits for an explicit batch; actually run the invalid
+  // boundary through the compiler instead of waiting on an unflushed queue.
+  (void)Pool->requestCodeBatchFlushAndWait();
+#endif
   const auto Deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
   while (!Shared->counters.compileFailed.loadAcquire() &&
          std::chrono::steady_clock::now() < Deadline)
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   EXPECT_GT(Shared->counters.compileFailed.loadAcquire(), 0u);
+  EXPECT_EQ(Pool->tryCacheHit(Index, &Pair, 1).fnPtr, nullptr);
   Pool->ownerShutdown();
 }
 

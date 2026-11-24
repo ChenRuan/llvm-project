@@ -36,7 +36,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitReuseDiagnostics.h"
 #include "llvm/ADT/ScopeExit.h"
-#include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h"
+#include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -148,12 +148,12 @@ std::unique_ptr<Module> buildEntryModule(LLVMContext &Ctx, StringRef Name,
   Cfg->setMetadata(
       "ejit.metadata",
       MDNode::get(Ctx,
-                  {MDNode::get(Ctx, {MDString::get(Ctx, "ejit_period_arr"),
+                  {MDNode::get(Ctx, {MDString::get(Ctx, "ejit_group_indexed"),
                                      MDString::get(Ctx, "cell"),
                                      ConstantAsMetadata::get(
                                          ConstantInt::get(Type::getInt64Ty(Ctx),
                                                           kCells))}),
-                   MDNode::get(Ctx, {MDString::get(Ctx, "ejit_may_const_field"),
+                   MDNode::get(Ctx, {MDString::get(Ctx, "ejit_period_const_field"),
                                      ConstantAsMetadata::get(
                                          ConstantInt::get(Type::getInt64Ty(Ctx),
                                                           0))})}));
@@ -168,17 +168,13 @@ std::unique_ptr<Module> buildEntryModule(LLVMContext &Ctx, StringRef Name,
                  MDNode::get(Ctx,
                              {MDNode::get(Ctx,
                                           {MDString::get(Ctx, "ejit_entry")}),
-                              MDNode::get(Ctx, {MDString::get(Ctx,
-                                                             "ejit_period_arr_"
-                                                             "ind"),
+                              MDNode::get(Ctx, {MDString::get(Ctx, "ejit_dim"),
                                                 MDString::get(Ctx, "cell"),
                                                 ConstantAsMetadata::get(
                                                     ConstantInt::get(
                                                         Type::getInt32Ty(Ctx),
                                                         0))}),
-                              MDNode::get(Ctx, {MDString::get(Ctx,
-                                                             "ejit_period_arr_"
-                                                             "ind"),
+                              MDNode::get(Ctx, {MDString::get(Ctx, "ejit_dim"),
                                                 MDString::get(Ctx, "trp"),
                                                 ConstantAsMetadata::get(
                                                     ConstantInt::get(
@@ -220,7 +216,7 @@ std::unique_ptr<Module> buildEntryModule(LLVMContext &Ctx, StringRef Name,
   Value *GainPtr =
       B.CreateGEP(ArrTy, Cfg, {B.getInt64(0), Cell, B.getInt32(0)}, "gp");
   LoadInst *Gain = B.CreateLoad(Type::getInt32Ty(Ctx), GainPtr, "gain");
-  Gain->setMetadata("ejit.may_const", MDNode::get(Ctx, {}));
+  Gain->setMetadata("ejit.period_const", MDNode::get(Ctx, {}));
   Value *Cmp = B.CreateICmpUGT(X, Gain, "cmp");
   BasicBlock *Hot = BasicBlock::Create(Ctx, "hot", F);
   BasicBlock *Cold = BasicBlock::Create(Ctx, "cold", F);
@@ -502,9 +498,9 @@ void registerCrossCoreOwnerSymbols(EJitCompileDriver &Owner) {
 TEST_F(EJitRepresentativeRuntimeTest,
        InitRejectsRepresentativeSharingWithPgoOff) {
   // Real init rejection preserves the staged registrations for the next test.
-  ejit_config_t Sync{};
-  Sync.compileMode = EJIT_COMPILE_SYNC;
-  EXPECT_EQ(ejit_init_representative(&Sync), EJIT_ERR_INVALID_PARAM);
+  ejit_config_t Off{};
+  Off.compileMode = EJIT_COMPILE_OFF;
+  EXPECT_EQ(ejit_init_representative(&Off), EJIT_ERR_INVALID_PARAM);
   EXPECT_EQ(ejit_representative_test_pool(), nullptr);
   for (bool Audit : {false, true}) {
     Config C;
@@ -517,8 +513,7 @@ TEST_F(EJitRepresentativeRuntimeTest,
     EXPECT_EQ(Rejected.initError().code, EJIT_ERR_INVALID_PARAM);
     EXPECT_EQ(Rejected.compileDriver(), nullptr);
   }
-  for (CompileMode Mode : {CompileMode::Off, CompileMode::Sync,
-                           CompileMode::Async}) {
+  for (CompileMode Mode : {CompileMode::Off, CompileMode::Async}) {
     Config C;
     C.enableRepresentativeSharing = true;
     C.compileMode = Mode;
@@ -687,11 +682,7 @@ TEST_F(EJitRepresentativeRuntimeTest,
 
   auto *ModePool = static_cast<EJitSharedTaskPool *>(ejit_representative_test_pool());
   ASSERT_NE(ModePool, nullptr);
-  const auto Epoch = ModePool->state()->dispatchEpoch.loadAcquire();
-  ejit_set_compile_mode(EJIT_COMPILE_SYNC);
-  EXPECT_EQ(ejit_get_compile_mode(), EJIT_COMPILE_ASYNC);
   EXPECT_EQ(ModePool->getSharedMode(), EJitCompileMode::Async);
-  EXPECT_EQ(ModePool->state()->dispatchEpoch.loadAcquire(), Epoch);
   EXPECT_EQ(ModePool->pendingCount(), 0u);
 
   ASSERT_EQ(ejit_activate("cell", 0), EJIT_OK);

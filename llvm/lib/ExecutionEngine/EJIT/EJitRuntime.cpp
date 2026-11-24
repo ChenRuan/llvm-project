@@ -1316,7 +1316,7 @@ ejit_status_t ejit_representative_test_timeout(uint64_t ticks, uint32_t maxReele
 
 void *ejit_representative_test_pool(void) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  return activeTaskPool();
+  return gEJIT ? gEJIT->sharedTaskPool() : nullptr;
 #else
   return nullptr;
 #endif
@@ -1406,7 +1406,7 @@ ejit_status_t ejit_representative_deactivate_begin(const char *periodName,
   if (Dim == kEJitInvalidDimType) return EJIT_ERR_INVALID_PARAM;
   const auto Status = ejit_deactivate(periodName, instanceId);
   if (Status != EJIT_OK) return Status;
-  auto *Pool = activeTaskPool();
+  auto *Pool = gEJIT->sharedTaskPool();
   out->generation = Pool->state()->generation.loadAcquire();
   out->dimType = Dim;
   out->instanceId = instanceId;
@@ -1422,7 +1422,7 @@ ejit_status_t ejit_representative_borrow_status(const ejit_borrow_fence_t *scope
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (!gEJIT || !gEJIT->compileDriver() ||
       !gEJIT->compileDriver()->representativeSharingActive()) return EJIT_ERR_NOT_ACTIVE;
-  const auto Status = activeTaskPool()->instanceBorrowStatus(scope->dimType,
+  const auto Status = gEJIT->sharedTaskPool()->instanceBorrowStatus(scope->dimType,
       scope->instanceId, scope->generation, scope->version);
   switch (Status) {
   case EJitSharedTaskPool::BorrowScopeStatus::Complete: return EJIT_OK;

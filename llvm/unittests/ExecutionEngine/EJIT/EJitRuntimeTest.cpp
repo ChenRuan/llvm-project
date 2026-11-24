@@ -1288,15 +1288,8 @@ TEST(EJitCApiTaskpool, IcacheSlotRegistrationCarriesTheSentinel) {
                  sp->icacheBeginResolve());
   sp->icacheFill(guardedIdx, reinterpret_cast<void *>(0x3000), id, 1,
                  sp->icacheBeginResolve());
-  if (Cfg.enablePgo || Cfg.enableProfileAudit) {
-    // Audit sampling must not let unregistered mock pointers bypass Tier-1.
-    // Real Tier-2 publication/fill is covered by the production PGO tests.
-    ASSERT_EQ(sentinelCells[3], reinterpret_cast<uintptr_t>(&missFnStandIn));
-    ASSERT_EQ(guardedCells[3], 0u);
-  } else {
-    ASSERT_EQ(sentinelCells[3], 0x2000u);
-    ASSERT_EQ(guardedCells[3], 0x3000u);
-  }
+  ASSERT_EQ(sentinelCells[3], 0x2000u);
+  ASSERT_EQ(guardedCells[3], 0x3000u);
 
   // The public activate path drains: sentinel slot -> &MissFn, guarded slot
   // -> 0. This is the C-ABI end of the contract the SharedTaskPool tests pin

@@ -16,7 +16,7 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITREPRESENTATIVEDIAGNOSTICS_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITREPRESENTATIVEDIAGNOSTICS_H
 
-#include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h"
+#include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h"
 #include <cstdint>
 #include <type_traits>
 

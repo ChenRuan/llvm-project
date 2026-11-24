@@ -8,7 +8,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h" // EJitCompileRequest (v21)
+#include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h" // EJitCompileRequest (v21)
 #include "llvm/ProfileData/InstrProf.h"
 #include "llvm/ProfileData/InstrProfWriter.h"
 #include "llvm/Support/Error.h"
