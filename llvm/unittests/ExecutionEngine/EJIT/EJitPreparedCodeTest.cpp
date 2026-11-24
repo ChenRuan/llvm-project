@@ -421,6 +421,45 @@ TEST(EJitCandidateDirectory, BindingsSchemaCollisionAndBudgetsAreExact) {
   EXPECT_EQ(ByteBounded.identityBytes(), 0u);
 }
 
+TEST(EJitCandidateDirectory, HundredEntriesKeepExactHitsAfterDefaultGroupLimit) {
+  constexpr unsigned Entries = 100, Versions = 10;
+  EJitCandidateDirectory Directory;
+  auto TSM = parse("define i32 @f() { ret i32 7 }");
+  unsigned Opened = 0, Hits = 0, Rejected = 0;
+  TSM.withModuleDo([&](Module &M) {
+    auto &F = *M.getFunction("f");
+    auto *Ret = cast<ReturnInst>(F.getEntryBlock().getTerminator());
+    // Each entry first gets one group. The second version needs another
+    // group; all later versions match the first, even after admission fills.
+    for (unsigned V = 0; V < Versions; ++V)
+      for (unsigned E = 0; E < Entries; ++E) {
+        std::string Entry = "f_" + std::to_string(E);
+        F.setName(Entry);
+        Ret->setOperand(0, ConstantInt::get(F.getReturnType(), V == 1 ? 8 : 7));
+        PgoFunctionSchema Schema{Entry, 1, 2, 1, 0, 0, 0};
+        auto Result = Directory.classify(M, scope(Entry), {}, {Schema});
+        if (!Result) {
+          EXPECT_EQ(V, 1u);
+          EXPECT_EQ(errorToErrorCode(Result.takeError()),
+                    std::make_error_code(std::errc::no_buffer_space));
+          ++Rejected;
+        } else if (Result->existing) {
+          EXPECT_GE(V, 2u);
+          ++Hits;
+        } else {
+          ++Opened;
+        }
+      }
+  });
+  EXPECT_EQ(Opened, 128u);
+  EXPECT_EQ(Directory.groupCount(), 128u);
+  EXPECT_EQ(Hits, 800u);
+  EXPECT_EQ(Rejected, 72u);
+  RecordProperty("opened_groups", Opened);
+  RecordProperty("exact_hits", Hits);
+  RecordProperty("budget_rejections", Rejected);
+}
+
 TEST(EJitCandidateDirectory, RealPreservedCellPrefixRetainsDynamicSemantics) {
   struct CellData {
     int32_t frozen;

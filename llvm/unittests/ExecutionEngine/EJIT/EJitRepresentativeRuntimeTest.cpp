@@ -1812,9 +1812,11 @@ TEST_F(EJitRepresentativeRuntimeTest,
       EXPECT_FALSE(R.frozen.incomplete);
       ASSERT_EQ(R.frozen.different, 1u);
       ASSERT_EQ(R.frozen.shown, 1u);
-      // Peer selection is the oldest retained same-source group, whose
-      // earlier lifecycle froze 7, not necessarily the current equal group.
-      EXPECT_STREQ(R.frozen.differences[0].peer, "i32 7");
+      // The oldest retained same-source group may come from the earlier
+      // lifecycle case (7), or this case's initial group when run alone (40).
+      EXPECT_TRUE(StringRef(R.frozen.differences[0].peer) == "i32 7" ||
+                  StringRef(R.frozen.differences[0].peer) == "i32 40")
+          << R.frozen.differences[0].peer;
       EXPECT_STREQ(R.frozen.differences[0].request, "i32 201");
     }
   }
