@@ -120,7 +120,7 @@ public:
 private:
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
   template <typename ModuleT, typename OnLoad>
-  std::vector<EJitMayConstLoadSite> inventory(ModuleT &M, OnLoad Found) const;
+  std::vector<EJitPeriodConstLoadSite> inventory(ModuleT &M, OnLoad Found) const;
 #endif
 
   PeriodArrayRegistry &registry_;

@@ -123,7 +123,7 @@ constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_BOUND_V =
     "ejit_taskpool_compile_or_get_bound_v";
 constexpr const char *FN_TASKPOOL_RELEASE_READ = "ejit_taskpool_release_read";
 // Lifecycle activation is keyed by period/lifecycle name + instance index only.
-// PASS4 emits these name-level calls at ejit_period_lc entry/exit; there is no
+// PASS4 emits these name-level calls at ejit_guard entry/exit; there is no
 // array-pointer dimension in the active-state hot path.
 constexpr const char *FN_DEACTIVATE = "ejit_deactivate";
 constexpr const char *FN_ACTIVATE = "ejit_activate";

@@ -109,7 +109,7 @@ enum class EJitWorkerStep : uint32_t {
 // .mc_shared) rather than per-core .bss, so ONE table backs every core:
 //
 //  * PARTITIONED, so no locking. A cell's index is icacheLinearize(dims), the
-//    ejit_dim argument values (the ejit_period_lc instance indices). Cores
+//    ejit_dim argument values (the ejit_guard instance indices). Cores
 //    drive disjoint instance ranges, so they write disjoint cells and the hit
 //    path is what it was when the table was private: no gate, no contention,
 //    one load.
@@ -124,7 +124,7 @@ enum class EJitWorkerStep : uint32_t {
 //    to call.
 //
 // PREREQUISITE, and it is a CORRECTNESS one: the partitioning must be real --
-// each core drives its OWN ejit_period_lc instance indices, so no two cores
+// each core drives its OWN ejit_guard instance indices, so no two cores
 // call one ejit_entry with the same ejit_dim values.
 //
 // Disjointness is what makes a cell safe to jump to. A core only ever reads

@@ -18,4 +18,4 @@ define i64 @wide(i64 %cell) !ejit.metadata !0 {
   ret i64 %cell
 }
 
-!0 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
+!0 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}}
