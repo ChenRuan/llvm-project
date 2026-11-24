@@ -1,10 +1,6 @@
 //===-- EJitRuntimeTest.cpp - EmbeddedJIT Runtime Unit Tests
 //---------------===//
 //
-// NOTE: To call the C API functions, we need to include the C runtime header
-// which is in the non-canonical include path. We declare the symbols we need
-// via extern "C" declarations instead, since they're provided by libLLVMEJIT.
-//
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
@@ -21,6 +17,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
@@ -843,50 +840,13 @@ TEST(EJit, TaskpoolRegistrationFrozenAfterConstruction) {
 // C API tests with runtime-dynamic cellIdx (T3-21)
 //===----------------------------------------------------------------------===//
 
+constexpr auto EJIT_OK_C = EJIT_OK;
+
+// Generated AOT registration hooks, not part of EJitRuntime.h.
 extern "C" {
-typedef enum { EJIT_OK_C = 0 } ejit_status_test_t;
-typedef struct {
-  uint32_t dimType;
-  uint32_t instanceId;
-} ejit_dim_pair_test_t;
-extern ejit_status_test_t ejit_init(const void *config);
-extern void ejit_shutdown(void);
-extern ejit_status_test_t ejit_activate(const char *, uint32_t);
-extern ejit_status_test_t ejit_deactivate(const char *, uint32_t);
-extern bool ejit_is_active(const char *, uint32_t);
-extern void ejit_invalidate(const char *, uint32_t);
-extern void ejit_clear_cache(void);
-extern void ejit_register_period_array(const char *, const char *, void *,
-                                       uint64_t);
-extern void ejit_register_bitcode(const char *, const uint8_t *, uint64_t);
-extern void ejit_register_static_var(const char *, void *);
-extern void ejit_register_lifecycle(const char *, uint32_t *);
-// Icache slot registration: name-keyed (resolved against the SAME registry
-// funcIndex ejit_register_funcindex assigns), 4th arg is the sentinel MissFn
-// for branchless-probe slots (null keeps the guarded form's 0 semantics).
-extern void ejit_register_funcindex(const char *, uint32_t *);
-extern void ejit_register_icache_slot(const char *, void *, uint32_t, void *);
-extern int ejit_taskpool_compile_or_get_bound(uint32_t,
-                                              const ejit_dim_pair_test_t *,
-                                              uint32_t, const void *, uint32_t,
-                                              uint32_t, void **, uint32_t *);
-extern int ejit_taskpool_compile_or_get_bound_v(
-    uint32_t, const ejit_dim_pair_test_t *, uint32_t,
-    const llvm::ejit::EJitBoundPtrDescriptor *, uint32_t, void **, uint32_t *);
-extern void ejit_taskpool_release_read(uint32_t);
-extern void ejit_set_log_level(int level);
-extern int ejit_get_log_level(void);
-extern void ejit_print_registry(void);
-extern void ejit_print_func_meta(const char *funcName);
-// P0 diagnostics: code pool stats + active period map. Declared returning int
-// (the real ejit_status_t) with literal status values (0=OK, -1=INVALID_PARAM,
-// -2=NOT_ACTIVE, -9=DISABLED) so the test need not include the C API header.
-extern int ejit_get_code_pool_stats(void *out);
-extern int ejit_get_code_pool_stats_v2(void *out);
-extern void ejit_print_code_pool_stats(void);
-extern void ejit_print_period_const_ranking(void);
-extern void ejit_print_active(void);
-extern void ejit_print_version(void);
+void ejit_register_period_array(const char *, const char *, void *, uint64_t);
+void ejit_register_bitcode(const char *, const uint8_t *, uint64_t);
+void ejit_register_static_var(const char *, void *);
 }
 
 TEST(EJitCApi, ActivateWithDynamicCellIdx) {
@@ -1075,11 +1035,11 @@ TEST(EJitCApiTaskpool, OptionalOutputsAndValidationPrecedence) {
   ejit_taskpool_release_read(0);
 
   ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
-  ejit_dim_pair_test_t dim{0, 0};
+  ejit_dim_pair_t dim{0, 0};
   EXPECT_EQ(resolve(0, &dim, UINT32_MAX, nullptr, 0, nullptr, nullptr), -1);
   EXPECT_EQ(resolve(0, nullptr, 1, nullptr, 0, nullptr, nullptr), -1);
   EXPECT_EQ(resolve(0, nullptr, 0, nullptr, UINT32_MAX, nullptr, nullptr), -1);
-  llvm::ejit::EJitBoundPtrDescriptor b{nullptr, 4, 0};
+  ejit_bound_ptr_t b{nullptr, 4, 0};
   EXPECT_EQ(resolve(0, nullptr, 0, &b, 1, nullptr, nullptr), -1);
   dim.instanceId = UINT32_MAX;
   EXPECT_EQ(resolve(0, &dim, 1, nullptr, 0, nullptr, nullptr), -1);
@@ -2180,7 +2140,7 @@ TEST(EJitOptimizer, AuditEndpointsAcrossTierExits) {
       Ret->setOperand(0, B.CreateAdd(&BB.front(), Ret->getReturnValue()));
     }
     const auto OldLevel = ejit_get_log_level();
-    ejit_set_log_level(EJIT_LOG_LVL_DEBUG);
+    ejit_set_log_level(EJIT_LOG_DEBUG);
     testing::internal::CaptureStdout();
     Opt.runPipeline(*M, Spec);
     std::string Output = testing::internal::GetCapturedStdout();
@@ -5487,23 +5447,23 @@ TEST(EJitPipelineIR, PeriodIndexReplacementAndFold) {
 TEST(EJitDiagLogLevel, SetAndGet) {
   // Default level is INFO (1).
   EXPECT_EQ(ejit_get_log_level(), 1);
-  ejit_set_log_level(3); // DEBUG
+  ejit_set_log_level(EJIT_LOG_DEBUG);
   EXPECT_EQ(ejit_get_log_level(), 3);
-  ejit_set_log_level(0); // OFF
+  ejit_set_log_level(EJIT_LOG_OFF);
   EXPECT_EQ(ejit_get_log_level(), 0);
-  ejit_set_log_level(2); // VERBOSE
+  ejit_set_log_level(EJIT_LOG_VERBOSE);
   EXPECT_EQ(ejit_get_log_level(), 2);
   // Restore the default so subsequent tests are unaffected.
-  ejit_set_log_level(1);
+  ejit_set_log_level(EJIT_LOG_INFO);
   EXPECT_EQ(ejit_get_log_level(), 1);
 }
 
 TEST(EJitDiagLogLevel, ClampsOutOfRange) {
-  ejit_set_log_level(-5);
+  ejit_set_log_level(static_cast<ejit_log_level_t>(-5));
   EXPECT_EQ(ejit_get_log_level(), 0);
-  ejit_set_log_level(99);
+  ejit_set_log_level(static_cast<ejit_log_level_t>(99));
   EXPECT_EQ(ejit_get_log_level(), 3);
-  ejit_set_log_level(1); // restore
+  ejit_set_log_level(EJIT_LOG_INFO);
 }
 
 // Registry / func-meta prints must not crash on an uninitialized runtime and on
@@ -5532,9 +5492,12 @@ TEST(EJitDiagnostics, CodePoolStatsNullOutRejected) {
 // without EJIT_SRE_CODE_POOL). It must not crash and must not return a
 // positive value.
 TEST(EJitDiagnostics, CodePoolStatsNoCrash) {
-  int dummy = -1;
-  int rv = ejit_get_code_pool_stats(&dummy);
-  EXPECT_TRUE(rv == 0 || rv == -2 || rv == -9);
+  ejit_code_pool_stats_t Stats = {};
+  ejit_code_pool_stats_v2_t Tiered = {};
+  const auto Status = ejit_get_code_pool_stats(&Stats);
+  EXPECT_TRUE(Status == EJIT_OK || Status == EJIT_ERR_NOT_ACTIVE ||
+              Status == EJIT_ERR_DISABLED);
+  EXPECT_EQ(ejit_get_code_pool_stats_v2(&Tiered), Status);
 }
 
 TEST(EJitDiagnostics, PrintCodePoolStatsNoCrash) {
@@ -5543,6 +5506,7 @@ TEST(EJitDiagnostics, PrintCodePoolStatsNoCrash) {
 
 TEST(EJitDiagnostics, PrintPeriodConstRankingNoCrash) {
   ejit_print_period_const_ranking(); // uninitialized: prints a notice
+  ejit_print_mayconst_ranking();
 }
 
 // ejitDiagPermille() drives the code-pool usage percentage: integer-only

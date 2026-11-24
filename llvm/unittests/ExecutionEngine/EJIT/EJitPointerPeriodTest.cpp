@@ -1519,8 +1519,8 @@ static void runOnlinePgoLifecycle(bool Lightweight,
   ASSERT_EQ(ejit_init_pgo(nullptr), EJIT_OK);
   const ejit_dim_pair_t Dim{CellDim, 1};
   using Probe = uint8_t (*)(uint8_t, uint16_t);
+  constexpr unsigned SampleQuota = 64;
   uint16_t SlotNo = 0;
-  void *PreviousTier2 = nullptr;
   for (uint8_t Value : {1, 2}) {
     SCOPED_TRACE(static_cast<unsigned>(Value));
     // No invocation or compiler request is outstanding at the update point.
@@ -1528,11 +1528,15 @@ static void runOnlinePgoLifecycle(bool Lightweight,
     for (unsigned I = 0; I < Fixture.Slots; ++I)
       Fixture.Data[Element * Fixture.Stride + 8 + I * 4 + 1] = Value;
     ASSERT_EQ(ejit_activate("cell", 1), EJIT_OK);
-    void *Tier1 = nullptr, *Tier2 = nullptr;
+#ifdef EJIT_STATS_ENABLE
+    ejit_taskpool_stats_t Before{};
+    ASSERT_EQ(ejit_taskpool_get_stats(&Before), EJIT_OK);
+#endif
+    bool ExecutedTier2 = false;
     unsigned Tier1Executions = 0;
     const auto Deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (!Tier2 && std::chrono::steady_clock::now() < Deadline) {
+    while (!ExecutedTier2 && std::chrono::steady_clock::now() < Deadline) {
       void *Fn = nullptr;
       uint32_t Bucket = 0;
       auto Status = ejit_taskpool_compile_or_get(Func, &Dim, 1, &Fn, &Bucket);
@@ -1540,23 +1544,30 @@ static void runOnlinePgoLifecycle(bool Lightweight,
         uint8_t Actual = reinterpret_cast<Probe>(Fn)(1, SlotNo++);
         ejit_taskpool_release_read(Bucket);
         ASSERT_EQ(Actual, Value);
-        ASSERT_NE(Fn, PreviousTier2);
-        if (!Tier1)
-          Tier1 = Fn;
-        if (Fn == Tier1)
-          ++Tier1Executions;
+        // After the quota, dispatch stays pending until T2 is callable.
+        // ORC may reuse the same address for different tiers or generations.
+        if (Tier1Executions == SampleQuota)
+          ExecutedTier2 = true;
         else
-          Tier2 = Fn;
+          ++Tier1Executions;
       } else {
         ASSERT_EQ(Status, EJIT_PENDING);
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    ASSERT_NE(Tier1, nullptr);
-    ASSERT_NE(Tier2, nullptr)
-        << "online PGO did not publish T2 before deadline";
-    EXPECT_EQ(Tier1Executions, 64U);
-    PreviousTier2 = Tier2;
+    ASSERT_EQ(Tier1Executions, SampleQuota);
+    ASSERT_TRUE(ExecutedTier2) << "online PGO did not publish T2 before deadline";
+#ifdef EJIT_STATS_ENABLE
+    ejit_taskpool_stats_t After{};
+    // The worker increments stats after making the entry callable.
+    do {
+      ASSERT_EQ(ejit_taskpool_get_stats(&After), EJIT_OK);
+      if (After.asyncCompiles >= Before.asyncCompiles + 2)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < Deadline);
+    EXPECT_EQ(After.asyncCompiles, Before.asyncCompiles + 2);
+#endif
     ASSERT_EQ(ejit_deactivate("cell", 1), EJIT_OK);
     void *Disabled = nullptr;
     uint32_t Bucket = 0;
