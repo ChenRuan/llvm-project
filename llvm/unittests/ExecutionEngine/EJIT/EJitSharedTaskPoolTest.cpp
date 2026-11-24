@@ -8030,6 +8030,61 @@ TEST_F(SharedTaskPoolTest, AsyncServiceUnavailableWithoutAWorker) {
 }
 
 TEST_F(SharedTaskPoolTest,
+       RejectedRepresentativeObservationDoesNotPinTier1Execution) {
+  EJitSharedTaskPool Pool;
+  Pool.setPgoEnabled(true, 2);
+  bringUpOwner(Pool, /*codeSharing=*/false, /*requestAttempts=*/true);
+  Pool.setSamplingAdmissionCallback(
+      +[](void *, uint32_t, const EJitDimPair *, uint32_t, uint32_t, uint64_t) {
+        return EJitSharedTaskPool::SamplingAdmission::Grant;
+      },
+      nullptr);
+  bool Reject = true;
+  Pool.setDispatchObserver(
+      +[](void *Ctx, const EJitSharedTaskPool::DispatchObservation &) {
+        return !*static_cast<bool *>(Ctx);
+      },
+      &Reject);
+
+  constexpr uint32_t Func = 79;
+  ASSERT_EQ(Pool.compileOrGet(Func, nullptr, 0, codeFor(Func)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Pool.pollOne()); // Publish the real Tier-1 state.
+  auto *Slot = findReadySlot(Func);
+  ASSERT_NE(Slot, nullptr);
+  ASSERT_EQ(Slot->t1DispatchLimit.loadAcquire(), 2u);
+  const auto &Bucket = state_->buckets[bucketOfIdentity(Func, nullptr, 0)];
+  for (uint64_t Count = 0; Count != 2; ++Count) {
+    // Exercise both a normal dispatch and the dispatch that closes the quota.
+    Reject = true;
+    auto Denied = Pool.tryCacheHit0D(Func);
+    EXPECT_EQ(Denied.status, EJitCompileOrGetStatus::AlreadyPending);
+    EXPECT_FALSE(Denied.hasReadToken);
+    EXPECT_EQ(Denied.fnPtr, nullptr);
+    EXPECT_EQ(Slot->t1DispatchCount.loadAcquire(), Count);
+    EXPECT_EQ(Slot->t1QuotaEnd.loadAcquire(), 0u);
+    EXPECT_EQ(Pool.pendingCount(), 0u);
+    ASSERT_EQ(Bucket.readers.loadAcquire(), 0u)
+        << "a rejected dispatch has no caller to release its token";
+
+    Reject = false;
+    auto Granted = Pool.tryCacheHit0D(Func);
+    ASSERT_EQ(Granted.status, EJitCompileOrGetStatus::CacheHit);
+    ASSERT_TRUE(Granted.hasReadToken);
+    EXPECT_EQ(Bucket.readers.loadAcquire(), 1u);
+    Pool.releaseRead(Granted.bucketIndex);
+    EXPECT_EQ(Bucket.readers.loadAcquire(), 0u);
+    EXPECT_EQ(Slot->t1DispatchCount.loadAcquire(), Count + 1);
+  }
+  ASSERT_EQ(Pool.pendingCount(), 1u);
+  ASSERT_TRUE(Pool.pollOne());
+  Slot = findReadySlot(Func);
+  ASSERT_NE(Slot, nullptr);
+  EXPECT_EQ(Slot->tier.loadAcquire(), kEJitTierPgoUse);
+  EXPECT_EQ(Pool.liveRequestAttemptCount(), 0u);
+}
+
+TEST_F(SharedTaskPoolTest,
        RequestAttemptSettlesThreeEventsOnRealTier1Tier2Path) {
   BoundPointerLog log;
   EJitSharedTaskPool owner;

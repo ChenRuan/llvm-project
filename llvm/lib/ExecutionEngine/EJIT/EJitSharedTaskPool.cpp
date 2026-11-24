@@ -4390,12 +4390,6 @@ EJitSharedTaskPool::admitObservedT1Dispatch(const SharedLookup &Hit,
     return T1DispatchOutcome::IdentityChanged;
 #endif
   const T1DispatchOutcome Outcome = admitObservedT1DispatchLocked(Hit);
-#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-  if (samplingAdmissionFn_ &&
-      (Outcome == T1DispatchOutcome::Admitted ||
-       Outcome == T1DispatchOutcome::FinalAdmitted))
-    state_->buckets[Hit.tier2BucketIndex].readers.fetchAdd(1);
-#endif
   if (AdmittedCount &&
       (Outcome == T1DispatchOutcome::Admitted ||
        Outcome == T1DispatchOutcome::FinalAdmitted))
@@ -4586,11 +4580,17 @@ EJitSharedTaskPool::classifyHit(SharedLookup Hit,
     Observation.acquire(state_->buckets[Hit.tier2BucketIndex]);
     uint64_t AdmittedCount = 0;
     const auto Outcome = admitObservedT1Dispatch(Hit, &AdmittedCount);
+    auto PinSamplingToken = [&] {
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-    SamplingToken = samplingAdmissionFn_ &&
-                   (Outcome == T1DispatchOutcome::Admitted ||
-                    Outcome == T1DispatchOutcome::FinalAdmitted);
+      // A rejected observation returns no callable pointer, so it must not
+      // leave a token for Tier-2 to drain. Pin only after acknowledgement,
+      // while the observation lock still covers this exact published slot.
+      if (samplingAdmissionFn_ && Outcome != T1DispatchOutcome::NotApplicable) {
+        state_->buckets[Hit.tier2BucketIndex].readers.fetchAdd(1);
+        SamplingToken = true;
+      }
 #endif
+    };
     switch (Outcome) {
     case T1DispatchOutcome::Exhausted:
       // Lost the final admission to a racing core (or the quota closed between
@@ -4619,6 +4619,7 @@ EJitSharedTaskPool::classifyHit(SharedLookup Hit,
         R.fastPathTerminal = true;
         return R;
       }
+      PinSamplingToken();
       Observation.release();
       // The last allowed dispatch freezes the boundary AND claims Tier-2.
       enqueueTier2FromLookup(Hit, boundPointers, boundCount);
@@ -4635,6 +4636,7 @@ EJitSharedTaskPool::classifyHit(SharedLookup Hit,
         R.fastPathTerminal = true;
         return R;
       }
+      PinSamplingToken();
       Observation.release();
       break;
     case T1DispatchOutcome::IdentityChanged:
