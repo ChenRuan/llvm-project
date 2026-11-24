@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
@@ -882,6 +883,13 @@ TEST(EJitLocalFreeDim, UnsupportedMixedSelectKeepsRealLoad) {
 }
 
 TEST(EJitLocalFreeDim, NormalOnlineWorkerPGOAndLifecycleRefresh) {
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE) &&           \
+    GTEST_HAS_STREAM_REDIRECTION
+  const auto OldLevel = ejit_get_log_level();
+  ejit_set_log_level(EJIT_LOG_INFO);
+  // Restore the non-atomic log level only after the driver joins the worker.
+  auto RestoreLevel = make_scope_exit([OldLevel] { ejit_set_log_level(OldLevel); });
+#endif
   LLVMContext C;
   auto Original = makeLocalModule(C);
   ASSERT_NE(Original, nullptr);
@@ -940,15 +948,12 @@ TEST(EJitLocalFreeDim, NormalOnlineWorkerPGOAndLifecycleRefresh) {
   };
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE) &&           \
     GTEST_HAS_STREAM_REDIRECTION
-  const auto OldLevel = ejit_get_log_level();
-  ejit_set_log_level(EJIT_LOG_INFO);
   testing::internal::CaptureStdout();
 #endif
   const bool Published = RunGeneration(11, 1);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE) &&           \
     GTEST_HAS_STREAM_REDIRECTION
   const std::string AuditLog = testing::internal::GetCapturedStdout();
-  ejit_set_log_level(OldLevel);
   StringRef AuditLine = StringRef(AuditLog)
                             .split("period_const-audit entry=local_online_246 ")
                             .second.split('\n').first;
