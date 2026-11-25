@@ -333,19 +333,6 @@ EJit::EJit(const Config &config) : config_(config) {
         EJIT_DIAG("ORC engine skipped: not the compile owner");
       } else {
         EJIT_DIAG("taskpool async init complete: worker running");
-        // PGO and the default-off profile audit share the temporary
-        // Instrumented-tier hit window. Audit-only mode publishes ordinary
-        // Baseline code after collecting the window.
-        //
-        // Shared taskpool: already published above, before Ready (the values are
-        // immutable once Ready). The per-instance pool has no such window.
-#ifndef EJIT_SRE_SHARED_TASKPOOL
-        if (config_.enablePgo || config_.enableProfileAudit) {
-          constexpr uint32_t kDefaultPgoThreshold = 64;
-          compileDriver_->sharedTaskPool()->setPgoEnabled(
-              true, kDefaultPgoThreshold);
-        }
-#endif
       }
     } else {
       EJIT_DIAG_VERBOSE("taskpool off: AOT only");
@@ -495,7 +482,6 @@ void EJit::invalidateAllByPeriod(const std::string &periodName) {
 }
 
 void EJit::registerSymbol(const std::string &name, void *addr) {
-#ifdef EJIT_SRE_TASKPOOL
   // The worker reads the ORC user-symbol map without a concurrent-write
   // protocol. Keep symbol registration under the same frozen contract as the
   // other runtime registries; the C ABI wrapper records the rejection.
@@ -504,7 +490,6 @@ void EJit::registerSymbol(const std::string &name, void *addr) {
               name.c_str());
     return;
   }
-#endif
   if (compileDriver_)
     compileDriver_->registerSymbol(name, addr);
 }

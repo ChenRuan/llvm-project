@@ -859,9 +859,7 @@ TEST(EJit, PublicSymbolRegistrationFollowsFreezeContract) {
   int OriginalValue = 7;
   int ReplacementValue = 9;
   const char *Symbol = "public_registration_contract_value";
-#ifdef EJIT_SRE_TASKPOOL
   EJitRegistrationStore::instance().registerSymbol(Symbol, &OriginalValue);
-#endif
   EJit ejit(Config{});
   ASSERT_FALSE(ejit.initFailed());
   ASSERT_NE(ejit.compileDriver(), nullptr);
@@ -912,7 +910,6 @@ TEST(EJit, PublicSymbolRegistrationFollowsFreezeContract) {
     EXPECT_EQ(Published(), OriginalValue);
   };
 
-#ifdef EJIT_SRE_TASKPOOL
   ASSERT_TRUE(ejit.registrationFrozen());
   CompileAndRead(0xc101);
   ASSERT_NE(Published, nullptr);
@@ -921,14 +918,6 @@ TEST(EJit, PublicSymbolRegistrationFollowsFreezeContract) {
   EXPECT_EQ(ejit.compileDriver()->stagedUserSymbolCountForTest(), Before);
   CompileAndRead(0xc102);
   EXPECT_EQ(OriginalCode(), OriginalValue);
-#else
-  // Legacy EJit keeps the public C++ registration phase open after
-  // construction; this is the pre-freeze half of the contract.
-  ASSERT_FALSE(ejit.registrationFrozen());
-  ejit.registerSymbol(Symbol, &OriginalValue);
-  EXPECT_EQ(ejit.compileDriver()->stagedUserSymbolCountForTest(), Before + 1);
-  CompileAndRead(0xc101);
-#endif
 }
 #endif // EJIT_SRE_TASKPOOL_TESTING
 

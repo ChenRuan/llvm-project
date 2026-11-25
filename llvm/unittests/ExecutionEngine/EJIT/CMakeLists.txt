@@ -248,8 +248,6 @@ endforeach()
 # sources are compiled into this target, so diverging values would silently test
 # different geometry).
 target_compile_definitions(EJitRepresentativeGroupTests PRIVATE
-  EJIT_SRE_TASKPOOL
-  EJIT_SRE_SHARED_TASKPOOL
   EJIT_SRE_TASKPOOL_TESTING
   EJIT_STATS_ENABLE
   EJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS}
@@ -261,7 +259,7 @@ target_compile_definitions(EJitRepresentativeGroupTests PRIVATE
   EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=3
   EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=100
   )
-if(EJIT_SRE_SHARED_TASKPOOL AND EJIT_SRE_SHARED_CODE_POINTERS)
+if(EJIT_SRE_SHARED_CODE_POINTERS)
   target_compile_definitions(EJitRepresentativeGroupTests PRIVATE
     EJIT_SRE_SHARED_CODE_POINTERS)
 endif()
@@ -343,8 +341,6 @@ foreach(ejit_target ${LLVM_TARGETS_TO_BUILD})
 endforeach()
 
 target_compile_definitions(EJITRepresentativeRuntimeTests PRIVATE
-  EJIT_SRE_TASKPOOL
-  EJIT_SRE_SHARED_TASKPOOL
   EJIT_SRE_TASKPOOL_TESTING
   EJIT_STATS_ENABLE
   EJIT_DIAG_ENABLE

@@ -14,12 +14,10 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 // The group lifecycle is only reachable from the cross-core shared driver (the
 // only owner of the shared request/observation protocol); a freestanding or
 // per-instance build must not pull in the prepared-code/ORC headers.
 #include "llvm/ExecutionEngine/EJIT/EJitRepresentativeGroup.h"
-#endif
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
 #endif
@@ -122,7 +120,6 @@ public:
   void stopSharedTaskPool() { sharedPool_.ownerShutdown(); }
 
   EJitRuntimeState &getRuntimeState() { return runtimeState_; }
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   /// The driver-owned representative-PGO group registry (V1 sharing). Non-null
   /// only while Config::enableRepresentativeSharing is on AND the build really
   /// supports it; a caller reads group/publication state through it instead of
@@ -144,7 +141,6 @@ public:
   const EJitRepresentativeGroupRegistry *representativeGroups() const {
     return repGroups_.get();
   }
-#endif
   EJitModuleLoader &getLoader() { return loader_; }
   const Config &getConfig() { return config_; }
   EJitOrcEngine *getJitEngine() { return jitEngine_.get(); }
@@ -210,7 +206,6 @@ private:
   static bool sharedOwnerElected(void *ctx);
   /// Owner-release hook: the counterpart of sharedOwnerElected.
   static void sharedOwnerReleased(void *ctx);
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   /// Pool hook: in-flight sampling admission for one async PGO request. Denies
   /// a personal sampling admission to a member whose candidate group already
   /// owns its ONE representative sampling session.
@@ -281,7 +276,6 @@ private:
   bool bindRepresentativeTier1(const EJitCompileRequest *Request,
                                uint64_t CacheKey,
                                const EJitRepresentativeSession **OutSession);
-#endif
   // Async compiler will be added in EJitAsyncCompiler phase
 
   /// Cold compile path (decode → verify active → load bitcode → JIT compile).
@@ -317,7 +311,6 @@ private:
   std::unordered_map<uint64_t, Tier1ProfileIdentity> tier1ProfileIdentities_;
   std::unordered_map<uint64_t, EJitFrozenProfileBundle> frozenProfileBundles_;
   uint64_t nextSamplingSessionId_ = 1;
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   /// V1 representative sharing (default OFF). Created only when the opt-in
   /// passes the admission gate, so a product default build never allocates or
   /// consults it.
@@ -415,7 +408,6 @@ private:
     EJitDimPair dims[kEJitMaxRequestDims] = {};
   };
   std::vector<RepGroupIdentity> repGroupIdentities_;
-#endif
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   struct Tier1PeriodConstState {
     uintptr_t counterBase = 0;

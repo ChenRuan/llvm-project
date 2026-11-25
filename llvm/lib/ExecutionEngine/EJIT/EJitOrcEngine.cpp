@@ -1183,7 +1183,6 @@ void normalizeModuleForJIT(Module &M, const std::string &origFnName,
 #endif
 }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 /// Resolve the effective bindings of every REFERENCED external declaration of
 /// \p M through the same resolution environment loadBitcodeModule defines
 /// symbols from: the period-array registry (array bases / static vars), the
@@ -1256,10 +1255,8 @@ bool collectEffectiveBindings(
   return true;
 }
 
-#endif
 } // namespace
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 Expected<EJitCandidateResult> EJitOrcEngine::classifyCandidate(
     StringRef Bitcode, SpecializationContext Ctx,
     EJitCandidateDirectory &Directory, const EJitCodeIdentityScope &Scope) {
@@ -1362,7 +1359,6 @@ EJitPreparedCodeEmitter::Stats EJitOrcEngine::preparedEmitterStats() const {
     return {};
   return P->preparedEmitter->stats();
 }
-#endif // EJIT_SRE_SHARED_TASKPOOL
 
 Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
                                        const std::string &origFnName) {

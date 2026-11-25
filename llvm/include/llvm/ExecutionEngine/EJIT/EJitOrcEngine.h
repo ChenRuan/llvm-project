@@ -13,9 +13,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitBoundPtr.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitPreparedCode.h"
-#endif
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
 #endif
@@ -170,7 +168,6 @@ public:
   /// identified by cacheKey.
   Expected<void *> lookup(uint64_t cacheKey, const std::string &name);
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   Expected<EJitCandidateResult> classifyCandidate(
       StringRef Bitcode, SpecializationContext Ctx,
       EJitCandidateDirectory &Directory, const EJitCodeIdentityScope &Scope);
@@ -196,7 +193,6 @@ public:
   EJitPreparedCodeEmitter *preparedEmitter();
   /// Read-only emitter statistics (real physical objects / reuses / bytes).
   EJitPreparedCodeEmitter::Stats preparedEmitterStats() const;
-#endif
 
   /// Set the active specialization context (used during compilation).
   void setActiveContext(const SpecializationContext *ctx);

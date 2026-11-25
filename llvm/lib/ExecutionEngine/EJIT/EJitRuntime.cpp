@@ -214,10 +214,8 @@ ejit_status_t ejit_init_representative(const ejit_config_t *config) {
 void ejit_shutdown(void) {
   EJIT_DIAG("shutting down");
   setDumpSharedState(nullptr);
-  bool WasReuseOwner = false;
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  WasReuseOwner = gEJIT && gEJIT->sharedTaskPool() && gEJIT->sharedTaskPool()->isOwner();
-#endif
+  const bool WasReuseOwner =
+      gEJIT && gEJIT->sharedTaskPool() && gEJIT->sharedTaskPool()->isOwner();
   delete gEJIT;
   gEJIT = nullptr;
   if (WasReuseOwner)
@@ -229,7 +227,6 @@ void ejit_register_symbol(const char *name, void *addr) {
   EJIT_DIAG_VERBOSE("register_symbol name=%s addr=%p", name ? name : "<null>",
                     addr);
   if (gEJIT) {
-#ifdef EJIT_SRE_TASKPOOL
     if (gEJIT->registrationFrozen()) {
       EJitRegistrationStore::instance().recordError(
           EJIT_ERR_INVALID_PARAM, "runtime symbol registration rejected",
@@ -238,7 +235,6 @@ void ejit_register_symbol(const char *name, void *addr) {
                 name ? name : "<null>");
       return;
     }
-#endif
     gEJIT->registerSymbol(name, addr);
   } else {
     // Constructor-phase call (before ejit_init): stage for later consumption.
@@ -1118,14 +1114,10 @@ void ejit_taskpool_print_compiled() {
 }
 
 static bool reuseDiagOnOwner() {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   return gEJIT && gEJIT->sharedTaskPool() && gEJIT->sharedTaskPool()->isOwner() &&
          gEJIT->sharedTaskPool()->state() &&
          EJitCoreId::current() ==
              gEJIT->sharedTaskPool()->state()->ownerCoreId.loadAcquire();
-#else
-  return false;
-#endif
 }
 
 ejit_status_t ejit_reuse_diag_config(const char *entry, uint32_t level) {
@@ -1159,7 +1151,7 @@ ejit_status_t ejit_reuse_diag_print(void) {
 }
 
 ejit_status_t ejit_reuse_diag_print_summary(void) {
-#if defined(EJIT_DIAG_ENABLE) && defined(EJIT_SRE_SHARED_TASKPOOL)
+#ifdef EJIT_DIAG_ENABLE
   if (!reuseDiagOnOwner())
     return EJIT_ERR_NOT_ACTIVE;
   if (!gEJIT->compileDriver()->representativeSharingActive() ||
@@ -1247,7 +1239,6 @@ static ejit_status_t copyRepresentativeProfile(uint32_t groupIndex, bool scalars
                                                 size_t capacity, size_t *size) {
   if (!size) return EJIT_ERR_INVALID_PARAM;
   *size = 0;
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (!gEJIT || !gEJIT->compileDriver()) return EJIT_ERR_NOT_ACTIVE;
   EJitGroupDiagnostics D;
   EJitGroupSnapshot S;
@@ -1263,9 +1254,6 @@ static ejit_status_t copyRepresentativeProfile(uint32_t groupIndex, bool scalars
                             : static_cast<const void *>(Bundle->indexedProfile.data());
   if (*size) std::memcpy(buffer, Data, *size);
   return EJIT_OK;
-#else
-  return EJIT_ERR_NOT_ACTIVE;
-#endif
 }
 ejit_status_t ejit_representative_copy_profile(void *buffer, size_t capacity, size_t *size) {
   return copyRepresentativeProfile(0, false, buffer, capacity, size);
@@ -1277,49 +1265,33 @@ ejit_status_t ejit_representative_copy_scalar_profile(void *buffer, size_t capac
 
 #ifdef EJIT_SRE_TASKPOOL_TESTING
 ejit_status_t ejit_representative_test_fail_member_tier2(uint32_t count) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (gEJIT && gEJIT->compileDriver()) {
     gEJIT->compileDriver()->failMemberTier2ForTest(count);
     return EJIT_OK;
   }
-#endif
   return EJIT_ERR_NOT_ACTIVE;
 }
 
 uint32_t ejit_representative_test_candidate_gate(uint32_t command) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (gEJIT && gEJIT->compileDriver())
     return gEJIT->compileDriver()->candidateGateForTest(command);
-#endif
   return UINT32_MAX;
 }
 
 ejit_status_t ejit_representative_test_fail_next_tier2(void) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (!gEJIT || !gEJIT->compileDriver()) return EJIT_ERR_NOT_ACTIVE;
   gEJIT->compileDriver()->failNextRepresentativeTier2ForTest();
   return EJIT_OK;
-#else
-  return EJIT_ERR_NOT_ACTIVE;
-#endif
 }
 
 ejit_status_t ejit_representative_test_timeout(uint64_t ticks, uint32_t maxReelections) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (!ticks || !gEJIT || !gEJIT->compileDriver()) return EJIT_ERR_INVALID_PARAM;
   gEJIT->compileDriver()->setRepresentativeTimeoutForTest(ticks, maxReelections);
   return EJIT_OK;
-#else
-  return EJIT_ERR_NOT_ACTIVE;
-#endif
 }
 
 void *ejit_representative_test_pool(void) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   return gEJIT ? gEJIT->sharedTaskPool() : nullptr;
-#else
-  return nullptr;
-#endif
 }
 
 ejit_status_t ejit_representative_copy_group_profile(uint32_t groupIndex,
@@ -1335,7 +1307,6 @@ static ejit_status_t representativeGroupStats(uint32_t groupIndex, ejit_represen
   *out = ejit_representative_stats_t{};
   if (!gEJIT)
     return EJIT_ERR_NOT_ACTIVE;
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   const EJitCompileDriver *Drv = gEJIT->compileDriver();
   if (!Drv)
     return EJIT_OK;
@@ -1387,9 +1358,6 @@ static ejit_status_t representativeGroupStats(uint32_t groupIndex, ejit_represen
     }
   }
   return EJIT_OK;
-#else
-  return EJIT_OK;
-#endif
 }
 
 static_assert(sizeof(ejit_borrow_fence_t) == 4 * sizeof(uint32_t),
@@ -1399,7 +1367,6 @@ ejit_status_t ejit_representative_deactivate_begin(const char *periodName,
     uint32_t instanceId, ejit_borrow_fence_t *out) {
   if (!periodName || !out || instanceId >= kEJitMaxInstances)
     return EJIT_ERR_INVALID_PARAM;
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (!gEJIT || !gEJIT->compileDriver() ||
       !gEJIT->compileDriver()->representativeSharingActive()) return EJIT_ERR_NOT_ACTIVE;
   const uint32_t Dim = EJitLifecycleRegistry::instance().lookup(periodName);
@@ -1412,14 +1379,10 @@ ejit_status_t ejit_representative_deactivate_begin(const char *periodName,
   out->instanceId = instanceId;
   out->version = Pool->instanceVersionPublic(Dim, instanceId);
   return EJIT_OK;
-#else
-  return EJIT_ERR_NOT_ACTIVE;
-#endif
 }
 
 ejit_status_t ejit_representative_borrow_status(const ejit_borrow_fence_t *scope) {
   if (!scope) return EJIT_ERR_INVALID_PARAM;
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (!gEJIT || !gEJIT->compileDriver() ||
       !gEJIT->compileDriver()->representativeSharingActive()) return EJIT_ERR_NOT_ACTIVE;
   const auto Status = gEJIT->sharedTaskPool()->instanceBorrowStatus(scope->dimType,
@@ -1429,7 +1392,6 @@ ejit_status_t ejit_representative_borrow_status(const ejit_borrow_fence_t *scope
   case EJitSharedTaskPool::BorrowScopeStatus::Pending: return EJIT_PENDING;
   case EJitSharedTaskPool::BorrowScopeStatus::Invalid: return EJIT_ERR_INVALID_PARAM;
   }
-#endif
   return EJIT_ERR_NOT_ACTIVE;
 }
 

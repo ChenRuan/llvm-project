@@ -43,7 +43,6 @@ static uint64_t auditClockNow() { return ejit_taskpool_trace_now(); }
 using namespace llvm;
 using namespace llvm::ejit;
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 namespace {
 EJitReuseDiagnostic makeReuseDiagnostic(
     const EJitCompileRequest &Req, StringRef Entry, StringRef Stage,
@@ -107,7 +106,6 @@ void attachReuseDifference(EJitReuseDiagnostic &R, const EJitIdentityDiagnostic 
   }
 }
 } // namespace
-#endif
 
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 namespace {
@@ -418,7 +416,6 @@ bool sharedPeriodConstRankingThunk(void *ctx) {
 }
 } // namespace
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 #ifdef EJIT_SRE_TASKPOOL_TESTING
 EJitRepresentativeDiagReason
 EJitCompileDriver::candidateDiagReasonForTest(StringRef Detail) {
@@ -462,7 +459,6 @@ void EJitCompileDriver::setCandidateLimitsForTest(EJitCandidateLimits Limits) {
   candidateDirectory_ = std::make_unique<EJitCandidateDirectory>(Limits);
   unlockRepGroups();
 }
-#endif
 #endif
 
 namespace {
@@ -591,7 +587,6 @@ EJitCompileDriver::~EJitCompileDriver() {
   sharedPool_.ownerShutdown();
 }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 bool EJitCompileDriver::representativeSnapshot(
     EJitGroupDiagnostics &D, EJitGroupSnapshot &S, size_t &Groups,
     EJitFrozenProfileBundle &Bundle, size_t GroupIndex) const {
@@ -1983,7 +1978,7 @@ void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
 void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
                                      bool storeLru,
                                      const EJitCompileRequest *request) {
-#if defined(EJIT_SRE_SHARED_TASKPOOL) && defined(EJIT_SRE_TASKPOOL_TESTING)
+#ifdef EJIT_SRE_TASKPOOL_TESTING
   if (repGroups_ && tier == kEJitTierPgoUse) {
     EJitSharedTaskPool::RequestAttemptSnapshot Status;
     if (request && sharedPool_.requestAttemptStatus(request->attemptToken, Status) &&
@@ -2113,7 +2108,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   const bool RunProfileStages =
       config_.enablePgo ||
       (config_.enableProfileAudit && config_.compileMode == CompileMode::Async);
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   // Representative sharing state this compile may consume. Filled by the
   // PGOUse profile selection below and used by the shared physical-code step
   // after the engine/context checks.
@@ -2122,14 +2116,12 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   EJitRepresentativeSession RepSessionForPhysical;
   bool HaveRepSessionForPhysical = false;
   bool IsRepresentativeTier2 = false;
-#endif
   if (RunProfileStages) {
     if (static_cast<CompileTier>(tier) == CompileTier::PGOUse) {
       ctx.tier = CompileTier::PGOUse;
       auto Identity = tier1ProfileIdentities_.find(cacheKey);
       if (Identity != tier1ProfileIdentities_.end())
         ctx.samplingSessionId = Identity->second.samplingSessionId;
-#ifdef EJIT_SRE_SHARED_TASKPOOL
       // Representative sharing: the GROUP's frozen bundle is the source of
       // truth for every member of the generation. A member consumes the SAME
       // immutable object the representative published - never a second
@@ -2189,7 +2181,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         // else: the representative's own Tier-2. It builds the bundle from its
         // own captured counters below and publishes it through the registry.
       }
-#endif
       auto Frozen = frozenProfileBundles_.find(cacheKey);
       if (!ctx.profileBundle && Frozen != frozenProfileBundles_.end()) {
         ctx.profileBundle = Frozen->second;
@@ -2361,7 +2352,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       }
       ctx.samplingSessionId = Identity.samplingSessionId;
       frozenProfileBundles_.erase(cacheKey);
-#ifdef EJIT_SRE_SHARED_TASKPOOL
       // Representative sharing: this Tier-1 request is the group's ONE
       // representative session only if it is the representative member's own
       // cell; bind the pool's attempt identity to the group session here, so
@@ -2378,7 +2368,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
           Identity.groupGeneration = RepSession->generation;
         }
       }
-#endif
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
       ctx.profileAuditOnly = !config_.enablePgo;
 #endif
@@ -2411,7 +2400,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         Tier1ProfileAttemptIdentity{RepresentativeToken,
                                     RepresentativeGeneration});
     Bundle->quality = ProfileSnapshotQuality::ApproximateInFlight;
-#ifdef EJIT_SRE_SHARED_TASKPOOL
     if (repGroups_ && IsRepresentativeTier2) {
       // The representative worker drained execution tokens before entering
       // this capture (including opt-in NO_RECLAIM sampling tokens).
@@ -2423,7 +2411,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       Bundle->quality = ProfileSnapshotQuality::EdgeOnly;
 #endif
     }
-#endif
     Bundle->hasEdgeProfile = true;
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
     Bundle->valueProfileEnabled = true;
@@ -2470,7 +2457,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
                 static_cast<unsigned long long>(Bundle->dispatchLimit),
                 static_cast<unsigned long long>(Bundle->quotaEnd),
                 static_cast<unsigned>(Bundle->dispatchQuality));
-#ifdef EJIT_SRE_SHARED_TASKPOOL
       // Representative sharing: publish the ONE immutable bundle of this group
       // generation from the REAL Tier-2 request of the representative. The
       // registry owns the session identity fields and rejects a bundle whose
@@ -2545,7 +2531,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         }
         unlockRepGroups();
       }
-#endif
     }
   }
 
@@ -2555,7 +2540,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     return nullptr;
   }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   // Representative sharing: the generation's ONE physical Tier-2 object. Every
   // validated member of the group goes through the owner-side prepared-code
   // emitter, which compares the member's FINAL identity (full optimized IR +
@@ -2577,7 +2561,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       return SharedFn;
     }
   }
-#endif
 
   jitEngine_->setActiveContext(&ctx);
 
@@ -2780,7 +2763,6 @@ void *EJitCompileDriver::compileNowValidated(const EJitCompileRequest &req) {
   EJIT_DIAG("compileNow dispatch func=%u key=0x%016lx dims=[%u,%u,%u,%u]",
             funcIdx, cacheKey, packedDims[0], packedDims[1], packedDims[2],
             packedDims[3]);
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (repGroups_ && tier == kEJitTierPgoUse) {
     lockRepGroups();
     auto C = candidateBindings_.find(cacheKey);
@@ -2788,9 +2770,7 @@ void *EJitCompileDriver::compileNowValidated(const EJitCompileRequest &req) {
     unlockRepGroups();
     if (Failed) return nullptr; // raced a terminal decision: no new source read
   }
-#endif
   void *Fn = compileCold(cacheKey, tier, /*storeLru=*/false, &req);
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (repGroups_ && tier == kEJitTierPgoUse) {
     bool Terminal = false;
     if (!Fn) {
@@ -2808,7 +2788,6 @@ void *EJitCompileDriver::compileNowValidated(const EJitCompileRequest &req) {
     }
     if (Fn || Terminal) completeCandidateBorrow(cacheKey, &req);
   }
-#endif
   return Fn;
 }
 
@@ -2854,7 +2833,6 @@ void EJitCompileDriver::notifyTaskpoolPgoLifecycleDrop(
 
 void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
                                                 bool published) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (repGroups_ && published && decodeReqTier(req.funcIndex) == kEJitTierInstrumented) {
     lockRepGroups();
     for (auto &B : repTier1Bindings_)
@@ -2862,7 +2840,6 @@ void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
         B.lastProgressAt = ejit_taskpool_trace_now();
     unlockRepGroups();
   }
-#endif
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   const uint32_t AuditTier = decodeReqTier(req.funcIndex);
   if (AuditTier == kEJitTierInstrumented) {
@@ -2905,4 +2882,3 @@ void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
   (void)published;
 #endif
 }
-#endif
