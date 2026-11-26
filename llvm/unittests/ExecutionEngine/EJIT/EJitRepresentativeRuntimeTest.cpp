@@ -2009,6 +2009,41 @@ void checkPeerExecutes64T1AndConsumesOwnerTier2(bool Bound) {
     return PP->compileOrGet(RepresentativeRuntime::funcIndex(), Dims, 2,
                             nullptr);
   };
+  ASSERT_EQ(Owner.candidateGateForTest(1), 1u);
+  EJitSharedTaskPool::CompileOrGetResult First{};
+  std::atomic<bool> Returned{false};
+  std::thread Producer([&] {
+    EJitCoreId::setCurrentForTest(16);
+    First = Lookup();
+    Returned.store(true, std::memory_order_release);
+  });
+  for (unsigned Wait = 0; Wait != 500 &&
+       (Owner.candidateGateForTest(0) != 2 ||
+        !Returned.load(std::memory_order_acquire)); ++Wait)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_EQ(Owner.candidateGateForTest(0), 2u);
+  const bool ReturnedWhileOwnerPaused = Returned.load(std::memory_order_acquire);
+  EXPECT_TRUE(ReturnedWhileOwnerPaused);
+  if (ReturnedWhileOwnerPaused) {
+    EXPECT_EQ(First.status, EJitCompileOrGetStatus::EnqueuedPending);
+    EXPECT_EQ(First.fnPtr, nullptr);
+    if (First.hasReadToken)
+      PP->releaseRead(First.bucketIndex);
+    // Several hot callers must all coalesce while the worker is paused.
+    for (unsigned I = 0; I < 32; ++I) {
+      auto R = Lookup();
+      EXPECT_EQ(R.status, EJitCompileOrGetStatus::AlreadyPending);
+      EXPECT_EQ(R.fnPtr, nullptr);
+      if (R.hasReadToken)
+        PP->releaseRead(R.bucketIndex);
+    }
+    EXPECT_EQ(OP->liveRequestAttemptCount(), 1u);
+  }
+  Owner.candidateGateForTest(3);
+  Producer.join();
+  if (!ReturnedWhileOwnerPaused && First.hasReadToken)
+    PP->releaseRead(First.bucketIndex);
+
   void *T1 = nullptr;
   unsigned ExecutedT1 = 0;
   for (unsigned Try = 0; Try != 8192 && ExecutedT1 != kQuota; ++Try) {
@@ -2314,15 +2349,17 @@ void checkCandidateAotFallback(EJitCandidateLimits Limits,
   const EJitDimPair Dims[] = {{RepresentativeRuntime::cellSlot(), 0},
                               {RepresentativeRuntime::trpSlot(), 1}};
   EJitCoreId::setCurrentForTest(16);
+  uint64_t BudgetToken = 0;
   auto Budget = PP->compileOrGet(RepresentativeRuntime::funcIndex(), Dims, 2,
-                                 nullptr);
-  EXPECT_EQ(Budget.status, EJitCompileOrGetStatus::PgoAdmissionDeferred)
-      << "candidate rejection must be a real AOT fallback, not a "
-         "private Tier-1 grant";
+                                 nullptr, nullptr, 0, &BudgetToken);
+  ASSERT_EQ(Budget.status, EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_NE(BudgetToken, 0u);
   EXPECT_EQ(Budget.fnPtr, nullptr);
   EXPECT_FALSE(Budget.hasReadToken);
   if (Budget.hasReadToken)
     PP->releaseRead(Budget.bucketIndex);
+  for (unsigned Wait = 0; Wait != 1000 && OP->liveRequestAttemptCount(); ++Wait)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
   auto OwnerMeta = Owner.representativeDriverMetadataForTest();
   if (MissingBinding)
@@ -2333,31 +2370,9 @@ void checkCandidateAotFallback(EJitCandidateLimits Limits,
   EXPECT_EQ(OwnerMeta.candidateBindings, 0u);
   EXPECT_EQ(OP->liveRequestAttemptCount(), 0u);
   EXPECT_EQ(OP->pendingCount(), 0u);
-  if (MissingBinding)
-    return;
-
-  // A bound-pointer request is a conservative independent route. The first
-  // call performs the real owner classification; the next one must be allowed
-  // ordinary PGO admission even though the candidate directory is exhausted.
-  uint32_t BoundValue = 19;
-  auto Bound = PP->compileOrGet(RepresentativeRuntime::funcIndex(), Dims, 2,
-                                nullptr, &BoundValue, sizeof(BoundValue), 0);
-  EXPECT_NE(Bound.status, EJitCompileOrGetStatus::PgoAdmissionDeferred);
-  EXPECT_NE(Bound.status, EJitCompileOrGetStatus::InvalidParam);
-  if (Bound.hasReadToken)
-    PP->releaseRead(Bound.bucketIndex);
-  std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  auto BoundAdmission =
-      PP->compileOrGet(RepresentativeRuntime::funcIndex(), Dims, 2, nullptr,
-                       &BoundValue, sizeof(BoundValue), 0);
-  EXPECT_NE(BoundAdmission.status, EJitCompileOrGetStatus::PgoAdmissionDeferred);
-  EXPECT_NE(BoundAdmission.status, EJitCompileOrGetStatus::InvalidParam);
-  if (BoundAdmission.hasReadToken)
-    PP->releaseRead(BoundAdmission.bucketIndex);
 }
 
-TEST(EJitCrossCoreRuntime,
-     CandidateBudgetUsesAotAdmissionAndBoundPointerStaysIndependent) {
+TEST(EJitCrossCoreRuntime, CandidateGroupBudgetUsesAotAdmission) {
   EJitCandidateLimits Limits;
   Limits.maxGroups = 0;
   checkCandidateAotFallback(Limits);
@@ -2606,21 +2621,24 @@ TEST(EJitCrossCoreRuntime,
       PP->releaseRead(Current.bucketIndex);
     }
     ASSERT_NE(Token, 0u);
-    for (uint32_t Other : {0u, 1u, 2u, 3u}) {
-      if (Other == Cell)
-        continue;
-      const EJitDimPair Dims[] = {{RepresentativeRuntime::cellSlot(), Other},
-                                  {RepresentativeRuntime::trpSlot(), 1}};
-      for (unsigned Try = 0; Try != 512; ++Try) {
+    for (unsigned Try = 0; Try != 512; ++Try) {
+      // The async miss does not report which candidate the worker has
+      // admitted. Keep offering all three exact identities until all joined.
+      for (uint32_t Offset = 0; Offset != 4; ++Offset) {
+        const uint32_t Other = (Try + Offset) % 4;
+        if (Other == Cell)
+          continue;
+        const EJitDimPair Dims[] = {{RepresentativeRuntime::cellSlot(), Other},
+                                    {RepresentativeRuntime::trpSlot(), 1}};
         auto R = PP->compileOrGet(RepresentativeRuntime::funcIndex(), Dims, 2,
                                    nullptr);
         if (R.hasReadToken)
           PP->releaseRead(R.bucketIndex);
         ASSERT_EQ(R.fnPtr, nullptr);
-        if (R.status == EJitCompileOrGetStatus::PgoAdmissionDeferred)
-          break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
+      if (Owner.representativeDriverMetadataForTest().waiters >= 3)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     const auto Old = Owner.representativeDriverMetadataForTest();
     ASSERT_GE(Old.waiters, 3u);

@@ -899,7 +899,10 @@ bool EJitCompileDriver::classifyRepresentativeRequest(const EJitCompileRequest &
     candidateBindings_[LogicalKey].outcome = CandidateOutcome;
     candidateBindings_[LogicalKey].reason = CandidateReason;
   }
-  const bool KeepBorrow = Current && candidateBindings_[LogicalKey].finalReadPending;
+  const bool KeepBorrow =
+      Current && (candidateBindings_[LogicalKey].finalReadPending ||
+                  (Route == CandidateAdmissionRoute::Independent &&
+                   Req.boundCount != 0));
   unlockRepGroups();
   if (SupersededBorrow && SupersededBorrow != Req.attemptToken)
     sharedPool_.completeRequestBorrow(SupersededBorrow);
@@ -1239,7 +1242,7 @@ EJitCompileDriver::admitSamplingRequest(uint32_t funcIndex,
                 funcIndex, static_cast<unsigned long long>(attemptToken));
       return Admission::Deny;
     }
-    return Admission::Grant;
+    return Admission::Independent;
   }
   refreshRepresentativeGroup(GroupKey);
   lockRepGroups();

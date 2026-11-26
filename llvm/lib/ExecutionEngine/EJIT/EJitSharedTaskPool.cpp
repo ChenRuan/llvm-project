@@ -1641,7 +1641,8 @@ void maybeRetireAttemptLocked(EJitSharedTaskPoolState *State,
 } // namespace
 
 uint64_t EJitSharedTaskPool::beginRequestAttempt(const EJitCompileRequest &Req,
-                                                 bool SamplingPending) {
+                                                 bool SamplingPending,
+                                                 bool EnqueuePeerCandidate) {
   if (!state_ || state_->requestAttemptsEnabled.loadAcquire() == 0)
     return 0;
 
@@ -1654,7 +1655,13 @@ uint64_t EJitSharedTaskPool::beginRequestAttempt(const EJitCompileRequest &Req,
   }
   const uint64_t Token = Last + 1;
 
-  requestAttemptLock(state_);
+  if (EnqueuePeerCandidate) {
+    uint32_t Expected = 0;
+    if (!state_->attemptLock.compareExchange(Expected, 1))
+      return 0; // a business miss must not wait for the owner
+  } else {
+    requestAttemptLock(state_);
+  }
   // Deactivation and scope completion must exclude a producer that observed
   // enabled before the transition but tries to acquire its borrow afterwards.
   if (samplingAdmissionFn_) {
@@ -1682,6 +1689,11 @@ uint64_t EJitSharedTaskPool::beginRequestAttempt(const EJitCompileRequest &Req,
     requestAttemptUnlock(state_);
     return 0;
   }
+  if (EnqueuePeerCandidate &&
+      dedupMark(Req.funcIndex, Token) != EJitDedupResult::Claimed) {
+    requestAttemptUnlock(state_);
+    return 0;
+  }
 
   Free->generation.storeRelaxed(Req.generation);
   Free->funcIndex.storeRelaxed(stripReqTier(Req.funcIndex));
@@ -1704,6 +1716,19 @@ uint64_t EJitSharedTaskPool::beginRequestAttempt(const EJitCompileRequest &Req,
   Free->token.storeRelease(Token);
   state_->attemptLiveCount.storeRelaxed(state_->attemptLiveCount.loadRelaxed() +
                                         1);
+  if (EnqueuePeerCandidate) {
+    // Commit the queue and the borrow as one operation. A full queue has no
+    // reader or published slot to cancel, and needs no bucket writer lock.
+    auto Queued = Req;
+    Queued.attemptToken = Token;
+    if (!queuePush(Queued)) {
+      dedupClear(Req.funcIndex, Token);
+      retireAttemptLocked(state_, *Free);
+      requestAttemptUnlock(state_);
+      EJIT_STAT_INC(state_->counters.queueFull);
+      return 0;
+    }
+  }
   requestAttemptUnlock(state_);
   return Token;
 }
@@ -4877,6 +4902,8 @@ EJitSharedTaskPool::compileOrGetValidated(
   // True miss: continue the slow path with the caller's fallback.
   R.fnPtr = fallback;
   const bool TrackAttempt = state_->requestAttemptsEnabled.loadAcquire() != 0;
+  const bool EnqueuePeerCandidate = TrackAttempt && !isOwner_ &&
+      state_->representativeSharingEnabled.loadAcquire() != 0;
   if (TrackAttempt && (state_->mode.loadAcquire() !=
                            static_cast<uint32_t>(EJitCompileMode::Async) ||
                        state_->pgoEnabled.loadAcquire() == 0)) {
@@ -4894,7 +4921,8 @@ EJitSharedTaskPool::compileOrGetValidated(
     // member whose FIRST attempt was coalesced by the representative's pending
     // Tier-1 must still be recorded as a waiter of the group generation (its
     // later wake-up is what turns it into a shared-code consumer).
-    if (state_->pgoEnabled.loadAcquire() != 0 && samplingAdmissionFn_ &&
+    if (!EnqueuePeerCandidate && state_->pgoEnabled.loadAcquire() != 0 &&
+        samplingAdmissionFn_ &&
         samplingAdmissionFn_(samplingAdmissionCtx_, funcIndex, dims, numDims,
                              boundCount, 0) ==
             SamplingAdmission::WakeTier2) {
@@ -4939,6 +4967,29 @@ EJitSharedTaskPool::compileOrGetValidated(
   Req.boundCount = boundCount;
   for (uint32_t i = 0; i < boundCount; ++i)
     Req.boundPointers[i] = boundPointers[i];
+  if (EnqueuePeerCandidate) {
+    if (funcIndex >= kEJitSharedMaxFuncIndex) {
+      R.status = EJitCompileOrGetStatus::InvalidParam;
+      return R;
+    }
+    if (state_->inFlight[funcIndex].loadAcquire()) {
+      EJIT_STAT_INC(state_->counters.alreadyPending);
+      R.status = EJitCompileOrGetStatus::AlreadyPending;
+      return R;
+    }
+    Req.funcIndex = encodeReqTier(funcIndex, kEJitTierCandidate);
+    const uint64_t Token = beginRequestAttempt(Req, true, true);
+    if (!Token) {
+      state_->pgoDeferredMisses.fetchAdd(1);
+      R.status = EJitCompileOrGetStatus::PgoAdmissionDeferred;
+      return R;
+    }
+    if (outAttemptToken)
+      *outAttemptToken = Token;
+    EJIT_STAT_INC(state_->counters.asyncEnqueues);
+    R.status = EJitCompileOrGetStatus::EnqueuedPending;
+    return R;
+  }
   if (TrackAttempt) {
     Req.attemptToken = beginRequestAttempt(Req, pgoForRequest);
     if (!Req.attemptToken) {
@@ -5006,9 +5057,6 @@ EJitSharedTaskPool::compileOrGetValidated(
         R.status = enqueueRepresentativeWake(Wake);
         return R;
       }
-      EJIT_DIAG("shared taskpool representative-defer func=%u: group owns the "
-                "sampling session",
-                funcIndex);
       R.status = EJitCompileOrGetStatus::PgoAdmissionDeferred;
       return R;
     }
@@ -5016,9 +5064,6 @@ EJitSharedTaskPool::compileOrGetValidated(
       dedupClear(funcIndex, Claim);
       acknowledgeRequestAttemptQueueDrop(Req.attemptToken,
                                          EJitRequestAttemptReason::Cancelled);
-      EJIT_DIAG("shared taskpool representative-defer func=%u: group owns the "
-                "sampling session",
-                funcIndex);
       R.status = EJitCompileOrGetStatus::PgoAdmissionDeferred;
       return R;
     }
@@ -5476,6 +5521,58 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     return;
   }
   if (tier == kEJitTierCandidate) {
+    if (state_->representativeSharingEnabled.loadAcquire() &&
+        samplingAdmissionFn_) {
+      auto Admit = [&] {
+        return samplingAdmissionFn_(samplingAdmissionCtx_, realFuncIndex,
+                                    req.dims, req.numDims, req.boundCount,
+                                    req.attemptToken);
+      };
+      SamplingAdmission Admission = Admit();
+      bool Classified = false;
+      if (Admission == SamplingAdmission::Classify && candidateClassifyFn_) {
+        Classified = candidateClassifyFn_(candidateClassifyCtx_, req);
+        if (Classified)
+          Admission = Admit();
+      }
+      auto Next = req;
+      bool Continue = false;
+      if (Admission == SamplingAdmission::Grant ||
+          Admission == SamplingAdmission::Independent) {
+        bool NewlyAdmitted = false;
+        Continue = admitPgoFunction(realFuncIndex, NewlyAdmitted,
+                                    req.attemptToken);
+        Next.funcIndex = encodeReqTier(realFuncIndex, kEJitTierInstrumented);
+      } else if (Admission == SamplingAdmission::WakeTier2) {
+        EJitCompileRequest Wake{};
+        if (representativeWakeFn_ &&
+            representativeWakeFn_(representativeWakeCtx_, realFuncIndex,
+                                  req.dims, req.numDims, Wake)) {
+          Next.funcIndex = Wake.funcIndex;
+          Next.t1DispatchCount = Wake.t1DispatchCount;
+          Next.t1QuotaEnd = Wake.t1QuotaEnd;
+          Next.t1DispatchLimit = Wake.t1DispatchLimit;
+          settleRequestAttemptSampling(req.attemptToken,
+                                       EJitRequestAttemptReason::None);
+          Continue = true;
+        }
+      }
+      if (Continue) {
+        endRequestAttemptCompile(req.attemptToken, /*finalRead=*/false);
+        if (Classified)
+          workerIdle(1); // let the core run between prefix and codegen
+        runCompile(Next);
+        return;
+      }
+      dedupClear(req.funcIndex, Claim);
+      // Keep only a classifier's own waiter lease. The owner maintenance
+      // wakes that waiter when the group publishes, without waiting for a peer.
+      const bool KeepBorrow =
+          Classified && Admission != SamplingAdmission::Independent;
+      endRequestAttemptCompile(req.attemptToken, /*finalRead=*/!KeepBorrow);
+      finishCandidateClassification(req.attemptToken);
+      return;
+    }
     // Prefix classification borrows the request through ordinary worker
     // ownership, but never admits PGO, links T1 or publishes a callable slot.
     const bool Classified = candidateClassifyFn_ &&

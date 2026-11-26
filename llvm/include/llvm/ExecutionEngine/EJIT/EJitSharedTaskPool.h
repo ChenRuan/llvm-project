@@ -347,6 +347,7 @@ public:
     /// private Tier-1. No sampling admission is granted.
     WakeTier2,
     Classify, ///< worker prefix/schema work, without sampling admission.
+    Independent, ///< ordinary PGO admission, with no candidate waiter lease.
   };
   using SamplingAdmissionCallback = SamplingAdmission (*)(
       void *ctx, uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
@@ -1633,7 +1634,8 @@ private:
   void cancelRepresentativeCommands();
 
   uint64_t beginRequestAttempt(const EJitCompileRequest &req,
-                               bool samplingPending);
+                               bool samplingPending,
+                               bool enqueuePeerCandidate = false);
   bool markRequestAttemptQueued(uint64_t token);
   bool beginRequestAttemptCompile(uint64_t token);
   void endRequestAttemptCompile(uint64_t token, bool finalRead);
