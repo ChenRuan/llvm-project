@@ -19,6 +19,14 @@ The existing core 6 -> core 16 -> core 6 sequence and final PASS conditions
 below are unchanged. Host regressions and BE object compilation do not certify
 product watchdog behavior; final board acceptance remains necessary.
 
+The follow-up bounded-publication fix also removes a queue-starvation path:
+once a T2 links, automatic publication waits only for the queue prefix already
+present at that moment. New candidate requests cannot extend that boundary.
+The INFO log `PGO Tier-2 publish boundary reached: auto-publishing ...
+queued_after=N` may legitimately show N greater than zero. Existing T1 sampling,
+physical-identity checks, worker throttling and explicit-flush failure policy
+are unchanged. This change adds no shared-protocol fields or new options.
+
 Source: `examples/ejit_reuse_sre_test.c`, a single header-free C file.
 Replace the previous file defining `test_ejit_period`; do not link both demos.
 The companion `ejit_reuse_host_check.c` is a host-only mock, NOT a board source.

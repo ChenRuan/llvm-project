@@ -5437,15 +5437,18 @@ bool EJitSharedTaskPool::serviceAutoTier2Publish() {
 #else
   if (!autoTier2PublishPending_ || !state_)
     return false;
-  // pollOne() has just observed the queue empty. Re-check both positions so a
-  // Tier-1 request that raced that observation is compiled from the far pool
-  // before the near-pool Tier-2 batch is sealed and published.
-  if (state_->enqueuePos.loadAcquire() != state_->dequeuePos.loadAcquire())
+  // Honor work already queued at the first linked T2, without requiring an
+  // idle producer window. Queue distances are bounded below 2^31, so this
+  // serial-number comparison also handles the uint32_t position wrap.
+  const uint32_t Dequeued = state_->dequeuePos.loadAcquire();
+  if (static_cast<int32_t>(Dequeued - autoTier2PublishBoundary_) < 0)
     return false;
 
   autoTier2PublishPending_ = false;
-  EJIT_DIAG("PGO Tier-2 queue drained: auto-publishing %zu linked version(s)",
-            pendingPublishes_.size());
+  EJIT_DIAG("PGO Tier-2 publish boundary reached: auto-publishing %zu linked "
+            "version(s), queued_after=%u",
+            pendingPublishes_.size(),
+            state_->enqueuePos.loadAcquire() - Dequeued);
   if (!flushPendingPublishes(/*compileBatchRequests=*/false))
     EJIT_DIAG("PGO Tier-2 auto-publish failed: pending=%zu; explicit publish "
               "may retry",
@@ -5750,13 +5753,15 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
   if (codeReadyFn_ && !codeReadyFn_(codeBatchCtx_, fn)) {
     if (tier == kEJitTierPgoUse) {
       // Tier-2 has completed compilation/JITLink into the near RW/NX pool, but
-      // must not replace the live Tier-1 slot until the worker observes the
-      // compile queue empty and seals the batch. Keep only owner-private state
-      // and retain the in-flight claim.
+      // must not replace the live Tier-1 slot until the worker seals the batch.
+      // Keep only owner-private state and retain the in-flight claim. Snapshot
+      // a finite queue prefix once; later T2s must not move its boundary.
       pendingPublishes_.push_back({PublishReq, fn});
       endRequestAttemptCompile(req.attemptToken, true);
+      if (!autoTier2PublishPending_)
+        autoTier2PublishBoundary_ = state_->enqueuePos.loadAcquire();
       autoTier2PublishPending_ = true;
-      EJIT_DIAG_DEBUG("PGO Tier-2 linked pending queue-drain publish func=%u "
+      EJIT_DIAG_DEBUG("PGO Tier-2 linked pending bounded publish func=%u "
                       "fn=%p pending=%zu",
                       realFuncIndex, fn, pendingPublishes_.size());
       return;
@@ -5891,7 +5896,7 @@ bool EJitSharedTaskPool::pollOne() {
   // compilation so explicit publication can sort their JITLink allocations.
   // Tier-1 compiles immediately into the far pool and starts sampling. Tier-2
   // also compiles immediately, but runCompile retains its near-pool result
-  // owner-private until queue-drain publication replaces the live Tier-1 slot.
+  // owner-private until bounded-batch publication replaces the live Tier-1 slot.
   EJitCompileRequest Req{};
   if (!queuePop(Req))
     return false;
@@ -5982,9 +5987,11 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
       Consumed = true;
     if (servicePeriodConstRankingRequest())
       Consumed = true;
-    if (pollOne())
-      return EJitWorkerStep::Consumed;
+    // Check before consuming a newer request: a continuously replenished
+    // candidate queue must not hold closed T1 quotas/admission slots forever.
     if (serviceAutoTier2Publish())
+      return EJitWorkerStep::Consumed;
+    if (pollOne())
       return EJitWorkerStep::Consumed;
     return Consumed ? EJitWorkerStep::Consumed : EJitWorkerStep::Idle;
   }

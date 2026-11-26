@@ -1663,6 +1663,73 @@ TEST_F(SharedTaskPoolTest, BatchPgoTier2AutoPublishesWhenQueueDrains) {
 }
 
 #ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
+TEST_F(SharedTaskPoolTest,
+       BatchPgoPublishesClosedQuotaDespiteContinuousPeerCandidates) {
+  BatchPublishCtx Batch;
+  Batch.tier1ReadyImmediately = true;
+  EJitSharedTaskPool Owner, Peer;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&mockBatchCompile, &Batch);
+  Owner.setCodeRangeProvider(&mockBatchRange, &Batch);
+  Owner.setCodeBatchCallbacks(&mockBatchReady, &mockBatchFlush, &Batch);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setPgoEnabled(true, 64, /*maxConcurrentProfiles=*/1);
+  ASSERT_TRUE(Owner.setRequestAttemptsEnabled(true));
+  Owner.setRepresentativeSharingEnabled(true);
+  Owner.setSamplingAdmissionCallback(
+      +[](void *, uint32_t, const EJitDimPair *, uint32_t, uint32_t, uint64_t) {
+        return EJitSharedTaskPool::SamplingAdmission::Independent;
+      }, nullptr);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(Owner.compileOrGet(52, nullptr, 0, nullptr).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  for (unsigned I = 0; I != 64; ++I) {
+    auto Hit = Owner.tryCacheHit0D(52);
+    ASSERT_NE(Hit.fnPtr, nullptr);
+    if (Hit.hasReadToken)
+      Owner.releaseRead(Hit.bucketIndex);
+  }
+
+  EJitCoreId::setCurrentForTest(1);
+  Peer.bind(state_.get());
+  Peer.setMode(EJitCompileMode::Async);
+  Peer.setRepresentativeSharingEnabled(true);
+  ASSERT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+  auto EnqueueCandidate = [&](uint32_t Func) {
+    EJitCoreId::setCurrentForTest(1);
+    auto R = Peer.compileOrGet(Func, nullptr, 0, nullptr);
+    EXPECT_EQ(R.status, EJitCompileOrGetStatus::EnqueuedPending);
+    EJitCoreId::setCurrentForTest(0);
+  };
+  EnqueueCandidate(100);
+  EnqueueCandidate(101);
+  ASSERT_TRUE(Owner.pollOne()); // Link T2, retaining the old T1 cache slot.
+  ASSERT_EQ(Owner.pendingPublishCount(), 1u);
+  ASSERT_EQ(Batch.flushCalls, 0u);
+  for (unsigned I = 0; I != 8; ++I) {
+    // The business workload keeps the candidate queue nonempty even when
+    // the profile admission limit prevents another T1 from starting.
+    EnqueueCandidate(102 + I);
+    ASSERT_NE(state_->enqueuePos.loadAcquire(), state_->dequeuePos.loadAcquire());
+    EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
+  }
+  EXPECT_EQ(Batch.flushCalls, 1u);
+  EXPECT_EQ(Owner.pendingPublishCount(), 0u);
+  EXPECT_NE(state_->enqueuePos.loadAcquire(), state_->dequeuePos.loadAcquire());
+  auto *Slot = findReadySlot(52);
+  ASSERT_NE(Slot, nullptr);
+  EXPECT_EQ(Slot->tier.loadAcquire(), kEJitTierPgoUse);
+  ASSERT_GE(Batch.compileOrder.size(), 2u);
+  EXPECT_EQ(Batch.compileOrder[1].t1DispatchCount, 64u);
+  EJitSharedDiagnostics D{};
+  Owner.getDiagnostics(D);
+  EXPECT_EQ(D.tier2Compiles, 1u);
+  EXPECT_GE(D.pgoCompletedFunctions, 1u);
+  EXPECT_GT(D.pgoDeferredMisses, 0u);
+}
+
 TEST_F(SharedTaskPoolTest, BatchPgoAutoPublishWaitsForQueuedTier1) {
   BatchPublishCtx Batch;
   Batch.tier1ReadyImmediately = true;

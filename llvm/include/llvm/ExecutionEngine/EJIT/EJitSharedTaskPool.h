@@ -1754,9 +1754,10 @@ private:
   };
   std::vector<PendingBatchCompile> pendingBatchCompiles_;
   std::vector<PendingPublish> pendingPublishes_;
-  /// Armed when Tier-2 links into the near RW/NX pool. Consumed only after the
-  /// owner worker observes the shared compile queue empty.
+  /// Armed when Tier-2 links into the near RW/NX pool. Drain only the queue
+  /// prefix present at that point; later producers cannot postpone publication.
   bool autoTier2PublishPending_ = false;
+  uint32_t autoTier2PublishBoundary_ = 0;
   // Inline-cache safety gate: true while the cache is safe to use (no releaser
   // wired - the production default). v2 does no HP-scan retire, so a wired
   // releaser (code may be freed) + the cache = UAF; the gate then auto-disables

@@ -99,3 +99,38 @@ image, then cold-reset all participating cores. Keep the existing
 BE object compilation is not final SDK linking. These host tests do not prove
 product memory mappings, SDK scheduling latency or watchdog recovery. Product
 board acceptance and a before/after watchdog trace remain outstanding.
+
+## Follow-up: publication with continuous candidate traffic
+
+Parent `ff8a57d1f00a41a67c39c38521ad4ac4cfe3e50a` still required the entire
+compile queue to become empty before automatically publishing linked T2 code.
+A new regression reproduces the resulting starvation through real pool paths:
+an independent T1 in representative mode consumes all 64 grants, T2 links,
+and another core continuously queues candidates while the PGO admission slot
+remains occupied. T2 never publishes and the next sampling admission cannot
+proceed. A later producer lull can make this look like unusually slow warmup.
+This establishes a runtime defect; it does not prove every delay in a product
+log has this single cause. The test uses mock generated-code readiness/flush
+callbacks; the broader suites also execute real ORC/JITLink code.
+
+The owner now snapshots the enqueue position when the first T2 in the batch
+links. Work already queued runs first, with ordinary per-item throttling.
+Once the consumer reaches that fixed boundary, publication runs before newer
+requests. Additional linked T2s do not move the boundary. The bounded queue
+distance permits a wrap-aware uint32 position comparison. The snapshot is
+owner-private; shared ABI v29 and all public entry points remain unchanged.
+Code remains RW/NX and invisible to dispatch until ordinary sealing and cache
+publication succeed. Existing explicit retry on batch-flush failure is retained.
+
+Regression: `SharedTaskPoolTest.BatchPgoPublishesClosedQuotaDespiteContinuousPeerCandidates`.
+It fails on the parent (zero flushes, one pending linked T2, no completed PGO)
+and passes with the fix while the queue remains nonempty. It checks the frozen
+64-call boundary and that PGO admission had actually deferred another request.
+
+Validation: 393/393 tests in five fresh processes; four focused publication,
+queued-T1 ordering, worker-throttle and flush-failure cases repeated 100 times
+with shuffled order; CompileDriver and SharedTaskPool BE objects compiled.
+Two pre-existing disabled tests remain unexecuted. Evidence under the same
+server directory: `publish-starvation-red.log`,
+`publish-starvation-final-{1..5}.log/xml`, `publish-starvation-stress.log`, and
+`publish-starvation-be.log`. No product-board validation was performed here.
