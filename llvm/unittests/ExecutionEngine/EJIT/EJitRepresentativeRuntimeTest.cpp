@@ -16,7 +16,7 @@
 //     real ORC/JITLink/optimizer path compiles Tier-1 and Tier-2;
 //   * the group lifecycle (candidate grouping, representative election, waiter
 //     join, quota, exactly-once publication) is driven by the production pool
-//     hooks - `setSamplingAdmissionCallback` and `setDispatchObserver` - and
+//     admission hook and worker reconciliation of the shared dispatch quota,
 //     never by a test-side call to recordRepresentativeDispatch;
 //   * the 64 granted Tier-1 dispatches are consumed through the real entry, and
 //     the ONE physical Tier-2 pointer is resolved from the real shared cache.
@@ -692,6 +692,28 @@ void releaseIfHeld(uint32_t status, uint32_t bucket) {
 /// its own real PGOUse consumption of the group's published bundle.
 TEST_F(EJitRepresentativeRuntimeTest,
        SixCellsShareOneRepresentativeTier1AndOneSharedTier2) {
+  auto AwaitGrant = [](uint32_t Cell, void **Fn, uint32_t *Bucket) {
+    ejit_status_t S = EJIT_PENDING;
+    for (unsigned Try = 0; Try != 4000; ++Try) {
+      S = entryCall(Cell, 1, Fn, Bucket);
+      if (S != EJIT_PENDING)
+        break;
+      releaseIfHeld(S, *Bucket);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return S;
+  };
+  auto AwaitCount = [](uint32_t Group, uint64_t Count,
+                       ejit_representative_stats_t &Stats) {
+    for (unsigned Try = 0; Try != 4000; ++Try) {
+      if (ejit_representative_get_group_stats(Group, &Stats) != EJIT_OK)
+        return false;
+      if (Stats.representativeDispatchCount == Count)
+        return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+  };
   // The representative is the FIRST legal arrival, not a hardcoded cell 0: cell
   // 1 arrives first on purpose.
   ejit_config_t Cfg{};
@@ -793,7 +815,7 @@ TEST_F(EJitRepresentativeRuntimeTest,
   for (uint32_t I = 1; I < kQuota; ++I) {
     void *DispatchFn = nullptr;
     uint32_t DispatchBucket = 0;
-    const ejit_status_t S = entryCall(1, 1, &DispatchFn, &DispatchBucket);
+    const ejit_status_t S = AwaitGrant(1, &DispatchFn, &DispatchBucket);
     ASSERT_EQ(S, EJIT_OK) << "granted dispatch " << I << " status=" << S;
     ASSERT_NE(DispatchFn, nullptr) << "dispatch " << I;
     EXPECT_EQ(DispatchFn, T1Fn)
@@ -832,6 +854,7 @@ TEST_F(EJitRepresentativeRuntimeTest,
   // The production diagnostics must already agree with the real dispatches.
   {
     ejit_representative_stats_t St{};
+    ASSERT_TRUE(AwaitCount(0, kQuota, St));
     ASSERT_EQ(ejit_representative_get_stats(&St), EJIT_OK);
     EXPECT_EQ(St.active, 1u) << "the opt-in must really drive the runtime";
     EXPECT_EQ(St.groups, 1u);
@@ -1027,7 +1050,7 @@ TEST_F(EJitRepresentativeRuntimeTest,
   for (uint32_t I = 1; I < kQuota; ++I) {
     void *F = nullptr;
     uint32_t B = 0;
-    auto S = entryCall(6, 1, &F, &B);
+    auto S = AwaitGrant(6, &F, &B);
     ASSERT_EQ(S, EJIT_OK);
     EXPECT_EQ(F, SecondT1);
     executeAndCheck(F, 6, 1, I < 16 ? 19 : 5);
@@ -1134,7 +1157,7 @@ TEST_F(EJitRepresentativeRuntimeTest,
   ASSERT_NE(CancelledT1, nullptr);
   ASSERT_NE(CancelToken, 0u);
   ejit_representative_stats_t BeforeCancel{};
-  ASSERT_EQ(ejit_representative_get_group_stats(2, &BeforeCancel), EJIT_OK);
+  ASSERT_TRUE(AwaitCount(2, 1, BeforeCancel));
   EXPECT_EQ(BeforeCancel.representativeDispatchCount, 1u);
   PauseLast.store(true, std::memory_order_release);
   LastEntered.store(false, std::memory_order_release);
@@ -1296,7 +1319,7 @@ TEST_F(EJitRepresentativeRuntimeTest,
   ASSERT_EQ(ejit_activate("cell", 11), EJIT_OK);
   ASSERT_NE(Sample(10, 31), nullptr);
   ejit_representative_stats_t ColdBefore{};
-  ASSERT_EQ(ejit_representative_get_group_stats(3, &ColdBefore), EJIT_OK);
+  ASSERT_TRUE(AwaitCount(3, 1, ColdBefore));
   EXPECT_EQ(ColdBefore.representativeDispatchCount, 1u);
   // Register the waiting peer while the default timeout is still generous.
   for (unsigned A = 0; A < 4000; ++A) {
@@ -1942,13 +1965,17 @@ TEST(EJitCrossCoreRuntime, IndependentRuntimePeerKeepsRepresentativeSharing) {
   EXPECT_TRUE(Peer->compileDriver()->representativeSharingActive());
 }
 
-void checkPeerExecutes64T1AndConsumesOwnerTier2(bool Bound) {
+void checkPeerExecutes64T1AndConsumesOwnerTier2(bool Bound,
+                                              bool PauseSampling = false,
+                                              uint32_t FailureStage = 1) {
   CrossCoreReset Reset;
   initRuntimeOnce();
   uint32_t BoundValue = 19;
   RepresentativeRuntime::rows()[0].gain = 7;
   RepresentativeRuntime::rows()[0].live[0] = 0;
   RepresentativeRuntime::rows()[0].live[1] = 0;
+  if (PauseSampling)
+    RepresentativeRuntime::rows()[1] = RepresentativeRuntime::rows()[0];
 
   Config C;
   C.compileMode = CompileMode::Async;
@@ -1992,6 +2019,9 @@ void checkPeerExecutes64T1AndConsumesOwnerTier2(bool Bound) {
                                      true));
   ASSERT_TRUE(OP->setInstanceEnabled(RepresentativeRuntime::trpSlot(), 1,
                                      true));
+  if (PauseSampling)
+    ASSERT_TRUE(OP->setInstanceEnabled(RepresentativeRuntime::cellSlot(), 1,
+                                       true));
 
   EJitCoreId::setCurrentForTest(16);
   ASSERT_TRUE(Peer.startSharedTaskPool());
@@ -2063,12 +2093,113 @@ void checkPeerExecutes64T1AndConsumesOwnerTier2(bool Bound) {
       executeAndCheckRows(RepresentativeRuntime::rows(), R.fnPtr, 0, 1,
                           ExecutedT1 + 1, Bound ? &BoundValue : nullptr);
       ++ExecutedT1;
+      if (PauseSampling && ExecutedT1 == 1) {
+        // Hold the real compiler worker in a different candidate request.
+        // Every remaining T1 grant, including the closing grant, must return
+        // without a mailbox reply from that worker.
+        ASSERT_EQ(Owner.candidateGateForTest(1), 1u);
+        const EJitDimPair MemberDims[] = {
+            {RepresentativeRuntime::cellSlot(), 1},
+            {RepresentativeRuntime::trpSlot(), 1}};
+        auto ResumeWorker = make_scope_exit([&] { Owner.candidateGateForTest(3); });
+        for (unsigned Wait = 0; Wait != 1000 &&
+             Owner.candidateGateForTest(0) != 2; ++Wait) {
+          // A try-lock miss is a terminal AOT result, not an accepted request.
+          // Retry setup until the worker actually reaches the pause gate.
+          auto M = PP->compileOrGet(RepresentativeRuntime::funcIndex(),
+                                    MemberDims, 2, nullptr);
+          EXPECT_TRUE(crossCoreRoutingStatus(M.status));
+          EXPECT_EQ(M.fnPtr, nullptr);
+          if (M.hasReadToken)
+            PP->releaseRead(M.bucketIndex);
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_EQ(Owner.candidateGateForTest(0), 2u);
+
+        EJitSharedTaskPool::CompileOrGetResult Last{};
+        std::atomic<bool> SamplesReturned{false};
+        std::thread Sampler([&] {
+          EJitCoreId::setCurrentForTest(16);
+          for (unsigned I = 1; I < kQuota; ++I) {
+            auto Hit = Lookup();
+            EXPECT_EQ(Hit.fnPtr, T1) << "sample=" << I + 1;
+            EXPECT_TRUE(Hit.hasReadToken);
+            if (!Hit.fnPtr) {
+              if (Hit.hasReadToken)
+                PP->releaseRead(Hit.bucketIndex);
+              break;
+            }
+            if (I == kQuota - 1) {
+              Last = Hit; // the last real execution has not happened yet
+            } else {
+              executeAndCheckRows(RepresentativeRuntime::rows(), Hit.fnPtr,
+                                  0, 1, I + 1);
+              ++ExecutedT1;
+              if (Hit.hasReadToken)
+                PP->releaseRead(Hit.bucketIndex);
+            }
+          }
+          SamplesReturned.store(true, std::memory_order_release);
+        });
+        for (unsigned Wait = 0; Wait != 500 &&
+             !SamplesReturned.load(std::memory_order_acquire); ++Wait)
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const bool Nonblocking = SamplesReturned.load(std::memory_order_acquire);
+        EXPECT_TRUE(Nonblocking) << "representative T1 waited for the worker";
+        if (!Nonblocking)
+          Owner.candidateGateForTest(3);
+        Sampler.join();
+        auto ReleaseLast = make_scope_exit([&] {
+          if (Last.hasReadToken)
+            PP->releaseRead(Last.bucketIndex);
+        });
+        ASSERT_TRUE(Nonblocking);
+        ASSERT_EQ(ExecutedT1, kQuota - 1);
+        ASSERT_EQ(Last.fnPtr, T1);
+        // Closed-quota misses must not enqueue or wait for the paused worker.
+        for (unsigned I = 0; I < 32; ++I) {
+          auto Closed = Lookup();
+          EXPECT_EQ(Closed.fnPtr, nullptr);
+          EXPECT_TRUE(Closed.fastPathTerminal);
+          if (Closed.hasReadToken)
+            PP->releaseRead(Closed.bucketIndex);
+        }
+        OP->failNextTier2QueuePushForTest();
+        Owner.failNextRepresentativeTier2ForTest(FailureStage);
+        Owner.candidateGateForTest(3);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        EJitGroupDiagnostics D;
+        EJitGroupSnapshot S;
+        EJitFrozenProfileBundle B;
+        size_t Groups = 0;
+        ASSERT_TRUE(Owner.representativeSnapshot(D, S, Groups, B));
+        EXPECT_FALSE(S.hasBundle) << "profile read before the final T1 leave";
+        executeAndCheckRows(RepresentativeRuntime::rows(), Last.fnPtr, 0, 1,
+                            kQuota);
+        ++ExecutedT1;
+      }
     } else {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
   ASSERT_NE(T1, nullptr);
   ASSERT_EQ(ExecutedT1, kQuota);
+
+  if (PauseSampling) {
+    // No producer retries after sample 64: the worker owns queue-full and
+    // compiler-failure recovery, even when the representative goes cold.
+    EJitSharedDiagnostics Diag{};
+    for (unsigned Wait = 0; Wait != 8192; ++Wait) {
+      OP->getDiagnostics(Diag);
+      if (Diag.tier2Compiles >= 2)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_GE(Diag.queueFull, 1u);
+    EXPECT_GE(Diag.compileFailed, 1u);
+    EXPECT_EQ(Diag.tier1Compiles, 1u);
+    ASSERT_GE(Diag.tier2Compiles, 2u);
+  }
 
   void *T2 = nullptr;
   for (unsigned Try = 0; Try != 8192 && !T2; ++Try) {
@@ -2113,6 +2244,19 @@ void checkPeerExecutes64T1AndConsumesOwnerTier2(bool Bound) {
   EXPECT_EQ(S.physicalFn, T2);
   ASSERT_TRUE(B);
   EXPECT_EQ(B->actualDispatchCount, kQuota);
+  if (PauseSampling) {
+    const EJitDimPair MemberDims[] = {{RepresentativeRuntime::cellSlot(), 1},
+                                      {RepresentativeRuntime::trpSlot(), 1}};
+    auto Member = PP->compileOrGet(RepresentativeRuntime::funcIndex(), MemberDims,
+                                   2, nullptr);
+    EXPECT_EQ(Member.fnPtr, T2);
+    if (Member.fnPtr)
+      executeAndCheckRows(RepresentativeRuntime::rows(), Member.fnPtr, 1, 1, 66);
+    if (Member.hasReadToken)
+      PP->releaseRead(Member.bucketIndex);
+    EXPECT_EQ(D.representativeSessions, 1u);
+    EXPECT_EQ(D.physicalCodeObjects, 1u);
+  }
 }
 
 TEST(EJitCrossCoreRuntime, IndependentPeerExecutes64T1AndConsumesOwnerTier2) {
@@ -2121,6 +2265,20 @@ TEST(EJitCrossCoreRuntime, IndependentPeerExecutes64T1AndConsumesOwnerTier2) {
 
 TEST(EJitCrossCoreRuntime, BoundPointerFallbackExecutes64T1AndConsumesTier2) {
   checkPeerExecutes64T1AndConsumesOwnerTier2(/*Bound=*/true);
+}
+
+TEST(EJitCrossCoreRuntime,
+     RepresentativeSamplingDoesNotWaitForWorkerAndRetriesWithoutProducer) {
+  checkPeerExecutes64T1AndConsumesOwnerTier2(/*Bound=*/false,
+                                          /*PauseSampling=*/true);
+}
+
+TEST(EJitCrossCoreRuntime, RepresentativeRetriesAfterBundleWithoutProducer) {
+  checkPeerExecutes64T1AndConsumesOwnerTier2(false, true, 2);
+}
+
+TEST(EJitCrossCoreRuntime, RepresentativeRetriesAfterLinkWithoutProducer) {
+  checkPeerExecutes64T1AndConsumesOwnerTier2(false, true, 3);
 }
 
 TEST(EJitCrossCoreRuntime,
@@ -2611,14 +2769,18 @@ TEST(EJitCrossCoreRuntime,
     const EJitDimPair CurrentDims[] = {
         {RepresentativeRuntime::cellSlot(), Cell},
         {RepresentativeRuntime::trpSlot(), 1}};
-    auto Current = PP->compileOrGet(RepresentativeRuntime::funcIndex(),
-                                     CurrentDims, 2, nullptr);
     uint64_t Token = 0;
-    if (Current.hasReadToken) {
-      for (const auto &Slot : OP->state()->buckets[Current.bucketIndex].slots)
-        if (Slot.fnPtr.loadAcquire() == reinterpret_cast<uintptr_t>(Current.fnPtr))
-          Token = Slot.attemptToken;
-      PP->releaseRead(Current.bucketIndex);
+    for (unsigned Try = 0; Try != 4096 && !Token; ++Try) {
+      auto Current = PP->compileOrGet(RepresentativeRuntime::funcIndex(),
+                                       CurrentDims, 2, nullptr);
+      if (Current.hasReadToken) {
+        for (const auto &Slot : OP->state()->buckets[Current.bucketIndex].slots)
+          if (Slot.fnPtr.loadAcquire() == reinterpret_cast<uintptr_t>(Current.fnPtr))
+            Token = Slot.attemptToken;
+        PP->releaseRead(Current.bucketIndex);
+      }
+      if (!Token)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     ASSERT_NE(Token, 0u);
     for (unsigned Try = 0; Try != 512; ++Try) {

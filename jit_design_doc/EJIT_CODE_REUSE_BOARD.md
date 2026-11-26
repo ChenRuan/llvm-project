@@ -1,5 +1,24 @@
 # PR230 Board Smoke Test (spec5)
 
+## Async representative sampling update (2026-11-26)
+
+The shared-pool protocol is now v29. Rebuild the runtime package and link a
+fresh image for all participating cores; reset before testing. Do not mix
+v28 and v29. No new SDK hook, CMake option, public entry point or demo source
+change is required for this update. Keep `ejit_init_representative` and the
+existing audit-enabled configuration.
+
+The representative's Tier-1 grants no longer wait for worker mailbox replies.
+The worker observes the shared 64-dispatch quota and owns Tier-2 retries even
+after business calls stop. Contended lookups return AOT for that call without
+consuming a sample or requesting a duplicate compile. Profile capture still
+waits for the last granted Tier-1 execution to leave. See the
+[async sampling validation record](EJIT_REPRESENTATIVE_ASYNC_SAMPLING.md).
+
+The existing core 6 -> core 16 -> core 6 sequence and final PASS conditions
+below are unchanged. Host regressions and BE object compilation do not certify
+product watchdog behavior; final board acceptance remains necessary.
+
 Source: `examples/ejit_reuse_sre_test.c`, a single header-free C file.
 Replace the previous file defining `test_ejit_period`; do not link both demos.
 The companion `ejit_reuse_host_check.c` is a host-only mock, NOT a board source.
@@ -25,7 +44,7 @@ difference diagnostics remain available independently via
 `ejit_reuse_diag_print` on core 6. Update the demo object as well as the runtime
 package, then link a fresh board image. Shell arguments do not select the mode.
 
-The PGO quota remains 64; worker throttling, mailbox protocol and sample
+The PGO quota remains 64; worker throttling and sample
 lookup/execute/release/yield discipline are unchanged. Reduced workload and
 omitting full dumps should shorten the run, but no board timing is promised.
 SRE dump-loop throttling applies to bulk dump lines, not every ordinary log.
@@ -105,8 +124,8 @@ accidentally frozen write address cannot pass just because the gain is equal.
    a time. Each call performs a fresh lookup, executes the grant immediately,
    releases its read token and yields between attempts. Pending calls do not
    count. It then polls ALL 120 identities to verify final publication/reuse.
-   This avoids leaving a newly published T1 idle while slow cross-core mailbox
-   handshakes and logging process the rest of a 120-identity first sweep.
+   This avoids leaving a newly published T1 idle while worker scheduling and
+   logging process the rest of a 120-identity first sweep.
    Admission deferral is retried; actual queue/compile/publish failures are
    rejected separately. The same generated wrappers are exercised after
    convergence. This diagnostic smoke is neither a hot-path benchmark nor a

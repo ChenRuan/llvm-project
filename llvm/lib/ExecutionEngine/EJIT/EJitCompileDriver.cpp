@@ -1082,32 +1082,68 @@ bool EJitCompileDriver::serviceRepresentativeTimeouts() {
   const uint64_t Timeout = repTimeoutTicks_.loadAcquire();
   RepTier1Binding Expired;
   uint64_t Key = 0;
+  uint64_t ExpiredCount = 0;
+  SmallVector<std::pair<uint64_t, RepTier1Binding>, 8> Active;
   SmallVector<uint64_t, 8> RetiredBorrows;
   lockRepGroups();
-  for (const auto &H : repGroupHandles_) {
-    if (repGroups_->bundleFor(H.second) ||
-        repGroups_->snapshot(H.second).hasPhysical || repRetiringGroups_[H.first] ||
-        repFailedGroups_[H.first]) continue;
-    const auto *Live = repGroups_->currentRepresentative(H.second);
-    if (!Live || Live->dispatchCount >= Live->dispatchLimit) continue;
-    for (const auto &B : repTier1Bindings_)
-      if (B.group.groupId == H.second.groupId &&
-          B.group.generation == H.second.generation && B.requestAttemptToken &&
-          B.lastProgressAt && Now >= B.lastProgressAt &&
-          Now - B.lastProgressAt >= Timeout) {
-        Expired = B;
-        Key = H.first;
-        break;
-      }
-    if (Key) break;
+  // Completed groups remain retained for reuse. Scan bindings once rather
+  // than searching all bindings again for every retained group each tick.
+  for (const auto &B : repTier1Bindings_) {
+    if (!B.requestAttemptToken || !B.lastProgressAt || B.tier2Published)
+      continue;
+    const auto H = repGroupHandles_.find(B.candidateGroupKey);
+    if (H == repGroupHandles_.end() ||
+        H->second.groupId != B.group.groupId ||
+        H->second.generation != B.group.generation ||
+        repRetiringGroups_[H->first] || repFailedGroups_[H->first])
+      continue;
+    const auto *Live = repGroups_->currentRepresentative(H->second);
+    if (Live && Live->attemptToken == B.session.attemptToken &&
+        Live->samplingSessionId == B.session.samplingSessionId)
+      Active.emplace_back(H->first, B);
   }
-  if (Key) repRetiringGroups_[Key] = true;
   unlockRepGroups();
+
+  for (const auto &Entry : Active) {
+    const auto &B = Entry.second;
+    EJitSharedTaskPool::DispatchObservation Obs;
+    const auto Snapshot =
+        sharedPool_.readRepresentativeDispatch(B.requestIdentity, Obs);
+    if (Snapshot == EJitSharedTaskPool::DispatchSnapshot::Busy)
+      continue;
+    if (Snapshot == EJitSharedTaskPool::DispatchSnapshot::Observed && Obs.count) {
+      const bool Reconciled = dispatchObserverThunk(this, Obs);
+      if (Obs.closedQuota) {
+        if (Reconciled)
+          sharedPool_.enqueueObservedRepresentativeTier2(Obs);
+        continue;
+      }
+    }
+    if (Key || Now < B.lastProgressAt || Now - B.lastProgressAt < Timeout)
+      continue;
+    lockRepGroups();
+    auto H = repGroupHandles_.find(Entry.first);
+    if (H != repGroupHandles_.end() &&
+        H->second.generation == B.group.generation &&
+        !repRetiringGroups_[Entry.first] && !repFailedGroups_[Entry.first]) {
+      for (const auto &Current : repTier1Bindings_)
+        if (Current.requestAttemptToken == B.requestAttemptToken &&
+            Current.lastProgressAt == B.lastProgressAt) {
+          Expired = B;
+          ExpiredCount = Obs.count;
+          Key = Entry.first;
+          repRetiringGroups_[Key] = true;
+          break;
+        }
+    }
+    unlockRepGroups();
+  }
   if (!Key) return false;
   // Pool cancellation owns admission/borrow settlement and token drain. It
   // must run outside the group lock, and no new election may pass meanwhile.
   const bool Cancelled = sharedPool_.cancelRequestAttempt(
-      Expired.requestAttemptToken, EJitRequestAttemptReason::Cancelled);
+      Expired.requestAttemptToken, EJitRequestAttemptReason::Cancelled,
+      ExpiredCount);
   lockRepGroups();
   auto H = repGroupHandles_.find(Key);
   if (Cancelled && H != repGroupHandles_.end()) {
@@ -1433,6 +1469,8 @@ bool EJitCompileDriver::bindRepresentativeTier1(
   if (!repGroups_ || !Request || Request->attemptToken == 0)
     return false;
   const uint32_t FuncIdx = stripReqTier(Request->funcIndex);
+  const uint64_t GroupKey =
+      candidateGroupKey(FuncIdx, Request->dims, Request->numDims);
   const EJitGroupHandle G =
       repGroupFor(FuncIdx, Request->dims, Request->numDims);
   if (!G.valid())
@@ -1478,6 +1516,7 @@ bool EJitCompileDriver::bindRepresentativeTier1(
   Binding->requestGeneration = Request->generation;
   Binding->requestIdentity = *Request;
   Binding->logicalKey = LogicalKey;
+  Binding->candidateGroupKey = GroupKey;
   Binding->lastProgressAt = ejit_taskpool_trace_now();
   if (OutSession)
     *OutSession = &Binding->session;
@@ -1494,28 +1533,15 @@ bool EJitCompileDriver::bindRepresentativeTier1(
 bool EJitCompileDriver::dispatchObserverThunk(
     void *ctx, const EJitSharedTaskPool::DispatchObservation &Obs) {
   auto *drv = static_cast<EJitCompileDriver *>(ctx);
-  if (!drv->sharedPool_.isOwner()) {
-    const bool Delivered = drv->sharedPool_.submitRepresentativeDispatch(Obs);
-    if (!Delivered)
-      EJIT_DIAG("representative dispatch observation could not reach owner "
-                "worker: attempt=%llu generation=%u",
-                static_cast<unsigned long long>(Obs.attemptToken),
-                Obs.generation);
-    return Delivered;
-  }
-  if (!drv->repGroups_)
+  if (!drv->sharedPool_.isOwner() || !drv->repGroups_)
     return false;
   EJitSharedTaskPool::RequestAttemptSnapshot Attempt;
-  // This callback can run with the bucket observation lock held. A writer
-  // may already own attemptLock and be waiting for that observation to end.
-  // Let the caller roll back the admission rather than wait for the writer.
-  bool Busy = false;
-  const bool Found =
-      drv->sharedPool_.requestAttemptStatus(Obs.attemptToken, Attempt, &Busy);
-  if (Busy)
-    return false;
+  // The worker reads the slot and releases its exclusion before touching the
+  // attempt table. No business dispatch is waiting for this reconciliation.
+  const bool Found = drv->sharedPool_.requestAttemptStatus(Obs.attemptToken, Attempt);
   if (!Found || !Attempt.live || Attempt.retained ||
       (Attempt.flags & EJitAttemptCancelRequested) ||
+      !(Attempt.flags & EJitAttemptRepresentativeT1) ||
       Attempt.generation != Obs.generation) {
     // A dispatch observation is a lease on the exact pool attempt, not just
     // on a group generation. A cancelled/retained attempt must be rejected
@@ -1528,6 +1554,7 @@ bool EJitCompileDriver::dispatchObserverThunk(
     return false;
   }
   bool Accepted = false;
+  bool Closed = false;
   drv->lockRepGroups();
   // Exact-attempt routing: the observation carries the publish identity of the
   // slot the dispatch was granted from, so a retired attempt's late dispatch
@@ -1543,11 +1570,8 @@ bool EJitCompileDriver::dispatchObserverThunk(
     if (!Live || Live->attemptToken != Binding.session.attemptToken ||
         Live->samplingSessionId != Binding.session.samplingSessionId)
       break; // exact pool request belonged to a retired group session
-    // The pool's slot counter is the shared source of truth. Observations may
-    // be delayed, duplicated, or arrive out of order, so reconcile the owner
-    // registry to the monotonic cumulative count instead of treating delivery
-    // as one count. A later high-water mark repairs a missing mailbox event;
-    // an old/duplicate count is a no-op and can never charge a new generation.
+    // The pool's slot is authoritative. Account for all newly granted calls
+    // in a single worker visit; duplicate snapshots never add quota.
     if (Obs.limit != Live->dispatchLimit || Obs.count == 0 ||
         Obs.count > Obs.limit) {
       EJIT_DIAG("representative dispatch rejected count=%llu limit=%llu "
@@ -1595,11 +1619,18 @@ bool EJitCompileDriver::dispatchObserverThunk(
                 static_cast<unsigned long long>(Live->dispatchCount),
                 static_cast<unsigned long long>(Obs.attemptToken),
                  Obs.generation);
-    else
+    else {
       Accepted = true;
+      Closed = Advanced && Obs.closedQuota;
+    }
     break;
   }
   drv->unlockRepGroups();
+  if (Closed)
+    EJIT_DIAG("PGO sampling complete func=%u: observed %llu/%llu; routing AOT "
+              "until Tier-2 publish",
+              Obs.funcIndex, static_cast<unsigned long long>(Obs.count),
+              static_cast<unsigned long long>(Obs.limit));
   return Accepted;
 }
 
@@ -1711,8 +1742,16 @@ void *EJitCompileDriver::sharePhysicalTier2(
     bool Noted = false;
     {
       lockRepGroups();
-      Noted = repGroups_->noteRepresentativeCode(
-          G, RepSession, Linked->codeId, Linked->fn, !Linked->reused);
+      const auto Existing = repGroups_->snapshot(G);
+      const auto *Live = repGroups_->currentRepresentative(G);
+      if (Existing.hasPhysical)
+        Noted = Live && Live->attemptToken == RepSession.attemptToken &&
+                Live->samplingSessionId == RepSession.samplingSessionId &&
+                Existing.physicalCodeId == Linked->codeId &&
+                Existing.physicalFn == Linked->fn;
+      else
+        Noted = repGroups_->noteRepresentativeCode(
+            G, RepSession, Linked->codeId, Linked->fn, !Linked->reused);
       unlockRepGroups();
     }
     if (!Noted) {
@@ -2145,6 +2184,20 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
             request->generation == PgoIdentity->second.generation;
         lockRepGroups();
         GroupBundle = repGroups_->bundleFor(PgoGroup);
+        if (GroupBundle && IsRepresentativeTier2) {
+          const auto *Live = repGroups_->currentRepresentative(PgoGroup);
+          for (const auto &B : repTier1Bindings_)
+            if (Live && B.requestAttemptToken == request->attemptToken &&
+                B.requestGeneration == request->generation &&
+                B.group.groupId == PgoGroup.groupId &&
+                B.group.generation == PgoGroup.generation &&
+                Live->attemptToken == B.session.attemptToken &&
+                Live->samplingSessionId == B.session.samplingSessionId) {
+              RepSessionForPhysical = *Live;
+              HaveRepSessionForPhysical = true;
+              break;
+            }
+        }
         unlockRepGroups();
         if (!GroupBundle && !IsRepresentativeTier2) {
           // A plain member reached Tier-2 before the group published anything.
@@ -2555,10 +2608,22 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   // request really belongs to a published generation.
   if (repGroups_ && ctx.tier == CompileTier::PGOUse && PgoGroup.valid() &&
       GroupBundle) {
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+    uint32_t BeforeLink = 2;
+    if (HaveRepSessionForPhysical &&
+        failRepresentativeT2_.compareExchange(BeforeLink, 0))
+      return nullptr;
+#endif
     void *SharedFn =
         sharePhysicalTier2(request, cacheKey, funcName, bitcode, ctx, PgoGroup,
                            RepSessionForPhysical, HaveRepSessionForPhysical);
     if (SharedFn) {
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+      uint32_t AfterLink = 3;
+      if (HaveRepSessionForPhysical &&
+          failRepresentativeT2_.compareExchange(AfterLink, 0))
+        return nullptr;
+#endif
       tier1Counters_.erase(cacheKey); // profile consumed (as the ordinary route)
       EJIT_DIAG("compile OK (group physical Tier-2) key=0x%016lx func=%s → "
                 "pfn=%p",
@@ -2838,11 +2903,16 @@ void EJitCompileDriver::notifyTaskpoolPgoLifecycleDrop(
 
 void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
                                                 bool published) {
-  if (repGroups_ && published && decodeReqTier(req.funcIndex) == kEJitTierInstrumented) {
+  if (repGroups_ && published) {
     lockRepGroups();
     for (auto &B : repTier1Bindings_)
-      if (B.requestAttemptToken == req.attemptToken && B.requestGeneration == req.generation)
-        B.lastProgressAt = ejit_taskpool_trace_now();
+      if (B.requestAttemptToken == req.attemptToken &&
+          B.requestGeneration == req.generation) {
+        if (decodeReqTier(req.funcIndex) == kEJitTierInstrumented)
+          B.lastProgressAt = ejit_taskpool_trace_now();
+        else if (decodeReqTier(req.funcIndex) == kEJitTierPgoUse)
+          B.tier2Published = true;
+      }
     unlockRepGroups();
   }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)

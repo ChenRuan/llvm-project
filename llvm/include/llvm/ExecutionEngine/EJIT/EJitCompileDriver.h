@@ -84,7 +84,9 @@ public:
       candidateGate_.storeRelease(0);
     return candidateGate_.loadAcquire();
   }
-  void failNextRepresentativeTier2ForTest() { failRepresentativeT2_.storeRelease(1); }
+  void failNextRepresentativeTier2ForTest(uint32_t Stage = 1) {
+    failRepresentativeT2_.storeRelease(Stage);
+  }
   void setRepresentativeTimeoutForTest(uint64_t Ticks, uint32_t MaxReelections) {
     repMaxReelections_.storeRelease(MaxReelections);
     repTimeoutTicks_.storeRelease(Ticks);
@@ -213,9 +215,7 @@ private:
   samplingAdmissionThunk(void *ctx, uint32_t funcIndex,
                          const EJitDimPair *dims, uint32_t numDims,
                          uint32_t boundCount, uint64_t attemptToken);
-  /// Pool hook: ONE real granted Tier-1 dispatch. Routes the exact publish
-  /// identity into the group registry so the group quota is owned by the real
-  /// runtime dispatch, never by a test-side call.
+  /// Owner-only reconciliation of the exact published Tier-1 high-water mark.
   static bool dispatchObserverThunk(
       void *ctx, const EJitSharedTaskPool::DispatchObservation &Obs);
   /// Pool hook: build the Tier-2 request of a represented member that owns no
@@ -353,8 +353,10 @@ private:
     uint64_t requestAttemptToken = 0;
     uint32_t requestGeneration = 0;
     uint64_t logicalKey = 0;
+    uint64_t candidateGroupKey = 0;
     uint64_t lastProgressAt = 0;
     EJitCompileRequest requestIdentity{};
+    bool tier2Published = false;
   };
   std::vector<RepTier1Binding> repTier1Bindings_;
   /// Every waiter token this driver registered, so a coalesced/retried request

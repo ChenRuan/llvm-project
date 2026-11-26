@@ -226,11 +226,8 @@ void bucketWriteRelease(EJitSharedCacheBucket &b) {
 //   * enqueueTier2FromLookup: the coherent count/quotaEnd read.
 //
 // Lock order: bucket writeFlag -> observationLock. observationLock is a LEAF: a
-// holder performs only the bounded dispatch/reply handshake and never waits
-// for an earlier lock. In particular, the callback only tries attemptLock,
-// since publish/cancel can already hold it while waiting for observationLock.
-// Token readers additionally hold their bucket read lease, which
-// keeps slot identity stable while the reply is in flight.
+// holder does not wait for the worker or acquire an earlier lock. Token
+// readers additionally hold their bucket read lease.
 //===----------------------------------------------------------------------===//
 void bucketObservationLock(EJitSharedCacheBucket &b) {
   uint32_t expected = 0;
@@ -1919,7 +1916,8 @@ bool EJitSharedTaskPool::markRequestAttemptRepresentativeT1(
 }
 
 bool EJitSharedTaskPool::cancelRequestAttempt(uint64_t Token,
-                                              EJitRequestAttemptReason Reason) {
+                                              EJitRequestAttemptReason Reason,
+                                              uint64_t ExpectedDispatchCount) {
   if (!state_ || !Token)
     return false;
   EJitCompileRequest Identity{};
@@ -1955,6 +1953,29 @@ bool EJitSharedTaskPool::cancelRequestAttempt(uint64_t Token,
     bucketWriteRelease(Bucket);
     return false;
   }
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationLock(Bucket);
+#endif
+  if (ExpectedDispatchCount != UINT64_MAX) {
+    for (const auto &Slot : Bucket.slots) {
+      if (Slot.state.loadRelaxed() !=
+              static_cast<uint32_t>(EJitSharedSlotState::Ready) ||
+          Slot.attemptToken != Token || Slot.generation != Identity.generation ||
+          !Slot.representativeT1.loadRelaxed())
+        continue;
+      // A dispatch raced the worker's idle check. Do not retract a moving
+      // sampling session (in particular one that just closed its quota).
+      if (Slot.t1DispatchCount.loadRelaxed() != ExpectedDispatchCount) {
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+        bucketObservationUnlock(Bucket);
+#endif
+        requestAttemptUnlock(state_);
+        bucketWriteRelease(Bucket);
+        return false;
+      }
+      break;
+    }
+  }
   uint32_t Flags = A->flags.loadRelaxed();
   HeldAdmission = (Flags & EJitAttemptHoldsAdmission) != 0;
   FuncIndex = A->funcIndex.loadRelaxed();
@@ -1970,9 +1991,6 @@ bool EJitSharedTaskPool::cancelRequestAttempt(uint64_t Token,
   // Observation exclusion (v22): writeFlag alone no longer excludes a committed
   // admission (which takes the leaf observationLock without writeFlag), so the
   // identity/observation reset below must hold that same lock.
-#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-  bucketObservationLock(Bucket);
-#endif
   for (EJitSharedCacheSlot &Slot : Bucket.slots) {
     if (Slot.state.loadRelaxed() !=
             static_cast<uint32_t>(EJitSharedSlotState::Ready) ||
@@ -2294,8 +2312,10 @@ EJitSharedTaskPool::cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
   uint64_t key = hashIdentity(funcIndex, dims, numDims);
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   EJitSharedCacheBucket &B = state_->buckets[bucket];
-  if (!bucketTryRead(B))
+  if (!bucketTryRead(B)) {
+    R.lookupContended = true;
     return R;
+  }
 
   uint32_t curGen = state_->generation.loadAcquire();
   for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
@@ -2334,8 +2354,8 @@ EJitSharedTaskPool::cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
 // cacheLookup() but with ZERO per-hit RMW on the shared bucket line: the reader
 // never touches bucket.readers. Consistency is a seqlock over bucket.publishSeq
 // (snapshot before the scan, re-check after resolving). If a publish raced the
-// read, retry a bounded number of times, then clean-miss and let the caller
-// fall back. Memory-safe ONLY because a published fnPtr is never freed in this
+// read, retry a bounded number of times, then report contention to the caller.
+// Memory-safe ONLY because a published fnPtr is never freed in this
 // build, so a returned pointer that holds no read token can never dangle.
 //===----------------------------------------------------------------------===//
 LLVM_ATTRIBUTE_ALWAYS_INLINE EJitSharedTaskPool::SharedLookup
@@ -2382,15 +2402,17 @@ EJitSharedTaskPool::cacheLookupSeq(uint32_t funcIndex, const EJitDimPair *dims,
     // A cold peer preparation (coldPrepared) re-validates itself and may
     // legally span a publish, so it is exempt from the outer seq re-check.
     fireSeqlockRetryHook(bucket);
-    if ((hit.fnPtr || hit.legacyHitCountPending) && !hit.coldPrepared &&
-        !bucketSeqStable(B, seq0)) {
+    // A scan that saw no Ready slot must also be stable: a publisher may
+    // temporarily hide the slot while replacing its Tier-1 with Tier-2.
+    if (!hit.coldPrepared && !bucketSeqStable(B, seq0)) {
       cpuRelax();
       continue; // publish raced the read -> retry
     }
     commitLegacyHit(hit);
     return hit; // validated hit (noTokenHit) or clean miss
   }
-  return R; // repeated contention -> clean fallback to the slow path
+  R.lookupContended = true;
+  return R;
 }
 
 #endif // EJIT_SRE_TASKPOOL_NO_RECLAIM
@@ -2441,7 +2463,8 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
           // profile snapshot still reads their counter storage.
           R.t1Observation = false;
           R.slot = &Slot;
-          R.tier2Arm = true;
+          R.tier2Arm = !R.representativeT1 ||
+                       !state_->representativeSharingEnabled.loadAcquire();
           R.tier2BucketIndex = bucket;
           R.tier2SlotIndex = slotIndex;
           R.tier2AttemptToken = Slot.attemptToken;
@@ -4373,6 +4396,63 @@ bool EJitSharedTaskPool::captureT1Observation(const EJitSharedCacheSlot &Slot,
   return true;
 }
 
+EJitSharedTaskPool::DispatchSnapshot EJitSharedTaskPool::readRepresentativeDispatch(
+    const EJitCompileRequest &Req, DispatchObservation &Out) {
+  if (!state_ || !isOwner_ || !Req.attemptToken ||
+      Req.generation != state_->generation.loadAcquire() || !versionsCurrent(Req))
+    return DispatchSnapshot::Missing;
+  const uint32_t Func = stripReqTier(Req.funcIndex);
+  const uint32_t Index =
+      hashIdentity(Func, Req.dims, Req.numDims) % kEJitSharedCacheBuckets;
+  auto &Bucket = state_->buckets[Index];
+  if (!bucketTryRead(Bucket))
+    return DispatchSnapshot::Busy;
+  uint32_t Expected = 0;
+  if (!Bucket.observationLock.compareExchange(Expected, 1)) {
+    bucketReadRelease(Bucket);
+    return DispatchSnapshot::Busy;
+  }
+  auto Result = DispatchSnapshot::Missing;
+  for (uint32_t I = 0; I < kEJitSharedCacheSlots; ++I) {
+    const auto &Slot = Bucket.slots[I];
+    if (Slot.state.loadRelaxed() !=
+            static_cast<uint32_t>(EJitSharedSlotState::Ready) ||
+        Slot.attemptToken != Req.attemptToken || Slot.generation != Req.generation ||
+        Slot.tier.loadRelaxed() != kEJitTierInstrumented ||
+        !Slot.representativeT1.loadRelaxed() ||
+        !slotIdentityMatches(Slot, Func, Req.dims, Req.numDims) ||
+        !slotVersionsMatch(Slot, Req.versions, Req.numDims))
+      continue;
+    Out.funcIndex = Func;
+    Out.attemptToken = Req.attemptToken;
+    Out.generation = Req.generation;
+    Out.count = Slot.t1DispatchCount.loadRelaxed();
+    Out.limit = Slot.t1DispatchLimit.loadRelaxed();
+    Out.closedQuota = Out.limit && Out.count == Out.limit;
+    Out.quotaEnd = Out.closedQuota ? Slot.t1QuotaEnd.loadRelaxed() : 0;
+    Out.bucketIndex = Index;
+    Out.slotIndex = I;
+    Result = DispatchSnapshot::Observed;
+    break;
+  }
+  bucketObservationUnlock(Bucket);
+  bucketReadRelease(Bucket);
+  return Result;
+}
+
+void EJitSharedTaskPool::enqueueObservedRepresentativeTier2(
+    const DispatchObservation &Obs) {
+  if (!state_ || !isOwner_ || !Obs.closedQuota ||
+      Obs.funcIndex >= kEJitSharedMaxFuncIndex ||
+      state_->inFlight[Obs.funcIndex].loadAcquire())
+    return;
+  SharedLookup Hit;
+  Hit.tier2BucketIndex = Obs.bucketIndex;
+  Hit.tier2SlotIndex = Obs.slotIndex;
+  Hit.tier2AttemptToken = Obs.attemptToken;
+  enqueueTier2FromLookup(Hit, nullptr, 0);
+}
+
 EJitSharedTaskPool::T1DispatchOutcome
 EJitSharedTaskPool::admitObservedT1Dispatch(const SharedLookup &Hit,
                                             uint64_t *AdmittedCount) {
@@ -4448,10 +4528,12 @@ EJitSharedTaskPool::admitObservedT1DispatchLocked(const SharedLookup &Hit) {
     // (FrozenAtQuota + quotaEnd 0), never as a queue/compile time and never as
     // another attempt's value.
     Slot.t1QuotaEnd.storeRelease(traceNow());
-    EJIT_DIAG("PGO sampling complete func=%u: observed %llu/%llu; routing AOT "
-              "until Tier-2 publish",
-              Slot.funcIndex, static_cast<unsigned long long>(Admitted),
-              static_cast<unsigned long long>(Limit));
+    if (!Hit.representativeT1 ||
+        !state_->representativeSharingEnabled.loadAcquire())
+      EJIT_DIAG("PGO sampling complete func=%u: observed %llu/%llu; routing AOT "
+                "until Tier-2 publish",
+                Slot.funcIndex, static_cast<unsigned long long>(Admitted),
+                static_cast<unsigned long long>(Limit));
     return T1DispatchOutcome::FinalAdmitted;
   }
   return T1DispatchOutcome::Admitted;
@@ -4462,15 +4544,30 @@ EJitSharedTaskPool::classifyHit(SharedLookup Hit,
                                  const EJitBoundPtrDescriptor *boundPointers,
                                  uint32_t boundCount) {
   CompileOrGetResult R;
+  if (Hit.lookupContended &&
+      state_->representativeSharingEnabled.loadAcquire()) {
+    // Publication contention is not evidence of a missing specialization.
+    // Stay on AOT for this call instead of classifying/compiling a duplicate.
+    R.status = EJitCompileOrGetStatus::AlreadyPending;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  const bool WorkerObserves = Hit.representativeT1 &&
+      state_->representativeSharingEnabled.loadAcquire() != 0;
   struct ObservationScope {
     EJitSharedCacheBucket *Bucket = nullptr;
     ~ObservationScope() {
       if (Bucket)
         bucketObservationUnlock(*Bucket);
     }
-    void acquire(EJitSharedCacheBucket &B) {
-      bucketObservationLock(B);
+    bool acquire(EJitSharedCacheBucket &B, bool TryOnly) {
+      uint32_t Expected = 0;
+      if (TryOnly && !B.observationLock.compareExchange(Expected, 1))
+        return false;
+      if (!TryOnly)
+        bucketObservationLock(B);
       Bucket = &B;
+      return true;
     }
     void release() {
       if (Bucket) {
@@ -4491,7 +4588,7 @@ EJitSharedTaskPool::classifyHit(SharedLookup Hit,
   auto DeliverDispatchObservation = [&](bool ClosedQuota) {
     // The same pool tracks the exact quota for independent Tier-1 attempts,
     // but only a bound representative session has an owner that can reply.
-    if (!Hit.representativeT1)
+    if (!Hit.representativeT1 || WorkerObserves)
       return true;
     if (!Hit.slot || !dispatchObserverFn_)
       return false;
@@ -4509,8 +4606,8 @@ EJitSharedTaskPool::classifyHit(SharedLookup Hit,
     Obs.mailboxIncarnation = DispatchMailboxIncarnation;
     const bool Delivered =
         dispatchObserverFn_(dispatchObserverCtx_, Obs);
-    // Production observers consume the reserved lease synchronously. A custom
-    // observer that declines it must not strand this mailbox slot.
+    // Legacy custom observers consume the reserved lease synchronously; the
+    // production representative path above never reserves or waits for one.
     CancelDispatchReservation();
     return Delivered;
   };
@@ -4535,7 +4632,7 @@ EJitSharedTaskPool::classifyHit(SharedLookup Hit,
   // Peer admission is backpressured before the shared count CAS. With every
   // mailbox legitimately held in Filling, no T1 pointer is granted and the
   // caller retries after the slot owners release their leases.
-  if (Hit.fnPtr && Hit.t1Observation && Hit.representativeT1 &&
+  if (Hit.fnPtr && Hit.t1Observation && Hit.representativeT1 && !WorkerObserves &&
       dispatchObserverFn_ && !isOwner_ &&
       !reserveRepresentativeDispatch(DispatchMailboxIndex,
                                      DispatchMailboxIncarnation)) {
@@ -4561,14 +4658,21 @@ EJitSharedTaskPool::classifyHit(SharedLookup Hit,
       R.fastPathTerminal = true;
       return R;
     }
-    Observation.acquire(state_->buckets[Hit.tier2BucketIndex]);
+    if (!Observation.acquire(state_->buckets[Hit.tier2BucketIndex],
+                             WorkerObserves)) {
+      if (Hit.hasReadToken)
+        releaseRead(Hit.bucketIndex);
+      R.status = EJitCompileOrGetStatus::AlreadyPending;
+      R.fastPathTerminal = true;
+      return R;
+    }
     uint64_t AdmittedCount = 0;
     const auto Outcome = admitObservedT1Dispatch(Hit, &AdmittedCount);
     auto PinSamplingToken = [&] {
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
       // A rejected observation returns no callable pointer, so it must not
-      // leave a token for Tier-2 to drain. Pin only after acknowledgement,
-      // while the observation lock still covers this exact published slot.
+      // leave a token for Tier-2 to drain. Pin while observation exclusion
+      // still covers this exact slot, before the worker can see quota closed.
       if (samplingAdmissionFn_ && Outcome != T1DispatchOutcome::NotApplicable) {
         state_->buckets[Hit.tier2BucketIndex].readers.fetchAdd(1);
         SamplingToken = true;
@@ -4591,9 +4695,8 @@ EJitSharedTaskPool::classifyHit(SharedLookup Hit,
       R.fastPathTerminal = true;
       return R;
     case T1DispatchOutcome::FinalAdmitted:
-      // Deliver the final high-water mark before Tier-2 can be serviced by the
-      // owner. Otherwise it could publish a count N-1 bundle while the peer is
-      // still waiting to submit the closing observation.
+      // Legacy custom observers acknowledge here. Production uses the shared
+      // high-water mark, pinned below before the worker can snapshot it.
       if (!DeliverDispatchObservation(true)) {
         (void)RollbackDispatchAdmission(AdmittedCount, true);
         Observation.release();
@@ -4605,8 +4708,10 @@ EJitSharedTaskPool::classifyHit(SharedLookup Hit,
       }
       PinSamplingToken();
       Observation.release();
-      // The last allowed dispatch freezes the boundary AND claims Tier-2.
-      enqueueTier2FromLookup(Hit, boundPointers, boundCount);
+      // The representative owner claims T2 after it reads the closed quota.
+      // Ordinary independent PGO still uses the existing enqueue path.
+      if (!WorkerObserves)
+        enqueueTier2FromLookup(Hit, boundPointers, boundCount);
       break;
     case T1DispatchOutcome::NotApplicable:
     case T1DispatchOutcome::Admitted:

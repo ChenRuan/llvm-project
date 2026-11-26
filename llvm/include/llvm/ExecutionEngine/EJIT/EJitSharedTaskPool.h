@@ -380,12 +380,7 @@ public:
     representativeWakeFn_ = fn;
     representativeWakeCtx_ = ctx;
   }
-  /// Fired from the ONE committed-return point (classifyHit) for a REAL granted
-  /// Tier-1 dispatch, after the admission CAS/freeze and before the pointer is
-  /// handed back. This is the production bookkeeping hook for a representative
-  /// group quota: a denied or abandoned lookup never reaches it, so a group can
-  /// never count a dispatch it did not grant. Unset by default (legacy pools do
-  /// no extra work per dispatch).
+  /// A snapshot of the committed Tier-1 quota for an exact published attempt.
   struct DispatchObservation {
     uint32_t funcIndex = 0;
     /// Exact publish identity the dispatch was attributed to.
@@ -416,9 +411,12 @@ public:
   }
   /// Owner compile path only: carry a successful session binding to publish.
   bool markRequestAttemptRepresentativeT1(const EJitCompileRequest &Req);
-  /// Peer-side representative callbacks use fixed-layout owner mailboxes.
-  /// The elected worker executes owner-private callbacks and returns only POD
-  /// decisions/observations to the requester.
+  enum class DispatchSnapshot : uint8_t { Missing, Busy, Observed };
+  DispatchSnapshot readRepresentativeDispatch(const EJitCompileRequest &Req,
+                                              DispatchObservation &Out);
+  void enqueueObservedRepresentativeTier2(const DispatchObservation &Obs);
+  /// Legacy explicit callback transport. Normal representative admission and
+  /// sampling use the asynchronous queue and shared slot, not these replies.
   bool requestRepresentativeCandidate(const EJitCompileRequest &req,
                                        bool &classified);
   SamplingAdmission requestRepresentativeAdmission(
@@ -1059,7 +1057,8 @@ public:
   /// carried by real queue entries; no separate test-only state machine exists.
   bool cancelRequestAttempt(
       uint64_t token,
-      EJitRequestAttemptReason reason = EJitRequestAttemptReason::Cancelled);
+      EJitRequestAttemptReason reason = EJitRequestAttemptReason::Cancelled,
+      uint64_t expectedDispatchCount = UINT64_MAX);
   /// If busy is supplied, try the attempt lock once and set it on contention.
   /// Observation callbacks must use this nonblocking form.
   bool requestAttemptStatus(uint64_t token, RequestAttemptSnapshot &out,
@@ -1352,6 +1351,7 @@ private:
     uint32_t bucketIndex = 0;
     bool hasReadToken = false;
     bool readyButNotShareable = false;
+    bool lookupContended = false;
     /// The instrumented Tier-1 has collected its configured number of root
     /// samples and Tier-2 is queued/compiling. Keep the Tier-1 allocation and
     /// counters alive for profile synthesis, but route calls back to AOT until
@@ -1493,7 +1493,7 @@ private:
   /// the diagnostic progress quarter. Never fabricates a count for a rejected
   /// lookup: only the committed-return path calls this.
   ///
-  /// Exclusion: the identity re-check, the CAS, the owner reply and the freeze
+  /// Exclusion: the identity re-check, the CAS, the token pin and the freeze
   /// run as one critical section against cachePublish()/cancelRequestAttempt().
   /// Both token and NO_RECLAIM builds use the separate leaf bucket
   /// observationLock (ABI v24); the token build also holds its read token, while

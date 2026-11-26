@@ -979,13 +979,13 @@ TEST_F(SharedTaskPoolTest, PeerRequestsPeriodConstRankingFromOwnerWorker) {
   EJitCoreId::setCurrentForTest(1);
   ASSERT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
 
-  // Keep a request outstanding across every ranking ticket. An idle-only
-  // service policy would drain the queue (or starve under continuous load).
+  // Each ranking ticket is served even with compile work queued. The same
+  // worker turn must also dequeue work, rather than starving compilation.
   for (unsigned i = 0; i != 32; ++i) {
     ASSERT_EQ(peer.compileOrGet(i, nullptr, 0, nullptr).status,
               EJitCompileOrGetStatus::EnqueuedPending);
     ASSERT_TRUE(peer.requestPeriodConstRanking());
-    EXPECT_EQ(state_->dequeuePos.loadAcquire(), i);
+    EXPECT_EQ(state_->dequeuePos.loadAcquire(), i + 1);
     driveOwnerOnRequesterIdle(&drive, 1);
   }
   EXPECT_EQ(owner.workerConsumeLoops(), 64u);
@@ -3639,7 +3639,7 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // publish/cancel/reset of the same bucket's observation identity. The v22
   // word lives in the bucket header padding, so the blob size and every slot
   // offset stay unchanged.
-  EXPECT_EQ(kEJitSharedAbiVersion, 25u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 29u);
   EXPECT_EQ(offsetof(EJitSharedCacheBucket, observationLock), 12u);
   EXPECT_EQ(offsetof(EJitSharedCacheBucket, slots), 16u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
@@ -8027,6 +8027,191 @@ TEST_F(SharedTaskPoolTest, AsyncServiceUnavailableWithoutAWorker) {
   ASSERT_EQ(state_->initState.loadAcquire(),
             static_cast<uint32_t>(EJitSharedInitState::Ready));
   EXPECT_FALSE(owner.asyncServiceAvailable());
+}
+
+class AsyncRepresentativeDispatchTest : public SharedTaskPoolTest {
+protected:
+  static constexpr uint32_t Func = 79;
+  EJitSharedTaskPool Pool;
+  EJitCompileRequest Identity{};
+  EJitSharedCacheSlot *Slot = nullptr;
+
+  void SetUp() override {
+    SharedTaskPoolTest::SetUp();
+    Pool.setPgoEnabled(true, 64);
+    Pool.setRepresentativeSharingEnabled(true);
+    bringUpOwner(Pool, false, true);
+    Pool.setCompiler(
+        +[](void *Ctx, const EJitCompileRequest &Req, void **Out) {
+          auto &T = *static_cast<AsyncRepresentativeDispatchTest *>(Ctx);
+          if (decodeReqTier(Req.funcIndex) == kEJitTierInstrumented) {
+            T.Identity = Req;
+            if (!T.Pool.markRequestAttemptRepresentativeT1(Req))
+              return false;
+          }
+          return mockCompile(nullptr, Req, Out);
+        }, this);
+    Pool.setSamplingAdmissionCallback(
+        +[](void *, uint32_t, const EJitDimPair *, uint32_t, uint32_t, uint64_t) {
+          return EJitSharedTaskPool::SamplingAdmission::Grant;
+        }, nullptr);
+    Pool.setDispatchObserver(
+        +[](void *, const EJitSharedTaskPool::DispatchObservation &) {
+          ADD_FAILURE() << "production dispatch must not call a sync observer";
+          return false;
+        }, nullptr);
+    ASSERT_EQ(Pool.compileOrGet(Func, nullptr, 0, nullptr).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Pool.pollOne());
+    Slot = findReadySlot(Func);
+    ASSERT_NE(Slot, nullptr);
+    ASSERT_EQ(Slot->representativeT1.loadAcquire(), 1u);
+  }
+
+  void resolveWhileLocked(EJitAtomicU32 &Lock, bool ExpectGrant) {
+    Lock.storeRelease(1);
+    std::atomic<bool> Returned{false};
+    EJitSharedTaskPool::CompileOrGetResult Hit;
+    std::thread Caller([&] {
+      EJitCoreId::setCurrentForTest(0);
+      Hit = Pool.tryCacheHit0D(Func);
+      Returned.store(true, std::memory_order_release);
+    });
+    const auto Deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(500);
+    while (!Returned.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < Deadline)
+      std::this_thread::yield();
+    const bool Nonblocking = Returned.load(std::memory_order_acquire);
+    Lock.storeRelease(0);
+    Caller.join();
+    EXPECT_TRUE(Nonblocking);
+    EXPECT_EQ(Hit.fnPtr != nullptr, ExpectGrant);
+    EXPECT_EQ(Hit.hasReadToken, ExpectGrant);
+    EXPECT_TRUE(Hit.fastPathTerminal);
+    if (Hit.hasReadToken)
+      Pool.releaseRead(Hit.bucketIndex);
+  }
+};
+
+TEST_F(AsyncRepresentativeDispatchTest,
+       BusyObservationAndAttemptLocksNeverMakeBusinessWait) {
+  ASSERT_NE(Slot, nullptr);
+  auto &Bucket = state_->buckets[bucketOfIdentity(Func, nullptr, 0)];
+  resolveWhileLocked(Bucket.observationLock, false);
+  EXPECT_EQ(Slot->t1DispatchCount.loadAcquire(), 0u);
+  EXPECT_EQ(Bucket.readers.loadAcquire(), 0u);
+  EJitSharedTaskPool::DispatchObservation Obs;
+  Bucket.observationLock.storeRelease(1);
+  EXPECT_EQ(Pool.readRepresentativeDispatch(Identity, Obs),
+            EJitSharedTaskPool::DispatchSnapshot::Busy);
+  Bucket.observationLock.storeRelease(0);
+
+  for (auto &Command : state_->representativeCommands)
+    Command.state.storeRelease(static_cast<uint32_t>(
+        EJitSharedRepresentativeCommandState::Filling));
+  resolveWhileLocked(state_->attemptLock, true);
+  EXPECT_EQ(Slot->t1DispatchCount.loadAcquire(), 1u);
+  for (auto &Command : state_->representativeCommands)
+    Command.state.storeRelease(static_cast<uint32_t>(
+        EJitSharedRepresentativeCommandState::Free));
+
+  // Six concurrent callers compete for the remaining 63 grants, with no
+  // worker available. Denied lookups do not consume the quota or leak tokens.
+  std::atomic<unsigned> Granted{1};
+  std::vector<std::thread> Callers;
+  for (unsigned I = 0; I != 6; ++I)
+    Callers.emplace_back([&] {
+      EJitCoreId::setCurrentForTest(0);
+      for (unsigned Try = 0; Try != 4096 && Granted.load() < 64; ++Try) {
+        auto Hit = Pool.tryCacheHit0D(Func);
+        if (Hit.fnPtr) {
+          EXPECT_TRUE(Hit.hasReadToken);
+          ++Granted;
+        }
+        if (Hit.hasReadToken)
+          Pool.releaseRead(Hit.bucketIndex);
+      }
+    });
+  for (auto &Caller : Callers)
+    Caller.join();
+  EXPECT_EQ(Granted.load(), 64u);
+  EXPECT_EQ(Slot->t1DispatchCount.loadAcquire(), 64u);
+  EXPECT_EQ(Bucket.readers.loadAcquire(), 0u);
+  EXPECT_EQ(Pool.pendingCount(), 0u);
+  EXPECT_EQ(Pool.tryCacheHit0D(Func).fnPtr, nullptr);
+  ASSERT_EQ(Pool.readRepresentativeDispatch(Identity, Obs),
+            EJitSharedTaskPool::DispatchSnapshot::Observed);
+  EXPECT_EQ(Obs.count, 64u);
+  EXPECT_TRUE(Obs.closedQuota);
+  Pool.failNextTier2QueuePushForTest();
+  Pool.enqueueObservedRepresentativeTier2(Obs);
+  EXPECT_EQ(Pool.pendingCount(), 0u);
+  Pool.enqueueObservedRepresentativeTier2(Obs);
+  EXPECT_EQ(Pool.pendingCount(), 1u);
+  Pool.enqueueObservedRepresentativeTier2(Obs);
+  EXPECT_EQ(Pool.pendingCount(), 1u);
+  ASSERT_TRUE(Pool.pollOne());
+  EXPECT_EQ(Slot->tier.loadAcquire(), kEJitTierPgoUse);
+  EXPECT_EQ(Pool.liveRequestAttemptCount(), 0u);
+  EXPECT_EQ(Pool.readRepresentativeDispatch(Identity, Obs),
+            EJitSharedTaskPool::DispatchSnapshot::Missing);
+}
+
+TEST_F(AsyncRepresentativeDispatchTest, TimeoutCannotCancelNewSamplingProgress) {
+  ASSERT_NE(Slot, nullptr);
+  auto Hit = Pool.tryCacheHit0D(Func);
+  ASSERT_TRUE(Hit.hasReadToken);
+  Pool.releaseRead(Hit.bucketIndex);
+  EXPECT_FALSE(Pool.cancelRequestAttempt(
+      Identity.attemptToken, EJitRequestAttemptReason::Cancelled, 0));
+  EJitSharedTaskPool::DispatchObservation Obs;
+  ASSERT_EQ(Pool.readRepresentativeDispatch(Identity, Obs),
+            EJitSharedTaskPool::DispatchSnapshot::Observed);
+  EXPECT_EQ(Obs.count, 1u);
+  EXPECT_TRUE(Pool.cancelRequestAttempt(
+      Identity.attemptToken, EJitRequestAttemptReason::Cancelled, 1));
+  EXPECT_EQ(Pool.readRepresentativeDispatch(Identity, Obs),
+            EJitSharedTaskPool::DispatchSnapshot::Missing);
+  // A stale, closed observation cannot queue T2 after its slot was cancelled.
+  Obs.closedQuota = true;
+  Pool.enqueueObservedRepresentativeTier2(Obs);
+  EXPECT_EQ(Pool.pendingCount(), 0u);
+  expectNoReaders();
+}
+
+TEST_F(AsyncRepresentativeDispatchTest,
+       PublicationContentionIsTerminalInsteadOfNewCompilation) {
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  Pool.setSeqlockRetryHookForTest(
+      +[](void *Ctx, uint32_t Bucket) {
+        static_cast<EJitSharedTaskPoolState *>(Ctx)
+            ->buckets[Bucket].publishSeq.fetchAdd(2);
+      }, state_.get());
+  auto Hit = Pool.tryCacheHit0D(Func);
+  auto Miss = Pool.tryCacheHit0D(Func + 1);
+  EXPECT_TRUE(Miss.fastPathTerminal);
+  EXPECT_EQ(Miss.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(Miss.fnPtr, nullptr);
+  Pool.setSeqlockRetryHookForTest(nullptr, nullptr);
+  EXPECT_FALSE(Pool.tryCacheHit0D(Func + 1).fastPathTerminal);
+#else
+  auto &Bucket = state_->buckets[bucketOfIdentity(Func, nullptr, 0)];
+  Bucket.writeFlag.storeRelease(1);
+  auto Hit = Pool.tryCacheHit0D(Func);
+  Bucket.writeFlag.storeRelease(0);
+#endif
+  EXPECT_TRUE(Hit.fastPathTerminal);
+  EXPECT_EQ(Hit.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(Hit.fnPtr, nullptr);
+  EXPECT_FALSE(Hit.hasReadToken);
+  EXPECT_EQ(Slot->t1DispatchCount.loadAcquire(), 0u);
+  EXPECT_EQ(Pool.pendingCount(), 0u);
+  EXPECT_EQ(Pool.liveRequestAttemptCount(), 1u);
+  auto Stable = Pool.tryCacheHit0D(Func);
+  ASSERT_TRUE(Stable.hasReadToken);
+  Pool.releaseRead(Stable.bucketIndex);
+  EXPECT_EQ(Slot->t1DispatchCount.loadAcquire(), 1u);
 }
 
 TEST_F(SharedTaskPoolTest,
