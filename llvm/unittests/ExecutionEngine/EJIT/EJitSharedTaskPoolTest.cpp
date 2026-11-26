@@ -3706,7 +3706,7 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // publish/cancel/reset of the same bucket's observation identity. The v22
   // word lives in the bucket header padding, so the blob size and every slot
   // offset stay unchanged.
-  EXPECT_EQ(kEJitSharedAbiVersion, 29u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 30u);
   EXPECT_EQ(offsetof(EJitSharedCacheBucket, observationLock), 12u);
   EXPECT_EQ(offsetof(EJitSharedCacheBucket, slots), 16u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
@@ -8525,6 +8525,197 @@ TEST_F(SharedTaskPoolTest, ShutdownAcknowledgesQueuedBorrowAndAllEvents) {
   EXPECT_EQ(snapshot.terminalReason, EJitRequestAttemptReason::Shutdown);
 }
 
+class RetainedCandidateCapacityTest : public SharedTaskPoolTest {
+protected:
+  EJitSharedTaskPool Owner, Peer;
+  EJitCompileRequest Last{};
+  std::vector<EJitCompileRequest> Retained;
+
+  void SetUp() override {
+    SharedTaskPoolTest::SetUp();
+    EJitCoreId::setCurrentForTest(0);
+    Owner.bind(state_.get());
+    Owner.setCompiler(&mockCompile, nullptr);
+    Owner.setMode(EJitCompileMode::Async);
+    Owner.setPgoEnabled(true, 64);
+    ASSERT_TRUE(Owner.setRequestAttemptsEnabled(true));
+    Owner.setRepresentativeSharingEnabled(true);
+    Owner.setSamplingAdmissionCallback(
+        +[](void *Ctx, uint32_t, const EJitDimPair *, uint32_t, uint32_t,
+            uint64_t Token) {
+          auto &Self = *static_cast<RetainedCandidateCapacityTest *>(Ctx);
+          return Token == Self.Last.attemptToken
+                     ? EJitSharedTaskPool::SamplingAdmission::Deny
+                     : EJitSharedTaskPool::SamplingAdmission::Classify;
+        }, this);
+    Owner.setCandidateClassifyCallback(
+        +[](void *Ctx, const EJitCompileRequest &Req) {
+          auto &Self = *static_cast<RetainedCandidateCapacityTest *>(Ctx);
+          Self.Last = Req;
+          Self.Retained.push_back(Req);
+          return true;
+        }, this);
+    Owner.setRepresentativeWakeCallback(
+        +[](void *Ctx, uint32_t Func, const EJitDimPair *Dims, uint32_t N,
+            EJitCompileRequest &Out) {
+          auto &Self = *static_cast<RetainedCandidateCapacityTest *>(Ctx);
+          Out = {};
+          Out.funcIndex = encodeReqTier(Func, kEJitTierPgoUse);
+          Out.generation = Self.state_->generation.loadAcquire();
+          Out.numDims = N;
+          for (uint32_t I = 0; I < N; ++I) {
+            Out.dims[I] = Dims[I];
+            Out.versions[I] = Self.Owner.instanceVersionPublic(
+                Dims[I].dimType, Dims[I].instanceId);
+          }
+          Out.t1DispatchCount = Out.t1DispatchLimit = 64;
+          return true;
+        }, this);
+    ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+    for (uint32_t D = 0; D < 2; ++D)
+      for (uint32_t I = 0; I < 6; ++I)
+        Owner.setInstanceEnabled(D, I, true);
+    EJitCoreId::setCurrentForTest(1);
+    Peer.bind(state_.get());
+    Peer.setMode(EJitCompileMode::Async);
+    Peer.setRepresentativeSharingEnabled(true);
+    ASSERT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+    EJitCoreId::setCurrentForTest(0);
+  }
+
+  void retain(uint32_t Count) {
+    for (uint32_t I = 0; I < Count; ++I) {
+      EJitDimPair Dims[] = {{0, (I / 6) % 6}, {1, I % 6}};
+      EJitCoreId::setCurrentForTest(1);
+      ASSERT_EQ(Peer.compileOrGet(100 + I / 36, Dims, 2, nullptr).status,
+                EJitCompileOrGetStatus::EnqueuedPending) << "identity=" << I;
+      EJitCoreId::setCurrentForTest(0);
+      ASSERT_TRUE(Owner.pollOne());
+      ASSERT_EQ(Owner.liveRequestAttemptCount(), I + 1);
+    }
+  }
+
+  void TearDown() override {
+    EJitCoreId::setCurrentForTest(0);
+    Owner.ownerShutdown();
+    EXPECT_EQ(Owner.liveRequestAttemptCount(), 0u);
+    SharedTaskPoolTest::TearDown();
+  }
+};
+
+TEST_F(RetainedCandidateCapacityTest, TwoHundredFunctionsSixCellsSixTrps) {
+  if (kEJitSharedRequestAttemptCapacity < 7200)
+    GTEST_SKIP() << "Product-scale test needs at least 7200 live slots";
+  retain(200 * 6 * 6);
+  ASSERT_EQ(Retained.size(), 7200u);
+  EXPECT_EQ(Owner.liveRequestAttemptCount(), 7200u);
+  EXPECT_EQ(Owner.pendingCount(), 0u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EJitSharedDiagnostics D{};
+  Owner.getDiagnostics(D);
+  EXPECT_EQ(D.attemptHighWater, 7200u);
+  EXPECT_EQ(D.attemptRejectedFull, 0u);
+  RecordProperty("attempt_bytes", sizeof(EJitSharedRequestAttempt));
+  RecordProperty("shared_state_bytes", sizeof(EJitSharedTaskPoolState));
+}
+
+TEST_F(RetainedCandidateCapacityTest,
+       FullTableResumesExistingMembersWithoutNewTokensOrSampling) {
+  retain(kEJitSharedRequestAttemptCapacity);
+  ASSERT_EQ(Retained.size(), kEJitSharedRequestAttemptCapacity);
+  const uint64_t Next = state_->nextAttemptToken.loadAcquire();
+  EJitDimPair Dims[] = {{0, 0}, {1, 0}};
+  for (unsigned I = 0; I < 100; ++I)
+    EXPECT_EQ(Owner.compileOrGet(900, Dims, 2, nullptr).status,
+              EJitCompileOrGetStatus::QueueFullFallback);
+  EXPECT_EQ(state_->nextAttemptToken.loadAcquire(), Next);
+  EJitSharedDiagnostics D{};
+  Owner.getDiagnostics(D);
+  EXPECT_EQ(D.attemptRejectedFull, 100u);
+  EXPECT_EQ(D.attemptRejectedToken, 0u);
+
+  // Queue rejection must preserve the original borrow for a later owner tick.
+  Owner.failNextTier2QueuePushForTest();
+  EXPECT_EQ(Owner.resumeRepresentativeWaiter(Retained[0]),
+            EJitCompileOrGetStatus::QueueFullFallback);
+  EJitSharedTaskPool::RequestAttemptSnapshot S;
+  ASSERT_TRUE(Owner.requestAttemptStatus(Retained[0].attemptToken, S));
+  EXPECT_EQ(S.flags, static_cast<uint32_t>(EJitAttemptBorrowPending));
+  EXPECT_EQ(Owner.pendingCount(), 0u);
+
+  const uint32_t ResumeCount = std::min(36u, kEJitSharedRequestAttemptCapacity);
+  for (unsigned I = 0; I < ResumeCount; ++I) {
+    ASSERT_EQ(Owner.resumeRepresentativeWaiter(Retained[I]),
+              EJitCompileOrGetStatus::EnqueuedPending);
+    EXPECT_EQ(Owner.resumeRepresentativeWaiter(Retained[I]),
+              EJitCompileOrGetStatus::AlreadyPending);
+    ASSERT_TRUE(Owner.pollOne());
+    auto Hit = Owner.tryCacheHit(stripReqTier(Retained[I].funcIndex),
+                                 Retained[I].dims, 2);
+    EXPECT_EQ(Hit.status, EJitCompileOrGetStatus::CacheHit);
+    if (Hit.hasReadToken) Owner.releaseRead(Hit.bucketIndex);
+    EXPECT_EQ(Owner.liveRequestAttemptCount(),
+              kEJitSharedRequestAttemptCapacity - I - 1);
+  }
+  EXPECT_EQ(state_->nextAttemptToken.loadAcquire(), Next);
+  Owner.getDiagnostics(D);
+  EXPECT_EQ(D.attemptResumed, ResumeCount);
+  EXPECT_EQ(D.tier1Compiles, 0u);
+  EXPECT_EQ(D.tier2Compiles, ResumeCount);
+  EXPECT_EQ(D.pgoActiveFunctionCount, 0u);
+  EXPECT_EQ(D.attemptHighWater, kEJitSharedRequestAttemptCapacity);
+}
+
+TEST_F(RetainedCandidateCapacityTest,
+       ResumedWaiterRejectsWrongIdentityAndCancelsQueuedRead) {
+  if (kEJitSharedRequestAttemptCapacity < 2)
+    GTEST_SKIP() << "Needs two independent live requests";
+  retain(2);
+  ASSERT_EQ(Retained.size(), 2u);
+  auto Wrong = Retained[0];
+  Wrong.dims[1].instanceId = 5;
+  EXPECT_EQ(Owner.resumeRepresentativeWaiter(Wrong),
+            EJitCompileOrGetStatus::InvalidParam);
+  ASSERT_EQ(Owner.resumeRepresentativeWaiter(Retained[0]),
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.cancelRequestAttempt(Retained[0].attemptToken));
+  ASSERT_TRUE(Owner.pollOne());
+  EXPECT_EQ(findReadySlot(stripReqTier(Retained[0].funcIndex)), nullptr);
+  EXPECT_EQ(Owner.liveRequestAttemptCount(), 1u);
+  Owner.setInstanceEnabled(1, 1, false);
+  EXPECT_EQ(Owner.liveRequestAttemptCount(), 0u);
+  EXPECT_NE(Owner.resumeRepresentativeWaiter(Retained[1]),
+            EJitCompileOrGetStatus::EnqueuedPending);
+}
+
+TEST_F(RetainedCandidateCapacityTest, ResumedMemberCompileFailureReleasesLease) {
+  retain(1);
+  ASSERT_EQ(Retained.size(), 1u);
+  Owner.setCompiler(&mockCompileAlwaysFail, nullptr);
+  ASSERT_EQ(Owner.resumeRepresentativeWaiter(Retained[0]),
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  EXPECT_EQ(Owner.liveRequestAttemptCount(), 0u);
+  EXPECT_EQ(Owner.pendingCount(), 0u);
+  EXPECT_EQ(Owner.resumeRepresentativeWaiter(Retained[0]),
+            EJitCompileOrGetStatus::InvalidParam);
+}
+
+TEST_F(RetainedCandidateCapacityTest, BusyPeerMissReturnsWithoutBurningToken) {
+  const uint64_t Before = state_->nextAttemptToken.loadAcquire();
+  state_->attemptLock.storeRelease(1);
+  EJitCoreId::setCurrentForTest(1);
+  auto R = Peer.compileOrGet(900, nullptr, 0, nullptr);
+  state_->attemptLock.storeRelease(0);
+  EXPECT_EQ(R.status, EJitCompileOrGetStatus::PgoAdmissionDeferred);
+  EXPECT_EQ(state_->nextAttemptToken.loadAcquire(), Before);
+  EXPECT_EQ(Owner.liveRequestAttemptCount(), 0u);
+  EJitSharedDiagnostics D{};
+  Owner.getDiagnostics(D);
+  EXPECT_EQ(D.attemptRejectedBusy, 1u);
+  EXPECT_EQ(D.attemptRejectedFull, 0u);
+}
+
 TEST_F(SharedTaskPoolTest, AttemptTokenExhaustionFailsClosedWithoutAdmission) {
   EJitSharedTaskPool owner;
   EJitCoreId::setCurrentForTest(0);
@@ -8541,6 +8732,10 @@ TEST_F(SharedTaskPoolTest, AttemptTokenExhaustionFailsClosedWithoutAdmission) {
   EXPECT_EQ(state_->inFlight[85].loadAcquire(), 0u);
   EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
   EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+  EJitSharedDiagnostics D{};
+  owner.getDiagnostics(D);
+  EXPECT_EQ(D.attemptRejectedToken, 1u);
+  EXPECT_EQ(D.attemptRejectedFull, 0u);
 }
 
 TEST_F(SharedTaskPoolTest, StaleGenerationSettlesOnlyItsAttempt) {

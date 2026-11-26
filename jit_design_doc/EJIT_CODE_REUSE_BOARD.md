@@ -1,10 +1,46 @@
 # PR230 Board Smoke Test (spec5)
 
+## Live request capacity update (2026-11-26)
+
+The current shared protocol is **v30**. Rebuild/relink all cores and cold-reset;
+do not mix it with v29 or a runtime built with another capacity.
+`EJIT_SRE_REQUEST_ATTEMPT_CAPACITY` defaults to **8192** in CMake and the header,
+and is explicit in the AArch64 BE preset. This is the number of live request
+leases (including waiting members), NOT a compile concurrency setting.
+200 functions x 6 cells x 6 TRPs needs 7200 logical requests. One request record
+is 208 bytes on the tested AArch64 configuration; the table grows by about
+1.57 MiB versus 256 slots. Check the final SDK shared-section placement/size.
+
+Retained members now reuse their own lease when a frozen profile becomes
+available. Even a completely full table can finish those members without
+allocating another request. Failed queue insertion keeps the original borrow
+for retry; cancellation and stale identities still reject execution. The
+representative still owns exactly 64 T1 samples. Worker throttling is unchanged.
+
+On core 6 call the existing `ejit_taskpool_print_stats` (already retained by
+lipo). Its additional line has this form, with illustrative numbers:
+
+```text
+attempts live=7200/8192 highwater=7200 resumed=36 reject_full=0 reject_busy=2 reject_stale=0 reject_token=0
+```
+
+`live`/`highwater` measure current/peak occupancy; `resumed` counts successful
+member requeues. Rejection counters distinguish full storage, transient lock
+contention, stale lifecycle and exhausted monotonic tokens. Busy misses stay on
+AOT without waiting. There is no per-miss `capacity/token` INFO flood.
+These counters reset at owner initialization. The C stats struct is unchanged.
+
+Queue slots, Ready-cache slots, group count and code-pool bytes remain separate
+limits. Raising request capacity does not promise 8192 cached versions or
+unlimited sharing groups. Host pressure tests cover request lifecycles and
+the existing real-JIT tests cover sampling/sharing; product acceptance still
+requires board validation. Existing initialization and the demo below are unchanged.
+
 ## Async representative sampling update (2026-11-26)
 
-The shared-pool protocol is now v29. Rebuild the runtime package and link a
-fresh image for all participating cores; reset before testing. Do not mix
-v28 and v29. No new SDK hook, CMake option, public entry point or demo source
+This earlier sampling change introduced v29; the capacity update above now
+requires v30. Rebuild the runtime package and link a fresh image for all
+participating cores; reset before testing. No new SDK hook, public entry point or demo source
 change is required for this update. Keep `ejit_init_representative` and the
 existing audit-enabled configuration.
 

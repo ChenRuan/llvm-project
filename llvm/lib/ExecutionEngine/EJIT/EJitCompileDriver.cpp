@@ -1021,6 +1021,7 @@ bool EJitCompileDriver::serviceRepresentativeWaiters() {
   CandidateBinding Work;
   uint64_t Key = 0;
   bool Found = false;
+  bool HasFinalBundle = false;
   lockRepGroups();
   for (auto &C : candidateBindings_) {
     if ((!C.second.finalReadPending && !C.second.needsReclassification) ||
@@ -1036,6 +1037,7 @@ bool EJitCompileDriver::serviceRepresentativeWaiters() {
       if (HasBundle && !C.second.finalReadyAt)
         C.second.finalReadyAt = ejit_taskpool_trace_now();
       Work = C.second;
+      HasFinalBundle = HasBundle;
       Key = C.first;
       Found = true;
       break;
@@ -1066,8 +1068,19 @@ bool EJitCompileDriver::serviceRepresentativeWaiters() {
   }
   // This is owner scheduling after group publication/re-election, never execution:
   // waiters have no private T1 and a representative's closed T1 routes AOT.
-  auto Result = sharedPool_.compileOrGet(stripReqTier(R.funcIndex), R.dims,
-                                         R.numDims, nullptr);
+  auto Result = sharedPool_.tryCacheHit(stripReqTier(R.funcIndex), R.dims,
+                                      R.numDims);
+  if (!Result.fastPathTerminal) {
+    // A frozen bundle resumes the existing final-read lease. With no bundle,
+    // normal admission must still elect a replacement representative.
+    const auto Resumed = HasFinalBundle && Work.finalReadPending &&
+                                 !Work.needsReclassification
+                             ? sharedPool_.resumeRepresentativeWaiter(R)
+                             : EJitCompileOrGetStatus::InvalidParam;
+    if (Resumed == EJitCompileOrGetStatus::InvalidParam)
+      Result = sharedPool_.compileOrGet(stripReqTier(R.funcIndex), R.dims,
+                                       R.numDims, nullptr);
+  }
   if (Result.hasReadToken) sharedPool_.releaseRead(Result.bucketIndex);
   if (Result.status == EJitCompileOrGetStatus::CacheHit)
     completeCandidateBorrow(Key, &R);

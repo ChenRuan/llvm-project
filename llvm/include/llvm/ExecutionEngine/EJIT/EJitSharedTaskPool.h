@@ -64,6 +64,9 @@ struct EJitSharedDiagnostics {
   uint32_t queueDepth;      ///< approximate in-ring requests
   uint32_t pendingCount;    ///< in-flight dedup slots
   uint32_t cacheReadyCount; ///< Ready cache slots
+  uint32_t attemptLiveCount, attemptCapacity, attemptHighWater;
+  uint64_t attemptRejectedFull, attemptRejectedBusy, attemptRejectedStale;
+  uint64_t attemptRejectedToken, attemptResumed;
   uint64_t cacheHits;
   uint64_t asyncEnqueues;
   uint64_t asyncCompiles;
@@ -1067,6 +1070,10 @@ public:
   bool completeRequestBorrow(uint64_t token);
   /// Keep only the source borrow after successful no-code prefix classification.
   void finishCandidateClassification(uint64_t token);
+  /// Owner-only: reuse a retained member's borrow for its final Tier-2 read.
+  /// InvalidParam means the original lease is gone; normal admission may retry.
+  EJitCompileOrGetStatus
+  resumeRepresentativeWaiter(const EJitCompileRequest &retained);
   enum class BorrowScopeStatus { Invalid, Pending, Complete };
   BorrowScopeStatus instanceBorrowStatus(uint32_t dimType, uint32_t instanceId,
                                          uint32_t generation, uint32_t version) const;

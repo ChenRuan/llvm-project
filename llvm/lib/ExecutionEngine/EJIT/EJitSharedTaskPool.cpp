@@ -15,6 +15,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "EJitCodePoolCounters.h"
+#include "llvm/ADT/SmallVector.h"
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 #include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
 #endif
@@ -1643,19 +1644,12 @@ uint64_t EJitSharedTaskPool::beginRequestAttempt(const EJitCompileRequest &Req,
   if (!state_ || state_->requestAttemptsEnabled.loadAcquire() == 0)
     return 0;
 
-  uint64_t Last = state_->nextAttemptToken.loadRelaxed();
-  for (;;) {
-    if (Last == UINT64_MAX)
-      return 0;
-    if (state_->nextAttemptToken.compareExchange(Last, Last + 1))
-      break;
-  }
-  const uint64_t Token = Last + 1;
-
   if (EnqueuePeerCandidate) {
     uint32_t Expected = 0;
-    if (!state_->attemptLock.compareExchange(Expected, 1))
+    if (!state_->attemptLock.compareExchange(Expected, 1)) {
+      state_->attemptRejectedBusy.fetchAdd(1);
       return 0; // a business miss must not wait for the owner
+    }
   } else {
     requestAttemptLock(state_);
   }
@@ -1664,6 +1658,7 @@ uint64_t EJitSharedTaskPool::beginRequestAttempt(const EJitCompileRequest &Req,
   if (samplingAdmissionFn_) {
     if (Req.numDims > kEJitMaxRequestDims ||
         Req.generation != state_->generation.loadAcquire()) {
+      state_->attemptRejectedStale.fetchAdd(1);
       requestAttemptUnlock(state_);
       return 0;
     }
@@ -1672,20 +1667,38 @@ uint64_t EJitSharedTaskPool::beginRequestAttempt(const EJitCompileRequest &Req,
           Req.dims[I].instanceId >= kEJitSharedInstances ||
           state_->enabled[Req.dims[I].dimType][Req.dims[I].instanceId].loadAcquire() == 0 ||
           Req.versions[I] != instanceVersion(Req.dims[I].dimType, Req.dims[I].instanceId)) {
+        state_->attemptRejectedStale.fetchAdd(1);
         requestAttemptUnlock(state_);
         return 0;
       }
   }
   EJitSharedRequestAttempt *Free = nullptr;
-  for (EJitSharedRequestAttempt &A : state_->requestAttempts)
-    if (A.token.loadRelaxed() == 0) {
-      Free = &A;
-      break;
+  if (state_->attemptLiveCount.loadRelaxed() < kEJitSharedRequestAttemptCapacity) {
+    const uint32_t Start = state_->attemptFreeCursor.loadRelaxed();
+    for (uint32_t I = 0; I < kEJitSharedRequestAttemptCapacity; ++I) {
+      const uint32_t Index = (Start + I) % kEJitSharedRequestAttemptCapacity;
+      if (!state_->requestAttempts[Index].token.loadRelaxed()) {
+        Free = &state_->requestAttempts[Index];
+        state_->attemptFreeCursor.storeRelaxed(
+            (Index + 1) % kEJitSharedRequestAttemptCapacity);
+        break;
+      }
     }
+  }
   if (!Free) {
+    state_->attemptRejectedFull.fetchAdd(1);
     requestAttemptUnlock(state_);
     return 0;
   }
+  // Only admitted allocations consume a token, not busy/full-table misses.
+  const uint64_t Last = state_->nextAttemptToken.loadRelaxed();
+  if (Last == UINT64_MAX) {
+    state_->attemptRejectedToken.fetchAdd(1);
+    requestAttemptUnlock(state_);
+    return 0;
+  }
+  const uint64_t Token = Last + 1;
+  state_->nextAttemptToken.storeRelaxed(Token);
   if (EnqueuePeerCandidate &&
       dedupMark(Req.funcIndex, Token) != EJitDedupResult::Claimed) {
     requestAttemptUnlock(state_);
@@ -1713,6 +1726,8 @@ uint64_t EJitSharedTaskPool::beginRequestAttempt(const EJitCompileRequest &Req,
   Free->token.storeRelease(Token);
   state_->attemptLiveCount.storeRelaxed(state_->attemptLiveCount.loadRelaxed() +
                                         1);
+  state_->attemptHighWater.storeRelaxed(std::max(
+      state_->attemptHighWater.loadRelaxed(), state_->attemptLiveCount.loadRelaxed()));
   if (EnqueuePeerCandidate) {
     // Commit the queue and the borrow as one operation. A full queue has no
     // reader or published slot to cancel, and needs no bucket writer lock.
@@ -2111,7 +2126,8 @@ void EJitSharedTaskPool::cancelAttemptsForInstance(uint32_t DimType,
                                                    uint32_t InstanceId) {
   if (!state_ || state_->requestAttemptsEnabled.loadAcquire() == 0)
     return;
-  uint64_t Tokens[kEJitSharedRequestAttemptCapacity] = {};
+  SmallVector<uint64_t, 16> Tokens;
+  Tokens.resize(kEJitSharedRequestAttemptCapacity);
   uint32_t Count = 0;
   requestAttemptLock(state_);
   for (EJitSharedRequestAttempt &A : state_->requestAttempts) {
@@ -2134,7 +2150,8 @@ void EJitSharedTaskPool::cancelAllRequestAttempts(
     uint32_t Generation, EJitRequestAttemptReason Reason) {
   if (!state_ || state_->requestAttemptsEnabled.loadAcquire() == 0)
     return;
-  uint64_t Tokens[kEJitSharedRequestAttemptCapacity] = {};
+  SmallVector<uint64_t, 16> Tokens;
+  Tokens.resize(kEJitSharedRequestAttemptCapacity);
   uint32_t Count = 0;
   requestAttemptLock(state_);
   for (EJitSharedRequestAttempt &A : state_->requestAttempts)
@@ -2151,6 +2168,66 @@ void EJitSharedTaskPool::cancelAllRequestAttempts(
 //===----------------------------------------------------------------------===//
 // MPSC queue helpers (Vyukov, §3.3) over the shared ring.
 //===----------------------------------------------------------------------===//
+EJitCompileOrGetStatus EJitSharedTaskPool::resumeRepresentativeWaiter(
+    const EJitCompileRequest &Retained) {
+  if (!state_ || !isOwner_ || !representativeWakeFn_ ||
+      !state_->requestAttemptsEnabled.loadAcquire() ||
+      state_->initState.loadAcquire() !=
+          static_cast<uint32_t>(EJitSharedInitState::Ready))
+    return EJitCompileOrGetStatus::OffMode;
+  if (Retained.numDims > kEJitMaxRequestDims)
+    return EJitCompileOrGetStatus::InvalidParam;
+  EJitCompileRequest Wake{};
+  if (!representativeWakeFn_(representativeWakeCtx_,
+                            stripReqTier(Retained.funcIndex), Retained.dims,
+                            Retained.numDims, Wake))
+    return EJitCompileOrGetStatus::PgoAdmissionDeferred;
+  requestAttemptLock(state_);
+  auto *A = findAttemptLocked(state_, Retained.attemptToken);
+  if (!A || !attemptIdentityMatchesLocked(*A, Retained) ||
+      !attemptIdentityMatchesLocked(*A, Wake) ||
+      decodeReqTier(Wake.funcIndex) != kEJitTierPgoUse) {
+    requestAttemptUnlock(state_);
+    return EJitCompileOrGetStatus::InvalidParam;
+  }
+  const uint32_t Flags = A->flags.loadRelaxed();
+  if ((Flags & EJitAttemptCancelRequested) ||
+      Retained.generation != state_->generation.loadAcquire() ||
+      !versionsCurrent(Retained)) {
+    requestAttemptUnlock(state_);
+    return EJitCompileOrGetStatus::PgoAdmissionDeferred;
+  }
+  // Only a borrow-only classified waiter can be rearmed. A queued/active
+  // request, sampler or pending publication must retain its current owner.
+  if (Flags != EJitAttemptBorrowPending ||
+      dedupMark(Retained.funcIndex, Retained.attemptToken) !=
+          EJitDedupResult::Claimed) {
+    requestAttemptUnlock(state_);
+    return EJitCompileOrGetStatus::AlreadyPending;
+  }
+  auto Req = Retained;
+  Req.boundCount = A->boundCount;
+  for (uint32_t I = 0; I < Req.boundCount; ++I)
+    Req.boundPointers[I] = A->boundPointers[I];
+  Req.funcIndex = Wake.funcIndex;
+  Req.t1DispatchCount = Wake.t1DispatchCount;
+  Req.t1DispatchLimit = Wake.t1DispatchLimit;
+  Req.t1QuotaEnd = Wake.t1QuotaEnd;
+  A->flags.storeRelaxed(Flags | EJitAttemptQueueOwned |
+                       EJitAttemptPublicationPending);
+  if (!queuePush(Req)) {
+    A->flags.storeRelaxed(Flags);
+    dedupClear(Req.funcIndex, Req.attemptToken);
+    requestAttemptUnlock(state_);
+    EJIT_STAT_INC(state_->counters.queueFull);
+    return EJitCompileOrGetStatus::QueueFullFallback;
+  }
+  state_->attemptResumed.fetchAdd(1);
+  requestAttemptUnlock(state_);
+  EJIT_STAT_INC(state_->counters.asyncEnqueues);
+  return EJitCompileOrGetStatus::EnqueuedPending;
+}
+
 EJitCompileOrGetStatus EJitSharedTaskPool::enqueueRepresentativeWake(
     EJitCompileRequest &Req) {
   if (state_->requestAttemptsEnabled.loadAcquire()) {
@@ -3906,6 +3983,13 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   st->requestAttemptsEnabled.storeRelaxed(requestAttemptsEnabled ? 1u : 0u);
   st->attemptLock.storeRelaxed(0);
   st->attemptLiveCount.storeRelaxed(0);
+  st->attemptHighWater.storeRelaxed(0);
+  st->attemptFreeCursor.storeRelaxed(0);
+  st->attemptRejectedFull.storeRelaxed(0);
+  st->attemptRejectedBusy.storeRelaxed(0);
+  st->attemptRejectedStale.storeRelaxed(0);
+  st->attemptRejectedToken.storeRelaxed(0);
+  st->attemptResumed.storeRelaxed(0);
   st->attemptHistoryWrite.storeRelaxed(0);
   st->attemptHistoryCount.storeRelaxed(0);
   st->nextAttemptToken.storeRelaxed(nextAttemptToken);
@@ -5098,8 +5182,8 @@ EJitSharedTaskPool::compileOrGetValidated(
   if (TrackAttempt) {
     Req.attemptToken = beginRequestAttempt(Req, pgoForRequest);
     if (!Req.attemptToken) {
-      EJIT_DIAG("shared request attempt unavailable func=%u: capacity/token",
-                funcIndex);
+      // Count the precise rejection at allocation; do not flood business or
+      // maintenance loops with a log for every miss while the table is full.
       R.status = EJitCompileOrGetStatus::QueueFullFallback;
       return R;
     }
@@ -6119,6 +6203,14 @@ void EJitSharedTaskPool::getDiagnostics(EJitSharedDiagnostics &out) const {
   out.queueDepth =
       state_->enqueuePos.loadRelaxed() - state_->dequeuePos.loadRelaxed();
   out.pendingCount = pendingCount();
+  out.attemptLiveCount = state_->attemptLiveCount.loadAcquire();
+  out.attemptCapacity = kEJitSharedRequestAttemptCapacity;
+  out.attemptHighWater = state_->attemptHighWater.loadRelaxed();
+  out.attemptRejectedFull = state_->attemptRejectedFull.loadRelaxed();
+  out.attemptRejectedBusy = state_->attemptRejectedBusy.loadRelaxed();
+  out.attemptRejectedStale = state_->attemptRejectedStale.loadRelaxed();
+  out.attemptRejectedToken = state_->attemptRejectedToken.loadRelaxed();
+  out.attemptResumed = state_->attemptResumed.loadRelaxed();
   uint32_t ready = 0;
   for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
     for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s)

@@ -76,7 +76,9 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// v28 routes cold peer admission through the worker queue without a reply.
 /// v29 also routes representative sampling progress and Tier-2 claims to the
 /// worker, using the published slot's exact quota instead of per-call replies.
-constexpr uint32_t kEJitSharedAbiVersion = 29u;
+/// v30 expands live request storage and adds pressure diagnostics. All cores
+/// must agree on both this ABI and the configured request-attempt capacity.
+constexpr uint32_t kEJitSharedAbiVersion = 30u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

@@ -907,6 +907,14 @@ if(EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS LESS 1)
     "EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS (${EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS}) "
     "must be >= 1 (fixed slot array per cache bucket).")
 endif()
+set(EJIT_SRE_REQUEST_ATTEMPT_CAPACITY "8192" CACHE STRING
+  "Maximum live logical request leases, including representative waiters")
+ejit_require_numeric(EJIT_SRE_REQUEST_ATTEMPT_CAPACITY)
+if(EJIT_SRE_REQUEST_ATTEMPT_CAPACITY LESS 1 OR
+   EJIT_SRE_REQUEST_ATTEMPT_CAPACITY GREATER 65536)
+  message(FATAL_ERROR "EJIT_SRE_REQUEST_ATTEMPT_CAPACITY must be in [1, 65536]")
+endif()
+add_definitions(-DEJIT_SRE_REQUEST_ATTEMPT_CAPACITY=${EJIT_SRE_REQUEST_ATTEMPT_CAPACITY})
 # Cross-core fnPtr sharing capability (spec §11). DEFAULT OFF: a non-owner core
 # cleanly falls back instead of reading a cache fnPtr. Turn ON only when the
 # platform GUARANTEES: same address space, the code pool mapped at the SAME VA
@@ -1001,6 +1009,7 @@ if(EJIT_FREESTANDING AND NOT EJIT_ICACHE_SECTION)
 endif()
 message(STATUS "EmbeddedJIT: cross-core shared taskpool enabled "
                "(cacheSlots=${EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS}, "
+               "requestAttempts=${EJIT_SRE_REQUEST_ATTEMPT_CAPACITY}, "
                "workerStack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}, "
                "workerCore=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE}, "
                "platformCoreId=${EJIT_FREESTANDING}, "

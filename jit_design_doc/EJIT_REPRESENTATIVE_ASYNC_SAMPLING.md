@@ -100,6 +100,9 @@ BE object compilation is not final SDK linking. These host tests do not prove
 product memory mappings, SDK scheduling latency or watchdog recovery. Product
 board acceptance and a before/after watchdog trace remain outstanding.
 
+The subsequent live-request-capacity update requires v30 instead; see the
+current deployment instructions in `EJIT_CODE_REUSE_BOARD.md`.
+
 ## Follow-up: publication with continuous candidate traffic
 
 Parent `ff8a57d1f00a41a67c39c38521ad4ac4cfe3e50a` still required the entire
@@ -134,3 +137,56 @@ Two pre-existing disabled tests remain unexecuted. Evidence under the same
 server directory: `publish-starvation-red.log`,
 `publish-starvation-final-{1..5}.log/xml`, `publish-starvation-stress.log`, and
 `publish-starvation-be.log`. No product-board validation was performed here.
+
+## Follow-up: retained request capacity and full-table progress
+
+On parent `7b83c089b1ee7733a8f09ff6a6996c58b70a359e`, a queue/classification
+test retaining 200 x 6 x 6 member identities failed at identity 256: the
+257th member could not allocate a lease. Waiting members consume live slots
+even though they have no private T1. A separate progress problem was that
+owner maintenance allocated a second request before waking a retained member.
+
+The default is now 8192 live slots, configurable in CMake (1..65536). A rotating
+free-slot cursor avoids repeatedly scanning the occupied prefix. Full-table
+and busy-lock misses do not burn attempt tokens. Owner final-member work
+rearms its original borrow with queue/publication ownership, not another
+allocation or sampling session. Ring rejection rolls back just the rearm,
+preserving the source lease. Identity/generation/version/cancellation checks
+remain in force. No-bundle re-election still goes through ordinary admission;
+it must not be confused with final T2 resumption. The old per-miss INFO line
+is replaced by snapshot counters in `ejit_taskpool_print_stats`.
+
+Shared ABI v30 includes pressure counters. Cancellation snapshots use private
+dynamic storage rather than an array proportional to capacity on the task
+stack. Native AArch64 measured 208 bytes per attempt and 2,133,952 bytes for
+the complete shared state in the test configuration. The request-array growth
+is 1,650,688 bytes; it does not allocate more executable code pools.
+
+The pressure fixture uses the real peer queue, classifier hook and attempt
+lifecycle with mock compilation, not 7200 ORC compilations. It covers 7200
+simultaneous retained identities, a completely full 8192-slot table, repeated
+overflow misses, member resumption, duplicate wake, failed enqueue rollback,
+stale/wrong identities, deactivation, compile failure and full shutdown cleanup.
+Existing real-ORC tests separately verify the exact 64-call quota, frozen
+profile, shared final function pointer, retries and repeated group re-election.
+Request capacity is not group capacity, cache capacity or code-pool capacity.
+
+Validation (audit ON, serialized builds, at most `-j8`):
+
+| Check | Result |
+| --- | --- |
+| Final native runtime/pool/PGO/folding suite | 398/398, five fresh processes; two pre-existing disabled tests |
+| Capacity, async observation and bounded-publication cases | 10/10, shuffled 50 repeats |
+| Existing 128-generation re-election/borrow regression | 20 repeats after fixing the no-bundle routing distinction |
+| BE Linux ABI/compiler model | SharedTaskPool, CompileDriver and Runtime compile; MSB AArch64 objects verified |
+| CMake capacity validation | 0, 65537 and nonnumeric input rejected; 8192 accepted |
+| lipo GC and merge roots | Real AArch64 object/archive test passes, including `ejit_taskpool_print_stats`; bound-pointer root test passes |
+
+Evidence is in the same server support directory:
+`attempt-capacity-red.log`, `attempt-capacity-release-{1..5}.log/xml`,
+`attempt-capacity-release-stress.log`, `attempt-capacity-reelection.log`,
+`attempt-capacity-be.log`, `attempt-capacity-config-*.log`,
+`attempt-capacity-lipo.log`, and `attempt-capacity-lipo-real.log`.
+An intermediate full-suite run caught the no-bundle re-election regression;
+it was corrected before the five final clean runs. The BE model uses real GNU
+target inputs but is not a final SRE SDK link or board validation.

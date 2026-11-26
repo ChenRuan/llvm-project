@@ -70,7 +70,7 @@
 #define EJIT_SRE_SHARED_DUMP_NAME_BYTES 128u
 #endif
 #ifndef EJIT_SRE_REQUEST_ATTEMPT_CAPACITY
-#define EJIT_SRE_REQUEST_ATTEMPT_CAPACITY 256u
+#define EJIT_SRE_REQUEST_ATTEMPT_CAPACITY 8192u
 #endif
 #ifndef EJIT_SRE_REQUEST_HISTORY_CAPACITY
 #define EJIT_SRE_REQUEST_HISTORY_CAPACITY 64u
@@ -745,6 +745,13 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   alignas(kEJitSharedCacheLine) EJitAtomicU32 requestAttemptsEnabled;
   EJitAtomicU32 attemptLock;
   EJitAtomicU32 attemptLiveCount;
+  EJitAtomicU32 attemptHighWater;
+  EJitAtomicU32 attemptFreeCursor;
+  EJitAtomicU64 attemptRejectedFull;
+  EJitAtomicU64 attemptRejectedBusy;
+  EJitAtomicU64 attemptRejectedStale;
+  EJitAtomicU64 attemptRejectedToken;
+  EJitAtomicU64 attemptResumed;
   EJitAtomicU32 attemptHistoryWrite;
   EJitAtomicU32 attemptHistoryCount;
   /// Monotonic and deliberately preserved across owner re-initialization.

@@ -907,6 +907,15 @@ void ejit_taskpool_print_stats() {
   if (EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr) {
     EJitSharedDiagnostics d;
     sp->getDiagnostics(d);
+    EJIT_DIAG_RAW("  attempts live=%u/%u highwater=%u resumed=%llu "
+                  "reject_full=%llu reject_busy=%llu reject_stale=%llu "
+                  "reject_token=%llu",
+                  d.attemptLiveCount, d.attemptCapacity, d.attemptHighWater,
+                  static_cast<unsigned long long>(d.attemptResumed),
+                  static_cast<unsigned long long>(d.attemptRejectedFull),
+                  static_cast<unsigned long long>(d.attemptRejectedBusy),
+                  static_cast<unsigned long long>(d.attemptRejectedStale),
+                  static_cast<unsigned long long>(d.attemptRejectedToken));
     EJIT_DIAG_RAW("  initState=%u ownerCore=%u gen=%u lastInitErr=%u "
                   "initAttempts=%u share=%u",
                   d.initState, d.ownerCoreId, d.generation, d.lastInitError,
