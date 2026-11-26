@@ -8034,6 +8034,15 @@ TEST_F(SharedTaskPoolTest,
   EJitSharedTaskPool Pool;
   Pool.setPgoEnabled(true, 2);
   bringUpOwner(Pool, /*codeSharing=*/false, /*requestAttempts=*/true);
+  Pool.setCompiler(
+      +[](void *Ctx, const EJitCompileRequest &Req, void **Out) {
+        auto &P = *static_cast<EJitSharedTaskPool *>(Ctx);
+        if (decodeReqTier(Req.funcIndex) == kEJitTierInstrumented &&
+            !P.markRequestAttemptRepresentativeT1(Req))
+          return false;
+        return mockCompile(nullptr, Req, Out);
+      },
+      &Pool);
   Pool.setSamplingAdmissionCallback(
       +[](void *, uint32_t, const EJitDimPair *, uint32_t, uint32_t, uint64_t) {
         return EJitSharedTaskPool::SamplingAdmission::Grant;
@@ -8053,6 +8062,7 @@ TEST_F(SharedTaskPoolTest,
   auto *Slot = findReadySlot(Func);
   ASSERT_NE(Slot, nullptr);
   ASSERT_EQ(Slot->t1DispatchLimit.loadAcquire(), 2u);
+  ASSERT_EQ(Slot->representativeT1.loadAcquire(), 1u);
   const auto &Bucket = state_->buckets[bucketOfIdentity(Func, nullptr, 0)];
   for (uint64_t Count = 0; Count != 2; ++Count) {
     // Exercise both a normal dispatch and the dispatch that closes the quota.
@@ -8081,6 +8091,7 @@ TEST_F(SharedTaskPoolTest,
   Slot = findReadySlot(Func);
   ASSERT_NE(Slot, nullptr);
   EXPECT_EQ(Slot->tier.loadAcquire(), kEJitTierPgoUse);
+  EXPECT_EQ(Slot->representativeT1.loadAcquire(), 0u);
   EXPECT_EQ(Pool.liveRequestAttemptCount(), 0u);
 }
 

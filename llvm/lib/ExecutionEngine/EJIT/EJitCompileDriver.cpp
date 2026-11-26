@@ -2360,6 +2360,8 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         const EJitRepresentativeSession *RepSession = nullptr;
         if (bindRepresentativeTier1(request, cacheKey, &RepSession) &&
             RepSession) {
+          if (!sharedPool_.markRequestAttemptRepresentativeT1(*request))
+            return nullptr;
           Identity.representativeAttemptToken = request->attemptToken;
           Identity.generation = request->generation;
           Identity.groupId = repGroupFor(stripReqTier(request->funcIndex),

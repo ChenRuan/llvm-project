@@ -200,6 +200,7 @@ enum EJitRequestAttemptFlag : uint32_t {
   EJitAttemptCancelRequested = 1u << 5,
   EJitAttemptWaitingProfile = 1u << 6,
   EJitAttemptHoldsAdmission = 1u << 7,
+  EJitAttemptRepresentativeT1 = 1u << 8,
 };
 
 enum class EJitRequestAttemptReason : uint32_t {
@@ -400,6 +401,10 @@ struct EJitSharedCacheSlot {
   /// that has not been reused after publish. The ABI field is always present;
   /// it is meaningful only when EJIT_STATS_ENABLE updates it.
   EJitAtomicU8 postPublishSeen;
+  /// Set only if this exact Tier-1 attempt bound a representative session.
+  /// Independent attempts still observe their own quota, but do not need
+  /// a reply from the representative owner.
+  EJitAtomicU8 representativeT1;
 
   /// Observed real Tier-1 dispatch boundary (v21, experimental sharing
   /// contract). These fields belong to the exact attempt that published this

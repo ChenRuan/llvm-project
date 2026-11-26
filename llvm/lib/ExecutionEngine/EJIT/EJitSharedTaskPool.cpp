@@ -1874,6 +1874,25 @@ void EJitSharedTaskPool::markRequestAttemptWaitingProfile(uint64_t Token) {
   requestAttemptUnlock(state_);
 }
 
+bool EJitSharedTaskPool::markRequestAttemptRepresentativeT1(
+    const EJitCompileRequest &Req) {
+  if (!state_ || !isOwner_ || !Req.attemptToken ||
+      decodeReqTier(Req.funcIndex) != kEJitTierInstrumented)
+    return false;
+  requestAttemptLock(state_);
+  EJitSharedRequestAttempt *Attempt =
+      findAttemptLocked(state_, Req.attemptToken);
+  const uint32_t Flags = Attempt ? Attempt->flags.loadRelaxed() : 0;
+  const bool Live = Attempt && attemptIdentityMatchesLocked(*Attempt, Req) &&
+                    (Flags & (EJitAttemptCompileActive |
+                              EJitAttemptCancelRequested)) ==
+                        EJitAttemptCompileActive;
+  if (Live)
+    Attempt->flags.storeRelaxed(Flags | EJitAttemptRepresentativeT1);
+  requestAttemptUnlock(state_);
+  return Live;
+}
+
 bool EJitSharedTaskPool::cancelRequestAttempt(uint64_t Token,
                                               EJitRequestAttemptReason Reason) {
   if (!state_ || !Token)
@@ -3601,6 +3620,7 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   }
 
   bool AttemptLocked = false;
+  bool RepresentativeT1 = false;
   if (req.attemptToken) {
     requestAttemptLock(state_);
     AttemptLocked = true;
@@ -3616,6 +3636,7 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
       bucketWriteRelease(B);
       return EJitPublishStatus::Failed;
     }
+    RepresentativeT1 = (Flags & EJitAttemptRepresentativeT1) != 0;
   }
 
   // Observation exclusion (v22): this writes the slot's identity and its
@@ -3699,6 +3720,7 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
       state_->pgoEnabled.loadAcquire() != 0;
   target->t1DispatchLimit.storeRelaxed(
       ObserveT1 ? state_->tier2Threshold.loadAcquire() : 0u);
+  target->representativeT1.storeRelaxed(ObserveT1 && RepresentativeT1);
   target->t1DispatchCount.storeRelaxed(0);
   target->t1QuotaEnd.storeRelaxed(0);
   target->postPublishSeen.storeRelaxed(0);
@@ -3996,6 +4018,7 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
       // cannot attribute a prior generation's dispatches or quota-end time to
       // a new attempt that reuses this slot address.
       Slot.t1DispatchLimit.storeRelaxed(0);
+      Slot.representativeT1.storeRelaxed(0);
       Slot.t1DispatchCount.storeRelaxed(0);
       Slot.t1QuotaEnd.storeRelaxed(0);
     }
@@ -4316,6 +4339,7 @@ bool EJitSharedTaskPool::captureT1Observation(const EJitSharedCacheSlot &Slot,
       Slot.t1DispatchLimit.loadRelaxed() == 0)
     return false;
   R.t1Observation = true;
+  R.representativeT1 = Slot.representativeT1.loadRelaxed() != 0;
   R.t1SlotAttemptToken = Slot.attemptToken;
   R.t1SlotGeneration = Slot.generation;
   R.t1DispatchCount = Slot.t1DispatchCount.loadRelaxed();
@@ -4440,13 +4464,12 @@ EJitSharedTaskPool::classifyHit(SharedLookup Hit,
     DispatchMailboxIncarnation = 0;
   };
   auto DeliverDispatchObservation = [&](bool ClosedQuota) {
-    if (!Hit.slot)
-      return false;
-    // The local/unit-test owner has no cross-core observer to acknowledge.
-    // That is still a successful local admission; only an installed observer
-    // can reject the mailbox handshake and require an exact quota rollback.
-    if (!dispatchObserverFn_)
+    // The same pool tracks the exact quota for independent Tier-1 attempts,
+    // but only a bound representative session has an owner that can reply.
+    if (!Hit.representativeT1)
       return true;
+    if (!Hit.slot || !dispatchObserverFn_)
+      return false;
     DispatchObservation Obs;
     Obs.funcIndex = Hit.slot->funcIndex;
     Obs.attemptToken = Hit.t1SlotAttemptToken;
@@ -4487,7 +4510,8 @@ EJitSharedTaskPool::classifyHit(SharedLookup Hit,
   // Peer admission is backpressured before the shared count CAS. With every
   // mailbox legitimately held in Filling, no T1 pointer is granted and the
   // caller retries after the slot owners release their leases.
-  if (Hit.fnPtr && Hit.t1Observation && dispatchObserverFn_ && !isOwner_ &&
+  if (Hit.fnPtr && Hit.t1Observation && Hit.representativeT1 &&
+      dispatchObserverFn_ && !isOwner_ &&
       !reserveRepresentativeDispatch(DispatchMailboxIndex,
                                      DispatchMailboxIncarnation)) {
     if (Hit.hasReadToken)

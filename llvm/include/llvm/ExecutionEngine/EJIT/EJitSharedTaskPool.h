@@ -413,6 +413,8 @@ public:
     dispatchObserverFn_ = fn;
     dispatchObserverCtx_ = ctx;
   }
+  /// Owner compile path only: carry a successful session binding to publish.
+  bool markRequestAttemptRepresentativeT1(const EJitCompileRequest &Req);
   /// Peer-side representative callbacks use fixed-layout owner mailboxes.
   /// The elected worker executes owner-private callbacks and returns only POD
   /// decisions/observations to the requester.
@@ -1384,6 +1386,7 @@ private:
     /// attribute a dispatch when the slot no longer carries it (NO_RECLAIM can
     /// legally republish between the resolve and the commit).
     bool t1Observation = false;
+    bool representativeT1 = false;
     uint64_t t1SlotAttemptToken = 0;
     uint32_t t1SlotGeneration = 0;
     /// Captured from the slot while the bucket snapshot was valid: the frozen
