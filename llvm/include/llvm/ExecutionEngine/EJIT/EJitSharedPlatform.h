@@ -56,7 +56,7 @@ namespace ejit {
 /// value so a partially-zeroed or foreign blob is rejected.
 constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 
-/// ABI v29. Bump on a layout or protocol change; peers must match the owner's
+/// Shared ABI. Bump on a layout or protocol change; peers must match the owner's
 /// ABI, generation and registration fingerprint before resolving an entry.
 ///
 /// Published code and counters use separate page ranges. On a fixed RX
@@ -78,7 +78,9 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// worker, using the published slot's exact quota instead of per-call replies.
 /// v30 expands live request storage and adds pressure diagnostics. All cores
 /// must agree on both this ABI and the configured request-attempt capacity.
-constexpr uint32_t kEJitSharedAbiVersion = 30u;
+/// v31 retains deferred sampling admissions and indexes live requests by
+/// function for exact-identity coalescing without a global hot-miss scan.
+constexpr uint32_t kEJitSharedAbiVersion = 31u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

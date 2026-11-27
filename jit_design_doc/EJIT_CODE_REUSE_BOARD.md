@@ -1,8 +1,50 @@
 # PR230 Board Smoke Test (spec5)
 
+## Deferred admission coalescing (2026-11-27)
+
+The current shared protocol is **v31**, superseding v30 below. Rebuild the
+runtime package, regenerate lipo output, relink every participating core and
+cold-reset. This runtime-only change needs no new Clang flag or wrapper ABI;
+previous compatible Clang/AOT objects and embedded bitcode can be reused.
+The default remains 8192 live attempts. On the tested native AArch64 build,
+each record is 224 bytes and shared taskpool state is 2,281,408 bytes, 144 KiB
+larger than v30. Check the final SDK shared-section placement/size.
+
+A classified request that cannot obtain a T1 sampling slot keeps its original
+lease. Repeated calls with the same function, dimension versions, generation
+and bound-pointer descriptors return AOT/pending without another queue entry,
+classification or token. The worker resumes it when a slot is available;
+business calls need not trigger the retry. The coarse per-function queue claim
+is released while waiting so another identity's T2 can progress. Representative
+waiters still use their group's profile, not their own private T1. Independent
+fallback still samples 64 dispatches per admitted logical version.
+
+On core 6, `ejit_taskpool_print_stats` now also prints (illustrative numbers):
+
+```text
+admission waiting=12 resumed=8 coalesced=2000
+```
+
+- `waiting`: current classified T1 requests waiting for a sampling slot.
+- `resumed`: successful worker requeues from that waiting state.
+- `coalesced`: duplicate producer requests suppressed before token allocation.
+
+These are separate from `attempts ... resumed=...`, which counts final-member
+T2 requeues. Both counter sets reset at owner initialization. A growing
+`coalesced` count with stable token/queue counts is expected for a hot loop.
+Attempt IDs are cumulative request identities, not a count of compiled bodies
+and not a strict `functions x cells` limit. Different TRPs, lifecycle versions,
+queue failures and legitimate retries can create additional attempts.
+
+This patch does **not** enable bound-pointer code sharing. The current candidate
+path explicitly selects independent compilation for bound pointers; this is not
+evidence that their final code differs. Descriptor-aware candidate preparation,
+source lifetime handling and exact final IR/binding comparison are required
+before that restriction can be lifted. Do not remove the check as a workaround.
+
 ## Live request capacity update (2026-11-26)
 
-The current shared protocol is **v30**. Rebuild/relink all cores and cold-reset;
+This earlier capacity update introduced **v30**. Rebuild/relink all cores and cold-reset;
 do not mix it with v29 or a runtime built with another capacity.
 `EJIT_SRE_REQUEST_ATTEMPT_CAPACITY` defaults to **8192** in CMake and the header,
 and is explicit in the AArch64 BE preset. This is the number of live request
@@ -38,8 +80,8 @@ requires board validation. Existing initialization and the demo below are unchan
 
 ## Async representative sampling update (2026-11-26)
 
-This earlier sampling change introduced v29; the capacity update above now
-requires v30. Rebuild the runtime package and link a fresh image for all
+This earlier sampling change introduced v29; the latest update above now
+requires v31. Rebuild the runtime package and link a fresh image for all
 participating cores; reset before testing. No new SDK hook, public entry point or demo source
 change is required for this update. Keep `ejit_init_representative` and the
 existing audit-enabled configuration.

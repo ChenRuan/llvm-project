@@ -1609,6 +1609,17 @@ bool attemptIdentityMatchesLocked(const EJitSharedRequestAttempt &Attempt,
 
 void retireAttemptLocked(EJitSharedTaskPoolState *State,
                          EJitSharedRequestAttempt &A) {
+  const uint32_t F = A.funcIndex.loadRelaxed();
+  if (F < kEJitSharedMaxFuncIndex) {
+    uint32_t *Link = &State->attemptFunctionHeads[F];
+    const uint32_t Index = static_cast<uint32_t>(&A - State->requestAttempts) + 1;
+    while (*Link && *Link != Index)
+      Link = &State->requestAttempts[*Link - 1].nextForFunction;
+    if (*Link) *Link = A.nextForFunction;
+  }
+  A.nextForFunction = 0;
+  if (A.flags.loadRelaxed() & EJitAttemptWaitingAdmission)
+    State->admissionWaiting.storeRelaxed(State->admissionWaiting.loadRelaxed() - 1);
   const uint32_t Write = State->attemptHistoryWrite.loadRelaxed();
   EJitSharedRequestAttemptHistory &H =
       State->requestHistory[Write % kEJitSharedRequestHistoryCapacity];
@@ -1640,7 +1651,9 @@ void maybeRetireAttemptLocked(EJitSharedTaskPoolState *State,
 
 uint64_t EJitSharedTaskPool::beginRequestAttempt(const EJitCompileRequest &Req,
                                                  bool SamplingPending,
-                                                 bool EnqueuePeerCandidate) {
+                                                 bool EnqueuePeerCandidate,
+                                                 bool *Coalesced) {
+  if (Coalesced) *Coalesced = false;
   if (!state_ || state_->requestAttemptsEnabled.loadAcquire() == 0)
     return 0;
 
@@ -1671,6 +1684,37 @@ uint64_t EJitSharedTaskPool::beginRequestAttempt(const EJitCompileRequest &Req,
         requestAttemptUnlock(state_);
         return 0;
       }
+  }
+  if (Coalesced) {
+    // Retained waiters have no coarse inFlight claim: that claim must remain
+    // available for another identity's T2. Compare only this function's chain.
+    const uint32_t F = stripReqTier(Req.funcIndex);
+    for (uint32_t Link = F < kEJitSharedMaxFuncIndex
+                             ? state_->attemptFunctionHeads[F] : 0;
+         Link;
+         Link = state_->requestAttempts[Link - 1].nextForFunction) {
+      const auto &A = state_->requestAttempts[Link - 1];
+      if ((A.flags.loadRelaxed() & (EJitAttemptBorrowPending |
+                                    EJitAttemptCancelRequested)) !=
+              EJitAttemptBorrowPending ||
+          !attemptIdentityMatchesLocked(A, Req) || A.boundCount != Req.boundCount)
+        continue;
+      bool SameBounds = true;
+      for (uint32_t I = 0; I < Req.boundCount; ++I) {
+        bool Found = false;
+        for (uint32_t J = 0; J < A.boundCount; ++J)
+          if (A.boundPointers[J].argIndex == Req.boundPointers[I].argIndex &&
+              A.boundPointers[J].rawPtr == Req.boundPointers[I].rawPtr &&
+              A.boundPointers[J].size == Req.boundPointers[I].size)
+            Found = true;
+        SameBounds &= Found;
+      }
+      if (!SameBounds) continue;
+      state_->attemptCoalesced.fetchAdd(1);
+      *Coalesced = true;
+      requestAttemptUnlock(state_);
+      return 0;
+    }
   }
   EJitSharedRequestAttempt *Free = nullptr;
   if (state_->attemptLiveCount.loadRelaxed() < kEJitSharedRequestAttemptCapacity) {
@@ -1716,6 +1760,13 @@ uint64_t EJitSharedTaskPool::beginRequestAttempt(const EJitCompileRequest &Req,
       static_cast<uint32_t>(EJitRequestAttemptReason::None));
   Free->numDims = Req.numDims;
   Free->boundCount = Req.boundCount;
+  Free->fallbackPtr = Req.fallbackPtr;
+  const uint32_t F = stripReqTier(Req.funcIndex);
+  if (F < kEJitSharedMaxFuncIndex) {
+    Free->nextForFunction = state_->attemptFunctionHeads[F];
+    state_->attemptFunctionHeads[F] =
+        static_cast<uint32_t>(Free - state_->requestAttempts) + 1;
+  }
   for (uint32_t I = 0; I < kEJitSharedMaxDims; ++I) {
     Free->dims[I] = I < Req.numDims ? Req.dims[I] : EJitDimPair{};
     Free->versions[I] = I < Req.numDims ? Req.versions[I] : 0;
@@ -1743,6 +1794,109 @@ uint64_t EJitSharedTaskPool::beginRequestAttempt(const EJitCompileRequest &Req,
   }
   requestAttemptUnlock(state_);
   return Token;
+}
+
+bool EJitSharedTaskPool::parkRequestAdmission(uint64_t Token) {
+  if (!Token) return false;
+  requestAttemptLock(state_);
+  auto *A = findAttemptLocked(state_, Token);
+  if (!A || (A->flags.loadRelaxed() & EJitAttemptCancelRequested)) {
+    requestAttemptUnlock(state_);
+    return false;
+  }
+  const uint32_t Flags = A->flags.loadRelaxed();
+  if (!(Flags & EJitAttemptWaitingAdmission))
+    state_->admissionWaiting.storeRelaxed(state_->admissionWaiting.loadRelaxed() + 1);
+  A->flags.storeRelaxed((Flags & ~(EJitAttemptCompileActive | EJitAttemptQueueOwned)) |
+                       EJitAttemptWaitingAdmission);
+  requestAttemptUnlock(state_);
+  return true;
+}
+
+bool EJitSharedTaskPool::serviceDeferredAdmission() {
+  if (!isOwner_ || !state_->admissionWaiting.loadAcquire() ||
+      state_->pgoActiveFunctionCount.loadAcquire() >=
+          state_->pgoMaxActiveFunctions.loadAcquire() ||
+      state_->enqueuePos.loadAcquire() - state_->dequeuePos.loadAcquire() >=
+          kEJitSharedQueueSlots)
+    return false;
+
+  EJitCompileRequest Req{};
+  requestAttemptLock(state_);
+  // Bounded round-robin work per worker step. A hot function's other versions
+  // cannot monopolize admission or hold the coarse claim needed by its T2.
+  const uint32_t Budget = std::min(64u, kEJitSharedRequestAttemptCapacity);
+  for (uint32_t I = 0; I < Budget; ++I) {
+    const uint32_t Index = admissionScanCursor_;
+    admissionScanCursor_ = (Index + 1) % kEJitSharedRequestAttemptCapacity;
+    const auto &A = state_->requestAttempts[Index];
+    const uint32_t Flags = A.flags.loadRelaxed();
+    if ((Flags & (EJitAttemptWaitingAdmission | EJitAttemptCancelRequested)) !=
+        EJitAttemptWaitingAdmission)
+      continue;
+    const uint32_t F = A.funcIndex.loadRelaxed();
+    if (F >= kEJitSharedMaxFuncIndex || state_->inFlight[F].loadAcquire())
+      continue;
+    bool Sampling = false;
+    for (const auto &Active : state_->pgoActiveFunctions)
+      Sampling |= Active.loadAcquire() == F + 1;
+    if (Sampling) continue;
+    Req.funcIndex = encodeReqTier(F, kEJitTierInstrumented);
+    Req.attemptToken = A.token.loadRelaxed();
+    Req.generation = A.generation.loadRelaxed();
+    Req.fallbackPtr = A.fallbackPtr;
+    Req.numDims = A.numDims;
+    for (uint32_t D = 0; D < Req.numDims; ++D) {
+      Req.dims[D] = A.dims[D];
+      Req.versions[D] = A.versions[D];
+    }
+    Req.boundCount = A.boundCount;
+    for (uint32_t B = 0; B < Req.boundCount; ++B)
+      Req.boundPointers[B] = A.boundPointers[B];
+    break;
+  }
+  requestAttemptUnlock(state_);
+  if (!Req.attemptToken) return false;
+  if (Req.generation != state_->generation.loadAcquire() || !versionsCurrent(Req)) {
+    cancelRequestAttempt(Req.attemptToken, EJitRequestAttemptReason::LifecycleChanged);
+    return false;
+  }
+  if (dedupMark(Req.funcIndex, Req.attemptToken) != EJitDedupResult::Claimed)
+    return false;
+  bool NewlyAdmitted = false;
+  if (!admitPgoFunction(stripReqTier(Req.funcIndex), NewlyAdmitted, Req.attemptToken)) {
+    dedupClear(Req.funcIndex, Req.attemptToken);
+    return false;
+  }
+  requestAttemptLock(state_);
+  auto *A = findAttemptLocked(state_, Req.attemptToken);
+  const bool Current = A &&
+      (A->flags.loadRelaxed() & (EJitAttemptWaitingAdmission | EJitAttemptCancelRequested)) ==
+          EJitAttemptWaitingAdmission &&
+      Req.generation == state_->generation.loadAcquire() && versionsCurrent(Req);
+  const bool Queued = Current && queuePush(Req);
+  if (Queued) {
+    A->flags.storeRelaxed((A->flags.loadRelaxed() & ~EJitAttemptWaitingAdmission) |
+                         EJitAttemptQueueOwned | EJitAttemptSamplingPending |
+                         EJitAttemptPublicationPending);
+    state_->admissionWaiting.storeRelaxed(state_->admissionWaiting.loadRelaxed() - 1);
+    state_->admissionResumed.fetchAdd(1);
+  }
+  requestAttemptUnlock(state_);
+  if (Queued) {
+    EJIT_STAT_INC(state_->counters.asyncEnqueues);
+    return true;
+  }
+  dedupClear(Req.funcIndex, Req.attemptToken);
+  // Queue-full rollback retains the source and its waiter; it does not create
+  // another attempt or require a future business call to trigger a retry.
+  finishPgoFunction(stripReqTier(Req.funcIndex), false,
+                    "deferred-admission-queue-retry", Req.attemptToken);
+  if (!Current)
+    cancelRequestAttempt(Req.attemptToken, EJitRequestAttemptReason::LifecycleChanged);
+  else
+    EJIT_STAT_INC(state_->counters.queueFull);
+  return false;
 }
 
 bool EJitSharedTaskPool::markRequestAttemptQueued(uint64_t Token) {
@@ -3990,6 +4144,10 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   st->attemptRejectedStale.storeRelaxed(0);
   st->attemptRejectedToken.storeRelaxed(0);
   st->attemptResumed.storeRelaxed(0);
+  st->attemptCoalesced.storeRelaxed(0);
+  st->admissionResumed.storeRelaxed(0);
+  st->admissionWaiting.storeRelaxed(0);
+  for (uint32_t &Head : st->attemptFunctionHeads) Head = 0;
   st->attemptHistoryWrite.storeRelaxed(0);
   st->attemptHistoryCount.storeRelaxed(0);
   st->nextAttemptToken.storeRelaxed(nextAttemptToken);
@@ -4002,6 +4160,8 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
     A.terminalReason.storeRelaxed(0);
     A.numDims = 0;
     A.boundCount = 0;
+    A.nextForFunction = 0;
+    A.fallbackPtr = 0;
     for (uint32_t D = 0; D < kEJitSharedMaxDims; ++D) {
       A.dims[D] = {};
       A.versions[D] = 0;
@@ -5167,8 +5327,14 @@ EJitSharedTaskPool::compileOrGetValidated(
       return R;
     }
     Req.funcIndex = encodeReqTier(funcIndex, kEJitTierCandidate);
-    const uint64_t Token = beginRequestAttempt(Req, true, true);
+    bool Coalesced = false;
+    const uint64_t Token = beginRequestAttempt(Req, true, true, &Coalesced);
     if (!Token) {
+      if (Coalesced) {
+        EJIT_STAT_INC(state_->counters.alreadyPending);
+        R.status = EJitCompileOrGetStatus::AlreadyPending;
+        return R;
+      }
       state_->pgoDeferredMisses.fetchAdd(1);
       R.status = EJitCompileOrGetStatus::PgoAdmissionDeferred;
       return R;
@@ -5180,7 +5346,14 @@ EJitSharedTaskPool::compileOrGetValidated(
     return R;
   }
   if (TrackAttempt) {
-    Req.attemptToken = beginRequestAttempt(Req, pgoForRequest);
+    bool Coalesced = false;
+    Req.attemptToken = beginRequestAttempt(Req, pgoForRequest, false,
+                                           &Coalesced);
+    if (Coalesced) {
+      EJIT_STAT_INC(state_->counters.alreadyPending);
+      R.status = EJitCompileOrGetStatus::AlreadyPending;
+      return R;
+    }
     if (!Req.attemptToken) {
       // Count the precise rejection at allocation; do not flood business or
       // maintenance loops with a log for every miss while the table is full.
@@ -5735,6 +5908,10 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
         Continue = admitPgoFunction(realFuncIndex, NewlyAdmitted,
                                     req.attemptToken);
         Next.funcIndex = encodeReqTier(realFuncIndex, kEJitTierInstrumented);
+        if (!Continue && parkRequestAdmission(req.attemptToken)) {
+          dedupClear(req.funcIndex, Claim);
+          return;
+        }
       } else if (Admission == SamplingAdmission::WakeTier2) {
         EJitCompileRequest Wake{};
         if (representativeWakeFn_ &&
@@ -6075,6 +6252,8 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
     // candidate queue must not hold closed T1 quotas/admission slots forever.
     if (serviceAutoTier2Publish())
       return EJitWorkerStep::Consumed;
+    if (serviceDeferredAdmission())
+      Consumed = true;
     if (pollOne())
       return EJitWorkerStep::Consumed;
     return Consumed ? EJitWorkerStep::Consumed : EJitWorkerStep::Idle;
@@ -6211,6 +6390,9 @@ void EJitSharedTaskPool::getDiagnostics(EJitSharedDiagnostics &out) const {
   out.attemptRejectedStale = state_->attemptRejectedStale.loadRelaxed();
   out.attemptRejectedToken = state_->attemptRejectedToken.loadRelaxed();
   out.attemptResumed = state_->attemptResumed.loadRelaxed();
+  out.admissionWaiting = state_->admissionWaiting.loadAcquire();
+  out.attemptCoalesced = state_->attemptCoalesced.loadRelaxed();
+  out.admissionResumed = state_->admissionResumed.loadRelaxed();
   uint32_t ready = 0;
   for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
     for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s)

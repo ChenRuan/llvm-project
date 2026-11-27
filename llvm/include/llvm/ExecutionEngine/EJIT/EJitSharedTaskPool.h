@@ -67,6 +67,8 @@ struct EJitSharedDiagnostics {
   uint32_t attemptLiveCount, attemptCapacity, attemptHighWater;
   uint64_t attemptRejectedFull, attemptRejectedBusy, attemptRejectedStale;
   uint64_t attemptRejectedToken, attemptResumed;
+  uint32_t admissionWaiting;
+  uint64_t attemptCoalesced, admissionResumed;
   uint64_t cacheHits;
   uint64_t asyncEnqueues;
   uint64_t asyncCompiles;
@@ -1642,7 +1644,10 @@ private:
 
   uint64_t beginRequestAttempt(const EJitCompileRequest &req,
                                bool samplingPending,
-                               bool enqueuePeerCandidate = false);
+                               bool enqueuePeerCandidate = false,
+                               bool *coalesced = nullptr);
+  bool parkRequestAdmission(uint64_t token);
+  bool serviceDeferredAdmission();
   bool markRequestAttemptQueued(uint64_t token);
   bool beginRequestAttemptCompile(uint64_t token);
   void endRequestAttemptCompile(uint64_t token, bool finalRead);
@@ -1765,6 +1770,7 @@ private:
   /// prefix present at that point; later producers cannot postpone publication.
   bool autoTier2PublishPending_ = false;
   uint32_t autoTier2PublishBoundary_ = 0;
+  uint32_t admissionScanCursor_ = 0;
   // Inline-cache safety gate: true while the cache is safe to use (no releaser
   // wired - the production default). v2 does no HP-scan retire, so a wired
   // releaser (code may be freed) + the cache = UAF; the gate then auto-disables

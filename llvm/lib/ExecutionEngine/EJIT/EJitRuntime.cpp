@@ -907,6 +907,10 @@ void ejit_taskpool_print_stats() {
   if (EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr) {
     EJitSharedDiagnostics d;
     sp->getDiagnostics(d);
+    EJIT_DIAG_RAW("  admission waiting=%u resumed=%llu coalesced=%llu",
+                  d.admissionWaiting,
+                  static_cast<unsigned long long>(d.admissionResumed),
+                  static_cast<unsigned long long>(d.attemptCoalesced));
     EJIT_DIAG_RAW("  attempts live=%u/%u highwater=%u resumed=%llu "
                   "reject_full=%llu reject_busy=%llu reject_stale=%llu "
                   "reject_token=%llu",

@@ -190,3 +190,61 @@ Evidence is in the same server support directory:
 An intermediate full-suite run caught the no-bundle re-election regression;
 it was corrected before the five final clean runs. The BE model uses real GNU
 target inputs but is not a final SRE SDK link or board validation.
+
+## Follow-up: deferred candidate hot loops (2026-11-27)
+
+On parent `f9840efda`, a bound-pointer candidate that selected independent T1
+could fail sampling admission while another entry held the slot. Its attempt
+was then retired, so the next identical business call enqueued classification
+again. A red regression reproduced this without timing assumptions.
+
+The worker now parks that attempt with its source borrow and exact descriptor
+identity intact. A per-function chain under the attempt lock lets producer
+calls coalesce only matching function/dimensions/versions/generation and
+`{argIndex, rawPtr, size}` descriptors. Peer admission still uses one try-lock;
+it never waits for a worker reply. No source memory is dereferenced by lookup,
+queueing or retry. Owner-origin calls also coalesce, avoiding competing T1
+attempts for a parked representative. Maintenance and final-member resumption
+explicitly retain their existing lifecycle transitions.
+
+Worker maintenance scans at most 64 attempt slots per step, resumes an eligible
+request with its original token, and preserves the borrow on queue-full
+rollback. It releases the coarse function queue claim while parked. Stale
+versions, deactivation, cancellation, shutdown and failed compilation settle
+their exact leases. No ordinary heap source or unrelated binding is silently
+treated as equivalent. The worker also refreshes cancelled representatives
+without another producer miss, including after their diagnostic tombstone
+rotates out. Exactly 64 T1 dispatches and final precise sharing checks remain.
+
+This is shared protocol v31 (record 224 bytes; state 2,281,408 bytes on the
+tested AArch64 configuration). All cores must rebuild/relink and cold-reset.
+Public C APIs, Clang metadata/wrappers, audit settings and worker throttling are
+unchanged. The existing lipo-retained `ejit_taskpool_print_stats` reports current
+admission waiters, worker resumptions and suppressed duplicates. Bound-pointer
+candidate eligibility itself is unchanged; enabling sharing is separate work.
+
+Regression coverage includes hot-loop peer and owner calls; distinct bound
+addresses/sizes/parameter indices; six independently sampled cell identities;
+queue insertion failure and retry; compilation failure and fresh retry;
+deactivation/version change; 7200 retained identities and full-table member
+resumption; cancellation/re-election without producer retries; and the real
+20-entry shared-profile/T2 flow. Host coverage does not replace the product
+watchdog, final SDK linkage or board acceptance.
+
+Validation for this follow-up:
+
+| Check | Result |
+| --- | --- |
+| Native complete runtime/pool/PGO/folding suite | 405/405 in five fresh processes; 406/406 after adding the final compile-failure retry test; two pre-existing disabled cases |
+| Deferred admission and retained-capacity regressions | 13/13, shuffled 50 repeats |
+| Real 128-generation cancellation/re-election regression | 20 repeats; initial re-election now requires no producer retry |
+| BE Linux ABI/compiler model | All three affected implementation objects compile as MSB AArch64, audit/diagnostics ON, capacity 8192 |
+| lipo roots | Bound-pointer root and real AArch64 archive GC tests pass, explicitly including `ejit_taskpool_print_stats` |
+
+Evidence in the same server support directory: `admission-coalesce-red.log`,
+`admission-coalesce-final-{1..5}.log/xml`, `admission-coalesce-release.log/xml`,
+`admission-coalesce-stress.log`, `admission-coalesce-reelection.log`,
+`admission-coalesce-be.log`, and `admission-coalesce-lipo-{bound,gc}.log`.
+Intermediate full-suite failures exposed owner-origin duplicate attempts and
+missing worker-driven cancelled-representative refresh; both were fixed before
+the final runs. The BE build is not a final SRE SDK link or board test.

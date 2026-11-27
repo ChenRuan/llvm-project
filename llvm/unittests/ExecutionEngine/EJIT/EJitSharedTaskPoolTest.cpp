@@ -3706,7 +3706,7 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // publish/cancel/reset of the same bucket's observation identity. The v22
   // word lives in the bucket header padding, so the blob size and every slot
   // offset stay unchanged.
-  EXPECT_EQ(kEJitSharedAbiVersion, 30u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 31u);
   EXPECT_EQ(offsetof(EJitSharedCacheBucket, observationLock), 12u);
   EXPECT_EQ(offsetof(EJitSharedCacheBucket, slots), 16u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
@@ -8599,6 +8599,7 @@ protected:
     EJitCoreId::setCurrentForTest(0);
     Owner.ownerShutdown();
     EXPECT_EQ(Owner.liveRequestAttemptCount(), 0u);
+    EXPECT_EQ(state_->admissionWaiting.loadAcquire(), 0u);
     SharedTaskPoolTest::TearDown();
   }
 };
@@ -8714,6 +8715,262 @@ TEST_F(RetainedCandidateCapacityTest, BusyPeerMissReturnsWithoutBurningToken) {
   Owner.getDiagnostics(D);
   EXPECT_EQ(D.attemptRejectedBusy, 1u);
   EXPECT_EQ(D.attemptRejectedFull, 0u);
+}
+
+class DeferredCandidateAdmissionTest : public RetainedCandidateCapacityTest {
+protected:
+  uint32_t Value = 19;
+  EJitDimPair Dims[2] = {{0, 0}, {1, 0}};
+  EJitBoundPtrDescriptor Bound{&Value, sizeof(Value), 3};
+
+  void SetUp() override {
+    RetainedCandidateCapacityTest::SetUp();
+    Owner.setSamplingAdmissionCallback(
+        +[](void *Ctx, uint32_t Func, const EJitDimPair *, uint32_t, uint32_t,
+            uint64_t Token) {
+          auto &Self = *static_cast<DeferredCandidateAdmissionTest *>(Ctx);
+          return Func == 50 || Token == Self.Last.attemptToken
+                     ? EJitSharedTaskPool::SamplingAdmission::Independent
+                     : EJitSharedTaskPool::SamplingAdmission::Classify;
+        }, this);
+    EJitCoreId::setCurrentForTest(0);
+    ASSERT_EQ(Owner.compileOrGet(50, nullptr, 0, nullptr).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Owner.pollOne()); // occupy the only sampling admission
+  }
+
+  EJitSharedTaskPool::CompileOrGetResult lookup(uint32_t Func = 100) {
+    EJitCoreId::setCurrentForTest(1);
+    auto R = Peer.compileOrGet(Func, Dims, 2, nullptr, &Bound, 1);
+    EJitCoreId::setCurrentForTest(0);
+    return R;
+  }
+};
+
+TEST_F(DeferredCandidateAdmissionTest,
+       HotLoopCoalescesBoundWaiterAndWorkerResumesWithoutProducer) {
+  ASSERT_EQ(lookup().status, EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  ASSERT_EQ(Retained.size(), 1u);
+  const uint64_t Token = Retained[0].attemptToken;
+  const uint64_t Next = state_->nextAttemptToken.loadAcquire();
+  for (unsigned I = 0; I < 2000; ++I) {
+    auto R = lookup();
+    ASSERT_EQ(R.status, EJitCompileOrGetStatus::AlreadyPending);
+    EXPECT_EQ(R.fnPtr, nullptr);
+    EXPECT_FALSE(Owner.pollOne());
+  }
+  EXPECT_EQ(Retained.size(), 1u);
+  EXPECT_EQ(state_->nextAttemptToken.loadAcquire(), Next);
+  EXPECT_EQ(Owner.liveRequestAttemptCount(), 2u);
+  EJitSharedDiagnostics D{};
+  Owner.getDiagnostics(D);
+  EXPECT_EQ(D.admissionWaiting, 1u);
+  EXPECT_EQ(D.attemptCoalesced, 2000u);
+  for (unsigned I = 0; I < 64; ++I) {
+    auto R = Owner.tryCacheHit0D(50);
+    ASSERT_EQ(R.status, EJitCompileOrGetStatus::CacheHit);
+    if (R.hasReadToken) Owner.releaseRead(R.bucketIndex);
+  }
+  for (unsigned I = 0; I < 16 && !findReadySlot(100); ++I)
+    Owner.workerPollOnce();
+  auto *Ready = findReadySlot(100);
+  ASSERT_NE(Ready, nullptr);
+  EXPECT_EQ(Ready->tier.loadAcquire(), kEJitTierInstrumented);
+  EXPECT_EQ(Ready->attemptToken, Token);
+  EXPECT_EQ(state_->nextAttemptToken.loadAcquire(), Next);
+  EXPECT_EQ(Retained.size(), 1u);
+  Owner.getDiagnostics(D);
+  EXPECT_EQ(D.admissionWaiting, 0u);
+  EXPECT_EQ(D.admissionResumed, 1u);
+  EXPECT_EQ(D.pgoCompletedFunctions, 1u);
+  for (unsigned I = 0; I < 64; ++I) {
+    auto R = lookup();
+    ASSERT_EQ(R.status, EJitCompileOrGetStatus::CacheHit);
+    if (R.hasReadToken) Peer.releaseRead(R.bucketIndex);
+  }
+  auto Closed = lookup();
+  EXPECT_EQ(Closed.fnPtr, nullptr);
+  EXPECT_FALSE(Closed.hasReadToken);
+  for (unsigned I = 0; I < 16 && Owner.liveRequestAttemptCount(); ++I)
+    Owner.workerPollOnce();
+  Ready = findReadySlot(100);
+  ASSERT_NE(Ready, nullptr);
+  EXPECT_EQ(Ready->tier.loadAcquire(), kEJitTierPgoUse);
+  EXPECT_EQ(Owner.liveRequestAttemptCount(), 0u);
+  Owner.getDiagnostics(D);
+  EXPECT_EQ(D.pgoCompletedFunctions, 2u);
+  EXPECT_EQ(state_->nextAttemptToken.loadAcquire(), Next);
+}
+
+TEST_F(DeferredCandidateAdmissionTest, OwnerCallsCoalesceThePeerWaiter) {
+  ASSERT_EQ(lookup().status, EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  const uint64_t Next = state_->nextAttemptToken.loadAcquire();
+  for (unsigned I = 0; I < 2000; ++I) {
+    auto R = Owner.compileOrGet(100, Dims, 2, nullptr, &Bound, 1);
+    ASSERT_EQ(R.status, EJitCompileOrGetStatus::AlreadyPending);
+    EXPECT_FALSE(Owner.pollOne());
+  }
+  EXPECT_EQ(state_->nextAttemptToken.loadAcquire(), Next);
+  EXPECT_EQ(Retained.size(), 1u);
+  EXPECT_EQ(state_->admissionWaiting.loadAcquire(), 1u);
+}
+
+TEST_F(DeferredCandidateAdmissionTest, DistinctDimensionsEachSampleExactly64) {
+  for (unsigned Cell = 0; Cell < 6; ++Cell) {
+    Dims[0].instanceId = Cell;
+    ASSERT_EQ(lookup().status, EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Owner.pollOne());
+  }
+  ASSERT_EQ(Retained.size(), 6u);
+  const uint64_t Next = state_->nextAttemptToken.loadAcquire();
+  auto *Blocking = findReadySlot(50);
+  ASSERT_NE(Blocking, nullptr);
+  ASSERT_TRUE(Owner.cancelRequestAttempt(Blocking->attemptToken));
+  for (unsigned Cell = 0; Cell < 6; ++Cell) {
+    Dims[0].instanceId = Cell;
+    EJitSharedCacheSlot *Ready = nullptr;
+    for (unsigned I = 0; I < 256 && !Ready; ++I) {
+      Owner.workerPollOnce();
+      for (auto &Bucket : state_->buckets)
+        for (auto &Slot : Bucket.slots)
+          if (Slot.attemptToken == Retained[Cell].attemptToken &&
+              Slot.fnPtr.loadAcquire() &&
+              Slot.tier.loadAcquire() == kEJitTierInstrumented)
+            Ready = &Slot;
+    }
+    ASSERT_NE(Ready, nullptr) << "cell=" << Cell;
+    for (unsigned I = 0; I < 64; ++I) {
+      auto R = lookup();
+      ASSERT_EQ(R.status, EJitCompileOrGetStatus::CacheHit);
+      if (R.hasReadToken) Peer.releaseRead(R.bucketIndex);
+    }
+    auto Closed = lookup();
+    EXPECT_EQ(Closed.fnPtr, nullptr);
+    EXPECT_FALSE(Closed.hasReadToken);
+    for (unsigned I = 0; I < 16 &&
+         state_->pgoCompletedFunctions.loadAcquire() != Cell + 1; ++I)
+      Owner.workerPollOnce();
+    EXPECT_EQ(state_->pgoCompletedFunctions.loadAcquire(), Cell + 1);
+  }
+  EXPECT_EQ(state_->nextAttemptToken.loadAcquire(), Next);
+  EXPECT_EQ(Retained.size(), 6u);
+  EXPECT_EQ(state_->admissionWaiting.loadAcquire(), 0u);
+  EXPECT_EQ(Owner.liveRequestAttemptCount(), 0u);
+}
+
+TEST_F(DeferredCandidateAdmissionTest, QueueFullRetryPreservesOriginalBorrow) {
+  ASSERT_EQ(lookup().status, EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  const uint64_t Token = Retained[0].attemptToken;
+  auto *Blocking = findReadySlot(50);
+  ASSERT_NE(Blocking, nullptr);
+  ASSERT_TRUE(Owner.cancelRequestAttempt(Blocking->attemptToken));
+  const uint32_t Pos = state_->enqueuePos.loadAcquire();
+  auto &Cell = state_->ring[Pos % kEJitSharedQueueSlots];
+  const uint32_t Seq = Cell.sequence.loadAcquire();
+  Cell.sequence.storeRelease(Pos - 1);
+  Owner.workerPollOnce();
+  Cell.sequence.storeRelease(Seq);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EJitSharedTaskPool::RequestAttemptSnapshot S;
+  ASSERT_TRUE(Owner.requestAttemptStatus(Token, S));
+  EXPECT_NE(S.flags & EJitAttemptWaitingAdmission, 0u);
+  EXPECT_NE(S.flags & EJitAttemptBorrowPending, 0u);
+  EXPECT_EQ(S.flags & EJitAttemptHoldsAdmission, 0u);
+  for (unsigned I = 0; I < 256 && !findReadySlot(100); ++I)
+    Owner.workerPollOnce();
+  ASSERT_NE(findReadySlot(100), nullptr);
+  EXPECT_EQ(findReadySlot(100)->attemptToken, Token);
+  EXPECT_EQ(Retained.size(), 1u);
+}
+
+TEST_F(DeferredCandidateAdmissionTest, DifferentBindingsDoNotAliasAndCancelUnlinks) {
+  ASSERT_EQ(lookup().status, EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  const auto Original = Bound;
+  uint32_t Other = 27;
+  Bound.rawPtr = &Other;
+  ASSERT_EQ(lookup().status, EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  Bound = Original;
+  Bound.size = 1;
+  ASSERT_EQ(lookup().status, EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  Bound = Original;
+  Bound.argIndex = 4;
+  ASSERT_EQ(lookup().status, EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  Bound = Original;
+  EXPECT_EQ(lookup().status, EJitCompileOrGetStatus::AlreadyPending);
+  ASSERT_EQ(Retained.size(), 4u);
+  // Remove the middle, tail and head of the per-function chain.
+  for (unsigned I : {1u, 0u, 3u, 2u})
+    ASSERT_TRUE(Owner.cancelRequestAttempt(Retained[I].attemptToken));
+  EXPECT_EQ(state_->attemptFunctionHeads[100], 0u);
+  EXPECT_EQ(state_->admissionWaiting.loadAcquire(), 0u);
+  ASSERT_EQ(lookup().status, EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  EXPECT_EQ(Retained.size(), 5u);
+}
+
+TEST_F(DeferredCandidateAdmissionTest, ResumedCompileFailureAllowsFreshAttempt) {
+  ASSERT_EQ(lookup().status, EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  const uint64_t Token = Retained[0].attemptToken;
+  auto *Blocking = findReadySlot(50);
+  ASSERT_NE(Blocking, nullptr);
+  ASSERT_TRUE(Owner.cancelRequestAttempt(Blocking->attemptToken));
+  Owner.setCompiler(+[](void *, const EJitCompileRequest &, void **) {
+    return false;
+  }, nullptr);
+  for (unsigned I = 0; I < 256 && Owner.liveRequestAttemptCount(); ++I)
+    Owner.workerPollOnce();
+  EJitSharedTaskPool::RequestAttemptSnapshot S;
+  ASSERT_TRUE(Owner.requestAttemptStatus(Token, S));
+  EXPECT_FALSE(S.live);
+  EXPECT_EQ(S.terminalReason, EJitRequestAttemptReason::CompileFailure);
+  EXPECT_EQ(S.flags & EJitAttemptBorrowPending, 0u);
+  EXPECT_EQ(state_->admissionWaiting.loadAcquire(), 0u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  Owner.setCompiler(&mockCompile, nullptr);
+  ASSERT_EQ(lookup().status, EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  ASSERT_NE(findReadySlot(100), nullptr);
+  EXPECT_NE(findReadySlot(100)->attemptToken, Token);
+}
+
+TEST_F(DeferredCandidateAdmissionTest, LifecycleCancelsParkedBoundSource) {
+  ASSERT_EQ(lookup().status, EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  const uint64_t Token = Retained[0].attemptToken;
+  Owner.setInstanceEnabled(0, 0, false);
+  EXPECT_EQ(state_->admissionWaiting.loadAcquire(), 0u);
+  EJitSharedTaskPool::RequestAttemptSnapshot S;
+  ASSERT_TRUE(Owner.requestAttemptStatus(Token, S));
+  EXPECT_FALSE(S.live);
+  EXPECT_EQ(S.flags & EJitAttemptBorrowPending, 0u);
+  Owner.setInstanceEnabled(0, 0, true);
+  ASSERT_EQ(lookup().status, EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  EXPECT_NE(Retained.back().attemptToken, Token);
+  EXPECT_NE(Retained.back().versions[0], Retained.front().versions[0]);
+}
+
+TEST_F(RetainedCandidateCapacityTest, GroupWaiterHotLoopCoalescesWithoutNewT1) {
+  retain(1);
+  const uint64_t Next = state_->nextAttemptToken.loadAcquire();
+  for (unsigned I = 0; I < 2000; ++I) {
+    EJitCoreId::setCurrentForTest(1);
+    auto R = Peer.compileOrGet(100, Retained[0].dims, 2, nullptr);
+    ASSERT_EQ(R.status, EJitCompileOrGetStatus::AlreadyPending);
+    EJitCoreId::setCurrentForTest(0);
+    EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Idle);
+  }
+  EXPECT_EQ(Retained.size(), 1u);
+  EXPECT_EQ(state_->nextAttemptToken.loadAcquire(), Next);
+  EXPECT_EQ(state_->admissionWaiting.loadAcquire(), 0u);
 }
 
 TEST_F(SharedTaskPoolTest, AttemptTokenExhaustionFailsClosedWithoutAdmission) {

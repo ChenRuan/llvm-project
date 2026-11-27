@@ -2683,42 +2683,26 @@ TEST(EJitCrossCoreRuntime,
   EJitCoreId::setCurrentForTest(16);
   EXPECT_FALSE(PP->submitRepresentativeDispatch(Late));
 
-  // The next same-group waiter forces owner refresh/re-election. Reclassify
-  // cell 1 immediately; its new attempt must not inherit cell 1's old token.
-  const EJitDimPair ReentryDims[] = {
-      {RepresentativeRuntime::cellSlot(), 1},
-      {RepresentativeRuntime::trpSlot(), 1}};
+  // No producer retries: worker maintenance must retire the cancelled session
+  // and elect a surviving waiter even while peers only inspect cache state.
   void *NewT1 = nullptr;
   for (unsigned Try = 0; Try != 8192 && !NewT1; ++Try) {
     EJitCoreId::setCurrentForTest(16);
-    auto R = PP->compileOrGet(RepresentativeRuntime::funcIndex(), ReentryDims,
-                              2, nullptr);
-    if (R.fnPtr) {
-      NewT1 = R.fnPtr;
-      if (R.hasReadToken)
-        PP->releaseRead(R.bucketIndex);
-    } else if (R.hasReadToken) {
-      PP->releaseRead(R.bucketIndex);
-    }
-    if (!NewT1) {
-      // Maintenance may elect any surviving waiter; retrying cell 1 must not
-      // require that cell to win the next election.
-      EJitGroupDiagnostics D;
-      EJitGroupSnapshot S;
-      EJitFrozenProfileBundle B;
-      size_t Groups = 0;
-      if (Owner.representativeSnapshot(D, S, Groups, B) && S.hasRepresentative &&
-          S.representative.generation > BeforeS.representative.generation) {
-        const EJitDimPair ElectedDims[] = {
-            {RepresentativeRuntime::cellSlot(),
-             static_cast<uint32_t>(S.representative.logicalKey & 255)},
-            {RepresentativeRuntime::trpSlot(), 1}};
-        auto Elected = PP->compileOrGet(RepresentativeRuntime::funcIndex(),
-                                        ElectedDims, 2, nullptr);
-        NewT1 = Elected.fnPtr;
-        if (Elected.hasReadToken)
-          PP->releaseRead(Elected.bucketIndex);
-      }
+    EJitGroupDiagnostics D;
+    EJitGroupSnapshot S;
+    EJitFrozenProfileBundle B;
+    size_t Groups = 0;
+    if (Owner.representativeSnapshot(D, S, Groups, B) && S.hasRepresentative &&
+        S.representative.generation > BeforeS.representative.generation) {
+      const EJitDimPair ElectedDims[] = {
+          {RepresentativeRuntime::cellSlot(),
+           static_cast<uint32_t>(S.representative.logicalKey & 255)},
+          {RepresentativeRuntime::trpSlot(), 1}};
+      auto Elected = PP->tryCacheHit(RepresentativeRuntime::funcIndex(),
+                                     ElectedDims, 2);
+      NewT1 = Elected.fnPtr;
+      if (Elected.hasReadToken)
+        PP->releaseRead(Elected.bucketIndex);
     }
     if (!NewT1)
       std::this_thread::sleep_for(std::chrono::milliseconds(1));

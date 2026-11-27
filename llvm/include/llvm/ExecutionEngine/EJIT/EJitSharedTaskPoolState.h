@@ -201,6 +201,7 @@ enum EJitRequestAttemptFlag : uint32_t {
   EJitAttemptWaitingProfile = 1u << 6,
   EJitAttemptHoldsAdmission = 1u << 7,
   EJitAttemptRepresentativeT1 = 1u << 8,
+  EJitAttemptWaitingAdmission = 1u << 9,
 };
 
 enum class EJitRequestAttemptReason : uint32_t {
@@ -228,6 +229,8 @@ struct EJitSharedRequestAttempt {
   uint32_t versions[kEJitSharedMaxDims];
   uint32_t boundCount;
   EJitBoundPtrDescriptor boundPointers[kEJitMaxBoundPointers];
+  uint32_t nextForFunction; ///< attemptLock; slot index + 1, zero ends chain
+  uintptr_t fallbackPtr;
 };
 
 /// Bounded diagnostic tombstone. It never occupies a live-attempt slot.
@@ -752,6 +755,10 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU64 attemptRejectedStale;
   EJitAtomicU64 attemptRejectedToken;
   EJitAtomicU64 attemptResumed;
+  EJitAtomicU64 attemptCoalesced;
+  EJitAtomicU64 admissionResumed;
+  EJitAtomicU32 admissionWaiting;
+  uint32_t attemptFunctionHeads[kEJitSharedMaxFuncIndex]; ///< attemptLock
   EJitAtomicU32 attemptHistoryWrite;
   EJitAtomicU32 attemptHistoryCount;
   /// Monotonic and deliberately preserved across owner re-initialization.

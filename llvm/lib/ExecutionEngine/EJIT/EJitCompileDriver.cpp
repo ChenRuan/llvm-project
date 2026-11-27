@@ -1124,6 +1124,10 @@ bool EJitCompileDriver::serviceRepresentativeTimeouts() {
         sharedPool_.readRepresentativeDispatch(B.requestIdentity, Obs);
     if (Snapshot == EJitSharedTaskPool::DispatchSnapshot::Busy)
       continue;
+    // Coalesced waiters do not invoke admission again. Retire a cancelled
+    // representative from worker maintenance so its group can elect anew.
+    if (Snapshot == EJitSharedTaskPool::DispatchSnapshot::Missing)
+      refreshRepresentativeGroup(Entry.first);
     if (Snapshot == EJitSharedTaskPool::DispatchSnapshot::Observed && Obs.count) {
       const bool Reconciled = dispatchObserverThunk(this, Obs);
       if (Obs.closedQuota) {
@@ -1205,9 +1209,12 @@ void EJitCompileDriver::refreshRepresentativeGroup(uint64_t GroupKey) {
   unlockRepGroups();
   if (!Found || !Binding.requestAttemptToken) return;
   EJitSharedTaskPool::RequestAttemptSnapshot Status;
-  if (!sharedPool_.requestAttemptStatus(Binding.requestAttemptToken, Status))
-    return;
-  const bool Cancelled = (Status.flags & EJitAttemptCancelRequested) ||
+  const bool FoundAttempt =
+      sharedPool_.requestAttemptStatus(Binding.requestAttemptToken, Status);
+  // Tokens are never reused. A missing live record and tombstone also means
+  // this old binding ended, even after the bounded history has rotated.
+  const bool Cancelled = !FoundAttempt ||
+      (Status.flags & EJitAttemptCancelRequested) ||
       (Status.retained && Status.terminalReason != EJitRequestAttemptReason::None &&
        Status.terminalReason != EJitRequestAttemptReason::Published);
   if (!Cancelled) return;
