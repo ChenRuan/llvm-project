@@ -779,7 +779,6 @@ void EJitCompileDriver::retireDriverGenerationMetadataLocked(
       It->second.needsReclassification = true;
       It->second.finalFailed = false;
       It->second.finalFailures = 0;
-      It->second.finalReadyAt = 0;
       ++It;
       continue;
     }
@@ -926,7 +925,7 @@ bool EJitCompileDriver::classifyRepresentativeRequest(const EJitCompileRequest &
         (Route == CandidateAdmissionRoute::Group && Group != UINT64_MAX &&
          !repFailedGroups_[Group]);
     candidateBindings_[LogicalKey] =
-        CandidateBinding{Group, Req, NeedsFinalRead, false, 0, 0, Route};
+        CandidateBinding{Group, Req, NeedsFinalRead, false, 0, Route};
     candidateBindings_[LogicalKey].outcome = CandidateOutcome;
     candidateBindings_[LogicalKey].reason = CandidateReason;
   }
@@ -1047,6 +1046,15 @@ void EJitCompileDriver::completeCandidateBorrowForAttempt(
     sharedPool_.completeRequestBorrow(Token);
 }
 
+bool EJitCompileDriver::representativePublishedLocked(
+    const EJitGroupHandle &Group) const {
+  for (const auto &B : repTier1Bindings_)
+    if (B.group.groupId == Group.groupId &&
+        B.group.generation == Group.generation && B.tier2Published)
+      return true;
+  return false;
+}
+
 bool EJitCompileDriver::serviceRepresentativeWaiters() {
   if (!repGroups_) return false;
   CandidateBinding Work;
@@ -1054,19 +1062,31 @@ bool EJitCompileDriver::serviceRepresentativeWaiters() {
   bool Found = false;
   bool HasFinalBundle = false;
   lockRepGroups();
-  for (auto &C : candidateBindings_) {
+  auto It = candidateBindings_.find(representativeWaiterCursor_);
+  if (It == candidateBindings_.end())
+    It = candidateBindings_.begin();
+  const size_t Budget = std::min<size_t>(64, candidateBindings_.size());
+  for (size_t I = 0; I < Budget; ++I) {
+    auto &C = *It++;
+    if (It == candidateBindings_.end())
+      It = candidateBindings_.begin();
+    representativeWaiterCursor_ = It->first;
     if ((!C.second.finalReadPending && !C.second.needsReclassification) ||
         C.second.groupId == UINT64_MAX ||
         repFailedGroups_[C.second.groupId] || repRetiringGroups_[C.second.groupId]) continue;
     auto G = repGroupHandles_.find(C.second.groupId);
     if (G == repGroupHandles_.end()) continue;
+    const auto *Representative = repGroups_->currentRepresentative(G->second);
+    // The representative owns sampling admission and its own T2 retry path.
+    // A frozen profile alone does not make its code callable by members.
+    if (Representative && Representative->logicalKey == C.first)
+      continue;
     const bool HasBundle = repGroups_->bundleFor(G->second) != nullptr;
     // A cancelled/cold representative need not call again to unblock waiters.
     // Elect one existing legal member; only actual business calls sample it.
-    if (C.second.needsReclassification || HasBundle ||
-        !repGroups_->currentRepresentative(G->second)) {
-      if (HasBundle && !C.second.finalReadyAt)
-        C.second.finalReadyAt = ejit_taskpool_trace_now();
+    if (C.second.needsReclassification ||
+        (HasBundle && representativePublishedLocked(G->second)) ||
+        !Representative) {
       Work = C.second;
       HasFinalBundle = HasBundle;
       Key = C.first;
@@ -1085,20 +1105,12 @@ bool EJitCompileDriver::serviceRepresentativeWaiters() {
     completeCandidateBorrow(Key, &R);
     return true;
   }
-  const uint64_t Now = ejit_taskpool_trace_now();
-  if (Work.finalReadyAt && Now >= Work.finalReadyAt &&
-      Now - Work.finalReadyAt >= repTimeoutTicks_.loadAcquire()) {
-    lockRepGroups();
-    auto C = candidateBindings_.find(Key);
-    if (C != candidateBindings_.end() && C->second.request.attemptToken == R.attemptToken)
-      C->second.finalFailed = true;
-    unlockRepGroups();
-    completeCandidateBorrow(Key, &R);
-    EJIT_DIAG("member final wait timed out key=0x%016lx; source lease ended", Key);
-    return false; // queued stale work still drains and observes finalFailed
-  }
-  // This is owner scheduling after group publication/re-election, never execution:
-  // waiters have no private T1 and a representative's closed T1 routes AOT.
+  // Queue residence is not a failed source read. Retain a valid member borrow
+  // until actual completion, bounded transform failure, or lifecycle cancel.
+  // Only a representative with no sampling progress uses the idle timeout.
+  // This is owner scheduling after group publication/re-election, never
+  // execution: waiters have no private T1 and a representative's closed T1
+  // routes AOT.
   auto Result = sharedPool_.tryCacheHit(stripReqTier(R.funcIndex), R.dims,
                                       R.numDims);
   if (!Result.fastPathTerminal) {
@@ -1421,7 +1433,8 @@ EJitCompileDriver::admitSamplingRequest(uint32_t funcIndex,
     // the bundle exists; before that it stays on its AOT fallback. Returning
     // WakeTier2 when the bundle is live is what turns a member with no sampling
     // session of its own into a consumer of the shared profile.
-    const bool Published = repGroups_->bundleFor(G) != nullptr;
+    const bool Published =
+        repGroups_->bundleFor(G) != nullptr && representativePublishedLocked(G);
     unlockRepGroups();
     return Published ? EJitSharedTaskPool::SamplingAdmission::WakeTier2
                      : EJitSharedTaskPool::SamplingAdmission::Deny;
@@ -1476,7 +1489,7 @@ bool EJitCompileDriver::representativeWakeThunk(void *ctx, uint32_t funcIndex,
   }
   const EJitGroupHandle G = It->second;
   EJitFrozenProfileBundle Bundle = drv->repGroups_->bundleFor(G);
-  if (!Bundle) {
+  if (!Bundle || !drv->representativePublishedLocked(G)) {
     drv->unlockRepGroups();
     return false; // publication barrier: the member stays on AOT
   }

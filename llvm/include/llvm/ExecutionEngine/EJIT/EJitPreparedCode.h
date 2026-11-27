@@ -108,7 +108,7 @@ struct EJitIdentityDiagnosticOptions {
 };
 
 struct EJitCandidateLimits {
-  uint32_t maxGroups = 128;
+  uint32_t maxGroups = 4096;
   uint64_t maxIdentityBytes = 16 * 1024 * 1024;
   uint64_t maxModuleBytes = 1024 * 1024;
 };
@@ -177,7 +177,7 @@ struct EJitPreparedCodeLimits {
   uint64_t maxModuleBytes = 1024 * 1024;
   uint64_t maxDefinedDataBytes = 1024 * 1024;
   uint64_t maxIdentityBytes = 16 * 1024 * 1024;
-  uint32_t maxCodeObjects = 128;
+  uint32_t maxCodeObjects = 4096;
   uint32_t maxIRNodes = 262144;
 };
 

@@ -1708,6 +1708,10 @@ TEST_F(SharedTaskPoolTest,
   ASSERT_TRUE(Owner.pollOne()); // Link T2, retaining the old T1 cache slot.
   ASSERT_EQ(Owner.pendingPublishCount(), 1u);
   ASSERT_EQ(Batch.flushCalls, 0u);
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
+  EXPECT_EQ(Batch.flushCalls, 1u);
+  EXPECT_EQ(Owner.pendingPublishCount(), 0u);
+  EXPECT_NE(state_->enqueuePos.loadAcquire(), state_->dequeuePos.loadAcquire());
   for (unsigned I = 0; I != 8; ++I) {
     // The business workload keeps the candidate queue nonempty even when
     // the profile admission limit prevents another T1 from starting.
@@ -1771,6 +1775,55 @@ TEST_F(SharedTaskPoolTest, BatchPgoAutoPublishWaitsForQueuedTier1) {
   EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
   EXPECT_EQ(Batch.flushCalls, 1u);
   EXPECT_EQ(Owner.pendingPublishCount(), 0u);
+}
+
+TEST_F(SharedTaskPoolTest, RepresentativePublishFailureRetriesWithoutProducer) {
+  BatchPublishCtx Batch;
+  Batch.tier1ReadyImmediately = true;
+  EJitSharedTaskPool Owner;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&mockBatchCompile, &Batch);
+  Owner.setCodeRangeProvider(&mockBatchRange, &Batch);
+  Owner.setCodeBatchCallbacks(&mockBatchReady, &mockBatchFlush, &Batch);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setPgoEnabled(true, 64, 1);
+  ASSERT_TRUE(Owner.setRequestAttemptsEnabled(true));
+  Owner.setRepresentativeSharingEnabled(true);
+  Owner.setSamplingAdmissionCallback(
+      +[](void *, uint32_t, const EJitDimPair *, uint32_t, uint32_t, uint64_t) {
+        return EJitSharedTaskPool::SamplingAdmission::Independent;
+      },
+      nullptr);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(Owner.compileOrGet(52, nullptr, 0, nullptr).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  for (unsigned I = 0; I < 64; ++I) {
+    auto R = Owner.tryCacheHit0D(52);
+    ASSERT_TRUE(R.hasReadToken);
+    Owner.releaseRead(R.bucketIndex);
+  }
+  ASSERT_TRUE(Owner.pollOne());
+  ASSERT_EQ(Owner.pendingPublishCount(), 1u);
+  Batch.failFlush = true;
+  Owner.workerPollOnce();
+  EXPECT_EQ(Batch.flushCalls, 1u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+  EXPECT_EQ(findReadySlot(52)->tier.loadAcquire(), kEJitTierInstrumented);
+  // A failing platform hook must neither recompile T2 nor spin on every turn.
+  for (unsigned I = 0; I < 8; ++I)
+    Owner.workerPollOnce();
+  EXPECT_EQ(Batch.flushCalls, 1u);
+  Batch.failFlush = false;
+  Owner.workerPollOnce();
+  EXPECT_EQ(Batch.flushCalls, 2u);
+  EXPECT_EQ(Batch.compileOrder.size(), 2u);
+  EXPECT_EQ(Batch.compileOrder.back().t1DispatchCount, 64u);
+  EXPECT_EQ(findReadySlot(52)->tier.loadAcquire(), kEJitTierPgoUse);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(Owner.liveRequestAttemptCount(), 0u);
+  EXPECT_EQ(Owner.pendingCount(), 0u);
 }
 
 TEST_F(SharedTaskPoolTest, BatchPgoFourTier2CompilesRetainWorkerThrottle) {
@@ -8105,7 +8158,7 @@ protected:
 
   void SetUp() override {
     SharedTaskPoolTest::SetUp();
-    Pool.setPgoEnabled(true, 64);
+    Pool.setPgoEnabled(true, 64, 4);
     Pool.setRepresentativeSharingEnabled(true);
     bringUpOwner(Pool, false, true);
     Pool.setCompiler(
@@ -8245,6 +8298,93 @@ TEST_F(AsyncRepresentativeDispatchTest, TimeoutCannotCancelNewSamplingProgress) 
   Pool.enqueueObservedRepresentativeTier2(Obs);
   EXPECT_EQ(Pool.pendingCount(), 0u);
   expectNoReaders();
+}
+
+TEST_F(AsyncRepresentativeDispatchTest,
+       ClosedRepresentativeOvertakesFullCandidateQueue) {
+  for (unsigned I = 0; I < 64; ++I) {
+    auto R = Pool.tryCacheHit0D(Func);
+    ASSERT_TRUE(R.hasReadToken);
+    Pool.releaseRead(R.bucketIndex);
+  }
+  EJitSharedTaskPool Peer;
+  EJitCoreId::setCurrentForTest(1);
+  Peer.bind(state_.get());
+  Peer.setMode(EJitCompileMode::Async);
+  Peer.setRepresentativeSharingEnabled(true);
+  ASSERT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+  for (uint32_t I = 0; I < kEJitSharedQueueSlots; ++I)
+    ASSERT_EQ(Peer.compileOrGet(100 + I, nullptr, 0, nullptr).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+  EJitCoreId::setCurrentForTest(0);
+  EJitSharedTaskPool::DispatchObservation Obs;
+  ASSERT_EQ(Pool.readRepresentativeDispatch(Identity, Obs),
+            EJitSharedTaskPool::DispatchSnapshot::Observed);
+  Pool.enqueueObservedRepresentativeTier2(Obs);
+  ASSERT_TRUE(Pool.pollOne());
+  EXPECT_EQ(Slot->tier.loadAcquire(), kEJitTierPgoUse);
+  EXPECT_EQ(state_->enqueuePos.loadAcquire() - state_->dequeuePos.loadAcquire(),
+            kEJitSharedQueueSlots);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  Pool.ownerShutdown();
+  EXPECT_EQ(Pool.liveRequestAttemptCount(), 0u);
+}
+
+TEST_F(AsyncRepresentativeDispatchTest, CancelledPriorityT2CannotPublish) {
+  for (unsigned I = 0; I < 64; ++I) {
+    auto R = Pool.tryCacheHit0D(Func);
+    ASSERT_TRUE(R.hasReadToken);
+    Pool.releaseRead(R.bucketIndex);
+  }
+  EJitSharedTaskPool::DispatchObservation Obs;
+  ASSERT_EQ(Pool.readRepresentativeDispatch(Identity, Obs),
+            EJitSharedTaskPool::DispatchSnapshot::Observed);
+  Pool.enqueueObservedRepresentativeTier2(Obs);
+  ASSERT_TRUE(Pool.cancelRequestAttempt(Identity.attemptToken));
+  ASSERT_TRUE(Pool.pollOne());
+  EXPECT_EQ(findReadySlot(Func), nullptr);
+  EXPECT_EQ(Pool.liveRequestAttemptCount(), 0u);
+  EXPECT_EQ(Pool.pendingCount(), 0u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+}
+
+TEST_F(AsyncRepresentativeDispatchTest,
+       MemberTrafficCannotEvictSamplingRepresentative) {
+  const EJitCompileRequest First = Identity;
+  const uint32_t Bucket = bucketOfIdentity(Func, nullptr, 0);
+  unsigned Collisions = 0;
+  for (uint32_t Other = Func + 1; Other < kEJitSharedMaxFuncIndex &&
+                                  Collisions < kEJitSharedCacheSlots + 4;
+       ++Other) {
+    if (bucketOfIdentity(Other, nullptr, 0) != Bucket)
+      continue;
+    ASSERT_EQ(Pool.compileOrGet(Other, nullptr, 0, nullptr).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Pool.pollOne());
+    auto *Original = findReadySlot(Func);
+    ASSERT_NE(Original, nullptr);
+    EXPECT_EQ(Original->attemptToken, First.attemptToken);
+    EXPECT_EQ(Original->tier.loadAcquire(), kEJitTierInstrumented);
+    for (unsigned I = 0; I < 64; ++I) {
+      auto R = Pool.tryCacheHit0D(Other);
+      ASSERT_TRUE(R.hasReadToken);
+      Pool.releaseRead(R.bucketIndex);
+    }
+    EJitSharedTaskPool::DispatchObservation Obs;
+    ASSERT_EQ(Pool.readRepresentativeDispatch(Identity, Obs),
+              EJitSharedTaskPool::DispatchSnapshot::Observed);
+    Pool.enqueueObservedRepresentativeTier2(Obs);
+    ASSERT_TRUE(Pool.pollOne());
+    ++Collisions;
+  }
+  EXPECT_EQ(Collisions, kEJitSharedCacheSlots + 4);
+  EJitSharedTaskPool::DispatchObservation Obs;
+  ASSERT_EQ(Pool.readRepresentativeDispatch(First, Obs),
+            EJitSharedTaskPool::DispatchSnapshot::Observed);
+  EXPECT_EQ(Obs.count, 0u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+  EXPECT_TRUE(Pool.cancelRequestAttempt(First.attemptToken));
+  EXPECT_EQ(Pool.liveRequestAttemptCount(), 0u);
 }
 
 TEST_F(AsyncRepresentativeDispatchTest,
@@ -8867,12 +9007,8 @@ TEST_F(DeferredCandidateAdmissionTest, QueueFullRetryPreservesOriginalBorrow) {
   auto *Blocking = findReadySlot(50);
   ASSERT_NE(Blocking, nullptr);
   ASSERT_TRUE(Owner.cancelRequestAttempt(Blocking->attemptToken));
-  const uint32_t Pos = state_->enqueuePos.loadAcquire();
-  auto &Cell = state_->ring[Pos % kEJitSharedQueueSlots];
-  const uint32_t Seq = Cell.sequence.loadAcquire();
-  Cell.sequence.storeRelease(Pos - 1);
+  Owner.failNextOwnerPgoQueueForTest();
   Owner.workerPollOnce();
-  Cell.sequence.storeRelease(Seq);
   EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
   EJitSharedTaskPool::RequestAttemptSnapshot S;
   ASSERT_TRUE(Owner.requestAttemptStatus(Token, S));
@@ -8884,6 +9020,27 @@ TEST_F(DeferredCandidateAdmissionTest, QueueFullRetryPreservesOriginalBorrow) {
   ASSERT_NE(findReadySlot(100), nullptr);
   EXPECT_EQ(findReadySlot(100)->attemptToken, Token);
   EXPECT_EQ(Retained.size(), 1u);
+}
+
+TEST_F(DeferredCandidateAdmissionTest, AdmittedT1BypassesBusyCandidateRing) {
+  ASSERT_EQ(lookup().status, EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  const uint64_t Token = Retained[0].attemptToken;
+  auto *Blocking = findReadySlot(50);
+  ASSERT_NE(Blocking, nullptr);
+  ASSERT_TRUE(Owner.cancelRequestAttempt(Blocking->attemptToken));
+  const uint32_t Pos = state_->enqueuePos.loadAcquire();
+  auto &Cell = state_->ring[Pos % kEJitSharedQueueSlots];
+  const uint32_t Seq = Cell.sequence.loadAcquire();
+  Cell.sequence.storeRelease(Pos - 1);
+  Owner.workerPollOnce();
+  Cell.sequence.storeRelease(Seq);
+  ASSERT_NE(findReadySlot(100), nullptr);
+  EXPECT_EQ(findReadySlot(100)->attemptToken, Token);
+  EXPECT_EQ(state_->admissionWaiting.loadAcquire(), 0u);
+  EJitSharedDiagnostics D{};
+  Owner.getDiagnostics(D);
+  EXPECT_EQ(D.ownerPgoServiced, 1u);
 }
 
 TEST_F(DeferredCandidateAdmissionTest, DifferentBindingsDoNotAliasAndCancelUnlinks) {

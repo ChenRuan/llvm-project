@@ -87,6 +87,8 @@ struct EJitSharedDiagnostics {
   uint64_t tier1Compiles;
   uint64_t tier2Compiles;
   uint64_t profileMergeFails;
+  uint32_t ownerPgoReady;
+  uint64_t ownerPgoServiced;
 };
 
 //===----------------------------------------------------------------------===//
@@ -920,6 +922,7 @@ public:
 
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   void failNextTier2QueuePushForTest() { failTier2QueuePush_.storeRelease(1); }
+  void failNextOwnerPgoQueueForTest() { failOwnerPgoPush_.storeRelease(1); }
   void setPgoAdmissionTestHook(TestHookFn fn, void *ctx) {
     pgoAdmissionTestHook_ = fn;
     pgoAdmissionTestHookCtx_ = ctx;
@@ -1460,7 +1463,7 @@ private:
   void
   enqueueTier2FromLookup(const SharedLookup &lookup,
                          const EJitBoundPtrDescriptor *boundPointers = nullptr,
-                         uint32_t boundCount = 0);
+                         uint32_t boundCount = 0, bool OwnerPriority = false);
   /// Cold non-owner first-touch execute-permission preparation for a matched
   /// slot, with the bucket read lock HELD on entry (this function releases it).
   /// Snapshots the slot, drops the lock for the per-core platform seal, then
@@ -1617,6 +1620,7 @@ private:
   // queue/dedup helpers
   EJitCompileOrGetStatus enqueueRepresentativeWake(EJitCompileRequest &req);
   bool queuePush(const EJitCompileRequest &req);
+  bool queueOwnerPgo(const EJitCompileRequest &req);
   bool queuePop(EJitCompileRequest &out);
   /// Claim the in-flight slot for \p funcIndex with \p claim: CAS 0->claim.
   /// The claim is the exact attempt token when request attempts are enabled,
@@ -1738,6 +1742,7 @@ private:
   // layout across LLVMEJIT and test translation units. The test-only APIs and
   // behavior remain guarded by EJIT_SRE_TASKPOOL_TESTING.
   EJitAtomicU32 failTier2QueuePush_{0};
+  EJitAtomicU32 failOwnerPgoPush_{0};
   TestHookFn pgoAdmissionTestHook_ = nullptr;
   void *pgoAdmissionTestHookCtx_ = nullptr;
   TestHookFn representativeReleasePauseHook_ = nullptr;
@@ -1766,9 +1771,15 @@ private:
   };
   std::vector<PendingBatchCompile> pendingBatchCompiles_;
   std::vector<PendingPublish> pendingPublishes_;
-  /// Armed when Tier-2 links into the near RW/NX pool. Drain only the queue
-  /// prefix present at that point; later producers cannot postpone publication.
+  // Only the worker accesses requests here. Every item owns one of the at
+  // most 16 sampling admissions, so priority work cannot grow with members.
+  std::vector<EJitCompileRequest> ownerPgoReady_;
+  EJitAtomicU32 ownerPgoReadyCount_{0};
+  EJitAtomicU64 ownerPgoServiced_{0};
+  /// Representative T2 publishes before members; legacy PGO drains only the
+  /// queue prefix present at link time, not an indefinitely growing queue.
   bool autoTier2PublishPending_ = false;
+  uint32_t autoTier2PublishRetryDelay_ = 0;
   uint32_t autoTier2PublishBoundary_ = 0;
   uint32_t admissionScanCursor_ = 0;
   // Inline-cache safety gate: true while the cache is safe to use (no releaser

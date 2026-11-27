@@ -423,9 +423,12 @@ TEST(EJitCandidateDirectory, BindingsSchemaCollisionAndBudgetsAreExact) {
   EXPECT_EQ(ByteBounded.identityBytes(), 0u);
 }
 
-TEST(EJitCandidateDirectory, HundredEntriesKeepExactHitsAfterDefaultGroupLimit) {
+TEST(EJitCandidateDirectory,
+     HundredEntriesKeepExactHitsAfterConfiguredGroupLimit) {
   constexpr unsigned Entries = 100, Versions = 10;
-  EJitCandidateDirectory Directory;
+  EJitCandidateLimits Limits;
+  Limits.maxGroups = 128;
+  EJitCandidateDirectory Directory(Limits);
   auto TSM = parse("define i32 @f() { ret i32 7 }");
   unsigned Opened = 0, Hits = 0, Rejected = 0;
   TSM.withModuleDo([&](Module &M) {

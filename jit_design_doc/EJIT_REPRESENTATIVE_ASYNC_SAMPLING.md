@@ -304,3 +304,92 @@ An intermediate invalid-formal test exposed the missing terminal failure reason;
 that diagnostic was corrected before the final full and repeated focused runs.
 These are server regressions and BE object checks, not a final SRE SDK link or
 product-board acceptance result.
+
+## Follow-up: representative PGO first, members after T2 publication (2026-11-27)
+
+The old scheduling order allowed candidate traffic to sit ahead of a closed
+representative's T2, and automatic batch publication waited for that queue
+prefix. Members could start after profile freeze, before representative code
+publication. Their final-read deadline also counted legitimate queue residence;
+the waiter scan could select the representative itself. The tiny-deadline real
+ORC regression fails on the parent runtime: the representative publishes but
+its member never completes.
+
+The owner now has a bounded, private priority queue for admitted T1 and closed
+representative T2 requests. It holds at most the existing 16 sampling admissions;
+it does not duplicate member IR, launch another worker, or change shared ABI.
+Closed representative T2 precedes admitted T1, which precedes the ordinary
+candidate/member queue. Queue rollback preserves the original attempt and source
+borrow. A full candidate ring does not prevent admitted PGO work from progressing.
+Normal worker throttling remains between requests and publication steps.
+
+Representative T2 publication no longer waits for unrelated queued candidates.
+Only successful publication opens that group's member T2 work: a frozen profile
+or a linked RW/NX object is insufficient. Publication failure retains the object
+and retries after eight worker turns, without compiling it again, blocking the
+business core, or starving unrelated queue work. Explicit publication failure
+also retains automatic retry. Legacy PGO with representative sharing disabled
+keeps its finite-prefix publication behavior.
+
+The representative still samples exactly 64 executed grants; the last read-token
+leave is required before profile consumption. Closed T1 calls use AOT while T2
+is pending. Members keep using AOT until their exact final identity is validated
+and published. Different final IR/bindings still do not share physical code.
+
+Member queue residence is no longer interpreted as an expired source read.
+Valid borrows remain until completion, bounded transform failure, cancellation,
+deactivation/version change, or shutdown. This does not authorize the product to
+mutate borrowed configuration: its existing deactivate/borrow-fence protocol
+remains mandatory. Cold representative sampling still has the no-progress timeout
+and bounded re-election policy. Waiter maintenance scans at most 64 bindings per
+turn and never schedules the representative as its own member. Active T1 cache
+entries are not eviction victims of unrelated member publications.
+
+Default candidate groups, representative groups and physical-code identity slots
+are aligned at 4096 (formerly 128). Existing identity/module/profile byte budgets
+and per-group member bounds remain enforced. These are lazy upper bounds, not
+4096 eagerly allocated IR modules. Count limits and byte budgets are distinct;
+large product modules can still reach a byte budget and must be diagnosed.
+
+The new real ORC regression drives 130 distinct entries across 6 cells and 6 TRPs
+with separate bound descriptors, actual inline-cache registration, and a slow
+compiler callback. There are 4680 logical identities. One unequal value requires
+a separate group: expected totals are 131 T1 sessions, 8384 real T1 dispatches,
+131 physical T2 objects, and 4680 logical T2 publications. It injects a T2 failure
+after profile freeze, checks all returned values and live writes, verifies equal
+members share pointers and the unequal member does not, drains attempts/admission,
+and verifies a warm sweep creates no new attempts. Native elapsed time is not a
+product compilation-time prediction.
+
+No new Clang option, product binding macro, public C entry point or lipo root is
+required. Rebuild the runtime and relink the image on all cores, then cold-reset.
+Shared protocol remains v31; compatible existing AOT/Clang output is unchanged.
+
+Validation for the PGO-first change (audit/diagnostics ON, serialized builds,
+maximum `-j8`):
+
+| Check | Result |
+| --- | --- |
+| Final complete native suite | 421/421; two existing disabled cases, none added |
+| Preceding complete-suite repetition | 421/421 in three fresh processes, before the final publication-failure throttle adjustment |
+| Queue, timeout, cancellation, nonblocking dispatch and publication regressions | 17/17, shuffled 50 rounds on the final runtime |
+| Real 130 x 6 x 6 pressure in each complete run | 4680 final identities; 131 sessions; exactly 8384 T1 dispatches; 131 shared physical objects; no remaining attempts/admissions |
+| Full-bucket contention | 20 colliding versions finish without evicting the unsampled representative T1 |
+| BE Linux ABI/compiler model | Seven affected/consuming objects compile as MSB AArch64; no undefined `wmemchr` |
+| lipo roots | Bound-pointer root check and real AArch64 archive GC check pass, including `ejit_taskpool_print_stats` |
+
+Evidence is in `/home/chen/chen/workspace/ejit-local-support/pr230-on-pr274-20261125`:
+`pgo-priority-red.log`, `pgo-priority-pressure*.log/xml`,
+`pgo-priority-final-{1..3}.log/xml`, `pgo-priority-release.log/xml`,
+`pgo-priority-repeat.log`, `pgo-priority-be.log`,
+`pgo-priority-be-objects.txt`, and `pgo-priority-lipo{,-real}.log`.
+Pressure uses deterministic shuffled caller order on every sweep. It does not
+skip unequal-configuration checks or substitute mocked compilation.
+
+The experimental whole-suite shuffle (`pgo-priority-release-1.log`) is NOT a
+passing result: existing singleton fixtures reset the global function registry
+while other fixtures retain constructor-time indices, producing missing-bitcode
+failures. That run was stopped. The complete-suite results above use the existing
+test order in fresh processes; the isolated 17-case scheduling subset is shuffled.
+The native/BE/lipo checks do not certify final SRE SDK linkage, real multicore
+permissions/cache maintenance, product watchdog behavior or product acceptance.

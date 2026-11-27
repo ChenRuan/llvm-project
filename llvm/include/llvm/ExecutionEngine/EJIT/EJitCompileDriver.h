@@ -378,7 +378,6 @@ private:
     bool finalReadPending = true;
     bool finalFailed = false;
     uint32_t finalFailures = 0;
-    uint64_t finalReadyAt = 0;
     CandidateAdmissionRoute route = CandidateAdmissionRoute::Group;
     bool needsReclassification = false;
     EJitRepresentativeDiagOutcome outcome = EJitRepresentativeDiagOutcome::Pending;
@@ -386,6 +385,8 @@ private:
   };
   std::unique_ptr<EJitCandidateDirectory> candidateDirectory_;
   std::unordered_map<uint64_t, CandidateBinding> candidateBindings_;
+  uint64_t representativeWaiterCursor_ = 0;
+  bool representativePublishedLocked(const EJitGroupHandle &Group) const;
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   EJitAtomicU64 candidateBudgetDefers_{0};
 #endif

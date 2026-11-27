@@ -243,7 +243,7 @@ struct EJitGroupDiagnostics {
 class EJitRepresentativeGroupRegistry {
 public:
   struct Limits {
-    uint32_t maxGroups = 128;
+    uint32_t maxGroups = 4096;
     uint32_t maxMembersPerGroup = 128;
     uint64_t maxRetainedBundleBytes = 64ull * 1024 * 1024;
   };

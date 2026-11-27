@@ -1817,8 +1817,9 @@ bool EJitSharedTaskPool::serviceDeferredAdmission() {
   if (!isOwner_ || !state_->admissionWaiting.loadAcquire() ||
       state_->pgoActiveFunctionCount.loadAcquire() >=
           state_->pgoMaxActiveFunctions.loadAcquire() ||
-      state_->enqueuePos.loadAcquire() - state_->dequeuePos.loadAcquire() >=
-          kEJitSharedQueueSlots)
+      (!state_->representativeSharingEnabled.loadAcquire() &&
+       state_->enqueuePos.loadAcquire() - state_->dequeuePos.loadAcquire() >=
+           kEJitSharedQueueSlots))
     return false;
 
   EJitCompileRequest Req{};
@@ -1874,7 +1875,10 @@ bool EJitSharedTaskPool::serviceDeferredAdmission() {
       (A->flags.loadRelaxed() & (EJitAttemptWaitingAdmission | EJitAttemptCancelRequested)) ==
           EJitAttemptWaitingAdmission &&
       Req.generation == state_->generation.loadAcquire() && versionsCurrent(Req);
-  const bool Queued = Current && queuePush(Req);
+  const bool Queued =
+      Current &&
+      (state_->representativeSharingEnabled.loadAcquire() ? queueOwnerPgo(Req)
+                                                          : queuePush(Req));
   if (Queued) {
     A->flags.storeRelaxed((A->flags.loadRelaxed() & ~EJitAttemptWaitingAdmission) |
                          EJitAttemptQueueOwned | EJitAttemptSamplingPending |
@@ -2403,6 +2407,24 @@ EJitCompileOrGetStatus EJitSharedTaskPool::enqueueRepresentativeWake(
   acknowledgeRequestAttemptQueueDrop(Req.attemptToken, EJitRequestAttemptReason::QueueFailure);
   EJIT_STAT_INC(state_->counters.queueFull);
   return EJitCompileOrGetStatus::QueueFullFallback;
+}
+
+bool EJitSharedTaskPool::queueOwnerPgo(const EJitCompileRequest &Req) {
+  if (!isOwner_ || ownerPgoReady_.size() >= kEJitSharedMaxConcurrentProfiles)
+    return false;
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  uint32_t FailOwner = 1;
+  if (failOwnerPgoPush_.compareExchange(FailOwner, 0))
+    return false;
+  if (decodeReqTier(Req.funcIndex) == kEJitTierPgoUse) {
+    uint32_t Armed = 1;
+    if (failTier2QueuePush_.compareExchange(Armed, 0))
+      return false;
+  }
+#endif
+  ownerPgoReady_.push_back(Req);
+  ownerPgoReadyCount_.storeRelease(ownerPgoReady_.size());
+  return true;
 }
 
 bool EJitSharedTaskPool::queuePush(const EJitCompileRequest &req) {
@@ -3009,7 +3031,7 @@ void EJitSharedTaskPool::commitLegacyHit(SharedLookup &Hit) {
 
 void EJitSharedTaskPool::enqueueTier2FromLookup(
     const SharedLookup &Lookup, const EJitBoundPtrDescriptor *boundPointers,
-    uint32_t boundCount) {
+    uint32_t boundCount, bool OwnerPriority) {
   if (state_->mode.loadAcquire() !=
           static_cast<uint32_t>(EJitCompileMode::Async) ||
       Lookup.tier2BucketIndex >= kEJitSharedCacheBuckets ||
@@ -3107,7 +3129,7 @@ void EJitSharedTaskPool::enqueueTier2FromLookup(
     return;
 
   const uint64_t Claim = T2.attemptToken ? T2.attemptToken : T2.generation;
-  if (queuePush(T2)) {
+  if (OwnerPriority ? queueOwnerPgo(T2) : queuePush(T2)) {
     EJIT_STAT_INC(state_->counters.asyncEnqueues);
     EJIT_DIAG_VERBOSE("shared taskpool PGO Tier-2 enqueued func=%u gen=%u",
                       stripReqTier(T2.funcIndex), T2.generation);
@@ -3745,7 +3767,9 @@ EJitSharedTaskPool::cacheStagePending(const EJitCompileRequest &req,
         State == static_cast<uint32_t>(EJitSharedSlotState::Empty))
       FirstEmpty = &Slot;
     if (!ReadyVictim &&
-        State == static_cast<uint32_t>(EJitSharedSlotState::Ready))
+        State == static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
+        (!state_->representativeSharingEnabled.loadAcquire() ||
+         Slot.tier.loadRelaxed() != kEJitTierInstrumented))
       ReadyVictim = &Slot;
   }
   if (!Target)
@@ -3888,7 +3912,10 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
     }
     if (!firstEmpty && st == static_cast<uint32_t>(EJitSharedSlotState::Empty))
       firstEmpty = &Slot;
-    if (!evict && st == static_cast<uint32_t>(EJitSharedSlotState::Ready))
+    // An active T1 owns a sampling admission. Eviction can strand its quota.
+    if (!evict && st == static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
+        (!state_->representativeSharingEnabled.loadAcquire() ||
+         Slot.tier.loadRelaxed() != kEJitTierInstrumented))
       evict = &Slot; // never evict a different pending batch identity
   }
   if (!target)
@@ -4392,7 +4419,11 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       // Owner-private batch state must never cross a generation boundary.
       pendingBatchCompiles_.clear();
       pendingPublishes_.clear();
+      ownerPgoReady_.clear();
+      ownerPgoReadyCount_.storeRelease(0);
+      ownerPgoServiced_.storeRelaxed(0);
       autoTier2PublishPending_ = false;
+      autoTier2PublishRetryDelay_ = 0;
       uint64_t NextAttemptToken = 0;
       if (state_->magic == kEJitSharedAbiMagic &&
           state_->abiVersion == kEJitSharedAbiVersion &&
@@ -4575,7 +4606,10 @@ void EJitSharedTaskPool::ownerShutdown() {
       releaseFn_(releaseCtx_, P.fn);
   pendingBatchCompiles_.clear();
   pendingPublishes_.clear();
+  ownerPgoReady_.clear();
+  ownerPgoReadyCount_.storeRelease(0);
   autoTier2PublishPending_ = false;
+  autoTier2PublishRetryDelay_ = 0;
   // Release what the election built, between the join and Uninitialized: no
   // compile can be in flight, and no peer can be elected yet. Without this the
   // former owner keeps its engine while a new owner builds another, so the
@@ -4694,7 +4728,7 @@ void EJitSharedTaskPool::enqueueObservedRepresentativeTier2(
   Hit.tier2BucketIndex = Obs.bucketIndex;
   Hit.tier2SlotIndex = Obs.slotIndex;
   Hit.tier2AttemptToken = Obs.attemptToken;
-  enqueueTier2FromLookup(Hit, nullptr, 0);
+  enqueueTier2FromLookup(Hit, nullptr, 0, /*OwnerPriority=*/true);
 }
 
 EJitSharedTaskPool::T1DispatchOutcome
@@ -4987,7 +5021,7 @@ EJitSharedTaskPool::classifyHit(SharedLookup Hit,
       break;
     }
   }
-  if (Hit.tier2Arm)
+  if (Hit.tier2Arm && !WorkerObserves)
     enqueueTier2FromLookup(Hit, boundPointers, boundCount);
   if (Hit.hasReadToken && Hit.fnPtr) {
     if (Hit.slot)
@@ -5677,14 +5711,19 @@ bool EJitSharedTaskPool::serviceCodeBatchRequest() {
   // by dimensions before ORC/JITLink allocation.
   uint32_t Queued =
       state_->enqueuePos.loadAcquire() - state_->dequeuePos.loadAcquire();
-  Queued = std::min(Queued, kEJitSharedQueueSlots);
+  Queued = std::min(Queued, kEJitSharedQueueSlots) + ownerPgoReady_.size();
   while (Queued-- != 0 && pollOne()) {
     // Explicit publication may drain several queued requests inside one
     // worker step. Preserve the normal per-request scheduling gap.
     workerThrottle();
   }
   autoTier2PublishPending_ = false;
+  autoTier2PublishRetryDelay_ = 0;
   const bool Ok = flushPendingPublishes();
+  if (!Ok && state_->representativeSharingEnabled.loadAcquire()) {
+    autoTier2PublishPending_ = !pendingPublishes_.empty();
+    autoTier2PublishRetryDelay_ = 8;
+  }
   state_->codeBatchRequestState.storeRelease(
       static_cast<uint32_t>(Ok ? EJitCodeBatchRequestState::Succeeded
                                : EJitCodeBatchRequestState::Failed));
@@ -5700,11 +5739,18 @@ bool EJitSharedTaskPool::serviceAutoTier2Publish() {
 #else
   if (!autoTier2PublishPending_ || !state_)
     return false;
-  // Honor work already queued at the first linked T2, without requiring an
-  // idle producer window. Queue distances are bounded below 2^31, so this
-  // serial-number comparison also handles the uint32_t position wrap.
+  if (autoTier2PublishRetryDelay_) {
+    --autoTier2PublishRetryDelay_;
+    return false;
+  }
+  // Representative T2 releases an admission before member work may begin.
+  // Legacy PGO still honors the finite queue prefix at the first linked T2;
+  // the serial-number comparison also handles the uint32_t position wrap.
   const uint32_t Dequeued = state_->dequeuePos.loadAcquire();
-  if (static_cast<int32_t>(Dequeued - autoTier2PublishBoundary_) < 0)
+  const bool Representative =
+      state_->representativeSharingEnabled.loadAcquire();
+  if (!Representative &&
+      static_cast<int32_t>(Dequeued - autoTier2PublishBoundary_) < 0)
     return false;
 
   autoTier2PublishPending_ = false;
@@ -5712,10 +5758,16 @@ bool EJitSharedTaskPool::serviceAutoTier2Publish() {
             "version(s), queued_after=%u",
             pendingPublishes_.size(),
             state_->enqueuePos.loadAcquire() - Dequeued);
-  if (!flushPendingPublishes(/*compileBatchRequests=*/false))
-    EJIT_DIAG("PGO Tier-2 auto-publish failed: pending=%zu; explicit publish "
-              "may retry",
-              pendingPublishes_.size());
+  if (!flushPendingPublishes(/*compileBatchRequests=*/false)) {
+    // A temporary seal/publication failure must not strand the sampling
+    // admission. Retain the compiled object, not another compilation request.
+    autoTier2PublishPending_ = Representative && !pendingPublishes_.empty();
+    autoTier2PublishRetryDelay_ = autoTier2PublishPending_ ? 8 : 0;
+    EJIT_DIAG("PGO Tier-2 auto-publish failed: pending=%zu retry=%s",
+              pendingPublishes_.size(), Representative ? "worker" : "explicit");
+    // This attempt gets the normal worker throttle. Backoff turns let other
+    // compiles progress while the platform cannot seal this batch.
+  }
   return true;
 #endif
 }
@@ -6170,8 +6222,22 @@ bool EJitSharedTaskPool::pollOne() {
   // also compiles immediately, but runCompile retains its near-pool result
   // owner-private until bounded-batch publication replaces the live Tier-1 slot.
   EJitCompileRequest Req{};
-  if (!queuePop(Req))
+  if (!ownerPgoReady_.empty()) {
+    // Finish closed quotas before starting another admitted T1. New candidate
+    // traffic cannot sit in front of work that releases a sampling admission.
+    size_t Next = 0;
+    for (size_t I = 0; I < ownerPgoReady_.size(); ++I)
+      if (decodeReqTier(ownerPgoReady_[I].funcIndex) == kEJitTierPgoUse) {
+        Next = I;
+        break;
+      }
+    Req = ownerPgoReady_[Next];
+    ownerPgoReady_.erase(ownerPgoReady_.begin() + Next);
+    ownerPgoReadyCount_.storeRelease(ownerPgoReady_.size());
+    ownerPgoServiced_.fetchAdd(1);
+  } else if (!queuePop(Req)) {
     return false;
+  }
   // The queue crosses a trust boundary. Check the local copy before batch
   // staging, version lookups, or a user-supplied compiler can index it.
   if (!validCompileRequest(Req)) {
@@ -6430,4 +6496,6 @@ void EJitSharedTaskPool::getDiagnostics(EJitSharedDiagnostics &out) const {
   out.tier1Compiles = state_->counters.tier1Compiles.loadRelaxed();
   out.tier2Compiles = state_->counters.tier2Compiles.loadRelaxed();
   out.profileMergeFails = state_->counters.profileMergeFails.loadRelaxed();
+  out.ownerPgoReady = ownerPgoReadyCount_.loadAcquire();
+  out.ownerPgoServiced = ownerPgoServiced_.loadRelaxed();
 }

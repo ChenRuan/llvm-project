@@ -936,6 +936,10 @@ void ejit_taskpool_print_stats() {
                   static_cast<unsigned long long>(d.tier1Compiles),
                   static_cast<unsigned long long>(d.tier2Compiles),
                   static_cast<unsigned long long>(d.profileMergeFails));
+    EJIT_DIAG_RAW("  pgo owner_ready=%u owner_serviced=%llu "
+                  "(worker-local priority queue)",
+                  d.ownerPgoReady,
+                  static_cast<unsigned long long>(d.ownerPgoServiced));
   }
   // Diagnostic: dump the inline-cache slot registry to help diagnose
   // why cacheHits keeps growing despite icache being enabled. Hand the

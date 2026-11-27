@@ -26,18 +26,20 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
+#include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLibcallStubs.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRepresentativeGroup.h"
+#include "llvm/ExecutionEngine/EJIT/EJitReuseDiagnostics.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
-#include "llvm/ExecutionEngine/EJIT/EJitReuseDiagnostics.h"
-#include "llvm/ADT/ScopeExit.h"
-#include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -47,21 +49,21 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
-#include "llvm/Bitcode/BitcodeWriter.h"
-#include "llvm/Support/TargetSelect.h"
-#include "llvm/TargetParser/Host.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Host.h"
 #include "gtest/gtest.h"
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <chrono>
-#include <atomic>
-#include <algorithm>
-#include <array>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -123,7 +125,7 @@ ValueTarget RuntimeTarget = &rep_runtime_target;
 
 struct CellRow {
   uint32_t gain;
-  uint32_t live[2];
+  uint32_t live[6];
 };
 
 /// Build the entry module of the runtime test: a real specialization-eligible
@@ -139,10 +141,9 @@ std::unique_ptr<Module> buildEntryModule(LLVMContext &Ctx, StringRef Name,
   new GlobalVariable(*M, Type::getInt32Ty(Ctx), false,
                      GlobalValue::ExternalLinkage, nullptr, "__llvm_profile_runtime");
 
-  StructType *CfgTy =
-      StructType::create(Ctx, {Type::getInt32Ty(Ctx),
-                               ArrayType::get(Type::getInt32Ty(Ctx), 2)},
-                         "Cfg");
+  StructType *CfgTy = StructType::create(
+      Ctx, {Type::getInt32Ty(Ctx), ArrayType::get(Type::getInt32Ty(Ctx), 6)},
+      "Cfg");
   ArrayType *ArrTy = ArrayType::get(CfgTy, kCells);
   auto *Cfg = new GlobalVariable(
       *M, ArrTy, /*isConstant=*/false, GlobalValue::ExternalLinkage, nullptr,
@@ -1975,9 +1976,9 @@ TEST(EJitCrossCoreRuntime, IndependentRuntimePeerKeepsRepresentativeSharing) {
   EXPECT_TRUE(Peer->compileDriver()->representativeSharingActive());
 }
 
-void checkPeerExecutes64T1AndConsumesOwnerTier2(bool Bound,
-                                              bool PauseSampling = false,
-                                              uint32_t FailureStage = 1) {
+void checkPeerExecutes64T1AndConsumesOwnerTier2(
+    bool Bound, bool PauseSampling = false, uint32_t FailureStage = 1,
+    bool ShortFinalDeadline = false) {
   CrossCoreReset Reset;
   initRuntimeOnce();
   uint32_t BoundValue = 19;
@@ -2189,6 +2190,8 @@ void checkPeerExecutes64T1AndConsumesOwnerTier2(bool Bound,
         executeAndCheckRows(RepresentativeRuntime::rows(), Last.fnPtr, 0, 1,
                             kQuota, Bound ? &BoundValue : nullptr);
         ++ExecutedT1;
+        if (ShortFinalDeadline)
+          Owner.setRepresentativeTimeoutForTest(1, 2);
       }
     } else {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -2280,6 +2283,10 @@ TEST(EJitCrossCoreRuntime, BoundRepresentativeRetriesWithoutProducer) {
 
 TEST(EJitCrossCoreRuntime, BoundRepresentativeRetriesAfterBundleWithoutProducer) {
   checkPeerExecutes64T1AndConsumesOwnerTier2(true, true, 2);
+}
+
+TEST(EJitCrossCoreRuntime, FrozenProfileWaitersDoNotExpireUnderQueueDelay) {
+  checkPeerExecutes64T1AndConsumesOwnerTier2(true, true, 2, true);
 }
 
 void checkBoundPointerMemberSharing(bool FoldBound, bool Unequal,
@@ -2481,6 +2488,191 @@ TEST(EJitCrossCoreRuntime, CancelledBoundWaitersRequireFreshDescriptors) {
 
 TEST(EJitCrossCoreRuntime, BoundDescriptorMustMatchAnAnnotatedPointerFormal) {
   checkBoundPointerMemberSharing(true, false, false, true);
+}
+
+TEST(EJitCrossCoreRuntime, PgoFirst130EntriesSixCellsSixTrps) {
+  CrossCoreReset Reset;
+  initRuntimeOnce();
+  constexpr unsigned Entries = 130, Cells = 6, Trps = 6;
+  constexpr unsigned Identities = Entries * Cells * Trps;
+  std::vector<CellRow> Rows(Entries * kCells);
+  std::vector<uint32_t> Values(Identities, 19);
+  Values.back() = 41; // An unequal authorized field must not reuse wrong code.
+  std::vector<std::string> Names(Entries), Configs(Entries), Bitcodes(Entries);
+  std::vector<uint32_t> Indices(Entries);
+  std::vector<
+      std::array<uintptr_t, EJIT_ICACHE_DIM_SIZE * EJIT_ICACHE_DIM_SIZE>>
+      Tables(Entries);
+  ejitIcacheClearAll();
+  auto ClearRegistrations = make_scope_exit([] { ejitIcacheClearAll(); });
+  Config C;
+  C.compileMode = CompileMode::Async;
+  C.optLevel = OptimizationLevel::L2;
+  C.enablePgo = C.enableRepresentativeSharing = true;
+  EJitRuntimeState OwnerState, PeerState;
+  EJitModuleLoader OwnerLoader, PeerLoader;
+  for (unsigned E = 0; E < Entries; ++E) {
+    Names[E] = "entry_pgo_first_" + std::to_string(E);
+    Configs[E] = "cfg_pgo_first_" + std::to_string(E);
+    for (unsigned Cell = 0; Cell < kCells; ++Cell)
+      Rows[E * kCells + Cell].gain = 7 + E;
+    LLVMContext Context;
+    auto M = buildEntryModule(Context, Names[E], Configs[E], true, true);
+    ASSERT_FALSE(verifyModule(*M, &errs()));
+    raw_string_ostream OS(Bitcodes[E]);
+    WriteBitcodeToFile(*M, OS);
+    ASSERT_TRUE(OwnerLoader.registerBitcode(
+        Names[E], reinterpret_cast<const uint8_t *>(Bitcodes[E].data()),
+        Bitcodes[E].size()));
+    Indices[E] = EJitFuncRegistry::instance().lookup(Names[E]);
+    OwnerState.getRegistry().registerArray("cell", Configs[E],
+                                           &Rows[E * kCells], kCells);
+    ASSERT_EQ(ejitIcacheRegisterSlot(Indices[E], Tables[E].data(), 2),
+              EJitIcacheRegResult::Ok);
+  }
+  EJitCompileDriver Owner(C, OwnerState, OwnerLoader);
+  EJitCompileDriver Peer(C, PeerState, PeerLoader);
+  registerCrossCoreOwnerSymbols(Owner);
+  for (unsigned E = 0; E < Entries; ++E)
+    Owner.registerSymbol(Configs[E], &Rows[E * kCells]);
+  auto *OP = Owner.sharedTaskPool();
+  auto *PP = Peer.sharedTaskPool();
+  OP->setCodeSharingEnabled(true);
+  PP->setCodeSharingEnabled(true);
+  OP->setPrepareCodeCallback(&crossCoreHostCodeAlreadyExecutable, nullptr);
+  PP->setPrepareCodeCallback(&crossCoreHostCodeAlreadyExecutable, nullptr);
+  OP->setPgoEnabled(true, kQuota, 4);
+  struct SlowCompiler {
+    EJitCompileDriver *Driver;
+    unsigned Calls = 0;
+    bool Failed = false;
+  } Slow{&Owner};
+  OP->setCompiler(
+      +[](void *Ctx, const EJitCompileRequest &Req, void **Out) {
+        auto &S = *static_cast<SlowCompiler *>(Ctx);
+        ++S.Calls;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        if (!S.Failed && decodeReqTier(Req.funcIndex) == kEJitTierPgoUse &&
+            Req.t1DispatchLimit) {
+          S.Failed = true;
+          S.Driver->failNextRepresentativeTier2ForTest(2);
+        }
+        *Out = S.Driver->compileNow(Req);
+        return *Out != nullptr;
+      },
+      &Slow);
+  EJitCoreId::setCurrentForTest(6);
+  ASSERT_TRUE(Owner.startSharedTaskPool());
+  for (unsigned I = 0; I < Cells; ++I)
+    ASSERT_TRUE(
+        OP->setInstanceEnabled(RepresentativeRuntime::cellSlot(), I, true));
+  for (unsigned I = 0; I < Trps; ++I)
+    ASSERT_TRUE(
+        OP->setInstanceEnabled(RepresentativeRuntime::trpSlot(), I, true));
+  EJitCoreId::setCurrentForTest(16);
+  ASSERT_TRUE(Peer.startSharedTaskPool());
+  CrossCoreOwnerShutdown Shutdown{OP};
+  std::vector<void *> Final(Identities, nullptr);
+  std::vector<unsigned> Order(Identities);
+  for (unsigned I = 0; I < Identities; ++I)
+    Order[I] = I;
+  std::mt19937 Shuffle(13066);
+  std::shuffle(Order.begin(), Order.end(), Shuffle);
+  unsigned Done = 0;
+  const auto Start = std::chrono::steady_clock::now();
+  const auto Deadline = Start + std::chrono::seconds(180);
+  for (unsigned Round = 0;
+       Done != Identities && std::chrono::steady_clock::now() < Deadline;
+       ++Round) {
+    for (unsigned N : Order) {
+      const unsigned E = N / (Cells * Trps);
+      const unsigned Cell = (N / Trps) % Cells;
+      const unsigned Trp = N % Trps;
+      if (Final[N])
+        continue;
+      const EJitDimPair Dims[] = {{RepresentativeRuntime::cellSlot(), Cell},
+                                  {RepresentativeRuntime::trpSlot(), Trp}};
+      const uint32_t X = Round % 31 + 1;
+      void *Fast = nullptr;
+      if (PP->icacheTry(Indices[E], Dims, 2, &Fast)) {
+        Final[N] = Fast;
+        ++Done;
+        executeAndCheckRows(&Rows[E * kCells], Fast, Cell, Trp, X, &Values[N]);
+        continue;
+      }
+      const uint64_t Resolve = PP->icacheBeginResolve();
+      auto R = PP->compileOrGet(Indices[E], Dims, 2, nullptr, &Values[N],
+                                sizeof(Values[N]), 3);
+      ASSERT_TRUE(crossCoreRoutingStatus(R.status) ||
+                  R.status == EJitCompileOrGetStatus::QueueFullFallback);
+      if (R.fnPtr) {
+        executeAndCheckRows(&Rows[E * kCells], R.fnPtr, Cell, Trp, X,
+                            &Values[N]);
+        PP->icacheFill(Indices[E], R.fnPtr, Dims, 2, Resolve);
+      }
+      if (R.hasReadToken)
+        PP->releaseRead(R.bucketIndex);
+    }
+    std::shuffle(Order.begin(), Order.end(), Shuffle);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EJitSharedDiagnostics Diag{};
+  OP->getDiagnostics(Diag);
+  const auto Millis = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - Start)
+                          .count();
+  RecordProperty("ready_identities", Done);
+  RecordProperty("elapsed_ms", Millis);
+  RecordProperty("t1_compiles", Diag.tier1Compiles);
+  RecordProperty("t2_publications", Diag.tier2Compiles);
+  RecordProperty("attempt_highwater", Diag.attemptHighWater);
+  RecordProperty("priority_serviced", Diag.ownerPgoServiced);
+  ASSERT_EQ(Done, Identities)
+      << "active=" << Diag.pgoActiveFunctionCount
+      << " waiting=" << Diag.admissionWaiting << " queued=" << Diag.queueDepth
+      << " failures=" << Diag.compileFailed;
+  for (unsigned E = 0; E < Entries; ++E)
+    for (unsigned I = 1; I < Cells * Trps; ++I)
+      if (E == Entries - 1 && I == Cells * Trps - 1)
+        EXPECT_NE(Final[E * Cells * Trps + I], Final[E * Cells * Trps]);
+      else
+        EXPECT_EQ(Final[E * Cells * Trps + I], Final[E * Cells * Trps]);
+  for (unsigned I = 0; I < 5000 && OP->liveRequestAttemptCount(); ++I)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EJitGroupDiagnostics D;
+  EJitGroupSnapshot S;
+  EJitFrozenProfileBundle B;
+  size_t Groups = 0;
+  ASSERT_TRUE(Owner.representativeSnapshot(D, S, Groups, B));
+  EXPECT_EQ(Groups, Entries + 1u);
+  RecordProperty("representative_sessions", D.representativeSessions);
+  RecordProperty("real_t1_dispatches", D.representativeDispatches);
+  RecordProperty("physical_t2_objects", D.physicalCodeObjects);
+  EXPECT_EQ(D.representativeSessions, Entries + 1u);
+  EXPECT_EQ(D.representativeDispatches, (Entries + 1u) * kQuota);
+  EXPECT_EQ(D.physicalCodeObjects, Entries + 1u);
+  EXPECT_EQ(D.bundlePublications, Entries + 1u);
+  EXPECT_EQ(OP->liveRequestAttemptCount(), 0u);
+  EXPECT_EQ(OP->pendingCount(), 0u);
+  OP->getDiagnostics(Diag);
+  EXPECT_EQ(Diag.pgoActiveFunctionCount, 0u);
+  EXPECT_EQ(Diag.admissionWaiting, 0u);
+  EXPECT_EQ(Diag.tier1Compiles, Entries + 1u);
+  EXPECT_GE(Diag.ownerPgoServiced, Entries + 1u);
+  EXPECT_GE(Diag.compileFailed, 1u);
+  const uint64_t NextAttempt = OP->state()->nextAttemptToken.loadAcquire();
+  for (unsigned E = 0; E < Entries; ++E)
+    for (unsigned Cell = 0; Cell < Cells; ++Cell)
+      for (unsigned Trp = 0; Trp < Trps; ++Trp) {
+        const EJitDimPair Dims[] = {{RepresentativeRuntime::cellSlot(), Cell},
+                                    {RepresentativeRuntime::trpSlot(), Trp}};
+        void *Fast = nullptr;
+        ASSERT_TRUE(PP->icacheTry(Indices[E], Dims, 2, &Fast));
+        const unsigned N = (E * Cells + Cell) * Trps + Trp;
+        EXPECT_EQ(Fast, Final[N]);
+        executeAndCheckRows(&Rows[E * kCells], Fast, Cell, Trp, 5, &Values[N]);
+      }
+  EXPECT_EQ(OP->state()->nextAttemptToken.loadAcquire(), NextAttempt);
 }
 
 TEST(EJitCrossCoreRuntime,

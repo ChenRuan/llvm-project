@@ -292,3 +292,36 @@ tests do not certify AArch64 BE code generation, SRE mappings/cache maintenance,
 or board execution. Those require the three board commands above and their
 resulting logs. This example does not cover `bound_ptr`, PR231 or every product
 may_const site.
+
+## PGO-First Scheduling Diagnostics (2026-11-27)
+
+Use `ejit_taskpool_print_stats` on the worker core (6) twice, about 20 seconds
+apart. It is already retained by lipo. There is no new enable switch for the
+PGO-first scheduling fix; representative reuse must still be enabled normally.
+
+- `pgo owner_ready` is the worker-private admitted-PGO queue, bounded by the
+  existing sampling concurrency. `owner_serviced` counts priority requests
+  consumed, including retries; it is not a count of unique generated functions.
+- `tier1Compiles`, `tier2Compiles`, active profiles and admission waiters show
+  sampling/publication progress. Logical T2 publications can greatly exceed the
+  number of physical shared objects; use reuse diagnostics for physical counts.
+- `registered` / `with any cell filled` describe inline-cache table coverage,
+  not compile counts. A collecting T1 does not fill that fast table. A function
+  with no post-publication business call can still show an empty fast table.
+- `PGO Tier-2 publish boundary reached` now publishes a representative before
+  unrelated candidates drain. Member final preparation starts only after that
+  representative T2 is published, not merely after profile freeze.
+- A transient publication failure is retried by the worker with a scheduling
+  gap, keeping the compiled object. Persistent platform permission/seal failure
+  still needs diagnosis; this change does not make a failed mapping executable.
+- Normal member queue delay no longer emits `member final wait timed out ...
+  source lease ended`. Cold representative no-progress timeout and real source
+  cancellation/version fences are still enforced. Do not ignore cancellation
+  messages or change configuration while its compiler-source borrow is live.
+
+The existing 6-16-6 board example and its 20-entry smoke mode are unchanged. The
+new 130-entry x 6-cell x 6-TRP concurrency regression is a server test using real
+ORC, PGO and generated code, not an assertion that the product board has passed.
+Its expected 4680 logical T2 identities share 131 physical objects (one deliberate
+unequal configuration), with 131 x 64 real samples. All pressure identities use
+registered inline-cache tables, as the generated product wrappers do.
