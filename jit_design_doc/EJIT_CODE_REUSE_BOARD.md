@@ -1,5 +1,35 @@
 # PR230 Board Smoke Test (spec5)
 
+## Bound-pointer sharing (2026-11-27)
+
+Bound-pointer entries now participate in representative sharing; they no longer
+take the unconditional `bound-pointer identity uses independent fallback` route.
+No additional option, Clang change, annotation or SDK callback is required.
+Keep the existing `ejit_init_representative` initialization, active dimensions,
+bound-pointer descriptors and authorized constant-field annotations. This
+follow-up retains shared ABI v31 and adds no shared storage or wrapper steps.
+
+Candidate classification and final compilation receive the same bound context:
+different cell/TRP objects at different addresses may share if their optimized
+code and effective bindings match. Six distinct bound objects with equal
+authorized fields can therefore use one representative's 64 T1 samples and one
+physical T2. Unannotated fields remain runtime reads through the actual pointer.
+Unequal specialized constants still form separate groups; no member executes
+another member's baked-in value merely because both pointers were annotated.
+
+Descriptors remain borrowed until their final compiler read or cancellation.
+Existing queued/final-member retries retain the same live lease. After an
+explicit cancellation ends that lease, a new business request must provide a
+fresh descriptor; maintenance must not resurrect the old raw address. Changes
+to active bound objects still require the existing deactivate/borrow-drain/
+update/reactivate protocol. The usual business-execution lifetime also applies.
+
+On core 6, use the existing `ejit_reuse_diag_print_summary`,
+`ejit_reuse_diag_print`, and `ejit_taskpool_print_stats`. Successful member reuse
+reports `stage=FINAL_COMPARE outcome=SHARED_REUSE reason=IDENTITY_EQUAL`.
+`PREFIX_IR_DIFF` / `NEW_GROUP` remains normal when specialized values differ.
+Other eligibility checks and final exact comparison are unchanged.
+
 ## Deferred admission coalescing (2026-11-27)
 
 The current shared protocol is **v31**, superseding v30 below. Rebuild the
@@ -36,11 +66,10 @@ Attempt IDs are cumulative request identities, not a count of compiled bodies
 and not a strict `functions x cells` limit. Different TRPs, lifecycle versions,
 queue failures and legitimate retries can create additional attempts.
 
-This patch does **not** enable bound-pointer code sharing. The current candidate
-path explicitly selects independent compilation for bound pointers; this is not
-evidence that their final code differs. Descriptor-aware candidate preparation,
-source lifetime handling and exact final IR/binding comparison are required
-before that restriction can be lifted. Do not remove the check as a workaround.
+The original coalescing commit `de8d39e7f` did not enable bound-pointer sharing;
+the follow-up above now connects descriptor-aware candidate preparation and
+the existing exact final comparison. Coalescing is still request deduplication,
+not proof that distinct logical versions can share physical code.
 
 ## Live request capacity update (2026-11-26)
 

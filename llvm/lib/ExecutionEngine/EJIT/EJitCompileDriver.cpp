@@ -44,6 +44,34 @@ using namespace llvm;
 using namespace llvm::ejit;
 
 namespace {
+Error applyRequestBoundPointers(const EJitCompileRequest *Request,
+                                ArrayRef<uint32_t> BoundFormals,
+                                SpecializationContext &Ctx) {
+  if (!Request || !Request->boundCount)
+    return Error::success();
+  if (!validateBoundPtrDescriptors(Request->boundPointers, Request->boundCount))
+    return make_error<StringError>("invalid bound-pointer descriptors",
+                                    inconvertibleErrorCode());
+  for (uint32_t I = 0; I < Request->boundCount; ++I) {
+    const auto &B = Request->boundPointers[I];
+    // Avoid libc++ range searches that can introduce wmemchr on SRE.
+    bool Matched = false;
+    for (uint32_t Arg : BoundFormals)
+      if (Arg == B.argIndex) {
+        Matched = true;
+        break;
+      }
+    if (!Matched)
+      return make_error<StringError>(
+          "bound argIndex=" + std::to_string(B.argIndex) +
+              " has no matching EJIT_BOUND_PTR pointer formal",
+          inconvertibleErrorCode());
+    Ctx.boundPointers.push_back(
+        {static_cast<const uint8_t *>(B.rawPtr), B.size, B.argIndex});
+  }
+  return Error::success();
+}
+
 EJitReuseDiagnostic makeReuseDiagnostic(
     const EJitCompileRequest &Req, StringRef Entry, StringRef Stage,
     StringRef Reason, StringRef Action, uint64_t Group, uint64_t GroupGeneration) {
@@ -744,7 +772,10 @@ void EJitCompileDriver::retireDriverGenerationMetadataLocked(
       ++It;
       continue;
     }
-    if (WasPending && It->first != RetiredRepresentativeLogicalKey) {
+    // Ending a bound borrow forbids maintenance from reacquiring its raw
+    // address. A fresh business request must supply the next descriptor.
+    if (WasPending && !It->second.request.boundCount &&
+        It->first != RetiredRepresentativeLogicalKey) {
       It->second.needsReclassification = true;
       It->second.finalFailed = false;
       It->second.finalFailures = 0;
@@ -815,6 +846,14 @@ bool EJitCompileDriver::classifyRepresentativeRequest(const EJitCompileRequest &
     for (unsigned J = 0; J < Req.numDims; ++J)
       if (Meta.dimTypes[I] == Req.dims[J].dimType)
         Ctx.dimensions.push_back({Meta.periodNames[I], static_cast<uint8_t>(Req.dims[J].instanceId)});
+  if (auto Err = applyRequestBoundPointers(&Req, Meta.boundPointerArgIndices, Ctx)) {
+    const std::string Reason = toString(std::move(Err));
+    EJIT_DIAG("ejit_diag stage=CANDIDATE outcome=FAILURE reason=INVALID_INPUT "
+              "func=%u attempt=%llu detail=%s", F,
+              static_cast<unsigned long long>(Req.attemptToken),
+              Reason.c_str());
+    return false;
+  }
   EJitCodeIdentityScope Scope;
   Scope.source = SHA256::hash(ArrayRef<uint8_t>(
       reinterpret_cast<const uint8_t *>(BC->data()), BC->size()));
@@ -825,8 +864,9 @@ bool EJitCompileDriver::classifyRepresentativeRequest(const EJitCompileRequest &
   // effective bindings referenced by the module. Registration count is not an
   // identity component: unrelated symbols must not split a candidate group.
   Scope.bindingGeneration = 1;
-  // Bound-pointer identity needs descriptor-aware admission. Until that path
-  // is classified exactly, keep those requests on independent compilation.
+  // Bound descriptors drive the same authorized folding as final compilation.
+  // Their raw addresses are not a separate veto: remaining pointer identity
+  // and specialized values are compared through canonical IR and bindings.
   uint64_t Group = UINT64_MAX;
   bool ExistingCandidate = false;
   uint64_t CandidatePeerGroup = 0;
@@ -838,34 +878,25 @@ bool EJitCompileDriver::classifyRepresentativeRequest(const EJitCompileRequest &
   std::string CandidateDetail;
   bool CandidateEvent = false;
   CandidateAdmissionRoute Route = CandidateAdmissionRoute::Group;
-  if (Req.boundCount == 0 && Meta.boundPointerArgIndices.empty()) {
-    auto Candidate = jitEngine_->classifyCandidate(*BC, Ctx, *candidateDirectory_, Scope);
-    if (Candidate) {
-      Group = Candidate->groupId;
-      ExistingCandidate = Candidate->existing;
-      CandidatePeerGroup = Candidate->relatedGroupId;
-      CandidateDifference = std::move(Candidate->diagnostic);
-    } else {
-      CandidateDetail = toString(Candidate.takeError());
-      CandidateReason = diagReasonForCandidateError(CandidateDetail);
-      CandidateOutcome = diagOutcomeForCandidateError(CandidateReason);
-      CandidateEvent = true;
-      Route = CandidateOutcome == EJitRepresentativeDiagOutcome::Independent
-                  ? CandidateAdmissionRoute::Independent
-                  : CandidateAdmissionRoute::AotFallback;
-#ifdef EJIT_SRE_TASKPOOL_TESTING
-      if (CandidateOutcome == EJitRepresentativeDiagOutcome::Deferred)
-        candidateBudgetDefers_.fetchAdd(1);
-#endif
-    }
+  auto Candidate =
+      jitEngine_->classifyCandidate(*BC, Ctx, *candidateDirectory_, Scope);
+  if (Candidate) {
+    Group = Candidate->groupId;
+    ExistingCandidate = Candidate->existing;
+    CandidatePeerGroup = Candidate->relatedGroupId;
+    CandidateDifference = std::move(Candidate->diagnostic);
   } else {
-    // Bound-pointer requests remain on the conservative independent route;
-    // this is an intentional policy result, not a classifier failure.
-    CandidateReason = EJitRepresentativeDiagReason::Binding;
-    CandidateOutcome = EJitRepresentativeDiagOutcome::Independent;
-    CandidateDetail = "bound-pointer identity uses independent fallback";
+    CandidateDetail = toString(Candidate.takeError());
+    CandidateReason = diagReasonForCandidateError(CandidateDetail);
+    CandidateOutcome = diagOutcomeForCandidateError(CandidateReason);
     CandidateEvent = true;
-    Route = CandidateAdmissionRoute::Independent;
+    Route = CandidateOutcome == EJitRepresentativeDiagOutcome::Independent
+                ? CandidateAdmissionRoute::Independent
+                : CandidateAdmissionRoute::AotFallback;
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+    if (CandidateOutcome == EJitRepresentativeDiagOutcome::Deferred)
+      candidateBudgetDefers_.fetchAdd(1);
+#endif
   }
   uint64_t SupersededBorrow = 0;
   lockRepGroups();
@@ -1077,6 +1108,12 @@ bool EJitCompileDriver::serviceRepresentativeWaiters() {
                                  !Work.needsReclassification
                              ? sharedPool_.resumeRepresentativeWaiter(R)
                              : EJitCompileOrGetStatus::InvalidParam;
+    if (Resumed == EJitCompileOrGetStatus::InvalidParam && R.boundCount) {
+      // A cancelled/missing bound lease cannot be replaced using an old raw
+      // pointer. End metadata ownership; the next producer supplies a new one.
+      completeCandidateBorrow(Key, &R);
+      return false;
+    }
     if (Resumed == EJitCompileOrGetStatus::InvalidParam)
       Result = sharedPool_.compileOrGet(stripReqTier(R.funcIndex), R.dims,
                                        R.numDims, nullptr);
@@ -2120,28 +2157,11 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   ctx.optLevel = config_.optLevel;
   for (unsigned i = 0; i < dimCount; ++i)
     ctx.dimensions.push_back({periodNames[i], dims[i]});
-  if (request && request->boundCount) {
-    for (uint32_t I = 0; I < request->boundCount; ++I) {
-      const EJitBoundPtrDescriptor &B = request->boundPointers[I];
-      // Keep this lookup as an explicit loop. libc++ may lower generic
-      // uint32_t range searches to wmemchr, which is unavailable on the
-      // freestanding SRE target.
-      bool HasMatchingBoundFormal = false;
-      for (uint32_t ArgIndex : meta.boundPointerArgIndices) {
-        if (ArgIndex == B.argIndex) {
-          HasMatchingBoundFormal = true;
-          break;
-        }
-      }
-      if (!HasMatchingBoundFormal) {
-        EJIT_DIAG("compile FAIL key=0x%016lx func=%s: bound argIndex=%u "
-                  "has no matching EJIT_BOUND_PTR pointer formal",
-                  cacheKey, funcName.c_str(), B.argIndex);
-        return nullptr;
-      }
-      ctx.boundPointers.push_back(
-          {static_cast<const uint8_t *>(B.rawPtr), B.size, B.argIndex});
-    }
+  if (auto Err = applyRequestBoundPointers(request, meta.boundPointerArgIndices, ctx)) {
+    const std::string Reason = toString(std::move(Err));
+    EJIT_DIAG("compile FAIL key=0x%016lx func=%s: %s", cacheKey,
+              funcName.c_str(), Reason.c_str());
+    return nullptr;
   }
 
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE

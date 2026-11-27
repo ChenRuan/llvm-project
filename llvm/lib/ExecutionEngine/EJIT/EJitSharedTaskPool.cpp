@@ -5280,6 +5280,9 @@ EJitSharedTaskPool::compileOrGetValidated(
       EJitCompileRequest Wake{};
       if (representativeWakeFn_ &&
           representativeWakeFn_(representativeWakeCtx_, funcIndex, dims, numDims, Wake)) {
+        Wake.boundCount = boundCount;
+        for (uint32_t I = 0; I < boundCount; ++I)
+          Wake.boundPointers[I] = boundPointers[I];
         R.status = enqueueRepresentativeWake(Wake);
         return R;
       }
@@ -5416,6 +5419,9 @@ EJitSharedTaskPool::compileOrGetValidated(
       EJitCompileRequest Wake{};
       if (representativeWakeFn_ &&
           representativeWakeFn_(representativeWakeCtx_, funcIndex, dims, numDims, Wake)) {
+        Wake.boundCount = boundCount;
+        for (uint32_t I = 0; I < boundCount; ++I)
+          Wake.boundPointers[I] = boundPointers[I];
         R.status = enqueueRepresentativeWake(Wake);
         return R;
       }
@@ -5934,6 +5940,11 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
         return;
       }
       dedupClear(req.funcIndex, Claim);
+      if (!Classified && Admission == SamplingAdmission::Classify) {
+        settleRequestAttemptSampling(req.attemptToken,
+                                     EJitRequestAttemptReason::CompileFailure);
+        EJIT_STAT_INC(state_->counters.compileFailed);
+      }
       // Keep only a classifier's own waiter lease. The owner maintenance
       // wakes that waiter when the group publishes, without waiting for a peer.
       const bool KeepBorrow =

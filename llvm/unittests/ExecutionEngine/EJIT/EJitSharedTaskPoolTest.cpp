@@ -8973,6 +8973,35 @@ TEST_F(RetainedCandidateCapacityTest, GroupWaiterHotLoopCoalescesWithoutNewT1) {
   EXPECT_EQ(state_->admissionWaiting.loadAcquire(), 0u);
 }
 
+TEST_F(RetainedCandidateCapacityTest, OwnerWakePreservesBoundDescriptors) {
+  uint32_t Values[] = {19, 31};
+  const EJitBoundPtrDescriptor Bounds[] = {
+      {&Values[0], sizeof(Values[0]), 3}, {&Values[1], sizeof(Values[1]), 4}};
+  EJitCompileRequest Compiled{};
+  Owner.setCompiler(+[](void *Ctx, const EJitCompileRequest &Req, void **Out) {
+    *static_cast<EJitCompileRequest *>(Ctx) = Req;
+    *Out = codeFor(Req.funcIndex);
+    return true;
+  }, &Compiled);
+  Owner.setSamplingAdmissionCallback(
+      +[](void *, uint32_t, const EJitDimPair *, uint32_t, uint32_t, uint64_t) {
+        return EJitSharedTaskPool::SamplingAdmission::WakeTier2;
+      }, nullptr);
+  const EJitDimPair Dims[] = {{0, 1}, {1, 2}};
+  ASSERT_EQ(Owner.compileOrGet(100, Dims, 2, nullptr, Bounds, 2).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  EXPECT_EQ(decodeReqTier(Compiled.funcIndex), kEJitTierPgoUse);
+  ASSERT_EQ(Compiled.boundCount, 2u);
+  for (unsigned I = 0; I < 2; ++I) {
+    EXPECT_EQ(Compiled.boundPointers[I].argIndex, Bounds[I].argIndex);
+    EXPECT_EQ(Compiled.boundPointers[I].rawPtr, Bounds[I].rawPtr);
+    EXPECT_EQ(Compiled.boundPointers[I].size, Bounds[I].size);
+  }
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(Owner.liveRequestAttemptCount(), 0u);
+}
+
 TEST_F(SharedTaskPoolTest, AttemptTokenExhaustionFailsClosedWithoutAdmission) {
   EJitSharedTaskPool owner;
   EJitCoreId::setCurrentForTest(0);

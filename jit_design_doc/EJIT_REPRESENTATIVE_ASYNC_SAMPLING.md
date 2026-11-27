@@ -248,3 +248,59 @@ Evidence in the same server support directory: `admission-coalesce-red.log`,
 Intermediate full-suite failures exposed owner-origin duplicate attempts and
 missing worker-driven cancelled-representative refresh; both were fixed before
 the final runs. The BE build is not a final SRE SDK link or board test.
+
+## Follow-up: bound-pointer candidate eligibility (2026-11-27)
+
+By product request, remove the blanket independent route for entries with bound
+pointer formals/descriptors. Candidate and final compilation now use one context
+builder, preserving range validation and exact formal matching. Runtime views
+feed the existing preserved-dimension/authorized-load pipeline. Raw descriptor
+addresses are not added as an unconditional group discriminator: differing
+addresses may produce identical code, while embedded constants, observable
+addresses and effective symbol bindings still participate in exact identity.
+Unannotated reads remain dynamic. No equality is fabricated and no differing
+final IR is force-shared. Existing wrapper and annotation contracts are unchanged.
+
+Retained member T2 work uses its original descriptor-bearing lease. Fresh
+owner-origin wakeups also carry the supplied descriptors. Group retirement
+ends old bound borrows and removes their automatic reclassification triggers;
+the next business request supplies a fresh descriptor instead of maintenance
+reopening a completed borrow. A failed/missing retained bound lease similarly
+does not fall through to descriptor-less or stale-pointer compilation. Normal
+T2 queue/compiler retries retain live leases and require no producer retry.
+
+Shared ABI remains v31; there is no new public API, flag, SDK hook, lipo root,
+shared-memory allocation, or business hit-path work. Rebuild the runtime and
+relink the package/image; compatible AOT/Clang output can be reused.
+
+Real ORC/PGO cross-core tests cover six different object addresses sharing one
+T2, unequal authorized fields forming two groups, unannotated differing values
+remaining dynamic under shared code, configuration rebind, cancellation with
+fresh descriptor re-entry, and strict 64-sample retries before/after bundle
+freeze. A pool regression separately checks both bound descriptors survive an
+owner-origin T2 wakeup. The old runtime fails the new bound-group acceptance
+test; the previous fallback-only test is updated to require a real group.
+
+Invalid descriptor/formal combinations are rejected before candidate admission,
+release their request borrow, and record `CompileFailure` instead of an empty
+terminal reason. A regression checks rejection and subsequent valid re-entry.
+
+Validation (serialized builds, at most `-j8`, audit/diagnostics retained):
+
+| Check | Result |
+| --- | --- |
+| Original runtime with bound-group acceptance test | Fails as expected: no representative group |
+| Complete native runtime/pool/PGO/folding suite | 414/414 on the final patch; two pre-existing disabled cases |
+| Earlier full-suite repetition | 413/413 in five fresh processes, before the invalid-formal diagnostic regression/fix |
+| Final bound-pointer and owner-wakeup regressions | 9/9, shuffled 50 repeats |
+| BE Linux ABI/compiler model | Both changed implementation objects compile as MSB AArch64; no undefined `wmemchr` |
+| lipo roots | Bound-pointer roots and real AArch64 archive GC checks pass, including `ejit_taskpool_print_stats` |
+
+Evidence in the same server support directory: `bound-sharing-red.log`,
+`bound-sharing-release-{1..5}.log/xml`, `bound-sharing-final2.log/xml`,
+`bound-sharing-final2-stress.log`, `bound-sharing-be.log`,
+`bound-sharing-be-undefined.txt`, and `bound-sharing-lipo-{bound,gc}.log`.
+An intermediate invalid-formal test exposed the missing terminal failure reason;
+that diagnostic was corrected before the final full and repeated focused runs.
+These are server regressions and BE object checks, not a final SRE SDK link or
+product-board acceptance result.
