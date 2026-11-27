@@ -8301,6 +8301,42 @@ TEST_F(AsyncRepresentativeDispatchTest, TimeoutCannotCancelNewSamplingProgress) 
 }
 
 TEST_F(AsyncRepresentativeDispatchTest,
+       ProgressSnapshotReportsQuotaAndBusyWithoutTakingSamples) {
+  auto P = Pool.getPgoProgress(0);
+  ASSERT_TRUE(P.active);
+  ASSERT_TRUE(P.liveAttempt);
+  ASSERT_TRUE(P.hasTier1);
+  EXPECT_FALSE(P.busy);
+  EXPECT_EQ(P.attemptToken, Identity.attemptToken);
+  EXPECT_EQ(P.samples, 0u);
+  EXPECT_EQ(P.limit, 64u);
+  EXPECT_EQ(P.readers, 0u);
+  for (unsigned I = 0; I < 63; ++I) {
+    auto R = Pool.tryCacheHit0D(Func);
+    ASSERT_TRUE(R.hasReadToken);
+    Pool.releaseRead(R.bucketIndex);
+  }
+  auto Last = Pool.tryCacheHit0D(Func);
+  ASSERT_TRUE(Last.hasReadToken);
+  P = Pool.getPgoProgress(0);
+  EXPECT_EQ(P.samples, 64u);
+  EXPECT_EQ(P.readers, 1u);
+  Pool.releaseRead(Last.bucketIndex);
+  auto &Bucket = state_->buckets[bucketOfIdentity(Func, nullptr, 0)];
+  state_->attemptLock.storeRelease(1);
+  EXPECT_TRUE(Pool.getPgoProgress(0).busy);
+  state_->attemptLock.storeRelease(0);
+  Bucket.observationLock.storeRelease(1);
+  EXPECT_TRUE(Pool.getPgoProgress(0).busy);
+  Bucket.observationLock.storeRelease(0);
+  EXPECT_EQ(Bucket.readers.loadAcquire(), 0u);
+  EXPECT_EQ(Slot->t1DispatchCount.loadAcquire(), 64u);
+  EXPECT_FALSE(Pool.getPgoProgress(kEJitSharedMaxConcurrentProfiles).active);
+  Pool.ownerShutdown();
+  EXPECT_FALSE(Pool.getPgoProgress(0).active);
+}
+
+TEST_F(AsyncRepresentativeDispatchTest,
        ClosedRepresentativeOvertakesFullCandidateQueue) {
   for (unsigned I = 0; I < 64; ++I) {
     auto R = Pool.tryCacheHit0D(Func);
@@ -8346,6 +8382,109 @@ TEST_F(AsyncRepresentativeDispatchTest, CancelledPriorityT2CannotPublish) {
   EXPECT_EQ(Pool.liveRequestAttemptCount(), 0u);
   EXPECT_EQ(Pool.pendingCount(), 0u);
   EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+}
+
+TEST_F(AsyncRepresentativeDispatchTest,
+       ClosedRepresentativeOvertakesSameFunctionCandidate) {
+  EJitSharedTaskPool Peer;
+  Pool.setInstanceEnabled(0, 1, true);
+  EJitCoreId::setCurrentForTest(1);
+  Peer.bind(state_.get());
+  Peer.setMode(EJitCompileMode::Async);
+  Peer.setRepresentativeSharingEnabled(true);
+  ASSERT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+  for (uint32_t I = 0; I < 16; ++I)
+    ASSERT_EQ(Peer.compileOrGet(100 + I, nullptr, 0, nullptr).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+  const EJitDimPair Member[] = {{0, 1}};
+  ASSERT_EQ(Peer.compileOrGet(Func, Member, 1, nullptr).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  const uint64_t MemberClaim = state_->inFlight[Func].loadAcquire();
+  ASSERT_NE(MemberClaim, 0u);
+  ASSERT_NE(MemberClaim, Identity.attemptToken);
+
+  EJitCoreId::setCurrentForTest(0);
+  for (unsigned I = 0; I < 64; ++I) {
+    auto R = Pool.tryCacheHit0D(Func);
+    ASSERT_TRUE(R.hasReadToken);
+    Pool.releaseRead(R.bucketIndex);
+  }
+  EJitSharedTaskPool::DispatchObservation Obs;
+  ASSERT_EQ(Pool.readRepresentativeDispatch(Identity, Obs),
+            EJitSharedTaskPool::DispatchSnapshot::Observed);
+  ASSERT_TRUE(Obs.closedQuota);
+  Pool.failNextTier2QueuePushForTest();
+  Pool.enqueueObservedRepresentativeTier2(Obs);
+  EXPECT_EQ(state_->inFlight[Func].loadAcquire(), MemberClaim);
+  EJitSharedDiagnostics FailedPush{};
+  Pool.getDiagnostics(FailedPush);
+  EXPECT_EQ(FailedPush.ownerPgoReady, 0u);
+  Pool.enqueueObservedRepresentativeTier2(Obs);
+  Pool.enqueueObservedRepresentativeTier2(Obs);
+  EJitSharedDiagnostics D{};
+  Pool.getDiagnostics(D);
+  ASSERT_EQ(D.ownerPgoReady, 1u)
+      << "same-function candidate must not block the closed representative";
+  bool FailedCompile = false;
+  Pool.setCompiler(
+      +[](void *Ctx, const EJitCompileRequest &Req, void **Out) {
+        auto &Failed = *static_cast<bool *>(Ctx);
+        if (!Failed && decodeReqTier(Req.funcIndex) == kEJitTierPgoUse) {
+          Failed = true;
+          *Out = nullptr;
+          return false;
+        }
+        return mockCompile(nullptr, Req, Out);
+      },
+      &FailedCompile);
+  ASSERT_TRUE(Pool.pollOne());
+  EXPECT_TRUE(FailedCompile);
+  EXPECT_EQ(Slot->tier.loadAcquire(), kEJitTierInstrumented);
+  EXPECT_EQ(Slot->t1DispatchCount.loadAcquire(), 64u);
+  EXPECT_EQ(state_->inFlight[Func].loadAcquire(), MemberClaim);
+  Pool.enqueueObservedRepresentativeTier2(Obs);
+  ASSERT_TRUE(Pool.pollOne());
+  EXPECT_EQ(Slot->tier.loadAcquire(), kEJitTierPgoUse);
+  EXPECT_EQ(state_->inFlight[Func].loadAcquire(), MemberClaim);
+  EXPECT_EQ(state_->enqueuePos.loadAcquire() - state_->dequeuePos.loadAcquire(),
+            17u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  Pool.ownerShutdown();
+  EXPECT_EQ(Pool.liveRequestAttemptCount(), 0u);
+}
+
+TEST_F(AsyncRepresentativeDispatchTest,
+       CancellingPriorityT2PreservesSameFunctionMemberClaim) {
+  EJitSharedTaskPool Peer;
+  Pool.setInstanceEnabled(0, 1, true);
+  EJitCoreId::setCurrentForTest(1);
+  Peer.bind(state_.get());
+  Peer.setMode(EJitCompileMode::Async);
+  Peer.setRepresentativeSharingEnabled(true);
+  ASSERT_EQ(Peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+  const EJitDimPair Member[] = {{0, 1}};
+  ASSERT_EQ(Peer.compileOrGet(Func, Member, 1, nullptr).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  const uint64_t MemberClaim = state_->inFlight[Func].loadAcquire();
+  EJitCoreId::setCurrentForTest(0);
+  for (unsigned I = 0; I < 64; ++I) {
+    auto R = Pool.tryCacheHit0D(Func);
+    ASSERT_TRUE(R.hasReadToken);
+    Pool.releaseRead(R.bucketIndex);
+  }
+  EJitSharedTaskPool::DispatchObservation Obs;
+  ASSERT_EQ(Pool.readRepresentativeDispatch(Identity, Obs),
+            EJitSharedTaskPool::DispatchSnapshot::Observed);
+  Pool.enqueueObservedRepresentativeTier2(Obs);
+  ASSERT_TRUE(Pool.cancelRequestAttempt(Identity.attemptToken));
+  ASSERT_TRUE(Pool.pollOne());
+  EXPECT_EQ(findReadySlot(Func), nullptr);
+  EXPECT_EQ(state_->inFlight[Func].loadAcquire(), MemberClaim);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(state_->enqueuePos.loadAcquire() - state_->dequeuePos.loadAcquire(),
+            1u);
+  Pool.ownerShutdown();
+  EXPECT_EQ(Pool.liveRequestAttemptCount(), 0u);
 }
 
 TEST_F(AsyncRepresentativeDispatchTest,

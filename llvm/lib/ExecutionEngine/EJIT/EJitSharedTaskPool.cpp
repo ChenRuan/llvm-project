@@ -3088,6 +3088,9 @@ void EJitSharedTaskPool::enqueueTier2FromLookup(
   T2.t1DispatchCount = Slot.t1DispatchCount.loadRelaxed();
   T2.t1QuotaEnd = Slot.t1QuotaEnd.loadRelaxed();
   T2.t1DispatchLimit = Slot.t1DispatchLimit.loadRelaxed();
+  const bool ClosedOwnerRepresentative =
+      OwnerPriority && isOwner_ && Slot.representativeT1.loadRelaxed() &&
+      T2.t1DispatchLimit && T2.t1DispatchCount == T2.t1DispatchLimit;
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
   bucketObservationUnlock(Bucket);
 #endif
@@ -3103,7 +3106,13 @@ void EJitSharedTaskPool::enqueueTier2FromLookup(
         (A->flags.loadRelaxed() &
          (Required | EJitAttemptCancelRequested | EJitAttemptQueueOwned |
           EJitAttemptCompileActive)) == Required &&
-        dedupMark(T2.funcIndex, T2.attemptToken) == EJitDedupResult::Claimed) {
+        (dedupMark(T2.funcIndex, T2.attemptToken) == EJitDedupResult::Claimed ||
+         ClosedOwnerRepresentative)) {
+      // A queued member can own this function's coarse claim. The exact
+      // representative attempt owns its T2 queue flag and sampling admission,
+      // so the single worker can finish it first without stealing that claim.
+      // Rollback/publication clear only this attempt's claim, never the
+      // member's.
       T2.boundCount = A->boundCount;
       for (uint32_t I = 0; I < T2.boundCount; ++I)
         T2.boundPointers[I] = A->boundPointers[I];
@@ -4721,8 +4730,7 @@ EJitSharedTaskPool::DispatchSnapshot EJitSharedTaskPool::readRepresentativeDispa
 void EJitSharedTaskPool::enqueueObservedRepresentativeTier2(
     const DispatchObservation &Obs) {
   if (!state_ || !isOwner_ || !Obs.closedQuota ||
-      Obs.funcIndex >= kEJitSharedMaxFuncIndex ||
-      state_->inFlight[Obs.funcIndex].loadAcquire())
+      Obs.funcIndex >= kEJitSharedMaxFuncIndex)
     return;
   SharedLookup Hit;
   Hit.tier2BucketIndex = Obs.bucketIndex;
@@ -6406,6 +6414,89 @@ void EJitSharedTaskPool::workerEntryThunk(void *ctx) {
 //===----------------------------------------------------------------------===//
 // Diagnostics (§11 observability).
 //===----------------------------------------------------------------------===//
+EJitSharedTaskPool::PgoProgress
+EJitSharedTaskPool::getPgoProgress(uint32_t Index) const {
+  PgoProgress Out;
+  if (!state_ || Index >= kEJitSharedMaxConcurrentProfiles)
+    return Out;
+  const uint32_t Encoded = state_->pgoActiveFunctions[Index].loadAcquire();
+  if (!Encoded)
+    return Out;
+  Out.active = true;
+  Out.funcIndex = Encoded - 1;
+  Out.attemptToken = state_->pgoActiveAttemptTokens[Index].loadAcquire();
+  if (Out.funcIndex >= kEJitSharedMaxFuncIndex) {
+    Out.busy = true;
+    return Out;
+  }
+  Out.functionClaim = state_->inFlight[Out.funcIndex].loadAcquire();
+  uint32_t Expected = 0;
+  if (!state_->attemptLock.compareExchange(Expected, 1)) {
+    Out.busy = true;
+    return Out;
+  }
+  EJitCompileRequest Req{};
+  if (const auto *A = findAttemptLocked(state_, Out.attemptToken)) {
+    if (A->funcIndex.loadRelaxed() == Out.funcIndex &&
+        A->numDims <= kEJitSharedMaxDims) {
+      Out.liveAttempt = true;
+      Out.flags = A->flags.loadRelaxed();
+      Req.funcIndex = Out.funcIndex;
+      Req.attemptToken = Out.attemptToken;
+      Req.generation = A->generation.loadRelaxed();
+      Req.numDims = A->numDims;
+      for (uint32_t I = 0; I < Req.numDims; ++I) {
+        Req.dims[I] = A->dims[I];
+        Req.versions[I] = A->versions[I];
+      }
+    }
+  }
+  requestAttemptUnlock(state_);
+  if (Out.liveAttempt) {
+    auto &Bucket =
+        state_->buckets[hashIdentity(Req.funcIndex, Req.dims, Req.numDims) %
+                        kEJitSharedCacheBuckets];
+    if (!bucketTryRead(Bucket)) {
+      Out.busy = true;
+      return Out;
+    }
+    Expected = 0;
+    if (!Bucket.observationLock.compareExchange(Expected, 1)) {
+      bucketReadRelease(Bucket);
+      Out.busy = true;
+      return Out;
+    }
+    Out.readers = Bucket.readers.loadAcquire();
+#ifndef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    // Exclude this diagnostic's read token in the reclaiming build.
+    --Out.readers;
+#endif
+    for (const auto &Slot : Bucket.slots) {
+      if (Slot.state.loadRelaxed() !=
+              static_cast<uint32_t>(EJitSharedSlotState::Ready) ||
+          Slot.attemptToken != Req.attemptToken ||
+          Slot.generation != Req.generation ||
+          Slot.tier.loadRelaxed() != kEJitTierInstrumented ||
+          !slotIdentityMatches(Slot, Req.funcIndex, Req.dims, Req.numDims) ||
+          !slotVersionsMatch(Slot, Req.versions, Req.numDims))
+        continue;
+      Out.hasTier1 = true;
+      Out.limit = Slot.t1DispatchLimit.loadRelaxed();
+      Out.samples = Out.limit ? Slot.t1DispatchCount.loadRelaxed()
+                              : Slot.hitCount.loadRelaxed();
+      if (!Out.limit)
+        Out.limit = state_->tier2Threshold.loadAcquire();
+      break;
+    }
+    bucketObservationUnlock(Bucket);
+    bucketReadRelease(Bucket);
+  }
+  Out.busy =
+      state_->pgoActiveFunctions[Index].loadAcquire() != Encoded ||
+      state_->pgoActiveAttemptTokens[Index].loadAcquire() != Out.attemptToken;
+  return Out;
+}
+
 uint32_t EJitSharedTaskPool::sharedInitState() const {
   return state_ ? state_->initState.loadAcquire()
                 : static_cast<uint32_t>(EJitSharedInitState::Uninitialized);

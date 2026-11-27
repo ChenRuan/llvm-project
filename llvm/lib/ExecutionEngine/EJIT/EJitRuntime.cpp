@@ -940,6 +940,33 @@ void ejit_taskpool_print_stats() {
                   "(worker-local priority queue)",
                   d.ownerPgoReady,
                   static_cast<unsigned long long>(d.ownerPgoServiced));
+#ifdef EJIT_DIAG_ENABLE
+    for (uint32_t I = 0; I < kEJitSharedMaxConcurrentProfiles; ++I) {
+      const auto P = sp->getPgoProgress(I);
+      if (!P.active)
+        continue;
+      const char *Stage =
+          P.busy                                   ? "SNAPSHOT_BUSY"
+          : !P.attemptToken                        ? "LEGACY_UNTRACKED"
+          : !P.liveAttempt                         ? "ATTEMPT_MISSING"
+          : (P.flags & EJitAttemptCancelRequested) ? "CANCELLING"
+          : (P.flags & EJitAttemptCompileActive)   ? "COMPILING_OR_DRAINING"
+          : (P.flags & EJitAttemptQueueOwned)      ? "QUEUED"
+          : P.hasTier1 && P.samples == P.limit     ? "T2_WAIT_QUEUE"
+          : P.hasTier1                             ? "SAMPLING"
+                                                   : "WAIT_T1_OR_PUBLICATION";
+      EJIT_DIAG_RAW("  pgo progress func=%u attempt=%llu stage=%s "
+                    "samples=%llu/%llu t1=%u flags=0x%x claim=%llu "
+                    "bucket_readers=%u snapshot=%s",
+                    P.funcIndex,
+                    static_cast<unsigned long long>(P.attemptToken), Stage,
+                    static_cast<unsigned long long>(P.samples),
+                    static_cast<unsigned long long>(P.limit),
+                    static_cast<unsigned>(P.hasTier1), P.flags,
+                    static_cast<unsigned long long>(P.functionClaim), P.readers,
+                    P.busy ? "busy" : "ok");
+    }
+#endif
   }
   // Diagnostic: dump the inline-cache slot registry to help diagnose
   // why cacheHits keeps growing despite icache being enabled. Hand the

@@ -1284,6 +1284,22 @@ public:
 
   //--- diagnostics ------------------------------------------------------------
   void getDiagnostics(EJitSharedDiagnostics &out) const;
+
+  struct PgoProgress {
+    bool active = false;
+    bool busy = false;
+    bool liveAttempt = false;
+    bool hasTier1 = false;
+    uint32_t funcIndex = 0;
+    uint32_t flags = 0;
+    uint32_t readers = 0;
+    uint64_t attemptToken = 0;
+    uint64_t functionClaim = 0;
+    uint64_t samples = 0;
+    uint64_t limit = 0;
+  };
+  // Bounded, nonblocking snapshot of one sampling admission; no shared ABI.
+  PgoProgress getPgoProgress(uint32_t admissionIndex) const;
   uint32_t sharedInitState() const;
   /// In-flight dedup count (used by the taskpool C ABI pending_count).
   uint32_t pendingCount() const;

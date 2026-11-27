@@ -2490,7 +2490,7 @@ TEST(EJitCrossCoreRuntime, BoundDescriptorMustMatchAnAnnotatedPointerFormal) {
   checkBoundPointerMemberSharing(true, false, false, true);
 }
 
-TEST(EJitCrossCoreRuntime, PgoFirst130EntriesSixCellsSixTrps) {
+static void checkPgoFirst130EntriesSixCellsSixTrps(bool ConcurrentPeers) {
   CrossCoreReset Reset;
   initRuntimeOnce();
   constexpr unsigned Entries = 130, Cells = 6, Trps = 6;
@@ -2572,62 +2572,100 @@ TEST(EJitCrossCoreRuntime, PgoFirst130EntriesSixCellsSixTrps) {
   EJitCoreId::setCurrentForTest(16);
   ASSERT_TRUE(Peer.startSharedTaskPool());
   CrossCoreOwnerShutdown Shutdown{OP};
+  std::array<EJitRuntimeState, Cells - 1> ExtraStates;
+  std::array<EJitModuleLoader, Cells - 1> ExtraLoaders;
+  std::vector<std::unique_ptr<EJitCompileDriver>> ExtraPeers;
+  std::array<EJitSharedTaskPool *, Cells> PeerPools{};
+  PeerPools[0] = PP;
+  if (ConcurrentPeers) {
+    for (unsigned I = 1; I < Cells; ++I) {
+      ExtraPeers.push_back(std::make_unique<EJitCompileDriver>(
+          C, ExtraStates[I - 1], ExtraLoaders[I - 1]));
+      auto *Pool = ExtraPeers.back()->sharedTaskPool();
+      Pool->setCodeSharingEnabled(true);
+      Pool->setPrepareCodeCallback(&crossCoreHostCodeAlreadyExecutable,
+                                   nullptr);
+      EJitCoreId::setCurrentForTest(16 + I);
+      ASSERT_TRUE(ExtraPeers.back()->startSharedTaskPool());
+      PeerPools[I] = Pool;
+    }
+  }
   std::vector<void *> Final(Identities, nullptr);
   std::vector<unsigned> Order(Identities);
   for (unsigned I = 0; I < Identities; ++I)
     Order[I] = I;
   std::mt19937 Shuffle(13066);
   std::shuffle(Order.begin(), Order.end(), Shuffle);
-  unsigned Done = 0;
+  std::atomic<unsigned> Done{0};
   const auto Start = std::chrono::steady_clock::now();
   const auto Deadline = Start + std::chrono::seconds(180);
-  for (unsigned Round = 0;
-       Done != Identities && std::chrono::steady_clock::now() < Deadline;
-       ++Round) {
-    for (unsigned N : Order) {
-      const unsigned E = N / (Cells * Trps);
-      const unsigned Cell = (N / Trps) % Cells;
-      const unsigned Trp = N % Trps;
-      if (Final[N])
-        continue;
-      const EJitDimPair Dims[] = {{RepresentativeRuntime::cellSlot(), Cell},
-                                  {RepresentativeRuntime::trpSlot(), Trp}};
-      const uint32_t X = Round % 31 + 1;
-      void *Fast = nullptr;
-      if (PP->icacheTry(Indices[E], Dims, 2, &Fast)) {
-        Final[N] = Fast;
-        ++Done;
-        executeAndCheckRows(&Rows[E * kCells], Fast, Cell, Trp, X, &Values[N]);
-        continue;
+  auto Call = [&](unsigned Caller) {
+    EJitCoreId::setCurrentForTest(16 + Caller);
+    auto *CallerPool = PeerPools[Caller];
+    std::vector<unsigned> CallerOrder;
+    for (unsigned N : Order)
+      if (!ConcurrentPeers || (N / Trps) % Cells == Caller)
+        CallerOrder.push_back(N);
+    std::mt19937 CallerShuffle(13066 + Caller);
+    for (unsigned Round = 0; Done.load() != Identities &&
+                             std::chrono::steady_clock::now() < Deadline;
+         ++Round) {
+      for (unsigned N : CallerOrder) {
+        const unsigned E = N / (Cells * Trps);
+        const unsigned Cell = (N / Trps) % Cells;
+        const unsigned Trp = N % Trps;
+        if (Final[N])
+          continue;
+        const EJitDimPair Dims[] = {{RepresentativeRuntime::cellSlot(), Cell},
+                                    {RepresentativeRuntime::trpSlot(), Trp}};
+        const uint32_t X = Round % 31 + 1;
+        void *Fast = nullptr;
+        if (CallerPool->icacheTry(Indices[E], Dims, 2, &Fast)) {
+          Final[N] = Fast;
+          ++Done;
+          executeAndCheckRows(&Rows[E * kCells], Fast, Cell, Trp, X,
+                              &Values[N]);
+          continue;
+        }
+        const uint64_t Resolve = CallerPool->icacheBeginResolve();
+        auto R = CallerPool->compileOrGet(Indices[E], Dims, 2, nullptr,
+                                          &Values[N], sizeof(Values[N]), 3);
+        ASSERT_TRUE(crossCoreRoutingStatus(R.status) ||
+                    R.status == EJitCompileOrGetStatus::QueueFullFallback);
+        if (R.fnPtr) {
+          executeAndCheckRows(&Rows[E * kCells], R.fnPtr, Cell, Trp, X,
+                              &Values[N]);
+          CallerPool->icacheFill(Indices[E], R.fnPtr, Dims, 2, Resolve);
+        }
+        if (R.hasReadToken)
+          CallerPool->releaseRead(R.bucketIndex);
       }
-      const uint64_t Resolve = PP->icacheBeginResolve();
-      auto R = PP->compileOrGet(Indices[E], Dims, 2, nullptr, &Values[N],
-                                sizeof(Values[N]), 3);
-      ASSERT_TRUE(crossCoreRoutingStatus(R.status) ||
-                  R.status == EJitCompileOrGetStatus::QueueFullFallback);
-      if (R.fnPtr) {
-        executeAndCheckRows(&Rows[E * kCells], R.fnPtr, Cell, Trp, X,
-                            &Values[N]);
-        PP->icacheFill(Indices[E], R.fnPtr, Dims, 2, Resolve);
-      }
-      if (R.hasReadToken)
-        PP->releaseRead(R.bucketIndex);
+      std::shuffle(CallerOrder.begin(), CallerOrder.end(), CallerShuffle);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    std::shuffle(Order.begin(), Order.end(), Shuffle);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  };
+  if (ConcurrentPeers) {
+    std::vector<std::thread> Callers;
+    for (unsigned I = 0; I < Cells; ++I)
+      Callers.emplace_back(Call, I);
+    for (auto &Caller : Callers)
+      Caller.join();
+  } else {
+    Call(0);
   }
+  EJitCoreId::setCurrentForTest(16);
   EJitSharedDiagnostics Diag{};
   OP->getDiagnostics(Diag);
   const auto Millis = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - Start)
                           .count();
-  RecordProperty("ready_identities", Done);
-  RecordProperty("elapsed_ms", Millis);
-  RecordProperty("t1_compiles", Diag.tier1Compiles);
-  RecordProperty("t2_publications", Diag.tier2Compiles);
-  RecordProperty("attempt_highwater", Diag.attemptHighWater);
-  RecordProperty("priority_serviced", Diag.ownerPgoServiced);
-  ASSERT_EQ(Done, Identities)
+  ::testing::Test::RecordProperty("ready_identities", Done.load());
+  ::testing::Test::RecordProperty("elapsed_ms", Millis);
+  ::testing::Test::RecordProperty("t1_compiles", Diag.tier1Compiles);
+  ::testing::Test::RecordProperty("t2_publications", Diag.tier2Compiles);
+  ::testing::Test::RecordProperty("attempt_highwater", Diag.attemptHighWater);
+  ::testing::Test::RecordProperty("priority_serviced", Diag.ownerPgoServiced);
+  ASSERT_EQ(Done.load(), Identities)
       << "active=" << Diag.pgoActiveFunctionCount
       << " waiting=" << Diag.admissionWaiting << " queued=" << Diag.queueDepth
       << " failures=" << Diag.compileFailed;
@@ -2645,9 +2683,11 @@ TEST(EJitCrossCoreRuntime, PgoFirst130EntriesSixCellsSixTrps) {
   size_t Groups = 0;
   ASSERT_TRUE(Owner.representativeSnapshot(D, S, Groups, B));
   EXPECT_EQ(Groups, Entries + 1u);
-  RecordProperty("representative_sessions", D.representativeSessions);
-  RecordProperty("real_t1_dispatches", D.representativeDispatches);
-  RecordProperty("physical_t2_objects", D.physicalCodeObjects);
+  ::testing::Test::RecordProperty("representative_sessions",
+                                  D.representativeSessions);
+  ::testing::Test::RecordProperty("real_t1_dispatches",
+                                  D.representativeDispatches);
+  ::testing::Test::RecordProperty("physical_t2_objects", D.physicalCodeObjects);
   EXPECT_EQ(D.representativeSessions, Entries + 1u);
   EXPECT_EQ(D.representativeDispatches, (Entries + 1u) * kQuota);
   EXPECT_EQ(D.physicalCodeObjects, Entries + 1u);
@@ -2673,6 +2713,14 @@ TEST(EJitCrossCoreRuntime, PgoFirst130EntriesSixCellsSixTrps) {
         executeAndCheckRows(&Rows[E * kCells], Fast, Cell, Trp, 5, &Values[N]);
       }
   EXPECT_EQ(OP->state()->nextAttemptToken.loadAcquire(), NextAttempt);
+}
+
+TEST(EJitCrossCoreRuntime, PgoFirst130EntriesSixCellsSixTrps) {
+  checkPgoFirst130EntriesSixCellsSixTrps(false);
+}
+
+TEST(EJitCrossCoreRuntime, PgoFirst130EntriesSixConcurrentCellCallers) {
+  checkPgoFirst130EntriesSixCellsSixTrps(true);
 }
 
 TEST(EJitCrossCoreRuntime,

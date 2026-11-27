@@ -393,3 +393,72 @@ failures. That run was stopped. The complete-suite results above use the existin
 test order in fresh processes; the isolated 17-case scheduling subset is shuffled.
 The native/BE/lipo checks do not certify final SRE SDK linkage, real multicore
 permissions/cache maintenance, product watchdog behavior or product acceptance.
+
+## Follow-up: same-function candidate cannot block closed T2 (2026-11-27)
+
+The next board report was from the PGO-first runtime, not its predecessor. It
+contained six published T1s, all six observed at 64/64, but only two completed
+sampling admissions. Four admissions remained occupied, with `owner_ready=0`,
+`owner_serviced=2`, 124 waiting admissions and no compile/publication failures.
+Candidate matches are identities, not executable code. Twelve logical T2
+publications in this report belonged to the two completed functions; they were
+not twelve completed representative sessions.
+
+A deterministic regression found a gap before the priority queue: another
+cell/TRP candidate for the SAME function can hold the per-function `inFlight`
+claim while waiting behind unrelated candidates. The closed representative then
+failed both the early claim check and the enqueue claim, so it never entered the
+priority queue. Prior full-ring coverage used other function indices and did
+not exercise this ordering. This is a reproduced defect consistent with the
+board symptom; the report did not capture every blocked attempt's flags.
+
+The owner may now enqueue its closed representative T2 using that exact
+attempt's sampling admission and queue-ownership flags, even when a member owns
+the coarse function claim. It does not steal or clear the member's claim. The
+worker still compiles serially, and duplicate observation, queue rollback,
+compile failure and cancellation all preserve the correct attempt ownership.
+Only a real representative with a closed quota uses this exception. Legacy
+enqueue paths retain their coarse-claim checks. The final T1 execution token
+must still leave before the profile is consumed; no additional samples or
+cross-identity profile sharing are introduced.
+
+`ejit_taskpool_print_stats` additionally prints at most 16 active sampling rows:
+
+```text
+pgo progress func=... attempt=... stage=T2_WAIT_QUEUE samples=64/64 t1=1 flags=... claim=... bucket_readers=0 snapshot=ok
+```
+
+`QUEUED`, `COMPILING_OR_DRAINING`, `SAMPLING` and `T2_WAIT_QUEUE` distinguish the
+attempt's current phase. `claim` is the coarse function claim, so a different
+token reveals a same-function contender. `bucket_readers` counts outstanding
+execution tokens in the bucket, including colliding identities, not necessarily
+only this function. A contended snapshot says `SNAPSHOT_BUSY`; its partial fields
+must not be interpreted as zero progress. These are explicit diagnostic prints,
+not business-path logs, and do not consume sampling quota. No new C/lipo entry,
+shared ABI version, Clang option or product macro is introduced.
+
+Regression coverage includes the same-function backlog, duplicate closed
+observations, injected priority enqueue and compiler failures, cancellation
+without clearing a member's claim, and nonblocking diagnostic snapshots. The
+real 130-entry/6-cell/6-TRP test also runs with six independent peer runtimes and
+concurrent callers; each cell has its own writable test data. It still checks
+4680 logical publications, 131 physical T2s, exactly 8384 real T1 executions,
+unequal-value separation, actual generated-code results and complete draining.
+
+The separate `PREPARE_REJECTED` / private-global fallback in the report is not
+changed here. It did produce independent T2s; removing object-identity checks is
+not a scheduling fix. Product-board timing and any remaining stall require the
+new progress rows; native completion alone is not board acceptance.
+
+Validation on this follow-up (serialized builds, at most `-j8`, audit/diagnostics
+enabled): full native suite 425/425 (the same two pre-existing disabled tests);
+20 focused scheduling cases shuffled 50 times; six-caller real-ORC pressure
+completed in the full suite and two additional repeated rounds with the totals
+above; four changed/consuming objects compiled as
+AArch64 MSB without undefined `wmemchr`; lipo bound-pointer and real archive GC
+checks passed, explicitly including `ejit_taskpool_print_stats`. Evidence is
+`same-function-red.log`, `same-function-full.log/xml`,
+`same-function-focused.log`, `same-function-repeat.log`,
+`same-function-concurrent*.log/xml`, `same-function-be.log` and
+`same-function-lipo*.log` beside the preceding evidence. The original board log
+is not committed. No final product SDK link or board acceptance is claimed.
